@@ -22,6 +22,10 @@ to compress page upon page only to reject them all.  Instead, the limit is
 checked against current usage, then we compress and charge.  This allows
 some limit overrun, but not enough to matter in practice.
 
+[hannes@cmpxchg.org: fix for CONFIG_SLOB builds]
+  Link: https://lkml.kernel.org/r/YnwD14zxYjUJPc2w@cmpxchg.org
+[hannes@cmpxchg.org: opt out of cgroups v1]
+  Link: https://lkml.kernel.org/r/Yn6it9mBYFA+/lTb@cmpxchg.org
 Link: https://lkml.kernel.org/r/20220510152847.230957-7-hannes@cmpxchg.org
 Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@suse.com>
@@ -34,10 +38,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/admin-guide/cgroup-v2.rst |   21 ++
- include/linux/memcontrol.h              |   54 ++++++
- mm/memcontrol.c                         |  196 +++++++++++++++++++++-
- mm/zswap.c                              |   37 +++-
- 4 files changed, 293 insertions(+), 15 deletions(-)
+ include/linux/memcontrol.h              |   54 +++++
+ mm/memcontrol.c                         |  205 +++++++++++++++++++++-
+ mm/zswap.c                              |   37 +++
+ 4 files changed, 302 insertions(+), 15 deletions(-)
 
 --- a/Documentation/admin-guide/cgroup-v2.rst~zswap-memcg-accounting
 +++ a/Documentation/admin-guide/cgroup-v2.rst
@@ -91,7 +95,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Range enforcement for interrupt charges */
  	struct work_struct high_work;
  
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +	unsigned long zswap_max;
 +#endif
 +
@@ -187,7 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	{ "sock",			MEMCG_SOCK			},
  	{ "vmalloc",			MEMCG_VMALLOC			},
  	{ "shmem",			NR_SHMEM			},
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +	{ "zswap",			MEMCG_ZSWAP_B			},
 +	{ "zswapped",			MEMCG_ZSWAPPED			},
 +#endif
@@ -206,7 +210,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGLAZYFREED),
  		       memcg_events(memcg, PGLAZYFREED));
  
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +	seq_buf_printf(&s, "%s %lu\n", vm_event_name(ZSWPIN),
 +		       memcg_events(memcg, ZSWPIN));
 +	seq_buf_printf(&s, "%s %lu\n", vm_event_name(ZSWPOUT),
@@ -258,13 +262,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	if (!memcg_kmem_enabled() || memcg_kmem_bypass())
 +		return NULL;
- 
++
 +	if (PageMemcgKmem(page)) {
 +		objcg = __folio_objcg(page_folio(page));
 +		obj_cgroup_get(objcg);
 +	} else {
 +		struct mem_cgroup *memcg;
-+
+ 
 +		rcu_read_lock();
 +		memcg = __folio_memcg(page_folio(page));
 +		if (memcg)
@@ -280,17 +284,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	page_counter_set_high(&memcg->memory, PAGE_COUNTER_MAX);
  	memcg->soft_limit = PAGE_COUNTER_MAX;
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +	memcg->zswap_max = PAGE_COUNTER_MAX;
 +#endif
  	page_counter_set_high(&memcg->swap, PAGE_COUNTER_MAX);
  	if (parent) {
  		memcg->swappiness = mem_cgroup_swappiness(parent);
-@@ -7421,6 +7466,139 @@ static struct cftype memsw_files[] = {
+@@ -7421,6 +7466,148 @@ static struct cftype memsw_files[] = {
  	{ },	/* terminate */
  };
  
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +/**
 + * obj_cgroup_may_zswap - check if this cgroup can zswap
 + * @objcg: the object cgroup
@@ -307,6 +311,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct mem_cgroup *memcg, *original_memcg;
 +	bool ret = true;
++
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
++		return true;
 +
 +	original_memcg = get_mem_cgroup_from_objcg(objcg);
 +	for (memcg = original_memcg; memcg != root_mem_cgroup;
@@ -344,6 +351,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct mem_cgroup *memcg;
 +
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
++		return;
++
 +	VM_WARN_ON_ONCE(!(current->flags & PF_MEMALLOC));
 +
 +	/* PF_MEMALLOC context, charging must succeed */
@@ -367,6 +377,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +void obj_cgroup_uncharge_zswap(struct obj_cgroup *objcg, size_t size)
 +{
 +	struct mem_cgroup *memcg;
++
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys))
++		return;
 +
 +	obj_cgroup_uncharge(objcg, size);
 +
@@ -421,17 +434,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	},
 +	{ }	/* terminate */
 +};
-+#endif /* CONFIG_ZSWAP */
++#endif /* CONFIG_MEMCG_KMEM && CONFIG_ZSWAP */
 +
  /*
   * If mem_cgroup_swap_init() is implemented as a subsys_initcall()
   * instead of a core_initcall(), this could mean cgroup_memory_noswap still
-@@ -7439,7 +7617,9 @@ static int __init mem_cgroup_swap_init(v
+@@ -7439,7 +7626,9 @@ static int __init mem_cgroup_swap_init(v
  
  	WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys, swap_files));
  	WARN_ON(cgroup_add_legacy_cftypes(&memory_cgrp_subsys, memsw_files));
 -
-+#ifdef CONFIG_ZSWAP
++#if defined(CONFIG_MEMCG_KMEM) && defined(CONFIG_ZSWAP)
 +	WARN_ON(cgroup_add_dfl_cftypes(&memory_cgrp_subsys, zswap_files));
 +#endif
  	return 0;
