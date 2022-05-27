@@ -1,0 +1,133 @@
+From: Zi Yan <ziy@nvidia.com>
+Subject: mm: split free page with properly free memory accounting and without race
+Date: Thu, 26 May 2022 19:15:31 -0400
+
+In isolate_single_pageblock(), free pages are checked without holding zone
+lock, but they can go away in split_free_page() when zone lock is held.
+Check the free page and its order again in split_free_page() when zone lock
+is held. Recheck the page if the free page is gone under zone lock.
+
+In addition, in split_free_page(), the free page was deleted from the page
+list without changing free page accounting. Add the missing free page
+accounting code.
+
+Fix the type of order parameter in split_free_page().
+
+Link: https://lore.kernel.org/lkml/20220525103621.987185e2ca0079f7b97b856d@linux-foundation.org/
+Link: https://lkml.kernel.org/r/20220526231531.2404977-2-zi.yan@sent.com
+Fixes: b2c9e2fbba32 ("mm: make alloc_contig_range work at pageblock granularity")
+Signed-off-by: Zi Yan <ziy@nvidia.com>
+Reported-by: Doug Berger <opendmb@gmail.com>
+  Link: https://lore.kernel.org/linux-mm/c3932a6f-77fe-29f7-0c29-fe6b1c67ab7b@gmail.com/
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Qian Cai <quic_qiancai@quicinc.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Eric Ren <renzhengeek@gmail.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Cc: Michael Walle <michael@walle.cc>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/internal.h       |    4 ++--
+ mm/page_alloc.c     |   24 ++++++++++++++++++++----
+ mm/page_isolation.c |   10 +++++++---
+ 3 files changed, 29 insertions(+), 9 deletions(-)
+
+--- a/mm/internal.h~mm-split-free-page-with-properly-free-memory-accounting-and-without-race
++++ a/mm/internal.h
+@@ -374,8 +374,8 @@ extern void *memmap_alloc(phys_addr_t si
+ 			  phys_addr_t min_addr,
+ 			  int nid, bool exact_nid);
+ 
+-void split_free_page(struct page *free_page,
+-				int order, unsigned long split_pfn_offset);
++int split_free_page(struct page *free_page,
++			unsigned int order, unsigned long split_pfn_offset);
+ 
+ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
+ 
+--- a/mm/page_alloc.c~mm-split-free-page-with-properly-free-memory-accounting-and-without-race
++++ a/mm/page_alloc.c
+@@ -1100,30 +1100,44 @@ done_merging:
+  * @order:		the order of the page
+  * @split_pfn_offset:	split offset within the page
+  *
++ * Return -ENOENT if the free page is changed, otherwise 0
++ *
+  * It is used when the free page crosses two pageblocks with different migratetypes
+  * at split_pfn_offset within the page. The split free page will be put into
+  * separate migratetype lists afterwards. Otherwise, the function achieves
+  * nothing.
+  */
+-void split_free_page(struct page *free_page,
+-				int order, unsigned long split_pfn_offset)
++int split_free_page(struct page *free_page,
++			unsigned int order, unsigned long split_pfn_offset)
+ {
+ 	struct zone *zone = page_zone(free_page);
+ 	unsigned long free_page_pfn = page_to_pfn(free_page);
+ 	unsigned long pfn;
+ 	unsigned long flags;
+ 	int free_page_order;
++	int mt;
++	int ret = 0;
+ 
+ 	if (split_pfn_offset == 0)
+-		return;
++		return ret;
+ 
+ 	spin_lock_irqsave(&zone->lock, flags);
++
++	if (!PageBuddy(free_page) || buddy_order(free_page) != order) {
++		ret = -ENOENT;
++		goto out;
++	}
++
++	mt = get_pageblock_migratetype(free_page);
++	if (likely(!is_migrate_isolate(mt)))
++		__mod_zone_freepage_state(zone, -(1UL << order), mt);
++
+ 	del_page_from_free_list(free_page, zone, order);
+ 	for (pfn = free_page_pfn;
+ 	     pfn < free_page_pfn + (1UL << order);) {
+ 		int mt = get_pfnblock_migratetype(pfn_to_page(pfn), pfn);
+ 
+-		free_page_order = min_t(int,
++		free_page_order = min_t(unsigned int,
+ 					pfn ? __ffs(pfn) : order,
+ 					__fls(split_pfn_offset));
+ 		__free_one_page(pfn_to_page(pfn), pfn, zone, free_page_order,
+@@ -1134,7 +1148,9 @@ void split_free_page(struct page *free_p
+ 		if (split_pfn_offset == 0)
+ 			split_pfn_offset = (1UL << order) - (pfn - free_page_pfn);
+ 	}
++out:
+ 	spin_unlock_irqrestore(&zone->lock, flags);
++	return ret;
+ }
+ /*
+  * A bad page could be due to a number of fields. Instead of multiple branches,
+--- a/mm/page_isolation.c~mm-split-free-page-with-properly-free-memory-accounting-and-without-race
++++ a/mm/page_isolation.c
+@@ -371,9 +371,13 @@ static int isolate_single_pageblock(unsi
+ 		if (PageBuddy(page)) {
+ 			int order = buddy_order(page);
+ 
+-			if (pfn + (1UL << order) > boundary_pfn)
+-				split_free_page(page, order, boundary_pfn - pfn);
+-			pfn += (1UL << order);
++			if (pfn + (1UL << order) > boundary_pfn) {
++				/* free page changed before split, check it again */
++				if (split_free_page(page, order, boundary_pfn - pfn))
++					continue;
++			}
++
++			pfn += 1UL << order;
+ 			continue;
+ 		}
+ 		/*
+_
