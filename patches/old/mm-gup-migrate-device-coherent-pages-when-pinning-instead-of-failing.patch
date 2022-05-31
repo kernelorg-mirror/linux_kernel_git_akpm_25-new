@@ -1,5 +1,6 @@
 From: Alistair Popple <apopple@nvidia.com>
 Subject: mm/gup: migrate device coherent pages when pinning instead of failing
+Date: Tue, 31 May 2022 10:56:21 -0500
 
 Currently any attempts to pin a device coherent page will fail.  This is
 because device coherent pages need to be managed by a device driver, and
@@ -10,39 +11,39 @@ coherent and accessible from the CPU so can be migrated just like pinning
 ZONE_MOVABLE pages.  So instead of failing all attempts to pin them first
 try migrating them out of ZONE_DEVICE.
 
-[hch@lst.de: rebased to the split device memory checks, moved migrate_device_page to migrate_device.c]
-Link: https://lkml.kernel.org/r/20220210072828.2930359-27-hch@lst.de
+[hch@lst.de: rebase to the split device memory checks, move migrate_device_page to migrate_device.c]
+Link: https://lkml.kernel.org/r/20220531155629.20057-6-alex.sierra@amd.com
 Signed-off-by: Alistair Popple <apopple@nvidia.com>
 Signed-off-by: Christoph Hellwig <hch@lst.de>
 Acked-by: Felix Kuehling <Felix.Kuehling@amd.com>
-Tested-by: "Sierra Guiza, Alejandro (Alex)" <alex.sierra@amd.com>
-Cc: Alex Deucher <alexander.deucher@amd.com>
-Cc: Ben Skeggs <bskeggs@redhat.com>
-Cc: Chaitanya Kulkarni <kch@nvidia.com>
-Cc: Christian Knig <christian.koenig@amd.com>
-Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
-Cc: Karol Herbst <kherbst@redhat.com>
-Cc: Logan Gunthorpe <logang@deltatee.com>
-Cc: Lyude Paul <lyude@redhat.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
-Cc: Muchun Song <songmuchun@bytedance.com>
-Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Ralph Campbell <rcampbell@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/gup.c            |   37 ++++++++++++++++++++++++-----
+ mm/gup.c            |   47 +++++++++++++++++++++++++++++++++----
  mm/internal.h       |    1 
  mm/migrate_device.c |   53 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 85 insertions(+), 6 deletions(-)
+ 3 files changed, 96 insertions(+), 5 deletions(-)
 
 --- a/mm/gup.c~mm-gup-migrate-device-coherent-pages-when-pinning-instead-of-failing
 +++ a/mm/gup.c
-@@ -1865,9 +1865,31 @@ static long check_and_migrate_movable_pa
- 			ret = -EFAULT;
- 			goto unpin_pages;
- 		}
+@@ -1927,9 +1927,43 @@ static long check_and_migrate_movable_pa
+ 			continue;
+ 		prev_folio = folio;
+ 
+-		if (folio_is_pinnable(folio))
++		/*
++		 * Device private pages will get faulted in during gup so it
++		 * shouldn't be possible to see one here.
++		 */
++		if (WARN_ON_ONCE(folio_is_device_private(folio))) {
++			ret = -EFAULT;
++			goto unpin_pages;
++		}
 +
 +		/*
 +		 * Device coherent pages are managed by a driver and should not
@@ -50,30 +51,32 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * page. So when trying to pin with FOLL_LONGTERM instead try
 +		 * to migrate the page out of device memory.
 +		 */
- 		if (is_device_coherent_page(head)) {
--			ret = -EFAULT;
--			goto unpin_pages;
-+			WARN_ON_ONCE(PageCompound(head));
++		if (folio_is_device_coherent(folio)) {
++			WARN_ON_ONCE(PageCompound(&folio->page));
 +
 +			/*
 +			 * Migration will fail if the page is pinned, so convert
 +			 * the pin on the source page to a normal reference.
 +			 */
 +			if (gup_flags & FOLL_PIN) {
-+				get_page(head);
-+				unpin_user_page(head);
++				get_page(&folio->page);
++				unpin_user_page(&folio->page);
 +			}
 +
-+			pages[i] = migrate_device_page(head, gup_flags);
++			pages[i] = migrate_device_page(&folio->page, gup_flags);
 +			if (!pages[i]) {
 +				ret = -EBUSY;
 +				goto unpin_pages;
 +			}
-+			continue;
- 		}
+ 			continue;
++		}
  
- 		if (is_pinnable_page(head))
-@@ -1907,10 +1929,13 @@ static long check_and_migrate_movable_pa
++		if (folio_is_pinnable(folio))
++			continue;
+ 		/*
+ 		 * Try to move out any movable page before pinning the range.
+ 		 */
+@@ -1965,10 +1999,13 @@ static long check_and_migrate_movable_pa
  	return nr_pages;
  
  unpin_pages:
@@ -93,16 +96,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/internal.h~mm-gup-migrate-device-coherent-pages-when-pinning-instead-of-failing
 +++ a/mm/internal.h
-@@ -720,5 +720,6 @@ int numa_migrate_prep(struct page *page,
- DECLARE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
+@@ -853,6 +853,7 @@ int numa_migrate_prep(struct page *page,
+ 		      unsigned long addr, int page_nid, int *flags);
  
  void free_zone_device_page(struct page *page);
 +struct page *migrate_device_page(struct page *page, unsigned int gup_flags);
  
- #endif	/* __MM_INTERNAL_H */
+ /*
+  * mm/gup.c
 --- a/mm/migrate_device.c~mm-gup-migrate-device-coherent-pages-when-pinning-instead-of-failing
 +++ a/mm/migrate_device.c
-@@ -768,3 +768,56 @@ void migrate_vma_finalize(struct migrate
+@@ -794,3 +794,56 @@ void migrate_vma_finalize(struct migrate
  	}
  }
  EXPORT_SYMBOL(migrate_vma_finalize);
