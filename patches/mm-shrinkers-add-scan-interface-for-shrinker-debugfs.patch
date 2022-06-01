@@ -1,0 +1,181 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: shrinkers: add scan interface for shrinker debugfs
+Date: Tue, 31 May 2022 20:22:27 -0700
+
+Add a scan interface which allows to trigger scanning of a particular
+shrinker and specify memcg and numa node.  It's useful for testing,
+debugging and profiling of a specific scan_objects() callback.  Unlike
+alternatives (creating a real memory pressure and dropping caches via
+/proc/sys/vm/drop_caches) this interface allows to interact with only one
+shrinker at once.  Also, if a shrinker is misreporting the number of
+objects (as some do), it doesn't affect scanning.
+
+Link: https://lkml.kernel.org/r/20220601032227.4076670-7-roman.gushchin@linux.dev
+Signed-off-by: Roman Gushchin <roman.gushchin@linux.dev>
+Acked-by: Muchun Song <songmuchun@bytedance.com>
+Cc: Christophe JAILLET <christophe.jaillet@wanadoo.fr>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Kent Overstreet <kent.overstreet@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/mm/shrinker_debugfs.rst |   39 +++++-
+ mm/shrinker_debug.c                               |   74 ++++++++++++
+ 2 files changed, 109 insertions(+), 4 deletions(-)
+
+--- a/Documentation/admin-guide/mm/shrinker_debugfs.rst~mm-shrinkers-add-scan-interface-for-shrinker-debugfs
++++ a/Documentation/admin-guide/mm/shrinker_debugfs.rst
+@@ -5,14 +5,16 @@ Shrinker Debugfs Interface
+ ==========================
+ 
+ Shrinker debugfs interface provides a visibility into the kernel memory
+-shrinkers subsystem and allows to get information about individual shrinkers.
++shrinkers subsystem and allows to get information about individual shrinkers
++and interact with them.
+ 
+ For each shrinker registered in the system a directory in **<debugfs>/shrinker/**
+ is created. The directory's name is composed from the shrinker's name and an
+ unique id: e.g. *kfree_rcu-0* or *sb-xfs:vda1-36*.
+ 
+-Each shrinker directory contains the **count** file, which allows to trigger
+-the *count_objects()* callback for each memcg and numa node (if applicable).
++Each shrinker directory contains **count** and **scan** files, which allow to
++trigger *count_objects()* and *scan_objects()* callbacks for each memcg and
++numa node (if applicable).
+ 
+ Usage:
+ ------
+@@ -43,7 +45,7 @@ Usage:
+ 
+     $ cd sb-btrfs\:vda2-24/
+     $ ls
+-    count
++    count            scan
+ 
+ 3. *Count objects*
+ 
+@@ -102,3 +104,32 @@ Usage:
+     2877 84 0
+     293 1 0
+     735 8 0
++
++4. *Scan objects*
++
++  The expected input format::
++
++    <cgroup inode id> <numa id> <number of objects to scan>
++
++  For a non-memcg-aware shrinker or on a system with no memory
++  cgrups **0** should be passed as cgroup id.
++  ::
++
++    $ cd /sys/kernel/debug/shrinker/
++    $ cd sb-btrfs\:vda2-24/
++
++    $ cat count | head -n 5
++    1 212 0
++    21 97 0
++    55 802 5
++    2367 2 0
++    225 13 0
++
++    $ echo "55 0 200" > scan
++
++    $ cat count | head -n 5
++    1 212 0
++    21 96 0
++    55 752 5
++    2367 2 0
++    225 13 0
+--- a/mm/shrinker_debug.c~mm-shrinkers-add-scan-interface-for-shrinker-debugfs
++++ a/mm/shrinker_debug.c
+@@ -99,6 +99,78 @@ static int shrinker_debugfs_count_show(s
+ }
+ DEFINE_SHOW_ATTRIBUTE(shrinker_debugfs_count);
+ 
++static int shrinker_debugfs_scan_open(struct inode *inode, struct file *file)
++{
++	file->private_data = inode->i_private;
++	return nonseekable_open(inode, file);
++}
++
++static ssize_t shrinker_debugfs_scan_write(struct file *file,
++					   const char __user *buf,
++					   size_t size, loff_t *pos)
++{
++	struct shrinker *shrinker = file->private_data;
++	unsigned long nr_to_scan = 0, ino;
++	struct shrink_control sc = {
++		.gfp_mask = GFP_KERNEL,
++	};
++	struct mem_cgroup *memcg = NULL;
++	int nid;
++	char kbuf[72];
++	int read_len = size < (sizeof(kbuf) - 1) ? size : (sizeof(kbuf) - 1);
++	ssize_t ret;
++
++	if (copy_from_user(kbuf, buf, read_len))
++		return -EFAULT;
++	kbuf[read_len] = '\0';
++
++	if (sscanf(kbuf, "%lu %d %lu", &ino, &nid, &nr_to_scan) < 2)
++		return -EINVAL;
++
++	if (nid < 0 || nid >= nr_node_ids)
++		return -EINVAL;
++
++	if (nr_to_scan == 0)
++		return size;
++
++	if (shrinker->flags & SHRINKER_MEMCG_AWARE) {
++		memcg = mem_cgroup_get_from_ino(ino);
++		if (!memcg || IS_ERR(memcg))
++			return -ENOENT;
++
++		if (!mem_cgroup_online(memcg)) {
++			mem_cgroup_put(memcg);
++			return -ENOENT;
++		}
++	} else if (ino != 0) {
++		return -EINVAL;
++	}
++
++	ret = down_read_killable(&shrinker_rwsem);
++	if (ret) {
++		mem_cgroup_put(memcg);
++		return ret;
++	}
++
++	sc.nid = nid;
++	sc.memcg = memcg;
++	sc.nr_to_scan = nr_to_scan;
++	sc.nr_scanned = nr_to_scan;
++
++	shrinker->scan_objects(shrinker, &sc);
++
++	up_read(&shrinker_rwsem);
++	mem_cgroup_put(memcg);
++
++	return size;
++}
++
++static const struct file_operations shrinker_debugfs_scan_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = shrinker_debugfs_scan_open,
++	.write	 = shrinker_debugfs_scan_write,
++};
++
+ int shrinker_debugfs_add(struct shrinker *shrinker)
+ {
+ 	struct dentry *entry;
+@@ -128,6 +200,8 @@ int shrinker_debugfs_add(struct shrinker
+ 
+ 	debugfs_create_file("count", 0220, entry, shrinker,
+ 			    &shrinker_debugfs_count_fops);
++	debugfs_create_file("scan", 0440, entry, shrinker,
++			    &shrinker_debugfs_scan_fops);
+ 	return 0;
+ }
+ 
+_
