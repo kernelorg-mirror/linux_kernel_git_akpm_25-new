@@ -1,0 +1,135 @@
+From: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Subject: fsdax: introduce dax_lock_mapping_entry()
+Date: Fri, 3 Jun 2022 13:37:28 +0800
+
+The current dax_lock_page() locks dax entry by obtaining mapping and index
+in page.  To support 1-to-N RMAP in NVDIMM, we need a new function to lock
+a specific dax entry corresponding to this file's mapping,index.  And
+output the page corresponding to the specific dax entry for caller use.
+
+Link: https://lkml.kernel.org/r/20220603053738.1218681-5-ruansy.fnst@fujitsu.com
+Signed-off-by: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Dan Williams <dan.j.wiliams@intel.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.de>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Ritesh Harjani <riteshh@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c            |   63 ++++++++++++++++++++++++++++++++++++++++++
+ include/linux/dax.h |   15 ++++++++++
+ 2 files changed, 78 insertions(+)
+
+--- a/fs/dax.c~fsdax-introduce-dax_lock_mapping_entry
++++ a/fs/dax.c
+@@ -456,6 +456,69 @@ void dax_unlock_page(struct page *page,
+ }
+ 
+ /*
++ * dax_lock_mapping_entry - Lock the DAX entry corresponding to a mapping
++ * @mapping: the file's mapping whose entry we want to lock
++ * @index: the offset within this file
++ * @page: output the dax page corresponding to this dax entry
++ *
++ * Return: A cookie to pass to dax_unlock_mapping_entry() or 0 if the entry
++ * could not be locked.
++ */
++dax_entry_t dax_lock_mapping_entry(struct address_space *mapping, pgoff_t index,
++		struct page **page)
++{
++	XA_STATE(xas, NULL, 0);
++	void *entry;
++
++	rcu_read_lock();
++	for (;;) {
++		entry = NULL;
++		if (!dax_mapping(mapping))
++			break;
++
++		xas.xa = &mapping->i_pages;
++		xas_lock_irq(&xas);
++		xas_set(&xas, index);
++		entry = xas_load(&xas);
++		if (dax_is_locked(entry)) {
++			rcu_read_unlock();
++			wait_entry_unlocked(&xas, entry);
++			rcu_read_lock();
++			continue;
++		}
++		if (!entry ||
++		    dax_is_zero_entry(entry) || dax_is_empty_entry(entry)) {
++			/*
++			 * Because we are looking for entry from file's mapping
++			 * and index, so the entry may not be inserted for now,
++			 * or even a zero/empty entry.  We don't think this is
++			 * an error case.  So, return a special value and do
++			 * not output @page.
++			 */
++			entry = (void *)~0UL;
++		} else {
++			*page = pfn_to_page(dax_to_pfn(entry));
++			dax_lock_entry(&xas, entry);
++		}
++		xas_unlock_irq(&xas);
++		break;
++	}
++	rcu_read_unlock();
++	return (dax_entry_t)entry;
++}
++
++void dax_unlock_mapping_entry(struct address_space *mapping, pgoff_t index,
++		dax_entry_t cookie)
++{
++	XA_STATE(xas, &mapping->i_pages, index);
++
++	if (cookie == ~0UL)
++		return;
++
++	dax_unlock_entry(&xas, (void *)cookie);
++}
++
++/*
+  * Find page cache entry at given index. If it is a DAX entry, return it
+  * with the entry locked. If the page cache doesn't contain an entry at
+  * that index, add a locked empty entry.
+--- a/include/linux/dax.h~fsdax-introduce-dax_lock_mapping_entry
++++ a/include/linux/dax.h
+@@ -161,6 +161,10 @@ struct page *dax_layout_busy_page(struct
+ struct page *dax_layout_busy_page_range(struct address_space *mapping, loff_t start, loff_t end);
+ dax_entry_t dax_lock_page(struct page *page);
+ void dax_unlock_page(struct page *page, dax_entry_t cookie);
++dax_entry_t dax_lock_mapping_entry(struct address_space *mapping,
++		unsigned long index, struct page **page);
++void dax_unlock_mapping_entry(struct address_space *mapping,
++		unsigned long index, dax_entry_t cookie);
+ #else
+ static inline struct page *dax_layout_busy_page(struct address_space *mapping)
+ {
+@@ -188,6 +192,17 @@ static inline dax_entry_t dax_lock_page(
+ static inline void dax_unlock_page(struct page *page, dax_entry_t cookie)
+ {
+ }
++
++static inline dax_entry_t dax_lock_mapping_entry(struct address_space *mapping,
++		unsigned long index, struct page **page)
++{
++	return 0;
++}
++
++static inline void dax_unlock_mapping_entry(struct address_space *mapping,
++		unsigned long index, dax_entry_t cookie)
++{
++}
+ #endif
+ 
+ int dax_zero_range(struct inode *inode, loff_t pos, loff_t len, bool *did_zero,
+_

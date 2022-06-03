@@ -1,0 +1,159 @@
+From: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Subject: xfs: add dax dedupe support
+Date: Fri, 3 Jun 2022 13:37:38 +0800
+
+Introduce xfs_mmaplock_two_inodes_and_break_dax_layout() for dax files who
+are going to be deduped.  After that, call compare range function only
+when files are both DAX or not.
+
+Link: https://lkml.kernel.org/r/20220603053738.1218681-15-ruansy.fnst@fujitsu.com
+Signed-off-by: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Dan Williams <dan.j.wiliams@intel.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.de>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Ritesh Harjani <riteshh@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/xfs/xfs_file.c    |    2 -
+ fs/xfs/xfs_inode.c   |   69 ++++++++++++++++++++++++++++++++++++++---
+ fs/xfs/xfs_inode.h   |    1 
+ fs/xfs/xfs_reflink.c |    4 +-
+ 4 files changed, 69 insertions(+), 7 deletions(-)
+
+--- a/fs/xfs/xfs_file.c~xfs-add-dax-dedupe-support
++++ a/fs/xfs/xfs_file.c
+@@ -808,7 +808,7 @@ xfs_wait_dax_page(
+ 	xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+ }
+ 
+-static int
++int
+ xfs_break_dax_layouts(
+ 	struct inode		*inode,
+ 	bool			*retry)
+--- a/fs/xfs/xfs_inode.c~xfs-add-dax-dedupe-support
++++ a/fs/xfs/xfs_inode.c
+@@ -3767,6 +3767,50 @@ retry:
+ 	return 0;
+ }
+ 
++static int
++xfs_mmaplock_two_inodes_and_break_dax_layout(
++	struct xfs_inode	*ip1,
++	struct xfs_inode	*ip2)
++{
++	int			error;
++	bool			retry;
++	struct page		*page;
++
++	if (ip1->i_ino > ip2->i_ino)
++		swap(ip1, ip2);
++
++again:
++	retry = false;
++	/* Lock the first inode */
++	xfs_ilock(ip1, XFS_MMAPLOCK_EXCL);
++	error = xfs_break_dax_layouts(VFS_I(ip1), &retry);
++	if (error || retry) {
++		xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
++		if (error == 0 && retry)
++			goto again;
++		return error;
++	}
++
++	if (ip1 == ip2)
++		return 0;
++
++	/* Nested lock the second inode */
++	xfs_ilock(ip2, xfs_lock_inumorder(XFS_MMAPLOCK_EXCL, 1));
++	/*
++	 * We cannot use xfs_break_dax_layouts() directly here because it may
++	 * need to unlock & lock the XFS_MMAPLOCK_EXCL which is not suitable
++	 * for this nested lock case.
++	 */
++	page = dax_layout_busy_page(VFS_I(ip2)->i_mapping);
++	if (page && page_ref_count(page) != 1) {
++		xfs_iunlock(ip2, XFS_MMAPLOCK_EXCL);
++		xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
++		goto again;
++	}
++
++	return 0;
++}
++
+ /*
+  * Lock two inodes so that userspace cannot initiate I/O via file syscalls or
+  * mmap activity.
+@@ -3781,8 +3825,19 @@ xfs_ilock2_io_mmap(
+ 	ret = xfs_iolock_two_inodes_and_break_layout(VFS_I(ip1), VFS_I(ip2));
+ 	if (ret)
+ 		return ret;
+-	filemap_invalidate_lock_two(VFS_I(ip1)->i_mapping,
+-				    VFS_I(ip2)->i_mapping);
++
++	if (IS_DAX(VFS_I(ip1)) && IS_DAX(VFS_I(ip2))) {
++		ret = xfs_mmaplock_two_inodes_and_break_dax_layout(ip1, ip2);
++		if (ret) {
++			inode_unlock(VFS_I(ip2));
++			if (ip1 != ip2)
++				inode_unlock(VFS_I(ip1));
++			return ret;
++		}
++	} else
++		filemap_invalidate_lock_two(VFS_I(ip1)->i_mapping,
++					    VFS_I(ip2)->i_mapping);
++
+ 	return 0;
+ }
+ 
+@@ -3792,8 +3847,14 @@ xfs_iunlock2_io_mmap(
+ 	struct xfs_inode	*ip1,
+ 	struct xfs_inode	*ip2)
+ {
+-	filemap_invalidate_unlock_two(VFS_I(ip1)->i_mapping,
+-				      VFS_I(ip2)->i_mapping);
++	if (IS_DAX(VFS_I(ip1)) && IS_DAX(VFS_I(ip2))) {
++		xfs_iunlock(ip2, XFS_MMAPLOCK_EXCL);
++		if (ip1 != ip2)
++			xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
++	} else
++		filemap_invalidate_unlock_two(VFS_I(ip1)->i_mapping,
++					      VFS_I(ip2)->i_mapping);
++
+ 	inode_unlock(VFS_I(ip2));
+ 	if (ip1 != ip2)
+ 		inode_unlock(VFS_I(ip1));
+--- a/fs/xfs/xfs_inode.h~xfs-add-dax-dedupe-support
++++ a/fs/xfs/xfs_inode.h
+@@ -467,6 +467,7 @@ xfs_itruncate_extents(
+ }
+ 
+ /* from xfs_file.c */
++int	xfs_break_dax_layouts(struct inode *inode, bool *retry);
+ int	xfs_break_layouts(struct inode *inode, uint *iolock,
+ 		enum layout_break_reason reason);
+ 
+--- a/fs/xfs/xfs_reflink.c~xfs-add-dax-dedupe-support
++++ a/fs/xfs/xfs_reflink.c
+@@ -1363,8 +1363,8 @@ xfs_reflink_remap_prep(
+ 	if (XFS_IS_REALTIME_INODE(src) || XFS_IS_REALTIME_INODE(dest))
+ 		goto out_unlock;
+ 
+-	/* Don't share DAX file data for now. */
+-	if (IS_DAX(inode_in) || IS_DAX(inode_out))
++	/* Don't share DAX file data with non-DAX file. */
++	if (IS_DAX(inode_in) != IS_DAX(inode_out))
+ 		goto out_unlock;
+ 
+ 	if (!IS_DAX(inode_in))
+_

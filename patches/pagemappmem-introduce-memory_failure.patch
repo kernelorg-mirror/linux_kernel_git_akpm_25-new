@@ -1,0 +1,121 @@
+From: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Subject: pagemap,pmem: introduce ->memory_failure()
+Date: Fri, 3 Jun 2022 13:37:27 +0800
+
+When memory-failure occurs, we call this function which is implemented by
+each kind of devices.  For the fsdax case, pmem device driver implements
+it.  Pmem device driver will find out the filesystem in which the
+corrupted page located in.
+
+With dax_holder notify support, we are able to notify the memory failure
+from pmem driver to upper layers.  If there is something not support in
+the notify routine, memory_failure will fall back to the generic hanlder.
+
+Link: https://lkml.kernel.org/r/20220603053738.1218681-4-ruansy.fnst@fujitsu.com
+Signed-off-by: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Reviewed-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Dan Williams <dan.j.wiliams@intel.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.com>
+Cc: Goldwyn Rodrigues <rgoldwyn@suse.de>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Ritesh Harjani <riteshh@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/nvdimm/pmem.c    |   17 +++++++++++++++++
+ include/linux/memremap.h |   12 ++++++++++++
+ mm/memory-failure.c      |   14 ++++++++++++++
+ 3 files changed, 43 insertions(+)
+
+--- a/drivers/nvdimm/pmem.c~pagemappmem-introduce-memory_failure
++++ a/drivers/nvdimm/pmem.c
+@@ -453,6 +453,21 @@ static void pmem_release_disk(void *__pm
+ 	blk_cleanup_disk(pmem->disk);
+ }
+ 
++static int pmem_pagemap_memory_failure(struct dev_pagemap *pgmap,
++		unsigned long pfn, unsigned long nr_pages, int mf_flags)
++{
++	struct pmem_device *pmem =
++			container_of(pgmap, struct pmem_device, pgmap);
++	u64 offset = PFN_PHYS(pfn) - pmem->phys_addr - pmem->data_offset;
++	u64 len = nr_pages << PAGE_SHIFT;
++
++	return dax_holder_notify_failure(pmem->dax_dev, offset, len, mf_flags);
++}
++
++static const struct dev_pagemap_ops fsdax_pagemap_ops = {
++	.memory_failure		= pmem_pagemap_memory_failure,
++};
++
+ static int pmem_attach_disk(struct device *dev,
+ 		struct nd_namespace_common *ndns)
+ {
+@@ -514,6 +529,7 @@ static int pmem_attach_disk(struct devic
+ 	pmem->pfn_flags = PFN_DEV;
+ 	if (is_nd_pfn(dev)) {
+ 		pmem->pgmap.type = MEMORY_DEVICE_FS_DAX;
++		pmem->pgmap.ops = &fsdax_pagemap_ops;
+ 		addr = devm_memremap_pages(dev, &pmem->pgmap);
+ 		pfn_sb = nd_pfn->pfn_sb;
+ 		pmem->data_offset = le64_to_cpu(pfn_sb->dataoff);
+@@ -527,6 +543,7 @@ static int pmem_attach_disk(struct devic
+ 		pmem->pgmap.range.end = res->end;
+ 		pmem->pgmap.nr_range = 1;
+ 		pmem->pgmap.type = MEMORY_DEVICE_FS_DAX;
++		pmem->pgmap.ops = &fsdax_pagemap_ops;
+ 		addr = devm_memremap_pages(dev, &pmem->pgmap);
+ 		pmem->pfn_flags |= PFN_MAP;
+ 		bb_range = pmem->pgmap.range;
+--- a/include/linux/memremap.h~pagemappmem-introduce-memory_failure
++++ a/include/linux/memremap.h
+@@ -87,6 +87,18 @@ struct dev_pagemap_ops {
+ 	 * the page back to a CPU accessible page.
+ 	 */
+ 	vm_fault_t (*migrate_to_ram)(struct vm_fault *vmf);
++
++	/*
++	 * Handle the memory failure happens on a range of pfns.  Notify the
++	 * processes who are using these pfns, and try to recover the data on
++	 * them if necessary.  The mf_flags is finally passed to the recover
++	 * function through the whole notify routine.
++	 *
++	 * When this is not implemented, or it returns -EOPNOTSUPP, the caller
++	 * will fall back to a common handler called mf_generic_kill_procs().
++	 */
++	int (*memory_failure)(struct dev_pagemap *pgmap, unsigned long pfn,
++			      unsigned long nr_pages, int mf_flags);
+ };
+ 
+ #define PGMAP_ALTMAP_VALID	(1 << 0)
+--- a/mm/memory-failure.c~pagemappmem-introduce-memory_failure
++++ a/mm/memory-failure.c
+@@ -1737,6 +1737,20 @@ static int memory_failure_dev_pagemap(un
+ 	if (!pgmap_pfn_valid(pgmap, pfn))
+ 		goto out;
+ 
++	/*
++	 * Call driver's implementation to handle the memory failure, otherwise
++	 * fall back to generic handler.
++	 */
++	if (pgmap->ops->memory_failure) {
++		rc = pgmap->ops->memory_failure(pgmap, pfn, 1, flags);
++		/*
++		 * Fall back to generic handler too if operation is not
++		 * supported inside the driver/device/filesystem.
++		 */
++		if (rc != -EOPNOTSUPP)
++			goto out;
++	}
++
+ 	rc = mf_generic_kill_procs(pfn, flags, pgmap);
+ out:
+ 	/* drop pgmap ref acquired in caller */
+_
