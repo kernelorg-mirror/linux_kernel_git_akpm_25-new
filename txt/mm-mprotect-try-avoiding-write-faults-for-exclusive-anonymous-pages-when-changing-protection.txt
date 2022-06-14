@@ -1,0 +1,81 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/mprotect: try avoiding write faults for exclusive anonymous pages when changing protection
+Date: Tue, 14 Jun 2022 11:36:29 +0200
+
+Similar to our MM_CP_DIRTY_ACCT handling for shared, writable mappings, we
+can try mapping anonymous pages in a private writable mapping writable if
+they are exclusive, the PTE is already dirty, and no special handling
+applies.  Mapping the anonymous page writable is essentially the same
+thing the write fault handler would do in this case.
+
+Special handling is required for uffd-wp and softdirty tracking, so take
+care of that properly.  Also, leave PROT_NONE handling alone for now; in
+the future, we could similarly extend the logic in do_numa_page() or use
+pte_mk_savedwrite() here.
+
+While this improves mprotect(PROT_READ)+mprotect(PROT_READ|PROT_WRITE)
+performance, it should also be a valuable optimization for uffd-wp, when
+un-protecting.
+
+This has been previously suggested by Peter Collingbourne in [1], relevant
+in the context of the Scudo memory allocator, before we had
+PageAnonExclusive.
+
+This commit doesn't add the same handling for PMDs (i.e., anonymous THP,
+anonymous hugetlb); benchmark results from Andrea indicate that there are
+minor performance gains, so it's might still be valuable to streamline
+that logic for all anonymous pages in the future.
+
+As we now also set MM_CP_DIRTY_ACCT for private mappings, let's rename it
+to MM_CP_TRY_CHANGE_WRITABLE, to make it clearer what's actually
+happening.
+
+Micro-benchmark courtesy of Andrea:
+
+===
+ #define _GNU_SOURCE
+ #include <sys/mman.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <stdio.h>
+ #include <unistd.h>
+
+ #define SIZE (1024*1024*1024)
+
+int main(int argc, char *argv[])
+{
+	char *p;
+	if (posix_memalign((void **)&p, sysconf(_SC_PAGESIZE)*512, SIZE))
+		perror("posix_memalign"), exit(1);
+	if (madvise(p, SIZE, argc > 1 ? MADV_HUGEPAGE : MADV_NOHUGEPAGE))
+		perror("madvise");
+	explicit_bzero(p, SIZE);
+	for (int loops = 0; loops < 40; loops++) {
+		if (mprotect(p, SIZE, PROT_READ))
+			perror("mprotect"), exit(1);
+		if (mprotect(p, SIZE, PROT_READ|PROT_WRITE))
+			perror("mprotect"), exit(1);
+		explicit_bzero(p, SIZE);
+	}
+}
+===
+
+Results on my Ryzen 9 3900X:
+
+Stock 10 runs (lower is better):   AVG 6.398s, STDEV 0.043
+Patched 10 runs (lower is better): AVG 3.780s, STDEV 0.026
+
+===
+
+[1] https://lkml.kernel.org/r/20210429214801.2583336-1-pcc@google.com
+
+Link: https://lkml.kernel.org/r/20220614093629.76309-1-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Suggested-by: Peter Collingbourne <pcc@google.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
