@@ -1,0 +1,136 @@
+From: Liam Howlett <liam.howlett@oracle.com>
+Subject: mm/mmap: change do_mas_align_munmap() to avoid preallocations for sidetree
+Date: Fri, 17 Jun 2022 13:46:42 +0000
+
+Recording the VMAs to be removed in the sidetree does not require a
+preallocation - after all, split allocates with GFP_KERNEL.  Changing to a
+regular maple tree write means we can avoid issues when there are a large
+number of VMAs.  Using mas_store_gfp() instead of preallocations also
+means that the maple state does not need to be destroyed (freeing unused
+nodes).  At the same time, switch the tree flags to just
+MT_FLAGS_LOCK_EXTERN since gaps do not need to be tracked in the side
+tree.  This will allow more VMAs per node.
+
+Also reorganize the goto statements and split them up for better
+unwinding.
+
+Link: https://lkml.kernel.org/r/20220617134637.1771711-1-Liam.Howlett@oracle.com
+Fixes: e34b4addc263 (mm/mmap: fix potential leak on do_mas_align_munmap())
+Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Qian Cai <quic_qiancai@quicinc.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mmap.c |   39 +++++++++++++++++++++------------------
+ 1 file changed, 21 insertions(+), 18 deletions(-)
+
+--- a/mm/mmap.c~mm-remove-the-vma-linked-list-fix-4
++++ a/mm/mmap.c
+@@ -2377,13 +2377,17 @@ int split_vma(struct mm_struct *mm, stru
+ 	return __split_vma(mm, vma, addr, new_below);
+ }
+ 
+-static inline void munmap_sidetree(struct vm_area_struct *vma,
++static inline int munmap_sidetree(struct vm_area_struct *vma,
+ 				   struct ma_state *mas_detach)
+ {
+ 	mas_set_range(mas_detach, vma->vm_start, vma->vm_end - 1);
+-	mas_store(mas_detach, vma);
++	if (mas_store_gfp(mas_detach, vma, GFP_KERNEL))
++		return -ENOMEM;
++
+ 	if (vma->vm_flags & VM_LOCKED)
+ 		vma->vm_mm->locked_vm -= vma_pages(vma);
++
++	return 0;
+ }
+ 
+ /*
+@@ -2407,16 +2411,13 @@ do_mas_align_munmap(struct ma_state *mas
+ 	struct maple_tree mt_detach;
+ 	int count = 0;
+ 	int error = -ENOMEM;
+-	MA_STATE(mas_detach, &mt_detach, start, end - 1);
+-	mt_init_flags(&mt_detach, MM_MT_FLAGS);
++	MA_STATE(mas_detach, &mt_detach, 0, 0);
++	mt_init_flags(&mt_detach, MT_FLAGS_LOCK_EXTERN);
+ 	mt_set_external_lock(&mt_detach, &mm->mmap_lock);
+ 
+ 	if (mas_preallocate(mas, vma, GFP_KERNEL))
+ 		return -ENOMEM;
+ 
+-	if (mas_preallocate(&mas_detach, vma, GFP_KERNEL))
+-		goto detach_alloc_fail;
+-
+ 	mas->last = end - 1;
+ 	/*
+ 	 * If we need to split any vma, do it now to save pain later.
+@@ -2443,7 +2444,7 @@ do_mas_align_munmap(struct ma_state *mas
+ 		 */
+ 		error = __split_vma(mm, vma, start, 0);
+ 		if (error)
+-			goto split_failed;
++			goto start_split_failed;
+ 
+ 		mas_set(mas, start);
+ 		vma = mas_walk(mas);
+@@ -2464,26 +2465,28 @@ do_mas_align_munmap(struct ma_state *mas
+ 
+ 			error = __split_vma(mm, next, end, 1);
+ 			if (error)
+-				goto split_failed;
++				goto end_split_failed;
+ 
+ 			mas_set(mas, end);
+ 			split = mas_prev(mas, 0);
+-			munmap_sidetree(split, &mas_detach);
++			if (munmap_sidetree(split, &mas_detach))
++				goto munmap_sidetree_failed;
++
+ 			count++;
+ 			if (vma == next)
+ 				vma = split;
+ 			break;
+ 		}
++		if (munmap_sidetree(next, &mas_detach))
++			goto munmap_sidetree_failed;
++
+ 		count++;
+-		munmap_sidetree(next, &mas_detach);
+ #ifdef CONFIG_DEBUG_VM_MAPLE_TREE
+ 		BUG_ON(next->vm_start < start);
+ 		BUG_ON(next->vm_start > end);
+ #endif
+ 	}
+ 
+-	mas_destroy(&mas_detach);
+-
+ 	if (!next)
+ 		next = mas_next(mas, ULONG_MAX);
+ 
+@@ -2544,18 +2547,18 @@ do_mas_align_munmap(struct ma_state *mas
+ 	/* Statistics and freeing VMAs */
+ 	mas_set(&mas_detach, start);
+ 	remove_mt(mm, &mas_detach);
+-	validate_mm(mm);
+ 	__mt_destroy(&mt_detach);
+ 
+ 
+ 	validate_mm(mm);
+ 	return downgrade ? 1 : 0;
+ 
+-map_count_exceeded:
+-split_failed:
+ userfaultfd_error:
+-	mas_destroy(&mas_detach);
+-detach_alloc_fail:
++munmap_sidetree_failed:
++end_split_failed:
++	__mt_destroy(&mt_detach);
++start_split_failed:
++map_count_exceeded:
+ 	mas_destroy(mas);
+ 	return error;
+ }
+_
