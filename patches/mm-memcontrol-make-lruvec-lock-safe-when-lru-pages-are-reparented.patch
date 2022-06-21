@@ -1,0 +1,266 @@
+From: Muchun Song <songmuchun@bytedance.com>
+Subject: mm: memcontrol: make lruvec lock safe when LRU pages are reparented
+Date: Tue, 21 Jun 2022 20:56:51 +0800
+
+The diagram below shows how to make the folio lruvec lock safe when LRU
+pages are reparented.
+
+folio_lruvec_lock(folio)
+	rcu_read_lock();
+    retry:
+	lruvec = folio_lruvec(folio);
+
+        // The folio is reparented at this time.
+        spin_lock(&lruvec->lru_lock);
+
+        if (unlikely(lruvec_memcg(lruvec) != folio_memcg(folio)))
+            // Acquired the wrong lruvec lock and need to retry.
+            // Because this folio is on the parent memcg lruvec list.
+            spin_unlock(&lruvec->lru_lock);
+	    goto retry;
+
+        // If we reach here, it means that folio_memcg(folio) is stable.
+
+memcg_reparent_objcgs(memcg)
+    // lruvec belongs to memcg and lruvec_parent belongs to parent memcg.
+    spin_lock(&lruvec->lru_lock);
+    spin_lock(&lruvec_parent->lru_lock);
+
+    // Move all the pages from the lruvec list to the parent lruvec list.
+
+    spin_unlock(&lruvec_parent->lru_lock);
+    spin_unlock(&lruvec->lru_lock);
+
+After we acquire the lruvec lock, we need to check whether the folio is
+reparented.  If so, we need to reacquire the new lruvec lock.  On the
+routine of the LRU pages reparenting, we will also acquire the lruvec lock
+(will be implemented in the later patch).  So folio_memcg() cannot be
+changed when we hold the lruvec lock.
+
+Since lruvec_memcg(lruvec) is always equal to folio_memcg(folio) after we
+hold the lruvec lock, lruvec_memcg_debug() check is pointless.  So remove
+it.
+
+This is a preparation for reparenting the LRU pages.
+
+Link: https://lkml.kernel.org/r/20220621125658.64935-5-songmuchun@bytedance.com
+Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memcontrol.h |   18 +----------
+ mm/compaction.c            |   27 +++++++++++++++--
+ mm/memcontrol.c            |   53 +++++++++++++++++++----------------
+ mm/swap.c                  |    5 +++
+ 4 files changed, 61 insertions(+), 42 deletions(-)
+
+--- a/include/linux/memcontrol.h~mm-memcontrol-make-lruvec-lock-safe-when-lru-pages-are-reparented
++++ a/include/linux/memcontrol.h
+@@ -758,7 +758,9 @@ out:
+  * folio_lruvec - return lruvec for isolating/putting an LRU folio
+  * @folio: Pointer to the folio.
+  *
+- * This function relies on folio->mem_cgroup being stable.
++ * The lruvec can be changed to its parent lruvec when the page reparented.
++ * The caller need to recheck if it cares about this changes (just like
++ * folio_lruvec_lock() does).
+  */
+ static inline struct lruvec *folio_lruvec(struct folio *folio)
+ {
+@@ -777,15 +779,6 @@ struct lruvec *folio_lruvec_lock_irq(str
+ struct lruvec *folio_lruvec_lock_irqsave(struct folio *folio,
+ 						unsigned long *flags);
+ 
+-#ifdef CONFIG_DEBUG_VM
+-void lruvec_memcg_debug(struct lruvec *lruvec, struct folio *folio);
+-#else
+-static inline
+-void lruvec_memcg_debug(struct lruvec *lruvec, struct folio *folio)
+-{
+-}
+-#endif
+-
+ static inline
+ struct mem_cgroup *mem_cgroup_from_css(struct cgroup_subsys_state *css){
+ 	return css ? container_of(css, struct mem_cgroup, css) : NULL;
+@@ -1260,11 +1253,6 @@ static inline struct lruvec *folio_lruve
+ 	return &pgdat->__lruvec;
+ }
+ 
+-static inline
+-void lruvec_memcg_debug(struct lruvec *lruvec, struct folio *folio)
+-{
+-}
+-
+ static inline struct mem_cgroup *parent_mem_cgroup(struct mem_cgroup *memcg)
+ {
+ 	return NULL;
+--- a/mm/compaction.c~mm-memcontrol-make-lruvec-lock-safe-when-lru-pages-are-reparented
++++ a/mm/compaction.c
+@@ -508,6 +508,25 @@ static bool compact_lock_irqsave(spinloc
+ 	return true;
+ }
+ 
++static struct lruvec *
++compact_folio_lruvec_lock_irqsave(struct folio *folio, unsigned long *flags,
++				  struct compact_control *cc)
++{
++	struct lruvec *lruvec;
++
++	rcu_read_lock();
++retry:
++	lruvec = folio_lruvec(folio);
++	compact_lock_irqsave(&lruvec->lru_lock, flags, cc);
++	if (unlikely(lruvec_memcg(lruvec) != folio_memcg(folio))) {
++		spin_unlock_irqrestore(&lruvec->lru_lock, *flags);
++		goto retry;
++	}
++	rcu_read_unlock();
++
++	return lruvec;
++}
++
+ /*
+  * Compaction requires the taking of some coarse locks that are potentially
+  * very heavily contended. The lock should be periodically unlocked to avoid
+@@ -834,6 +853,7 @@ isolate_migratepages_block(struct compac
+ 
+ 	/* Time to isolate some pages for migration */
+ 	for (; low_pfn < end_pfn; low_pfn++) {
++		struct folio *folio;
+ 
+ 		if (skip_on_failure && low_pfn >= next_skip_pfn) {
+ 			/*
+@@ -1055,18 +1075,17 @@ isolate_migratepages_block(struct compac
+ 		if (!TestClearPageLRU(page))
+ 			goto isolate_fail_put;
+ 
+-		lruvec = folio_lruvec(page_folio(page));
++		folio = page_folio(page);
++		lruvec = folio_lruvec(folio);
+ 
+ 		/* If we already hold the lock, we can skip some rechecking */
+ 		if (lruvec != locked) {
+ 			if (locked)
+ 				lruvec_unlock_irqrestore(locked, flags);
+ 
+-			compact_lock_irqsave(&lruvec->lru_lock, &flags, cc);
++			lruvec = compact_folio_lruvec_lock_irqsave(folio, &flags, cc);
+ 			locked = lruvec;
+ 
+-			lruvec_memcg_debug(lruvec, page_folio(page));
+-
+ 			/* Try get exclusive access under lock */
+ 			if (!skip_updated) {
+ 				skip_updated = true;
+--- a/mm/memcontrol.c~mm-memcontrol-make-lruvec-lock-safe-when-lru-pages-are-reparented
++++ a/mm/memcontrol.c
+@@ -1195,23 +1195,6 @@ int mem_cgroup_scan_tasks(struct mem_cgr
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_DEBUG_VM
+-void lruvec_memcg_debug(struct lruvec *lruvec, struct folio *folio)
+-{
+-	struct mem_cgroup *memcg;
+-
+-	if (mem_cgroup_disabled())
+-		return;
+-
+-	memcg = folio_memcg(folio);
+-
+-	if (!memcg)
+-		VM_BUG_ON_FOLIO(lruvec_memcg(lruvec) != root_mem_cgroup, folio);
+-	else
+-		VM_BUG_ON_FOLIO(lruvec_memcg(lruvec) != memcg, folio);
+-}
+-#endif
+-
+ /**
+  * folio_lruvec_lock - Lock the lruvec for a folio.
+  * @folio: Pointer to the folio.
+@@ -1226,10 +1209,18 @@ void lruvec_memcg_debug(struct lruvec *l
+  */
+ struct lruvec *folio_lruvec_lock(struct folio *folio)
+ {
+-	struct lruvec *lruvec = folio_lruvec(folio);
++	struct lruvec *lruvec;
+ 
++	rcu_read_lock();
++retry:
++	lruvec = folio_lruvec(folio);
+ 	spin_lock(&lruvec->lru_lock);
+-	lruvec_memcg_debug(lruvec, folio);
++
++	if (unlikely(lruvec_memcg(lruvec) != folio_memcg(folio))) {
++		spin_unlock(&lruvec->lru_lock);
++		goto retry;
++	}
++	rcu_read_unlock();
+ 
+ 	return lruvec;
+ }
+@@ -1249,10 +1240,18 @@ struct lruvec *folio_lruvec_lock(struct
+  */
+ struct lruvec *folio_lruvec_lock_irq(struct folio *folio)
+ {
+-	struct lruvec *lruvec = folio_lruvec(folio);
++	struct lruvec *lruvec;
+ 
++	rcu_read_lock();
++retry:
++	lruvec = folio_lruvec(folio);
+ 	spin_lock_irq(&lruvec->lru_lock);
+-	lruvec_memcg_debug(lruvec, folio);
++
++	if (unlikely(lruvec_memcg(lruvec) != folio_memcg(folio))) {
++		spin_unlock_irq(&lruvec->lru_lock);
++		goto retry;
++	}
++	rcu_read_unlock();
+ 
+ 	return lruvec;
+ }
+@@ -1274,10 +1273,18 @@ struct lruvec *folio_lruvec_lock_irq(str
+ struct lruvec *folio_lruvec_lock_irqsave(struct folio *folio,
+ 		unsigned long *flags)
+ {
+-	struct lruvec *lruvec = folio_lruvec(folio);
++	struct lruvec *lruvec;
+ 
++	rcu_read_lock();
++retry:
++	lruvec = folio_lruvec(folio);
+ 	spin_lock_irqsave(&lruvec->lru_lock, *flags);
+-	lruvec_memcg_debug(lruvec, folio);
++
++	if (unlikely(lruvec_memcg(lruvec) != folio_memcg(folio))) {
++		spin_unlock_irqrestore(&lruvec->lru_lock, *flags);
++		goto retry;
++	}
++	rcu_read_unlock();
+ 
+ 	return lruvec;
+ }
+--- a/mm/swap.c~mm-memcontrol-make-lruvec-lock-safe-when-lru-pages-are-reparented
++++ a/mm/swap.c
+@@ -337,6 +337,11 @@ void lru_note_cost(struct lruvec *lruvec
+ 
+ void lru_note_cost_folio(struct folio *folio)
+ {
++	WARN_ON_ONCE(!rcu_read_lock_held());
++	/*
++	 * The rcu read lock is held by the caller, so we do not need to
++	 * care about the lruvec returned by folio_lruvec() being released.
++	 */
+ 	lru_note_cost(folio_lruvec(folio), folio_is_file_lru(folio),
+ 			folio_nr_pages(folio));
+ }
+_
