@@ -1,5 +1,6 @@
 From: Mel Gorman <mgorman@techsingularity.net>
 Subject: mm/page_alloc: protect PCP lists with a spinlock
+Date: Mon, 13 Jun 2022 13:56:20 +0100
 
 Currently the PCP lists are protected by using local_lock_irqsave to
 prevent migration and IRQ reentrancy but this is inconvenient.  Remote
@@ -59,20 +60,21 @@ CoeffVar  faults/sec-8        0.2399 (   0.00%)        0.2032 (  15.28%)
 There is a small hit in the number of faults per second but given that the
 results are more stable, it's borderline noise.
 
-Link: https://lkml.kernel.org/r/20220512085043.5234-6-mgorman@techsingularity.net
+Link: https://lkml.kernel.org/r/20220613125622.18628-6-mgorman@techsingularity.net
 Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
 Tested-by: Minchan Kim <minchan@kernel.org>
 Acked-by: Minchan Kim <minchan@kernel.org>
 Reviewed-by: Nicolas Saenz Julienne <nsaenzju@redhat.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: Marcelo Tosatti <mtosatti@redhat.com>
 Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/mmzone.h |    1 
- mm/page_alloc.c        |  169 ++++++++++++++++++++++++++++++++++-----
- 2 files changed, 149 insertions(+), 21 deletions(-)
+ mm/page_alloc.c        |  167 ++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 147 insertions(+), 21 deletions(-)
 
 --- a/include/linux/mmzone.h~mm-page_alloc-protect-pcp-lists-with-a-spinlock
 +++ a/include/linux/mmzone.h
@@ -107,7 +109,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_USE_PERCPU_NUMA_NODE_ID
  DEFINE_PER_CPU(int, numa_node);
  EXPORT_PER_CPU_SYMBOL(numa_node);
-@@ -3097,15 +3111,22 @@ static int rmqueue_bulk(struct zone *zon
+@@ -3093,15 +3107,22 @@ static int rmqueue_bulk(struct zone *zon
   */
  void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp)
  {
@@ -134,7 +136,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  #endif
  
-@@ -3118,16 +3139,17 @@ void drain_zone_pages(struct zone *zone,
+@@ -3114,16 +3135,17 @@ void drain_zone_pages(struct zone *zone,
   */
  static void drain_pages_zone(unsigned int cpu, struct zone *zone)
  {
@@ -158,7 +160,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -3395,18 +3417,30 @@ static int nr_pcp_high(struct per_cpu_pa
+@@ -3391,18 +3413,30 @@ static int nr_pcp_high(struct per_cpu_pa
  	return min(READ_ONCE(pcp->batch) << 2, high);
  }
  
@@ -191,7 +193,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	list_add(&page->pcp_list, &pcp->lists[pindex]);
  	pcp->count += 1 << order;
  
-@@ -3424,6 +3458,13 @@ static void free_unref_page_commit(struc
+@@ -3420,6 +3454,13 @@ static void free_unref_page_commit(struc
  
  		free_pcppages_bulk(zone, nr_pcp_free(pcp, high, batch, free_high), pcp, pindex);
  	}
@@ -205,7 +207,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -3434,6 +3475,7 @@ void free_unref_page(struct page *page,
+@@ -3430,6 +3471,7 @@ void free_unref_page(struct page *page,
  	unsigned long flags;
  	unsigned long pfn = page_to_pfn(page);
  	int migratetype;
@@ -213,7 +215,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!free_unref_page_prepare(page, pfn, order))
  		return;
-@@ -3455,8 +3497,11 @@ void free_unref_page(struct page *page,
+@@ -3451,8 +3493,11 @@ void free_unref_page(struct page *page,
  	}
  
  	local_lock_irqsave(&pagesets.lock, flags);
@@ -226,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -3465,10 +3510,19 @@ void free_unref_page(struct page *page,
+@@ -3461,10 +3506,19 @@ void free_unref_page(struct page *page,
  void free_unref_page_list(struct list_head *list)
  {
  	struct page *page, *next;
@@ -246,7 +248,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Prepare pages for freeing */
  	list_for_each_entry_safe(page, next, list, lru) {
  		unsigned long pfn = page_to_pfn(page);
-@@ -3489,8 +3543,33 @@ void free_unref_page_list(struct list_he
+@@ -3485,8 +3539,31 @@ void free_unref_page_list(struct list_he
  		}
  	}
  
@@ -256,8 +258,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 */
 +	if (list_empty(list))
 +		return;
-+
-+	VM_BUG_ON(in_hardirq());
 +
  	local_lock_irqsave(&pagesets.lock, flags);
 +
@@ -280,7 +280,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * Non-isolated types over MIGRATE_PCPTYPES get added
  		 * to the MIGRATE_MOVABLE pcp list.
-@@ -3500,18 +3579,33 @@ void free_unref_page_list(struct list_he
+@@ -3496,18 +3573,33 @@ void free_unref_page_list(struct list_he
  			migratetype = MIGRATE_MOVABLE;
  
  		trace_mm_page_free_batched(page);
@@ -315,7 +315,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	local_unlock_irqrestore(&pagesets.lock, flags);
  }
  
-@@ -3680,9 +3774,28 @@ struct page *__rmqueue_pcplist(struct zo
+@@ -3676,9 +3768,28 @@ struct page *__rmqueue_pcplist(struct zo
  			int migratetype,
  			unsigned int alloc_flags,
  			struct per_cpu_pages *pcp,
@@ -345,7 +345,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	do {
  		if (list_empty(list)) {
-@@ -3703,8 +3816,10 @@ struct page *__rmqueue_pcplist(struct zo
+@@ -3699,8 +3810,10 @@ struct page *__rmqueue_pcplist(struct zo
  					migratetype, alloc_flags);
  
  			pcp->count += alloced << order;
@@ -358,7 +358,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  
  		page = list_first_entry(list, struct page, pcp_list);
-@@ -3712,6 +3827,12 @@ struct page *__rmqueue_pcplist(struct zo
+@@ -3708,6 +3821,12 @@ struct page *__rmqueue_pcplist(struct zo
  		pcp->count -= 1 << order;
  	} while (check_new_pcp(page, order));
  
@@ -371,7 +371,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return page;
  }
  
-@@ -3736,7 +3857,7 @@ static struct page *rmqueue_pcplist(stru
+@@ -3732,7 +3851,7 @@ static struct page *rmqueue_pcplist(stru
  	pcp = this_cpu_ptr(zone->per_cpu_pageset);
  	pcp->free_factor >>= 1;
  	list = &pcp->lists[order_to_pindex(migratetype, order)];
@@ -380,7 +380,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	local_unlock_irqrestore(&pagesets.lock, flags);
  	if (page) {
  		__count_zid_vm_events(PGALLOC, page_zonenum(page), 1);
-@@ -3771,7 +3892,8 @@ struct page *rmqueue(struct zone *prefer
+@@ -3767,7 +3886,8 @@ struct page *rmqueue(struct zone *prefer
  				migratetype != MIGRATE_MOVABLE) {
  			page = rmqueue_pcplist(preferred_zone, zone, order,
  					gfp_flags, migratetype, alloc_flags);
@@ -390,7 +390,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  	}
  
-@@ -5345,6 +5467,7 @@ unsigned long __alloc_pages_bulk(gfp_t g
+@@ -5328,6 +5448,7 @@ unsigned long __alloc_pages_bulk(gfp_t g
  	local_lock_irqsave(&pagesets.lock, flags);
  	pcp = this_cpu_ptr(zone->per_cpu_pageset);
  	pcp_list = &pcp->lists[order_to_pindex(ac.migratetype, 0)];
@@ -398,7 +398,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	while (nr_populated < nr_pages) {
  
-@@ -5355,11 +5478,13 @@ unsigned long __alloc_pages_bulk(gfp_t g
+@@ -5338,11 +5459,13 @@ unsigned long __alloc_pages_bulk(gfp_t g
  		}
  
  		page = __rmqueue_pcplist(zone, 0, ac.migratetype, alloc_flags,
@@ -414,7 +414,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		}
  		nr_account++;
-@@ -5372,6 +5497,7 @@ unsigned long __alloc_pages_bulk(gfp_t g
+@@ -5355,6 +5478,7 @@ unsigned long __alloc_pages_bulk(gfp_t g
  		nr_populated++;
  	}
  
@@ -422,7 +422,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	local_unlock_irqrestore(&pagesets.lock, flags);
  
  	__count_zid_vm_events(PGALLOC, zone_idx(zone), nr_account);
-@@ -7021,6 +7147,7 @@ static void per_cpu_pages_init(struct pe
+@@ -7013,6 +7137,7 @@ static void per_cpu_pages_init(struct pe
  	memset(pcp, 0, sizeof(*pcp));
  	memset(pzstats, 0, sizeof(*pzstats));
  
