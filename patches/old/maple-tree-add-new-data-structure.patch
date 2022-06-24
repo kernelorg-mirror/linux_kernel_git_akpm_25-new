@@ -1,14 +1,14 @@
 From: "Liam R. Howlett" <Liam.Howlett@Oracle.com>
 Subject: Maple Tree: add new data structure
 
+Patch series "Introducing the Maple Tree".
+
 The maple tree is an RCU-safe range based B-tree designed to use modern
 processor cache efficiently.  There are a number of places in the kernel
 that a non-overlapping range-based tree would be beneficial, especially
-one with a simple interface.  The first user that is covered in this patch
-set is the vm_area_struct, where three data structures are replaced by the
-maple tree: the augmented rbtree, the vma cache, and the linked list of
-VMAs in the mm_struct.  The long term goal is to reduce or remove the
-mmap_sem contention.
+one with a simple interface.  If you use an rbtree with other data
+structures to improve performance or an interval tree to track
+non-overlapping ranges, then this is for you.
 
 The tree has a branching factor of 10 for non-leaf nodes and 16 for leaf
 nodes.  With the increased branching factor, it is significantly shorter
@@ -16,73 +16,68 @@ than the rbtree so it has fewer cache misses.  The removal of the linked
 list between subsequent entries also reduces the cache misses and the need
 to pull in the previous and next VMA during many tree alterations.
 
-The benchmarks are around the same as they have always been.
+The first user that is covered in this patch set is the vm_area_struct,
+where three data structures are replaced by the maple tree: the augmented
+rbtree, the vma cache, and the linked list of VMAs in the mm_struct.  The
+long term goal is to reduce or remove the mmap_lock contention.
 
-kernbench                      
-                               rb5.18-rc2             mt5.18-rc2
-Amean     user-2        862.24 (   0.00%)      861.45 *   0.09%*
-Amean     syst-2        136.65 (   0.00%)      141.58 *  -3.61%*
-Amean     elsp-2        505.38 (   0.00%)      507.99 *  -0.52%*
-Amean     user-4        890.24 (   0.00%)      888.34 *   0.21%*
-Amean     syst-4        140.64 (   0.00%)      145.32 *  -3.33%*
-Amean     elsp-4        264.34 (   0.00%)      265.76 *  -0.54%*
-Amean     user-8        952.30 (   0.00%)      947.57 *   0.50%*
-Amean     syst-8        145.52 (   0.00%)      147.79 *  -1.56%*
-Amean     elsp-8        145.02 (   0.00%)      145.38 *  -0.24%*
-Amean     user-16       920.83 (   0.00%)      918.95 *   0.20%*
-Amean     syst-16       135.37 (   0.00%)      138.99 *  -2.67%*
-Amean     elsp-16        75.03 (   0.00%)       75.25 *  -0.29%*
-Amean     user-32       970.98 (   0.00%)      969.01 *   0.20%*
-Amean     syst-32       144.75 (   0.00%)      148.58 *  -2.64%*
-Amean     elsp-32        44.10 (   0.00%)       44.64 *  -1.24%*
-Amean     user-64      1062.19 (   0.00%)     1060.30 *   0.18%*
-Amean     syst-64       154.24 (   0.00%)      157.58 *  -2.17%*
-Amean     elsp-64        28.88 (   0.00%)       29.10 *  -0.76%*
-Amean     user-128     1609.09 (   0.00%)     1612.19 *  -0.19%*
-Amean     syst-128      210.05 (   0.00%)      215.09 *  -2.40%*
-Amean     elsp-128       25.22 (   0.00%)       25.45 *  -0.94%*
-Amean     user-256     1767.37 (   0.00%)     1766.86 *   0.03%*
-Amean     syst-256      215.99 (   0.00%)      221.56 *  -2.58%*
-Amean     elsp-256       25.20 (   0.00%)       25.33 *  -0.54%*
-Amean     user-288     1772.73 (   0.00%)     1772.35 *   0.02%*
-Amean     syst-288      216.08 (   0.00%)      221.39 *  -2.45%*
-Amean     elsp-288       25.16 (   0.00%)       25.44 *  -1.13%*
+The plan is to get to the point where we use the maple tree in RCU mode. 
+Readers will not block for writers.  A single write operation will be
+allowed at a time.  A reader re-walks if stale data is encountered.  VMAs
+would be RCU enabled and this mode would be entered once multiple tasks
+are using the mm_struct.
 
-Increase in performance in the following micro-benchmarks in Hmean:
-- context_switch1-processes +14.74% to 2.22%
+Davidlor said
 
-Mixed results in the following micro-benchmarks in Hmean:
-- malloc1-threads +34.95% to -30.06%
-- malloc1-processes +2.73% to -23.65%
-- page_fault3-threads +19.84% to -11.55%
-- pthread_mutex1-threads +42.50% to -11.76%
+: Yes I like the maple tree, and at this stage I don't think we can ask for
+: more from this series wrt the MM - albeit there seems to still be some
+: folks reporting breakage.  Fundamentally I see Liam's work to (re)move
+: complexity out of the MM (not to say that the actual maple tree is not
+: complex) by consolidating the three complimentary data structures very
+: much worth it considering performance does not take a hit.  This was very
+: much a turn off with the range locking approach, which worst case scenario
+: incurred in prohibitive overhead.  Also as Liam and Matthew have
+: mentioned, RCU opens up a lot of nice performance opportunities, and in
+: addition academia[1] has shown outstanding scalability of address spaces
+: with the foundation of replacing the locked rbtree with RCU aware trees.
 
-Decrease in performance in the following micro-benchmarks in Hmean:
-- brk1-processes -35.35% to -42.69%
+A similar work has been discovered in the academic press
 
-brk1-processes decrease is due to the test itself.  Since the VMA cannot
-be expanded, the test is actually inserting a new VMA.
+	https://pdos.csail.mit.edu/papers/rcuvm:asplos12.pdf
 
-Link: https://lkml.kernel.org/r/20220426150616.3937571-8-Liam.Howlett@oracle.com
+Sheer coincidence.  We designed our tree with the intention of solving the
+hardest problem first.  Upon settling on a b-tree variant and a rough
+outline, we researched ranged based b-trees and RCU b-trees and did find
+that article.  So it was nice to find reassurances that we were on the
+right path, but our design choice of using ranges made that paper unusable
+for us.
+
+
+This patch (of 69):
+
+Link: https://lkml.kernel.org/r/20220504010716.661115-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220504002554.654642-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220504010716.661115-3-Liam.Howlett@oracle.com
 Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
 Tested-by: David Howells <dhowells@redhat.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yu Zhao <yuzhao@google.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/core-api/index.rst                   |    1 
- Documentation/core-api/maple_tree.rst              |  218 
+ Documentation/core-api/maple_tree.rst              |  217 
  MAINTAINERS                                        |   12 
  include/linux/maple_tree.h                         |  685 +
  include/trace/events/maple_tree.h                  |  123 
  init/main.c                                        |    2 
  lib/Kconfig.debug                                  |   15 
  lib/Makefile                                       |    3 
- lib/maple_tree.c                                   | 6964 +++++++++++
+ lib/maple_tree.c                                   | 6965 +++++++++++
  tools/testing/radix-tree/.gitignore                |    2 
  tools/testing/radix-tree/generated/autoconf.h      |    1 
  tools/testing/radix-tree/linux/maple_tree.h        |    7 
@@ -92,7 +87,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/Documentation/core-api/index.rst~maple-tree-add-new-data-structure
 +++ a/Documentation/core-api/index.rst
-@@ -34,6 +34,7 @@ Library functionality that is used throu
+@@ -36,6 +36,7 @@ Library functionality that is used throu
     kref
     assoc_array
     xarray
@@ -102,7 +97,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
     rbtree
 --- /dev/null
 +++ a/Documentation/core-api/maple_tree.rst
-@@ -0,0 +1,218 @@
+@@ -0,0 +1,217 @@
 +.. SPDX-License-Identifier: GPL-2.0+
 +
 +
@@ -320,7 +315,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +.. kernel-doc:: include/linux/maple_tree.h
 +.. kernel-doc:: lib/maple_tree.c
-+
 --- /dev/null
 +++ a/include/linux/maple_tree.h
 @@ -0,0 +1,685 @@
@@ -1155,7 +1149,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * Set up housekeeping before setting up workqueues to allow the unbound
 --- a/lib/Kconfig.debug~maple-tree-add-new-data-structure
 +++ a/lib/Kconfig.debug
-@@ -845,6 +845,13 @@ config DEBUG_VM_VMACACHE
+@@ -812,6 +812,13 @@ config DEBUG_VM_VMACACHE
  	  can cause significant overhead, so only enable it in non-production
  	  environments.
  
@@ -1169,7 +1163,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	  If unsure, say N.
  
  config DEBUG_VM_RB
-@@ -1705,6 +1712,14 @@ config BUG_ON_DATA_CORRUPTION
+@@ -1627,6 +1634,14 @@ config BUG_ON_DATA_CORRUPTION
  
  	  If unsure, say N.
  
@@ -1198,7 +1192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 earlycpio.o seq_buf.o siphash.o dec_and_lock.o \
 --- /dev/null
 +++ a/lib/maple_tree.c
-@@ -0,0 +1,6964 @@
+@@ -0,0 +1,6965 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Maple Tree implementation
@@ -6772,6 +6766,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * mas_preallocate() - Preallocate enough nodes for a store operation
 + * @mas: The maple state
 + * @entry: The entry that will be stored
++ * @gfp: The GFP_FLAGS to use for allocations.
 + *
 + * Return: 0 on success, -ENOMEM if memory could not be allocated.
 + */
@@ -8165,7 +8160,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#endif /* CONFIG_DEBUG_MAPLE_TREE */
 --- a/MAINTAINERS~maple-tree-add-new-data-structure
 +++ a/MAINTAINERS
-@@ -11663,6 +11663,18 @@ L:	linux-man@vger.kernel.org
+@@ -11792,6 +11792,18 @@ L:	linux-man@vger.kernel.org
  S:	Maintained
  W:	http://www.kernel.org/doc/man-pages
  
