@@ -1,0 +1,98 @@
+From: Miaohe Lin <linmiaohe@huawei.com>
+Subject: mm/khugepaged: stop swapping in page when VM_FAULT_RETRY occurs
+Date: Sat, 25 Jun 2022 17:28:11 +0800
+
+When do_swap_page returns VM_FAULT_RETRY, we do not retry here and thus
+swap entry will remain in pagetable.  This will result in later failure. 
+So stop swapping in pages in this case to save cpu cycles.  As A further
+optimization, mmap_lock is released when __collapse_huge_page_swapin()
+fails to avoid relocking mmap_lock.  And "swapped_in++" is moved after
+error handling to make it more accurate.
+
+Link: https://lkml.kernel.org/r/20220625092816.4856-3-linmiaohe@huawei.com
+Signed-off-by: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: NeilBrown <neilb@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |   32 ++++++++++++++------------------
+ 1 file changed, 14 insertions(+), 18 deletions(-)
+
+--- a/mm/khugepaged.c~mm-khugepaged-stop-swapping-in-page-when-vm_fault_retry-occurs
++++ a/mm/khugepaged.c
+@@ -940,8 +940,8 @@ static int hugepage_vma_revalidate(struc
+  * Bring missing pages in from swap, to complete THP collapse.
+  * Only done if khugepaged_scan_pmd believes it is worthwhile.
+  *
+- * Called and returns without pte mapped or spinlocks held,
+- * but with mmap_lock held to protect against vma changes.
++ * Called and returns without pte mapped or spinlocks held.
++ * Note that if false is returned, mmap_lock will be released.
+  */
+ 
+ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
+@@ -968,27 +968,24 @@ static bool __collapse_huge_page_swapin(
+ 			pte_unmap(vmf.pte);
+ 			continue;
+ 		}
+-		swapped_in++;
+ 		ret = do_swap_page(&vmf);
+ 
+-		/* do_swap_page returns VM_FAULT_RETRY with released mmap_lock */
++		/*
++		 * do_swap_page returns VM_FAULT_RETRY with released mmap_lock.
++		 * Note we treat VM_FAULT_RETRY as VM_FAULT_ERROR here because
++		 * we do not retry here and swap entry will remain in pagetable
++		 * resulting in later failure.
++		 */
+ 		if (ret & VM_FAULT_RETRY) {
+-			mmap_read_lock(mm);
+-			if (hugepage_vma_revalidate(mm, haddr, &vma)) {
+-				/* vma is no longer available, don't continue to swapin */
+-				trace_mm_collapse_huge_page_swapin(mm, swapped_in, referenced, 0);
+-				return false;
+-			}
+-			/* check if the pmd is still valid */
+-			if (mm_find_pmd(mm, haddr) != pmd) {
+-				trace_mm_collapse_huge_page_swapin(mm, swapped_in, referenced, 0);
+-				return false;
+-			}
++			trace_mm_collapse_huge_page_swapin(mm, swapped_in, referenced, 0);
++			return false;
+ 		}
+ 		if (ret & VM_FAULT_ERROR) {
++			mmap_read_unlock(mm);
+ 			trace_mm_collapse_huge_page_swapin(mm, swapped_in, referenced, 0);
+ 			return false;
+ 		}
++		swapped_in++;
+ 	}
+ 
+ 	/* Drain LRU add pagevec to remove extra pin on the swapped in pages */
+@@ -1054,13 +1051,12 @@ static void collapse_huge_page(struct mm
+ 	}
+ 
+ 	/*
+-	 * __collapse_huge_page_swapin always returns with mmap_lock locked.
+-	 * If it fails, we release mmap_lock and jump out_nolock.
++	 * __collapse_huge_page_swapin will return with mmap_lock released
++	 * when it fails. So we jump out_nolock directly in that case.
+ 	 * Continuing to collapse causes inconsistency.
+ 	 */
+ 	if (unmapped && !__collapse_huge_page_swapin(mm, vma, address,
+ 						     pmd, referenced)) {
+-		mmap_read_unlock(mm);
+ 		goto out_nolock;
+ 	}
+ 
+_
