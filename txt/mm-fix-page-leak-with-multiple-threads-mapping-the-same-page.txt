@@ -1,0 +1,42 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Subject: mm: fix page leak with multiple threads mapping the same page
+Date: Tue, 5 Jul 2022 16:00:36 -0400
+
+We have an application with a lot of threads that use a shared mmap backed
+by tmpfs mounted with -o huge=within_size.  This application started
+leaking loads of huge pages when we upgraded to a recent kernel.
+
+Using the page ref tracepoints and a BPF program written by Tejun Heo we
+were able to determine that these pages would have multiple refcounts from
+the page fault path, but when it came to unmap time we wouldn't drop the
+number of refs we had added from the faults.
+
+I wrote a reproducer that mmap'ed a file backed by tmpfs with -o
+huge=always, and then spawned 20 threads all looping faulting random
+offsets in this map, while using madvise(MADV_DONTNEED) randomly for huge
+page aligned ranges.  This very quickly reproduced the problem.
+
+The problem here is that we check for the case that we have multiple
+threads faulting in a range that was previously unmapped.  One thread maps
+the PMD, the other thread loses the race and then returns 0.  However at
+this point we already have the page, and we are no longer putting this
+page into the processes address space, and so we leak the page.  We
+actually did the correct thing prior to f9ce0be71d1f, however it looks
+like Kirill copied what we do in the anonymous page case.  In the
+anonymous page case we don't yet have a page, so we don't have to drop a
+reference on anything.  Previously we did the correct thing for file based
+faults by returning VM_FAULT_NOPAGE so we correctly drop the reference on
+the page we faulted in.
+
+Fix this by returning VM_FAULT_NOPAGE in the pmd_devmap_trans_unstable()
+case, this makes us drop the ref on the page properly, and now my
+reproducer no longer leaks the huge pages.
+
+Link: https://lkml.kernel.org/r/2b798acfd95c9ab9395fe85e8d5a835e2e10a920.1657051137.git.josef@toxicpanda.com
+Fixes: f9ce0be71d1f ("mm: Cleanup faultaround and finish_fault() codepaths")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Rik van Riel <riel@surriel.com>
+Signed-off-by: Chris Mason <clm@fb.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: <stable@vger.kernel.org>
