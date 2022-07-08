@@ -1,0 +1,229 @@
+From: "Zach O'Keefe" <zokeefe@google.com>
+Subject: mm/thp: add flag to enforce sysfs THP in hugepage_vma_check()
+Date: Wed, 6 Jul 2022 16:59:25 -0700
+
+MADV_COLLAPSE is not coupled to the kernel-oriented sysfs THP settings[1].
+
+hugepage_vma_check() is the authority on determining if a VMA is eligible
+for THP allocation/collapse, and currently enforces the sysfs THP
+settings.  Add a flag to disable these checks.  For now, only apply this
+arg to anon and file, which use /sys/kernel/transparent_hugepage/enabled. 
+We can expand this to shmem, which uses
+/sys/kernel/transparent_hugepage/shmem_enabled, later.
+
+Use this flag in collapse_pte_mapped_thp() where previously the VMA flags
+passed to hugepage_vma_check() were OR'd with VM_HUGEPAGE to elide the
+VM_HUGEPAGE check in "madvise" THP mode.  Prior to "mm: khugepaged: check
+THP flag in hugepage_vma_check()", this check also didn't check "never"
+THP mode.  As such, this restores the previous behavior of
+collapse_pte_mapped_thp() where sysfs THP settings are ignored.  See
+comment in code for justification why this is OK.
+
+[1] https://lore.kernel.org/linux-mm/CAAa6QmQxay1_=Pmt8oCX2-Va18t44FV-Vs-WsQt_6+qBks4nZA@mail.gmail.com/
+
+Link: https://lkml.kernel.org/r/20220706235936.2197195-8-zokeefe@google.com
+Signed-off-by: Zach O'Keefe <zokeefe@google.com>
+Cc: Alex Shi <alex.shi@linux.alibaba.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Chris Kennelly <ckennelly@google.com>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: James Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Pavel Begunkov <asml.silence@gmail.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rongwei Wang <rongwei.wang@linux.alibaba.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/proc/task_mmu.c      |    2 +-
+ include/linux/huge_mm.h |    9 ++++-----
+ mm/huge_memory.c        |   14 ++++++--------
+ mm/khugepaged.c         |   25 ++++++++++++++-----------
+ mm/memory.c             |    4 ++--
+ 5 files changed, 27 insertions(+), 27 deletions(-)
+
+--- a/fs/proc/task_mmu.c~mm-thp-add-flag-to-enforce-sysfs-thp-in-hugepage_vma_check
++++ a/fs/proc/task_mmu.c
+@@ -866,7 +866,7 @@ static int show_smap(struct seq_file *m,
+ 	__show_smap(m, &mss, false);
+ 
+ 	seq_printf(m, "THPeligible:    %d\n",
+-		   hugepage_vma_check(vma, vma->vm_flags, true, false));
++		   hugepage_vma_check(vma, vma->vm_flags, true, false, true));
+ 
+ 	if (arch_pkeys_enabled())
+ 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+--- a/include/linux/huge_mm.h~mm-thp-add-flag-to-enforce-sysfs-thp-in-hugepage_vma_check
++++ a/include/linux/huge_mm.h
+@@ -168,9 +168,8 @@ static inline bool file_thp_enabled(stru
+ 	       !inode_is_open_for_write(inode) && S_ISREG(inode->i_mode);
+ }
+ 
+-bool hugepage_vma_check(struct vm_area_struct *vma,
+-			unsigned long vm_flags,
+-			bool smaps, bool in_pf);
++bool hugepage_vma_check(struct vm_area_struct *vma, unsigned long vm_flags,
++			bool smaps, bool in_pf, bool enforce_sysfs);
+ 
+ #define transparent_hugepage_use_zero_page()				\
+ 	(transparent_hugepage_flags &					\
+@@ -321,8 +320,8 @@ static inline bool transhuge_vma_suitabl
+ }
+ 
+ static inline bool hugepage_vma_check(struct vm_area_struct *vma,
+-				       unsigned long vm_flags,
+-				       bool smaps, bool in_pf)
++				      unsigned long vm_flags, bool smaps,
++				      bool in_pf, bool enforce_sysfs)
+ {
+ 	return false;
+ }
+--- a/mm/huge_memory.c~mm-thp-add-flag-to-enforce-sysfs-thp-in-hugepage_vma_check
++++ a/mm/huge_memory.c
+@@ -69,9 +69,8 @@ static atomic_t huge_zero_refcount;
+ struct page *huge_zero_page __read_mostly;
+ unsigned long huge_zero_pfn __read_mostly = ~0UL;
+ 
+-bool hugepage_vma_check(struct vm_area_struct *vma,
+-			unsigned long vm_flags,
+-			bool smaps, bool in_pf)
++bool hugepage_vma_check(struct vm_area_struct *vma, unsigned long vm_flags,
++			bool smaps, bool in_pf, bool enforce_sysfs)
+ {
+ 	if (!vma->vm_mm)		/* vdso */
+ 		return false;
+@@ -120,11 +119,10 @@ bool hugepage_vma_check(struct vm_area_s
+ 	if (!in_pf && shmem_file(vma->vm_file))
+ 		return shmem_huge_enabled(vma);
+ 
+-	if (!hugepage_flags_enabled())
+-		return false;
+-
+-	/* THP settings require madvise. */
+-	if (!(vm_flags & VM_HUGEPAGE) && !hugepage_flags_always())
++	/* Enforce sysfs THP requirements as necessary */
++	if (enforce_sysfs &&
++	    (!hugepage_flags_enabled() || (!(vm_flags & VM_HUGEPAGE) &&
++					   !hugepage_flags_always())))
+ 		return false;
+ 
+ 	/* Only regular file is valid */
+--- a/mm/khugepaged.c~mm-thp-add-flag-to-enforce-sysfs-thp-in-hugepage_vma_check
++++ a/mm/khugepaged.c
+@@ -478,7 +478,7 @@ void khugepaged_enter_vma(struct vm_area
+ {
+ 	if (!test_bit(MMF_VM_HUGEPAGE, &vma->vm_mm->flags) &&
+ 	    hugepage_flags_enabled()) {
+-		if (hugepage_vma_check(vma, vm_flags, false, false))
++		if (hugepage_vma_check(vma, vm_flags, false, false, true))
+ 			__khugepaged_enter(vma->vm_mm);
+ 	}
+ }
+@@ -844,7 +844,8 @@ static bool khugepaged_alloc_page(struct
+  */
+ 
+ static int hugepage_vma_revalidate(struct mm_struct *mm, unsigned long address,
+-		struct vm_area_struct **vmap)
++				   struct vm_area_struct **vmap,
++				   struct collapse_control *cc)
+ {
+ 	struct vm_area_struct *vma;
+ 
+@@ -855,7 +856,8 @@ static int hugepage_vma_revalidate(struc
+ 	if (!vma)
+ 		return SCAN_VMA_NULL;
+ 
+-	if (!hugepage_vma_check(vma, vma->vm_flags, false, false))
++	if (!hugepage_vma_check(vma, vma->vm_flags, false, false,
++				cc->is_khugepaged))
+ 		return SCAN_VMA_CHECK;
+ 	/*
+ 	 * Anon VMA expected, the address may be unmapped then
+@@ -974,7 +976,7 @@ static int collapse_huge_page(struct mm_
+ 		goto out_nolock;
+ 
+ 	mmap_read_lock(mm);
+-	result = hugepage_vma_revalidate(mm, address, &vma);
++	result = hugepage_vma_revalidate(mm, address, &vma, cc);
+ 	if (result != SCAN_SUCCEED) {
+ 		mmap_read_unlock(mm);
+ 		goto out_nolock;
+@@ -1006,7 +1008,7 @@ static int collapse_huge_page(struct mm_
+ 	 * handled by the anon_vma lock + PG_lock.
+ 	 */
+ 	mmap_write_lock(mm);
+-	result = hugepage_vma_revalidate(mm, address, &vma);
++	result = hugepage_vma_revalidate(mm, address, &vma, cc);
+ 	if (result != SCAN_SUCCEED)
+ 		goto out_up_write;
+ 	/* check if the pmd is still valid */
+@@ -1350,12 +1352,13 @@ void collapse_pte_mapped_thp(struct mm_s
+ 		return;
+ 
+ 	/*
+-	 * This vm_flags may not have VM_HUGEPAGE if the page was not
+-	 * collapsed by this mm. But we can still collapse if the page is
+-	 * the valid THP. Add extra VM_HUGEPAGE so hugepage_vma_check()
+-	 * will not fail the vma for missing VM_HUGEPAGE
++	 * If we are here, we've succeeded in replacing all the native pages
++	 * in the page cache with a single hugepage. If a mm were to fault-in
++	 * this memory (mapped by a suitably aligned VMA), we'd get the hugepage
++	 * and map it by a PMD, regardless of sysfs THP settings. As such, let's
++	 * analogously elide sysfs THP settings here.
+ 	 */
+-	if (!hugepage_vma_check(vma, vma->vm_flags | VM_HUGEPAGE, false, false))
++	if (!hugepage_vma_check(vma, vma->vm_flags, false, false, false))
+ 		return;
+ 
+ 	/* Keep pmd pgtable for uffd-wp; see comment in retract_page_tables() */
+@@ -2042,7 +2045,7 @@ static unsigned int khugepaged_scan_mm_s
+ 			progress++;
+ 			break;
+ 		}
+-		if (!hugepage_vma_check(vma, vma->vm_flags, false, false)) {
++		if (!hugepage_vma_check(vma, vma->vm_flags, false, false, true)) {
+ skip:
+ 			progress++;
+ 			continue;
+--- a/mm/memory.c~mm-thp-add-flag-to-enforce-sysfs-thp-in-hugepage_vma_check
++++ a/mm/memory.c
+@@ -5002,7 +5002,7 @@ static vm_fault_t __handle_mm_fault(stru
+ 		return VM_FAULT_OOM;
+ retry_pud:
+ 	if (pud_none(*vmf.pud) &&
+-	    hugepage_vma_check(vma, vm_flags, false, true)) {
++	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
+ 		ret = create_huge_pud(&vmf);
+ 		if (!(ret & VM_FAULT_FALLBACK))
+ 			return ret;
+@@ -5036,7 +5036,7 @@ retry_pud:
+ 		goto retry_pud;
+ 
+ 	if (pmd_none(*vmf.pmd) &&
+-	    hugepage_vma_check(vma, vm_flags, false, true)) {
++	    hugepage_vma_check(vma, vm_flags, false, true, true)) {
+ 		ret = create_huge_pmd(&vmf);
+ 		if (!(ret & VM_FAULT_FALLBACK))
+ 			return ret;
+_
