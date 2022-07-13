@@ -1,13 +1,17 @@
 From: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Subject: mm, hwpoison: make unpoison aware of raw error info in hwpoisoned hugepage
-Date: Mon, 4 Jul 2022 10:33:08 +0900
+Date: Fri, 8 Jul 2022 14:36:49 +0900
 
 Raw error info list needs to be removed when hwpoisoned hugetlb is
 unpoisoned.  And unpoison handler needs to know how many errors there are
 in the target hugepage.  So add them.
 
-Link: https://lkml.kernel.org/r/20220704013312.2415700-6-naoya.horiguchi@linux.dev
+HPageVmemmapOptimized(hpage) and HPageRawHwpUnreliable(hpage)) can't be
+unpoisoned, so let's skip them.
+
+Link: https://lkml.kernel.org/r/20220708053653.964464-5-naoya.horiguchi@linux.dev
 Signed-off-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Reported-by: kernel test robot <lkp@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Liu Shixin <liushixin2@huawei.com>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
@@ -18,9 +22,9 @@ Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/swapops.h |    9 +++++++++
- mm/memory-failure.c     |   31 +++++++++++++++++++++++++------
- 2 files changed, 34 insertions(+), 6 deletions(-)
+ include/linux/swapops.h |    9 ++++++
+ mm/memory-failure.c     |   50 +++++++++++++++++++++++++++++++++-----
+ 2 files changed, 53 insertions(+), 6 deletions(-)
 
 --- a/include/linux/swapops.h~mm-hwpoison-make-unpoison-aware-of-raw-error-info-in-hwpoisoned-hugepage
 +++ a/include/linux/swapops.h
@@ -49,12 +53,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline int non_swap_entry(swp_entry_t entry)
 --- a/mm/memory-failure.c~mm-hwpoison-make-unpoison-aware-of-raw-error-info-in-hwpoisoned-hugepage
 +++ a/mm/memory-failure.c
-@@ -1722,22 +1722,33 @@ static inline int hugetlb_set_page_hwpoi
+@@ -1720,22 +1720,41 @@ static int hugetlb_set_page_hwpoison(str
  	return ret;
  }
  
--inline int hugetlb_clear_page_hwpoison(struct page *hpage)
-+static inline long free_raw_hwp_pages(struct page *hpage, bool move_flag)
+-int hugetlb_clear_page_hwpoison(struct page *hpage)
++static long free_raw_hwp_pages(struct page *hpage, bool move_flag)
  {
  	struct llist_head *head;
  	struct llist_node *t, *tnode;
@@ -62,6 +66,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -	if (!HPageRawHwpUnreliable(hpage))
 -		ClearPageHWPoison(hpage);
++	/*
++	 * HPageVmemmapOptimized hugepages can't be unpoisoned because
++	 * struct pages for tail pages are required to free hwpoisoned
++	 * hugepages.  HPageRawHwpUnreliable hugepages shouldn't be
++	 * unpoisoned by definition.
++	 */
++	if (HPageVmemmapOptimized(hpage) || HPageRawHwpUnreliable(hpage))
++		return 0;
  	head = raw_hwp_list_head(hpage);
  	llist_for_each_safe(tnode, t, head->first) {
  		struct raw_hwp_page *p = container_of(tnode, struct raw_hwp_page, node);
@@ -77,7 +89,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return count;
 +}
 +
-+inline int hugetlb_clear_page_hwpoison(struct page *hpage)
++int hugetlb_clear_page_hwpoison(struct page *hpage)
 +{
 +	int ret = -EBUSY;
 +
@@ -88,17 +100,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -1882,6 +1893,9 @@ static inline int try_memory_failure_hug
+@@ -1879,6 +1898,10 @@ static inline int try_memory_failure_hug
  	return 0;
  }
  
-+static inline void free_raw_hwp_pages(struct page *hpage, bool move_flag)
++static inline long free_raw_hwp_pages(struct page *hpage, bool move_flag)
 +{
++	return 0;
 +}
  #endif	/* CONFIG_HUGETLB_PAGE */
  
  static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
-@@ -2287,6 +2301,7 @@ int unpoison_memory(unsigned long pfn)
+@@ -2284,6 +2307,7 @@ int unpoison_memory(unsigned long pfn)
  	struct page *p;
  	int ret = -EBUSY;
  	int freeit = 0;
@@ -106,25 +119,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	static DEFINE_RATELIMIT_STATE(unpoison_rs, DEFAULT_RATELIMIT_INTERVAL,
  					DEFAULT_RATELIMIT_BURST);
  
-@@ -2334,6 +2349,8 @@ int unpoison_memory(unsigned long pfn)
+@@ -2331,6 +2355,13 @@ int unpoison_memory(unsigned long pfn)
  
  	ret = get_hwpoison_page(p, MF_UNPOISON);
  	if (!ret) {
-+		if (PageHuge(p))
++		if (PageHuge(p)) {
 +			count = free_raw_hwp_pages(page, false);
++			if (count == 0) {
++				ret = -EBUSY;
++				goto unlock_mutex;
++			}
++		}
  		ret = TestClearPageHWPoison(page) ? 0 : -EBUSY;
  	} else if (ret < 0) {
  		if (ret == -EHWPOISON) {
-@@ -2342,6 +2359,8 @@ int unpoison_memory(unsigned long pfn)
+@@ -2339,6 +2370,13 @@ int unpoison_memory(unsigned long pfn)
  			unpoison_pr_info("Unpoison: failed to grab page %#lx\n",
  					 pfn, &unpoison_rs);
  	} else {
-+		if (PageHuge(p))
++		if (PageHuge(p)) {
 +			count = free_raw_hwp_pages(page, false);
++			if (count == 0) {
++				ret = -EBUSY;
++				goto unlock_mutex;
++			}
++		}
  		freeit = !!TestClearPageHWPoison(p);
  
  		put_page(page);
-@@ -2354,7 +2373,7 @@ int unpoison_memory(unsigned long pfn)
+@@ -2351,7 +2389,7 @@ int unpoison_memory(unsigned long pfn)
  unlock_mutex:
  	mutex_unlock(&mf_mutex);
  	if (!ret || freeit) {
