@@ -1,5 +1,6 @@
 From: "Liam R. Howlett" <Liam.Howlett@Oracle.com>
 Subject: Maple Tree: add new data structure
+Date: Tue, 21 Jun 2022 20:46:47 +0000
 
 Patch series "Introducing the Maple Tree".
 
@@ -21,7 +22,7 @@ where three data structures are replaced by the maple tree: the augmented
 rbtree, the vma cache, and the linked list of VMAs in the mm_struct.  The
 long term goal is to reduce or remove the mmap_lock contention.
 
-The plan is to get to the point where we use the maple tree in RCU mode. 
+The plan is to get to the point where we use the maple tree in RCU mode.
 Readers will not block for writers.  A single write operation will be
 allowed at a time.  A reader re-walks if stale data is encountered.  VMAs
 would be RCU enabled and this mode would be entered once multiple tasks
@@ -55,12 +56,50 @@ for us.
 
 This patch (of 69):
 
+The maple tree is an RCU-safe range based B-tree designed to use modern
+processor cache efficiently.  There are a number of places in the kernel
+that a non-overlapping range-based tree would be beneficial, especially
+one with a simple interface.  If you use an rbtree with other data
+structures to improve performance or an interval tree to track
+non-overlapping ranges, then this is for you.
+
+The tree has a branching factor of 10 for non-leaf nodes and 16 for leaf
+nodes.  With the increased branching factor, it is significantly shorter
+than the rbtree so it has fewer cache misses.  The removal of the linked
+list between subsequent entries also reduces the cache misses and the need
+to pull in the previous and next VMA during many tree alterations.
+
+The first user that is covered in this patch set is the vm_area_struct,
+where three data structures are replaced by the maple tree: the augmented
+rbtree, the vma cache, and the linked list of VMAs in the mm_struct.  The
+long term goal is to reduce or remove the mmap_lock contention.
+
+The plan is to get to the point where we use the maple tree in RCU mode. 
+Readers will not block for writers.  A single write operation will be
+allowed at a time.  A reader re-walks if stale data is encountered.  VMAs
+would be RCU enabled and this mode would be entered once multiple tasks
+are using the mm_struct.
+
+Link: https://lkml.kernel.org/r/20220621204632.3370049-1-Liam.Howlett@oracle.com
 Link: https://lkml.kernel.org/r/20220504010716.661115-1-Liam.Howlett@oracle.com
 Link: https://lkml.kernel.org/r/20220504002554.654642-1-Liam.Howlett@oracle.com
 Link: https://lkml.kernel.org/r/20220504010716.661115-3-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220511144304.1430851-2-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220517145913.3480729-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220517152209.3486724-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220519150304.1289636-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220607063834.7004-1-lukas.bulwahn@gmail.com
+Link: https://lkml.kernel.org/r/20220615141921.417598-2-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220615141921.417598-3-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220616011739.802669-3-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220615174213.738849-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220617134609.1771611-1-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220621204632.3370049-2-Liam.Howlett@oracle.com
 Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
 Tested-by: David Howells <dhowells@redhat.com>
+Tested-by: Sven Schnelle <svens@linux.ibm.com>
+Signed-off-by: Lukas Bulwahn <lukas.bulwahn@gmail.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Vlastimil Babka <vbabka@suse.cz>
@@ -77,13 +116,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  init/main.c                                        |    2 
  lib/Kconfig.debug                                  |   15 
  lib/Makefile                                       |    3 
- lib/maple_tree.c                                   | 6965 +++++++++++
+ lib/maple_tree.c                                   | 7041 +++++++++++
  tools/testing/radix-tree/.gitignore                |    2 
  tools/testing/radix-tree/generated/autoconf.h      |    1 
  tools/testing/radix-tree/linux/maple_tree.h        |    7 
  tools/testing/radix-tree/maple.c                   |   59 
- tools/testing/radix-tree/trace/events/maple_tree.h |    3 
- 14 files changed, 8094 insertions(+), 1 deletion(-)
+ tools/testing/radix-tree/trace/events/maple_tree.h |    5 
+ 14 files changed, 8172 insertions(+), 1 deletion(-)
 
 --- a/Documentation/core-api/index.rst~maple-tree-add-new-data-structure
 +++ a/Documentation/core-api/index.rst
@@ -357,7 +396,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
 +#define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
 +#define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
-+#define MAPLE_ARANGE64_META_MAX	22	/* Out of range for metadata */
++#define MAPLE_ARANGE64_META_MAX	31	/* Out of range for metadata */
 +#define MAPLE_ALLOC_SLOTS	(MAPLE_NODE_SLOTS - 2)
 +#endif /* defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64) */
 +
@@ -509,7 +548,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +typedef struct lockdep_map *lockdep_map_p;
 +#define mt_lock_is_held(mt)	lock_is_held(mt->ma_external_lock)
 +#define mt_set_external_lock(mt, lock)					\
-+	(mt)->ma_external_lock = &(lock)->dep_map;
++	(mt)->ma_external_lock = &(lock)->dep_map
 +#else
 +typedef struct { /* nothing */ } lockdep_map_p;
 +#define mt_lock_is_held(mt)	1
@@ -1042,7 +1081,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			__entry->node		= mas->node;
 +	),
 +
-+	TP_printk("%s\tNode: %px (%lu %lu) range: %lu-%lu",
++	TP_printk("%s\tNode: %p (%lu %lu) range: %lu-%lu",
 +		  __entry->fn,
 +		  (void *) __entry->node,
 +		  (unsigned long) __entry->min,
@@ -1075,7 +1114,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			__entry->node		= mas->node;
 +	),
 +
-+	TP_printk("%s\tNode: %px (%lu %lu) range: %lu-%lu",
++	TP_printk("%s\tNode: %p (%lu %lu) range: %lu-%lu",
 +		  __entry->fn,
 +		  (void *) __entry->node,
 +		  (unsigned long) __entry->min,
@@ -1114,7 +1153,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			__entry->node		= mas->node;
 +	),
 +
-+	TP_printk("%s\tNode %px (%lu %lu) range:%lu-%lu piv (%lu) val %px",
++	TP_printk("%s\tNode %p (%lu %lu) range:%lu-%lu piv (%lu) val %p",
 +		  __entry->fn,
 +		  (void *) __entry->node,
 +		  (unsigned long) __entry->min,
@@ -1149,7 +1188,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * Set up housekeeping before setting up workqueues to allow the unbound
 --- a/lib/Kconfig.debug~maple-tree-add-new-data-structure
 +++ a/lib/Kconfig.debug
-@@ -812,6 +812,13 @@ config DEBUG_VM_VMACACHE
+@@ -821,6 +821,13 @@ config DEBUG_VM_VMACACHE
  	  can cause significant overhead, so only enable it in non-production
  	  environments.
  
@@ -1163,7 +1202,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	  If unsure, say N.
  
  config DEBUG_VM_RB
-@@ -1627,6 +1634,14 @@ config BUG_ON_DATA_CORRUPTION
+@@ -1636,6 +1643,14 @@ config BUG_ON_DATA_CORRUPTION
  
  	  If unsure, say N.
  
@@ -1192,7 +1231,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 earlycpio.o seq_buf.o siphash.o dec_and_lock.o \
 --- /dev/null
 +++ a/lib/maple_tree.c
-@@ -0,0 +1,6965 @@
+@@ -0,0 +1,7041 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Maple Tree implementation
@@ -1489,7 +1528,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static inline void mte_set_node_dead(struct maple_enode *mn)
 +{
 +	mte_to_node(mn)->parent = ma_parent_ptr(mte_to_node(mn));
-+	smp_wmb();
++	smp_wmb(); /* Needed for RCU */
 +}
 +
 +/* Bit 1 indicates the root is a node */
@@ -1549,7 +1588,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +/*
 + * The Parent Pointer
 + * Excluding root, the parent pointer is 256B aligned like all other tree nodes.
-+ * When storing a 32 or 64 bit values, the offset can fit into 4 bits.  The 16
++ * When storing a 32 or 64 bit values, the offset can fit into 5 bits.  The 16
 + * bit values need an extra bit to store the offset.  This extra bit comes from
 + * a reuse of the last bit in the node type.  This is possible by using bit 1 to
 + * indicate if bit 2 is part of the type or the slot.
@@ -1561,19 +1600,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *  0x110 = 64 bit nodes
 + *
 + * Slot size and alignment
-+ *  0x??1 : Root
-+ *  0x?00 : 16 bit values, type in 0-1, slot in 2-6
-+ *  0x010 : 32 bit values, type in 0-2, slot in 3-6
-+ *  0x110 : 64 bit values, type in 0-2, slot in 3-6
++ *  0b??1 : Root
++ *  0b?00 : 16 bit values, type in 0-1, slot in 2-7
++ *  0b010 : 32 bit values, type in 0-2, slot in 3-7
++ *  0b110 : 64 bit values, type in 0-2, slot in 3-7
 + */
 +
 +#define MAPLE_PARENT_ROOT		0x01
 +
 +#define MAPLE_PARENT_SLOT_SHIFT		0x03
-+#define MAPLE_PARENT_SLOT_MASK		0x78
++#define MAPLE_PARENT_SLOT_MASK		0xF8
 +
 +#define MAPLE_PARENT_16B_SLOT_SHIFT	0x02
-+#define MAPLE_PARENT_16B_SLOT_MASK	0x7C
++#define MAPLE_PARENT_16B_SLOT_MASK	0xFC
 +
 +#define MAPLE_PARENT_RANGE64		0x06
 +#define MAPLE_PARENT_RANGE32		0x04
@@ -1664,7 +1703,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	BUG_ON(p_type == maple_dense);
 +	BUG_ON(p_type == maple_leaf_64);
 +
-+	switch(p_type) {
++	switch (p_type) {
 +	case maple_range_64:
 +	case maple_arange_64:
 +		shift = MAPLE_PARENT_SLOT_SHIFT;
@@ -1859,7 +1898,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct maple_node *node = mte_to_node(mn);
 +
-+	if(piv >= mt_pivots[piv]) {
++	if (piv >= mt_pivots[piv]) {
 +		WARN_ON(1);
 +		return 0;
 +	}
@@ -2583,7 +2622,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +/*
 + * mas_data_end() - Find the end of the data (slot).
 + * @mas: the maple state
-+ * @type: the type of maple node
 + *
 + * This method is optimized to check the metadata of a node if the node type
 + * supports data end metadata.
@@ -2852,7 +2890,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	do {
 +		child = mas_slot_locked(mas, slots, offset);
 +		mte_set_parent(child, parent, offset);
-+	} while(offset--);
++	} while (offset--);
 +}
 +
 +/*
@@ -3468,6 +3506,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/*
++ * mas_topiary_range() - Add a range of slots to the topiary.
++ * @mas: The maple state
++ * @destroy: The topiary to add the slots (usually destroy)
++ * @start: The starting slot inclusively
++ * @end: The end slot inclusively
++ */
++static inline void mas_topiary_range(struct ma_state *mas,
++	struct ma_topiary *destroy, unsigned char start, unsigned char end)
++{
++	void __rcu **slots;
++	unsigned offset;
++
++	MT_BUG_ON(mas->tree, mte_is_leaf(mas->node));
++	slots = ma_slots(mas_mn(mas), mte_node_type(mas->node));
++	for (offset = start; offset <= end; offset++) {
++		struct maple_enode *enode = mas_slot_locked(mas, slots, offset);
++
++		if (mte_dead_node(enode))
++			continue;
++
++		mat_add(destroy, enode);
++	}
++}
++
++/*
 + * mast_topiary() - Add the portions of the tree to the removal list; either to
 + * be freed or discarded (destroy walk).
 + * @mast: The maple_subtree_state.
@@ -3475,48 +3538,62 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static inline void mast_topiary(struct maple_subtree_state *mast)
 +{
 +	MA_WR_STATE(wr_mas, mast->orig_l, NULL);
-+	unsigned char l_off, r_off, offset;
-+	unsigned long l_index;
-+	struct maple_enode *child;
-+	void __rcu **slots;
++	unsigned char r_start, r_end;
++	unsigned char l_start, l_end;
++	void **l_slots, **r_slots;
 +
 +	wr_mas.type = mte_node_type(mast->orig_l->node);
-+	/* The left node is consumed, so add to the free list. */
-+	l_index = mast->orig_l->index;
 +	mast->orig_l->index = mast->orig_l->last;
 +	mas_wr_node_walk(&wr_mas);
-+	mast->orig_l->index = l_index;
-+	l_off = mast->orig_l->offset;
-+	r_off = mast->orig_r->offset;
-+	if (mast->orig_l->node == mast->orig_r->node) {
-+		slots = ma_slots(mte_to_node(mast->orig_l->node), wr_mas.type);
-+		for (offset = l_off + 1; offset < r_off; offset++)
-+			mat_add(mast->destroy, mas_slot_locked(mast->orig_l,
-+							slots, offset));
++	l_start = mast->orig_l->offset + 1;
++	l_end = mas_data_end(mast->orig_l);
++	r_start = 0;
++	r_end = mast->orig_r->offset;
 +
++	if (r_end)
++		r_end--;
++
++	l_slots = ma_slots(mas_mn(mast->orig_l),
++			   mte_node_type(mast->orig_l->node));
++
++	r_slots = ma_slots(mas_mn(mast->orig_r),
++			   mte_node_type(mast->orig_r->node));
++
++	if ((l_start < l_end) &&
++	    mte_dead_node(mas_slot_locked(mast->orig_l, l_slots, l_start))) {
++		l_start++;
++	}
++
++	if (mte_dead_node(mas_slot_locked(mast->orig_r, r_slots, r_end))) {
++		if (r_end)
++			r_end--;
++	}
++
++	if ((l_start > r_end) && (mast->orig_l->node == mast->orig_r->node))
 +		return;
++
++	/* At the node where left and right sides meet, add the parts between */
++	if (mast->orig_l->node == mast->orig_r->node) {
++		return mas_topiary_range(mast->orig_l, mast->destroy,
++					     l_start, r_end);
 +	}
 +
 +	/* mast->orig_r is different and consumed. */
 +	if (mte_is_leaf(mast->orig_r->node))
 +		return;
 +
-+	/* Now destroy l_off + 1 -> end and 0 -> r_off - 1 */
-+	offset = l_off + 1;
-+	slots = ma_slots(mte_to_node(mast->orig_l->node), wr_mas.type);
-+	while (offset < mt_slots[wr_mas.type]) {
-+		child = mas_slot_locked(mast->orig_l, slots, offset++);
-+		if (!child)
-+			break;
++	if (mte_dead_node(mas_slot_locked(mast->orig_l, l_slots, l_end)))
++		l_end--;
 +
-+		mat_add(mast->destroy, child);
-+	}
 +
-+	slots = ma_slots(mte_to_node(mast->orig_r->node),
-+			     mte_node_type(mast->orig_r->node));
-+	for (offset = 0; offset < r_off; offset++)
-+		mat_add(mast->destroy,
-+				mas_slot_locked(mast->orig_l, slots, offset));
++	if (l_start <= l_end)
++		mas_topiary_range(mast->orig_l, mast->destroy, l_start, l_end);
++
++	if (mte_dead_node(mas_slot_locked(mast->orig_r, r_slots, r_start)))
++		r_start++;
++
++	if (r_start <= r_end)
++		mas_topiary_range(mast->orig_r, mast->destroy, 0, r_end);
 +}
 +
 +/*
@@ -3524,19 +3601,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @mast: The maple subtree state
 + * @old_r: The encoded maple node to the right (next node).
 + */
-+static inline void mast_rebalance_next(struct maple_subtree_state *mast,
-+				       struct maple_enode *old_r, bool free)
++static inline void mast_rebalance_next(struct maple_subtree_state *mast)
 +{
 +	unsigned char b_end = mast->bn->b_end;
 +
 +	mas_mab_cp(mast->orig_r, 0, mt_slot_count(mast->orig_r->node),
 +		   mast->bn, b_end);
-+	if (free)
-+		mat_add(mast->free, old_r);
-+
 +	mast->orig_r->last = mast->orig_r->max;
-+	if (old_r == mast->orig_l->node)
-+		mast->orig_l->node = mast->orig_r->node;
 +}
 +
 +/*
@@ -3544,17 +3615,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @mast: The maple subtree state
 + * @old_l: The encoded maple node to the left (previous node)
 + */
-+static inline void mast_rebalance_prev(struct maple_subtree_state *mast,
-+				       struct maple_enode *old_l)
++static inline void mast_rebalance_prev(struct maple_subtree_state *mast)
 +{
 +	unsigned char end = mas_data_end(mast->orig_l) + 1;
 +	unsigned char b_end = mast->bn->b_end;
 +
 +	mab_shift_right(mast->bn, end);
 +	mas_mab_cp(mast->orig_l, 0, end - 1, mast->bn, 0);
-+	mat_add(mast->free, old_l);
-+	if (mast->orig_r->node == old_l)
-+		mast->orig_r->node = mast->orig_l->node;
 +	mast->l->min = mast->orig_l->min;
 +	mast->orig_l->index = mast->orig_l->min;
 +	mast->bn->b_end = end + b_end;
@@ -3562,68 +3629,116 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/*
-+ * mast_sibling_rebalance_right() - Rebalance from nodes with the same parents.
-+ * Check the right side, then the left.  Data is copied into the @mast->bn.
++ * mast_spanning_rebalance() - Rebalance nodes with nearest neighbour favouring
++ * the node to the right.  Checking the nodes to the right then the left at each
++ * level upwards until root is reached.  Free and destroy as needed.
++ * Data is copied into the @mast->bn.
 + * @mast: The maple_subtree_state.
 + */
 +static inline
-+bool mast_sibling_rebalance_right(struct maple_subtree_state *mast, bool free)
++bool mast_spanning_rebalance(struct maple_subtree_state *mast)
 +{
-+	struct maple_enode *old_r;
-+	struct maple_enode *old_l;
++	struct ma_state r_tmp = *mast->orig_r;
++	struct ma_state l_tmp = *mast->orig_l;
++	struct maple_enode *ancestor = NULL;
++	unsigned char start, end;
++	unsigned char depth = 0;
 +
-+	old_r = mast->orig_r->node;
-+	if (mas_next_sibling(mast->orig_r)) {
-+		mast_rebalance_next(mast, old_r, free);
-+		return true;
-+	}
++	r_tmp = *mast->orig_r;
++	l_tmp = *mast->orig_l;
++	do {
++		mas_ascend(mast->orig_r);
++		mas_ascend(mast->orig_l);
++		depth++;
++		if (!ancestor &&
++		    (mast->orig_r->node == mast->orig_l->node)) {
++			ancestor = mast->orig_r->node;
++			end = mast->orig_r->offset - 1;
++			start = mast->orig_l->offset + 1;
++		}
 +
-+	old_l = mast->orig_l->node;
-+	if (mas_prev_sibling(mast->orig_l)) {
-+		mast->bn->type = mte_node_type(mast->orig_l->node);
-+		mast_rebalance_prev(mast, old_l);
-+		return true;
-+	}
++		if (mast->orig_r->offset < mas_data_end(mast->orig_r)) {
++			if (!ancestor) {
++				ancestor = mast->orig_r->node;
++				start = 0;
++			}
 +
++			mast->orig_r->offset++;
++			do {
++				mas_descend(mast->orig_r);
++				mast->orig_r->offset = 0;
++				depth--;
++			} while (depth);
++
++			mast_rebalance_next(mast);
++			do {
++				unsigned char l_off = 0;
++				struct maple_enode *child = r_tmp.node;
++
++				mas_ascend(&r_tmp);
++				if (ancestor == r_tmp.node)
++					l_off = start;
++
++				if (r_tmp.offset)
++					r_tmp.offset--;
++
++				if (l_off < r_tmp.offset)
++					mas_topiary_range(&r_tmp, mast->destroy,
++							  l_off, r_tmp.offset);
++
++				if (l_tmp.node != child)
++					mat_add(mast->free, child);
++
++			} while (r_tmp.node != ancestor);
++
++			*mast->orig_l = l_tmp;
++			return true;
++
++		} else if (mast->orig_l->offset != 0) {
++			if (!ancestor) {
++				ancestor = mast->orig_l->node;
++				end = mas_data_end(mast->orig_l);
++			}
++
++			mast->orig_l->offset--;
++			do {
++				mas_descend(mast->orig_l);
++				mast->orig_l->offset =
++					mas_data_end(mast->orig_l);
++				depth--;
++			} while (depth);
++
++			mast_rebalance_prev(mast);
++			do {
++				unsigned char r_off;
++				struct maple_enode *child = l_tmp.node;
++
++				mas_ascend(&l_tmp);
++				if (ancestor == l_tmp.node)
++					r_off = end;
++				else
++					r_off = mas_data_end(&l_tmp);
++
++				if (l_tmp.offset < r_off)
++					l_tmp.offset++;
++
++				if (l_tmp.offset < r_off)
++					mas_topiary_range(&l_tmp, mast->destroy,
++							  l_tmp.offset, r_off);
++
++				if (r_tmp.node != child)
++					mat_add(mast->free, child);
++
++			} while (l_tmp.node != ancestor);
++
++			*mast->orig_r = r_tmp;
++			return true;
++		}
++	} while (!mte_is_root(mast->orig_r->node));
++
++	*mast->orig_r = r_tmp;
++	*mast->orig_l = l_tmp;
 +	return false;
-+}
-+
-+static inline int mas_prev_node(struct ma_state *mas, unsigned long min);
-+static inline int mas_next_node(struct ma_state *mas, struct maple_node *node,
-+				unsigned long max);
-+/*
-+ * mast_cousin_rebalance_right() - Rebalance from nodes with different parents.
-+ * Check the right side, then the left.  Data is copied into the @mast->bn.
-+ * @mast: The maple_subtree_state.
-+ */
-+static inline
-+bool mast_cousin_rebalance_right(struct maple_subtree_state *mast, bool free)
-+{
-+	struct maple_enode *old_l = mast->orig_l->node;
-+	struct maple_enode *old_r = mast->orig_r->node;
-+
-+	MA_STATE(tmp, mast->orig_r->tree, mast->orig_r->index, mast->orig_r->last);
-+
-+	tmp = *mast->orig_r;
-+	mas_next_node(mast->orig_r, mas_mn(mast->orig_r), ULONG_MAX);
-+	if (!mas_is_none(mast->orig_r)) {
-+		mast_rebalance_next(mast, old_r, free);
-+		return true;
-+	}
-+
-+	*mast->orig_r = *mast->orig_l;
-+	*mast->r = *mast->l;
-+	mas_prev_node(mast->orig_l, 0);
-+	if (mas_is_none(mast->orig_l)) {
-+		/* Making a new root with the contents of mast->bn */
-+		*mast->orig_l = *mast->orig_r;
-+		*mast->orig_r = tmp;
-+		return false;
-+	}
-+
-+	mast->orig_l->offset = 0;
-+	mast_rebalance_prev(mast, old_l);
-+	return true;
 +}
 +
 +/*
@@ -3657,18 +3772,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * The node may not contain the value so set slot to ensure all
 +	 * of the nodes contents are freed or destroyed.
 +	 */
-+	if (mast->orig_r->max < mast->orig_r->last)
-+		mast->orig_r->offset = mas_data_end(mast->orig_r) + 1;
-+	else {
-+		wr_mas.type = mte_node_type(mast->orig_r->node);
-+		mas_wr_node_walk(&wr_mas);
-+	}
++	wr_mas.type = mte_node_type(mast->orig_r->node);
++	mas_wr_node_walk(&wr_mas);
 +	/* Set up the left side of things */
 +	mast->orig_l->offset = 0;
 +	mast->orig_l->index = mast->l->min;
 +	wr_mas.mas = mast->orig_l;
 +	wr_mas.type = mte_node_type(mast->orig_l->node);
 +	mas_wr_node_walk(&wr_mas);
++
++	mast->bn->type = wr_mas.type;
 +}
 +
 +/*
@@ -3849,7 +3962,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				   struct ma_topiary *destroy)
 +{
 +	/* All nodes must see old data as dead prior to replacing that data */
-+	smp_wmb();
++	smp_wmb(); /* Needed for RCU */
 +
 +	/* Insert the new data in the tree */
 +	mas_replace(mas, true);
@@ -3872,7 +3985,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * mast_new_root() - Set a new tree root during subtree creation
 + * @mast: The maple subtree state
 + * @mas: The maple state
-+ * */
++ */
 +static inline void mast_new_root(struct maple_subtree_state *mast,
 +				 struct ma_state *mas)
 +{
@@ -4022,7 +4135,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +		do {
 +			offset++;
-+		} while((offset < end) && (pivots[offset] < mas->index));
++		} while ((offset < end) && (pivots[offset] < mas->index));
 +
 +		prev_min = min;
 +		min = pivots[offset - 1] + 1;
@@ -4076,7 +4189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct maple_enode *left = NULL, *middle = NULL, *right = NULL;
 +
 +	MA_STATE(l_mas, mas->tree, mas->index, mas->index);
-+	MA_STATE(r_mas, mas->tree, mas->index, mas->index);
++	MA_STATE(r_mas, mas->tree, mas->index, mas->last);
 +	MA_STATE(m_mas, mas->tree, mas->index, mas->index);
 +	MA_TOPIARY(free, mas->tree);
 +	MA_TOPIARY(destroy, mas->tree);
@@ -4092,14 +4205,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mast->destroy = &destroy;
 +	l_mas.node = r_mas.node = m_mas.node = MAS_NONE;
 +	if (!mas_is_root_limits(mast->orig_l) &&
-+	    unlikely(mast->bn->b_end <= mt_min_slots[mast->bn->type])) {
-+		/*
-+		 * Do not free the current node as it may be freed in a bulk
-+		 * free.
-+		 */
-+		if (!mast_sibling_rebalance_right(mast, false))
-+			mast_cousin_rebalance_right(mast, false);
-+	}
++	    unlikely(mast->bn->b_end <= mt_min_slots[mast->bn->type]))
++		mast_spanning_rebalance(mast);
++
 +	mast->orig_l->depth = 0;
 +
 +	/*
@@ -4156,15 +4264,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (mas_is_root_limits(mast->orig_l))
 +			break;
 +
-+		/* Try to get enough data for the next iteration. */
-+		if (!mast_sibling_rebalance_right(mast, true))
-+			if (!mast_cousin_rebalance_right(mast, true))
-+				break;
++		if (!mast_spanning_rebalance(mast))
++			break;
 +
 +		/* rebalancing from other nodes may require another loop. */
 +		if (!count)
 +			count++;
 +	}
++
 +	l_mas.node = mt_mk_node(ma_mnode_ptr(mas_pop_node(mas)),
 +				mte_node_type(mast->orig_l->node));
 +	mast->orig_l->depth++;
@@ -4237,6 +4344,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mast.orig_l = &l_mas;
 +	mast.orig_r = &r_mas;
 +	mast.bn = b_node;
++	mast.bn->type = mte_node_type(mas->node);
 +
 +	l_mas = r_mas = *mas;
 +
@@ -4474,7 +4582,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mast->l->max = mast->bn->pivot[split];
 +	mast->r->min = mast->l->max + 1;
 +	if (mte_is_leaf(mas->node))
-+	    return;
++		return;
 +
 +	p_slot = mast->orig_l->offset;
 +	mas_set_split_parent(mast->orig_l, mast->l->node, mast->r->node,
@@ -4671,11 +4779,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return false;
 +
 +	if (end > bn->b_end) {
-+			int clear = mt_slots[wr_mas->type] - bn->b_end;
-+			memset(wr_mas->slots + bn->b_end, 0,
-+			       sizeof(void *) * clear--);
-+			memset(wr_mas->pivots + bn->b_end, 0,
-+			       sizeof(void *) * clear);
++		int clear = mt_slots[wr_mas->type] - bn->b_end;
++
++		memset(wr_mas->slots + bn->b_end, 0, sizeof(void *) * clear--);
++		memset(wr_mas->pivots + bn->b_end, 0, sizeof(void *) * clear);
 +	}
 +	mab_mas_cp(bn, 0, bn->b_end, wr_mas->mas, false);
 +	return true;
@@ -4983,7 +5090,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +		do {
 +			offset++;
-+		} while((offset < end) && (pivots[offset] < mas->index));
++		} while ((offset < end) && (pivots[offset] < mas->index));
 +
 +		if (likely(offset > end))
 +			max = pivots[offset];
@@ -5051,7 +5158,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return 1;
 +}
 +/*
-+ * mas_spanning_store() - Create a subtree with the store operation completed
++ * mas_wr_spanning_store() - Create a subtree with the store operation completed
 + * and new nodes where necessary, then place the sub-tree in the actual tree.
 + * Note that mas is expected to point to the node which caused the store to
 + * span.
@@ -5176,8 +5283,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +		new_end++;
 +	} else {
-+		if (mas_safe_pivot(mas, wr_mas->pivots, wr_mas->offset_end,
-+				   wr_mas->type) == mas->last)
++		if (wr_mas->end_piv == mas->last)
 +			wr_mas->offset_end++;
 +
 +		new_end -= wr_mas->offset_end - offset - 1;
@@ -5303,7 +5409,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/* Overwriting a portion of offset and all of offset + 1 */
 +	if ((offset + 1 < mt_pivots[wr_mas->type]) &&
 +	    (wr_mas->entry || wr_mas->pivots[offset + 1]))
-+			wr_mas->pivots[offset + 1] = mas->last;
++		wr_mas->pivots[offset + 1] = mas->last;
 +
 +	rcu_assign_pointer(wr_mas->slots[offset + 1], wr_mas->entry);
 +	wr_mas->pivots[offset] = mas->index - 1;
@@ -5341,10 +5447,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			mas->last = mas->max;
 +		else
 +			mas->last = wr_mas->pivots[wr_mas->offset_end];
-+	} else if ((mas->last > wr_mas->end_piv) &&
-+		   !wr_mas->slots[wr_mas->offset_end]) {
-+		mas->last = wr_mas->end_piv;
-+		wr_mas->offset_end++;
++		wr_mas->end_piv = mas->last;
 +	}
 +
 +	if (!wr_mas->content) {
@@ -5426,9 +5529,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	if (wr_mas->entry && (wr_mas->node_end < node_slots - 1) &&
 +	    (mas->offset == wr_mas->node_end) && mas_wr_append(wr_mas)) {
-+			if (!wr_mas->content || !wr_mas->entry)
-+				mas_update_gap(mas);
-+			return;
++		if (!wr_mas->content || !wr_mas->entry)
++			mas_update_gap(mas);
++		return;
 +	}
 +
 +	if ((wr_mas->offset_end - mas->offset <= 1) && mas_wr_slot_store(wr_mas))
@@ -5457,8 +5560,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct ma_state *mas = wr_mas->mas;
 +
-+	if ((wr_mas->content = mas_start(mas)) || mas_is_none(mas) ||
-+	    mas_is_ptr(mas)) {
++	wr_mas->content = mas_start(mas);
++	if (mas_is_none(mas) || mas_is_ptr(mas)) {
 +		mas_store_root(mas, wr_mas->entry);
 +		return wr_mas->content;
 +	}
@@ -5746,6 +5849,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return NULL;
 +
 +	count = ma_data_end(node, type, pivots, mas->max);
++	if (mas->offset > count)
++		return NULL;
++
 +	while (mas->offset < count) {
 +		pivot = pivots[mas->offset];
 +		entry = mas_slot(mas, slots, mas->offset);
@@ -5824,8 +5930,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	node = mas_mn(mas);
 +	mt = mte_node_type(mas->node);
 +	mas->offset++;
-+	if (unlikely(mas->offset >= mt_slots[mt]))
++	if (unlikely(mas->offset >= mt_slots[mt])) {
++		mas->offset = mt_slots[mt] - 1;
 +		goto next_node;
++	}
 +
 +	while (!mas_is_none(mas)) {
 +		entry = mas_next_nentry(mas, node, limit, mt);
@@ -5883,6 +5991,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mn = mas_mn(mas);
 +	mt = mte_node_type(mas->node);
 +	offset = mas->offset - 1;
++	if (offset >= mt_slots[mt])
++		offset = mt_slots[mt] - 1;
++
 +	slots = ma_slots(mn, mt);
 +	pivots = ma_pivots(mn, mt);
 +	if (offset == mt_pivots[mt])
@@ -5961,7 +6072,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned char offset;
 +
 +	if (unlikely(mas_is_err(mas)))
-+	    return true;
++		return true;
 +
 +	if (ma_is_dense(type)) {
 +		/* dense nodes. */
@@ -6308,13 +6419,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long *pivots;
 +	enum maple_type mt;
 +
-+	if (mas_is_start(mas)) {
++	if (mas_is_start(mas))
 +		mas_start(mas);
-+	} else if (mas->offset >= 2) {
++	else if (mas->offset >= 2)
 +		mas->offset -= 2;
-+	} else if (!mas_skip_node(mas)) {
++	else if (!mas_skip_node(mas))
 +		return -EBUSY;
-+	}
 +
 +	/* Empty set */
 +	if (mas_is_none(mas) || mas_is_ptr(mas)) {
@@ -6500,7 +6610,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			break;
 +
 +		mte_set_node_dead(entry);
-+		smp_wmb();
++		smp_wmb(); /* Needed for RCU */
 +		node->type = type;
 +		rcu_assign_pointer(slots[offset], node);
 +	}
@@ -6580,6 +6690,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		node = mas_mn(mas);
 +		slots = ma_slots(node, mte_node_type(mas->node));
 +		next = mas_slot_locked(mas, slots, 0);
++		if ((mte_dead_node(next)))
++			next = mas_slot_locked(mas, slots, 1);
++
 +		mte_set_node_dead(mas->node);
 +		node->type = mte_node_type(mas->node);
 +		node->piv_parent = prev;
@@ -6587,6 +6700,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		offset = 0;
 +		prev = mas->node;
 +	} while (!mte_is_leaf(next));
++
 +	return slots;
 +}
 +
@@ -6620,9 +6734,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		mas.node = node->piv_parent;
 +		if (mas_mn(&mas) == node)
 +			goto start_slots_free;
++
 +		type = mte_node_type(mas.node);
 +		slots = ma_slots(mte_to_node(mas.node), type);
-+		if ((offset < mt_slots[type]) && (slots[offset])) {
++		if ((offset < mt_slots[type]) && mte_node_type(slots[offset]) &&
++		    mte_to_node(slots[offset])) {
 +			struct maple_enode *parent = mas.node;
 +
 +			mas.node = mas_slot_locked(&mas, slots, offset);
@@ -6699,7 +6815,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	trace_ma_write(__func__, mas, 0, entry);
 +#ifdef CONFIG_DEBUG_MAPLE_TREE
 +	if (mas->index > mas->last)
-+		printk("Error %lu > %lu %p\n", mas->index, mas->last, entry);
++		pr_err("Error %lu > %lu %p\n", mas->index, mas->last, entry);
 +	MT_BUG_ON(mas->tree, mas->index > mas->last);
 +	if (mas->index > mas->last) {
 +		mas_set_err(mas, -EINVAL);
@@ -6746,7 +6862,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/**
-+ * mas_store_prealloc() - Store a value into the tree using memeory
++ * mas_store_prealloc() - Store a value into the tree using memory
 + * preallocated in the maple state.
 + * @mas: The maple state
 + * @entry: The entry to store.
@@ -6772,16 +6888,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + */
 +int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp)
 +{
++	int ret;
 +
 +	mas_set_alloc_req(mas, 1 + mas_mt_height(mas) * 3);
 +	mas_alloc_nodes(mas, gfp);
-+	if (likely(mas->node != MA_ERROR(-ENOMEM)))
++	if (likely(!mas_is_err(mas)))
 +		return 0;
 +
 +	mas_set_alloc_req(mas, 0);
 +	mas_destroy(mas);
++	ret = xa_err(mas->node);
 +	mas->node = MAS_START;
-+	return -ENOMEM;
++	return ret;
 +}
 +
 +/*
@@ -7506,7 +7624,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		*index = mas.last + 1;
 +#ifdef CONFIG_DEBUG_MAPLE_TREE
 +		if ((*index) && (*index) <= copy)
-+			printk("index not increased! %lx <= %lx\n",
++			pr_err("index not increased! %lx <= %lx\n",
 +			       *index, copy);
 +		MT_BUG_ON(mt, (*index) && ((*index) <= copy));
 +#endif
@@ -7556,19 +7674,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +extern void kmem_cache_zero_nr_tallocated(struct kmem_cache *);
-+void mt_zero_nr_tallocated()
++void mt_zero_nr_tallocated(void)
 +{
 +	kmem_cache_zero_nr_tallocated(maple_node_cache);
 +}
 +
 +extern unsigned int kmem_cache_nr_tallocated(struct kmem_cache *);
-+unsigned int mt_nr_tallocated()
++unsigned int mt_nr_tallocated(void)
 +{
 +	return kmem_cache_nr_tallocated(maple_node_cache);
 +}
 +
 +extern unsigned int kmem_cache_nr_allocated(struct kmem_cache *);
-+unsigned int mt_nr_allocated()
++unsigned int mt_nr_allocated(void)
 +{
 +	return kmem_cache_nr_allocated(maple_node_cache);
 +}
@@ -7583,20 +7701,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + */
 +static inline int mas_dead_node(struct ma_state *mas, unsigned long index)
 +{
-+       if (unlikely(!mas_searchable(mas) || mas_is_start(mas)))
-+               return 0;
++	if (unlikely(!mas_searchable(mas) || mas_is_start(mas)))
++		return 0;
 +
-+       if (likely(!mte_dead_node(mas->node)))
-+               return 0;
++	if (likely(!mte_dead_node(mas->node)))
++		return 0;
 +
-+       mas_rewalk(mas, index);
-+       return 1;
++	mas_rewalk(mas, index);
++	return 1;
 +}
-+
-+#define MA_PTR "%p"
-+#else /*  __KERNEL__ is defined */
-+#define MA_PTR "%px"
-+#endif
++#endif /* not defined __KERNEL__ */
 +
 +/*
 + * mas_get_slot() - Get the entry in the maple state node stored at @offset.
@@ -7609,7 +7723,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		unsigned char offset)
 +{
 +	return mas_slot(mas, ma_slots(mas_mn(mas), mte_node_type(mas->node)),
-+		       offset);
++			offset);
 +}
 +
 +
@@ -7660,7 +7774,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (mas->index > limit)
 +		goto none;
 +
-+	if(likely(entry))
++	if (likely(entry))
 +		return entry;
 +
 +	pivots = ma_pivots(mn, mt);
@@ -7673,7 +7787,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (mas->index > limit)
 +		goto none;
 +
-+	if(likely(entry))
++	if (likely(entry))
 +		return entry;
 +
 +none:
@@ -7733,14 +7847,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mt_dump_range(min, max, depth);
 +
 +	if (xa_is_value(entry))
-+		pr_cont("value %ld (0x%lx) ["MA_PTR"]\n", xa_to_value(entry),
++		pr_cont("value %ld (0x%lx) [%p]\n", xa_to_value(entry),
 +				xa_to_value(entry), entry);
 +	else if (xa_is_zero(entry))
 +		pr_cont("zero (%ld)\n", xa_to_internal(entry));
 +	else if (mt_is_reserved(entry))
-+		pr_cont("UNKNOWN ENTRY ("MA_PTR")\n", entry);
++		pr_cont("UNKNOWN ENTRY (%p)\n", entry);
 +	else
-+		pr_cont(""MA_PTR"\n", entry);
++		pr_cont("%p\n", entry);
 +}
 +
 +static void mt_dump_range64(const struct maple_tree *mt, void *entry,
@@ -7753,8 +7867,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	pr_cont(" contents: ");
 +	for (i = 0; i < MAPLE_RANGE64_SLOTS - 1; i++)
-+		pr_cont(""MA_PTR" %lu ", node->slot[i], node->pivot[i]);
-+	pr_cont(""MA_PTR"\n", node->slot[i]);
++		pr_cont("%p %lu ", node->slot[i], node->pivot[i]);
++	pr_cont("%p\n", node->slot[i]);
 +	for (i = 0; i < MAPLE_RANGE64_SLOTS; i++) {
 +		unsigned long last = max;
 +
@@ -7774,7 +7888,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (last == max)
 +			break;
 +		if (last > max) {
-+			pr_err("node "MA_PTR" last (%lu) > max (%lu) at pivot %d!\n",
++			pr_err("node %p last (%lu) > max (%lu) at pivot %d!\n",
 +					node, last, max, i);
 +			break;
 +		}
@@ -7795,8 +7909,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		pr_cont("%lu ", node->gap[i]);
 +	pr_cont("| %02X %02X| ", node->meta.end, node->meta.gap);
 +	for (i = 0; i < MAPLE_ARANGE64_SLOTS - 1; i++)
-+		pr_cont(MA_PTR" %lu ", node->slot[i], node->pivot[i]);
-+	pr_cont(MA_PTR"\n", node->slot[i]);
++		pr_cont("%p %lu ", node->slot[i], node->pivot[i]);
++	pr_cont("%p\n", node->slot[i]);
 +	for (i = 0; i < MAPLE_ARANGE64_SLOTS; i++) {
 +		unsigned long last = max;
 +
@@ -7816,7 +7930,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (last == max)
 +			break;
 +		if (last > max) {
-+			pr_err("node "MA_PTR" last (%lu) > max (%lu) at pivot %d!\n",
++			pr_err("node %p last (%lu) > max (%lu) at pivot %d!\n",
 +					node, last, max, i);
 +			break;
 +		}
@@ -7833,7 +7947,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	mt_dump_range(min, max, depth);
 +
-+	pr_cont("node "MA_PTR" depth %d type %d parent "MA_PTR, node, depth, type,
++	pr_cont("node %p depth %d type %d parent %p", node, depth, type,
 +			node ? node->parent : NULL);
 +	switch (type) {
 +	case maple_dense:
@@ -7862,7 +7976,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	void *entry = rcu_dereference_check(mt->ma_root, mt_locked(mt));
 +
-+	pr_info("maple_tree("MA_PTR") flags %X, height %u root "MA_PTR"\n",
++	pr_info("maple_tree(%p) flags %X, height %u root %p\n",
 +		 mt, mt->ma_flags, mt_height(mt), entry);
 +	if (!xa_is_node(entry))
 +		mt_dump_entry(entry, 0, 0, 0);
@@ -7915,7 +8029,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			gap = gaps[i];
 +			if (!entry) {
 +				if (gap != p_end - p_start + 1) {
-+					pr_err(MA_PTR"[%u] -> "MA_PTR" %lu != %lu - %lu + 1\n",
++					pr_err("%p[%u] -> %p %lu != %lu - %lu + 1\n",
 +						mas_mn(mas), i,
 +						mas_get_slot(mas, i), gap,
 +						p_end, p_start);
@@ -7926,7 +8040,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				}
 +			} else {
 +				if (gap > p_end - p_start + 1) {
-+					pr_err(MA_PTR"[%u] %lu >= %lu - %lu + 1 (%lu)\n",
++					pr_err("%p[%u] %lu >= %lu - %lu + 1 (%lu)\n",
 +					mas_mn(mas), i, gap, p_end, p_start,
 +					p_end - p_start + 1);
 +					MT_BUG_ON(mas->tree,
@@ -7951,7 +8065,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	p_mn = mte_parent(mte);
 +	MT_BUG_ON(mas->tree, max_gap > mas->max);
 +	if (ma_gaps(p_mn, mas_parent_enum(mas, mte))[p_slot] != max_gap) {
-+		pr_err("gap "MA_PTR"[%u] != %lu\n", p_mn, p_slot, max_gap);
++		pr_err("gap %p[%u] != %lu\n", p_mn, p_slot, max_gap);
 +		mt_dump(mas->tree);
 +	}
 +
@@ -7985,8 +8099,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +					parent, i, mas_mn(mas));
 +			MT_BUG_ON(mas->tree, node != mas->node);
 +		} else if (node == mas->node) {
-+			pr_err("parent contains invalid child at "MA_PTR"[%u] "
-+				MA_PTR" p_slot %u\n", parent, i, mas_mn(mas), p_slot);
++			pr_err("Invalid child %p at parent %p[%u] p_slot %u\n",
++			       mas_mn(mas), parent, i, p_slot);
 +			MT_BUG_ON(mas->tree, node == mas->node);
 +		}
 +	}
@@ -8012,16 +8126,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			break;
 +
 +		if (mte_parent_slot(child) != i) {
-+			pr_err("child has incorrect slot at "MA_PTR"[%u] "
-+				MA_PTR" is set to %u\n", mas_mn(mas),
-+				i, mte_to_node(child), mte_parent_slot(child));
++			pr_err("Slot error at %p[%u]: child %p has pslot %u\n",
++			       mas_mn(mas), i, mte_to_node(child),
++			       mte_parent_slot(child));
 +			MT_BUG_ON(mas->tree, 1);
 +		}
 +
 +		if (mte_parent(child) != mte_to_node(mas->node)) {
-+			pr_err("child "MA_PTR" has parent "MA_PTR" not "MA_PTR"\n",
-+			mte_to_node(child), mte_parent(child),
-+			mte_to_node(mas->node));
++			pr_err("child %p has parent %p not %p\n",
++			       mte_to_node(child), mte_parent(child),
++			       mte_to_node(mas->node));
 +			MT_BUG_ON(mas->tree, 1);
 +		}
 +	}
@@ -8051,26 +8165,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +		if (!mte_is_leaf(mas->node)) {
 +			void *entry = mas_slot(mas, slots, i);
++
 +			if (!entry)
-+				pr_err(MA_PTR"[%u] cannot be null\n",
++				pr_err("%p[%u] cannot be null\n",
 +				       mas_mn(mas), i);
 +
 +			MT_BUG_ON(mas->tree, !entry);
 +		}
 +
 +		if (prev_piv > piv) {
-+			pr_err(MA_PTR"[%u] piv %lu < prev_piv %lu\n",
++			pr_err("%p[%u] piv %lu < prev_piv %lu\n",
 +				mas_mn(mas), i, piv, prev_piv);
 +			MT_BUG_ON(mas->tree, piv < prev_piv);
 +		}
 +
 +		if (piv < mas->min) {
-+			pr_err(MA_PTR"[%u] %lu < %lu\n", mas_mn(mas), i,
++			pr_err("%p[%u] %lu < %lu\n", mas_mn(mas), i,
 +				piv, mas->min);
 +			MT_BUG_ON(mas->tree, piv < mas->min);
 +		}
 +		if (piv > mas->max) {
-+			pr_err(MA_PTR"[%u] %lu > %lu\n", mas_mn(mas), i,
++			pr_err("%p[%u] %lu > %lu\n", mas_mn(mas), i,
 +				piv, mas->max);
 +			MT_BUG_ON(mas->tree, piv > mas->max);
 +		}
@@ -8138,7 +8253,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			end = mas_data_end(&mas);
 +			if ((end < mt_min_slot_count(mas.node)) &&
 +			    (mas.max != ULONG_MAX)) {
-+				pr_err("Invalid size %u of "MA_PTR"\n", end,
++				pr_err("Invalid size %u of %p\n", end,
 +				mas_mn(&mas));
 +				MT_BUG_ON(mas.tree, 1);
 +			}
@@ -8160,7 +8275,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#endif /* CONFIG_DEBUG_MAPLE_TREE */
 --- a/MAINTAINERS~maple-tree-add-new-data-structure
 +++ a/MAINTAINERS
-@@ -11792,6 +11792,18 @@ L:	linux-man@vger.kernel.org
+@@ -11826,6 +11826,18 @@ L:	linux-man@vger.kernel.org
  S:	Maintained
  W:	http://www.kernel.org/doc/man-pages
  
@@ -8173,7 +8288,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +F:	include/trace/events/maple_tree.h
 +F:	lib/maple_tree.c
 +F:	lib/test_maple_tree.c
-+F:	tools/testing/_adix-tree/linux/maple_tree.h
++F:	tools/testing/radix-tree/linux/maple_tree.h
 +F:	tools/testing/radix-tree/maple.c
 +
  MARDUK (CREATOR CI40) DEVICE TREE SUPPORT
@@ -8200,7 +8315,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#include "../../../../include/linux/maple_tree.h"
 +#define atomic_inc(x) uatomic_inc(x)
 +#define atomic_read(x) uatomic_read(x)
-+#define atomic_set(x, y) do {} while(0)
++#define atomic_set(x, y) do {} while (0)
 +#define U8_MAX UCHAR_MAX
 --- /dev/null
 +++ a/tools/testing/radix-tree/maple.c
@@ -8266,8 +8381,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 --- /dev/null
 +++ a/tools/testing/radix-tree/trace/events/maple_tree.h
-@@ -0,0 +1,3 @@
-+#define trace_ma_op(a, b) do {} while(0);
-+#define trace_ma_read(a, b) do {} while(0);
-+#define trace_ma_write(a, b, c, d) do {} while(0);
+@@ -0,0 +1,5 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++
++#define trace_ma_op(a, b) do {} while (0)
++#define trace_ma_read(a, b) do {} while (0)
++#define trace_ma_write(a, b, c, d) do {} while (0)
 _

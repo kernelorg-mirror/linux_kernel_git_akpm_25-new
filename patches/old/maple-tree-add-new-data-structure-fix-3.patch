@@ -1,68 +1,116 @@
 From: Liam Howlett <liam.howlett@oracle.com>
-Subject: maple_tree: fix 32b parent pointers
-Date: Tue, 17 May 2022 15:22:20 +0000
+Subject: maple_tree: Fix use of node for global range in mas_wr_spanning_store()
+Date: Wed, 6 Jul 2022 02:05:37 +0000
 
-32 bit parent pointers need an extra bit to account for increased slot
-count.  Update the constants and documentation to use the remaining high
-bit.
+When writing a range with a NULL which expands to 0 - ULONG_MAX, don't use
+a node to store this value.  Instead, call mas_new_root() which will set
+the tree pointer to NULL and free all the nodes.
 
-Link: https://lkml.kernel.org/r/20220517152209.3486724-1-Liam.Howlett@oracle.com
+Fix a comment for the allocations in mas_wr_spanning_store().
+
+Add mas_node_count_gfp() and use it to clean up mas_preallocate().
+
+Clean up mas_preallocate() and ensure the ma_state is safe on return.
+
+Update maple_tree.h to set alloc = NULL.
+
+Link: https://lkml.kernel.org/r/20220706020526.1869453-1-Liam.Howlett@oracle.com
+Fixes: d0aac5e48048 (Maple Tree: add new data structure)
 Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
-Reported-by: Linux Kernel Functional Testing <lkft@linaro.org>
-Cc: Stephen Rothwell <sfr@canb.auug.org.au>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/maple_tree.h |    2 +-
- lib/maple_tree.c           |   14 +++++++-------
- 2 files changed, 8 insertions(+), 8 deletions(-)
+ include/linux/maple_tree.h |    1 +
+ lib/maple_tree.c           |   34 +++++++++++++++++++++++++++-------
+ 2 files changed, 28 insertions(+), 7 deletions(-)
 
 --- a/include/linux/maple_tree.h~maple-tree-add-new-data-structure-fix-3
 +++ a/include/linux/maple_tree.h
-@@ -37,7 +37,7 @@
- #define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
- #define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
- #define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
--#define MAPLE_ARANGE64_META_MAX	22	/* Out of range for metadata */
-+#define MAPLE_ARANGE64_META_MAX	31	/* Out of range for metadata */
- #define MAPLE_ALLOC_SLOTS	(MAPLE_NODE_SLOTS - 2)
- #endif /* defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64) */
+@@ -434,6 +434,7 @@ struct ma_wr_state {
+ 		.node = MAS_START,					\
+ 		.min = 0,						\
+ 		.max = ULONG_MAX,					\
++		.alloc = NULL,						\
+ 	}
  
+ #define MA_WR_STATE(name, ma_state, wr_entry)				\
 --- a/lib/maple_tree.c~maple-tree-add-new-data-structure-fix-3
 +++ a/lib/maple_tree.c
-@@ -354,7 +354,7 @@ static inline bool mt_is_alloc(struct ma
- /*
-  * The Parent Pointer
-  * Excluding root, the parent pointer is 256B aligned like all other tree nodes.
-- * When storing a 32 or 64 bit values, the offset can fit into 4 bits.  The 16
-+ * When storing a 32 or 64 bit values, the offset can fit into 5 bits.  The 16
-  * bit values need an extra bit to store the offset.  This extra bit comes from
-  * a reuse of the last bit in the node type.  This is possible by using bit 1 to
-  * indicate if bit 2 is part of the type or the slot.
-@@ -366,19 +366,19 @@ static inline bool mt_is_alloc(struct ma
-  *  0x110 = 64 bit nodes
-  *
-  * Slot size and alignment
-- *  0x??1 : Root
-- *  0x?00 : 16 bit values, type in 0-1, slot in 2-6
-- *  0x010 : 32 bit values, type in 0-2, slot in 3-6
-- *  0x110 : 64 bit values, type in 0-2, slot in 3-6
-+ *  0b??1 : Root
-+ *  0b?00 : 16 bit values, type in 0-1, slot in 2-7
-+ *  0b010 : 32 bit values, type in 0-2, slot in 3-7
-+ *  0b110 : 64 bit values, type in 0-2, slot in 3-7
+@@ -1293,18 +1293,32 @@ static inline void mas_free(struct ma_st
+  * there is not enough nodes.
+  * @mas: The maple state
+  * @count: The number of nodes needed
++ * @gfp: the gfp flags
   */
+-static void mas_node_count(struct ma_state *mas, int count)
++static void mas_node_count_gfp(struct ma_state *mas, int count, gfp_t gfp)
+ {
+ 	unsigned long allocated = mas_allocated(mas);
  
- #define MAPLE_PARENT_ROOT		0x01
+ 	if (allocated < count) {
+ 		mas_set_alloc_req(mas, count - allocated);
+-		mas_alloc_nodes(mas, GFP_NOWAIT | __GFP_NOWARN);
++		mas_alloc_nodes(mas, gfp);
+ 	}
+ }
  
- #define MAPLE_PARENT_SLOT_SHIFT		0x03
--#define MAPLE_PARENT_SLOT_MASK		0x78
-+#define MAPLE_PARENT_SLOT_MASK		0xF8
+ /*
++ * mas_node_count() - Check if enough nodes are allocated and request more if
++ * there is not enough nodes.
++ * @mas: The maple state
++ * @count: The number of nodes needed
++ *
++ * Note: Uses GFP_NOWAIT | __GFP_NOWARN for gfp flags.
++ */
++static void mas_node_count(struct ma_state *mas, int count)
++{
++	return mas_node_count_gfp(mas, count, GFP_NOWAIT | __GFP_NOWARN);
++}
++
++/*
+  * mas_start() - Sets up maple state for operations.
+  * @mas: The maple state.
+  *
+@@ -3962,7 +3976,7 @@ static inline int mas_wr_spanning_store(
+ 	if (unlikely(!mas->index && mas->last == ULONG_MAX))
+ 		return mas_new_root(mas, wr_mas->entry);
+ 	/*
+-	 * Node rebalancing may occur due to this store, so there may be two new
++	 * Node rebalancing may occur due to this store, so there may be three new
+ 	 * entries per level plus a new root.
+ 	 */
+ 	height = mas_mt_height(mas);
+@@ -3995,6 +4009,12 @@ static inline int mas_wr_spanning_store(
+ 		mas->last = l_mas.last = r_mas.last;
+ 	}
  
- #define MAPLE_PARENT_16B_SLOT_SHIFT	0x02
--#define MAPLE_PARENT_16B_SLOT_MASK	0x7C
-+#define MAPLE_PARENT_16B_SLOT_MASK	0xFC
++	/* expanding NULLs may make this cover the entire range */
++	if (!l_mas.index && r_mas.last == ULONG_MAX) {
++		mas_set_range(mas, 0, ULONG_MAX);
++		return mas_new_root(mas, wr_mas->entry);
++	}
++
+ 	memset(&b_node, 0, sizeof(struct maple_big_node));
+ 	/* Copy l_mas and store the value in b_node. */
+ 	mas_store_b_node(&l_wr_mas, &b_node, l_wr_mas.node_end);
+@@ -5657,15 +5677,15 @@ int mas_preallocate(struct ma_state *mas
+ {
+ 	int ret;
  
- #define MAPLE_PARENT_RANGE64		0x06
- #define MAPLE_PARENT_RANGE32		0x04
+-	mas_set_alloc_req(mas, 1 + mas_mt_height(mas) * 3);
+-	mas_alloc_nodes(mas, gfp);
++	mas_node_count_gfp(mas, 1 + mas_mt_height(mas) * 3, gfp);
+ 	if (likely(!mas_is_err(mas)))
+ 		return 0;
+ 
+ 	mas_set_alloc_req(mas, 0);
+-	mas_destroy(mas);
+ 	ret = xa_err(mas->node);
+-	mas->node = MAS_START;
++	mas_reset(mas);
++	mas_destroy(mas);
++	mas_reset(mas);
+ 	return ret;
+ }
+ 
 _
