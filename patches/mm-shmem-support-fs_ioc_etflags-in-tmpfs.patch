@@ -1,0 +1,155 @@
+From: "Theodore Ts'o" <tytso@mit.edu>
+Subject: mm/shmem: support FS_IOC_[SG]ETFLAGS in tmpfs
+Date: Thu, 14 Jul 2022 21:59:12 -0400
+
+This allows userspace to set flags like FS_APPEND_FL, FS_IMMUTABLE_FL,
+FS_NODUMP_FL, etc., like all other standard Linux file systems.
+
+Link: https://lkml.kernel.org/r/20220715015912.2560575-1-tytso@mit.edu
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/shmem_fs.h |   11 ++++++
+ mm/shmem.c               |   63 ++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 73 insertions(+), 1 deletion(-)
+
+--- a/include/linux/shmem_fs.h~mm-shmem-support-fs_ioc_etflags-in-tmpfs
++++ a/include/linux/shmem_fs.h
+@@ -25,9 +25,20 @@ struct shmem_inode_info {
+ 	struct simple_xattrs	xattrs;		/* list of xattrs */
+ 	atomic_t		stop_eviction;	/* hold when working on inode */
+ 	struct timespec64	i_crtime;	/* file creation time */
++	unsigned int		fsflags;	/* flags for FS_IOC_[SG]ETFLAGS */
+ 	struct inode		vfs_inode;
+ };
+ 
++#define SHMEM_FL_USER_VISIBLE FS_FL_USER_VISIBLE
++#define SHMEM_FL_USER_MODIFIABLE FS_FL_USER_MODIFIABLE
++#define SHMEM_FL_INHERITED FS_FL_USER_MODIFIABLE
++
++/* Flags that are appropriate for regular files (all but dir-specific ones). */
++#define SHMEM_REG_FLMASK (~(FS_DIRSYNC_FL | FS_TOPDIR_FL))
++
++/* Flags that are appropriate for non-directories/regular files. */
++#define SHMEM_OTHER_FLMASK (FS_NODUMP_FL | FS_NOATIME_FL)
++
+ struct shmem_sb_info {
+ 	unsigned long max_blocks;   /* How many blocks are allowed */
+ 	struct percpu_counter used_blocks;  /* How many are allocated */
+--- a/mm/shmem.c~mm-shmem-support-fs_ioc_etflags-in-tmpfs
++++ a/mm/shmem.c
+@@ -28,6 +28,7 @@
+ #include <linux/ramfs.h>
+ #include <linux/pagemap.h>
+ #include <linux/file.h>
++#include <linux/fileattr.h>
+ #include <linux/mm.h>
+ #include <linux/random.h>
+ #include <linux/sched/signal.h>
+@@ -1058,6 +1059,15 @@ static int shmem_getattr(struct user_nam
+ 		shmem_recalc_inode(inode);
+ 		spin_unlock_irq(&info->lock);
+ 	}
++	if (info->fsflags & FS_APPEND_FL)
++		stat->attributes |= STATX_ATTR_APPEND;
++	if (info->fsflags & FS_IMMUTABLE_FL)
++		stat->attributes |= STATX_ATTR_IMMUTABLE;
++	if (info->fsflags & FS_NODUMP_FL)
++		stat->attributes |= STATX_ATTR_NODUMP;
++	stat->attributes_mask |= (STATX_ATTR_APPEND |
++			STATX_ATTR_IMMUTABLE |
++			STATX_ATTR_NODUMP);
+ 	generic_fillattr(&init_user_ns, inode, stat);
+ 
+ 	if (shmem_is_huge(NULL, inode, 0))
+@@ -2272,7 +2282,18 @@ static int shmem_mmap(struct file *file,
+ 	return 0;
+ }
+ 
+-static struct inode *shmem_get_inode(struct super_block *sb, const struct inode *dir,
++/* Mask out flags that are inappropriate for the given type of inode. */
++static unsigned shmem_mask_flags(umode_t mode, __u32 flags)
++{
++	if (S_ISDIR(mode))
++		return flags;
++	else if (S_ISREG(mode))
++		return flags & SHMEM_REG_FLMASK;
++	else
++		return flags & SHMEM_OTHER_FLMASK;
++}
++
++static struct inode *shmem_get_inode(struct super_block *sb, struct inode *dir,
+ 				     umode_t mode, dev_t dev, unsigned long flags)
+ {
+ 	struct inode *inode;
+@@ -2297,6 +2318,9 @@ static struct inode *shmem_get_inode(str
+ 		info->seals = F_SEAL_SEAL;
+ 		info->flags = flags & VM_NORESERVE;
+ 		info->i_crtime = inode->i_mtime;
++		info->fsflags = (dir == NULL) ? 0 :
++			SHMEM_I(dir)->fsflags & SHMEM_FL_INHERITED;
++		info->fsflags = shmem_mask_flags(mode, info->fsflags);
+ 		INIT_LIST_HEAD(&info->shrinklist);
+ 		INIT_LIST_HEAD(&info->swaplist);
+ 		simple_xattrs_init(&info->xattrs);
+@@ -2813,6 +2837,39 @@ out:
+ 	return error;
+ }
+ 
++static int shmem_fileattr_get(struct dentry *dentry, struct fileattr *fa)
++{
++	struct shmem_inode_info *info = SHMEM_I(d_inode(dentry));
++
++	fileattr_fill_flags(fa, info->fsflags & SHMEM_FL_USER_VISIBLE);
++
++	return 0;
++}
++
++static int shmem_fileattr_set(struct user_namespace *mnt_userns,
++			      struct dentry *dentry, struct fileattr *fa)
++{
++	struct inode *inode = d_inode(dentry);
++	struct shmem_inode_info *info = SHMEM_I(inode);
++
++	if (fileattr_has_fsx(fa))
++		return -EOPNOTSUPP;
++
++	info->fsflags = (info->fsflags & ~SHMEM_FL_USER_MODIFIABLE) |
++		(fa->flags & SHMEM_FL_USER_MODIFIABLE);
++
++	inode->i_flags &= ~(S_APPEND | S_IMMUTABLE | S_NOATIME);
++	if (info->fsflags & FS_APPEND_FL)
++		inode->i_flags |= S_APPEND;
++	if (info->fsflags & FS_IMMUTABLE_FL)
++		inode->i_flags |= S_IMMUTABLE;
++	if (info->fsflags & FS_NOATIME_FL)
++		inode->i_flags |= S_NOATIME;
++
++	inode->i_ctime = current_time(inode);
++	return 0;
++}
++
+ static int shmem_statfs(struct dentry *dentry, struct kstatfs *buf)
+ {
+ 	struct shmem_sb_info *sbinfo = SHMEM_SB(dentry->d_sb);
+@@ -3825,6 +3882,8 @@ static const struct inode_operations shm
+ #ifdef CONFIG_TMPFS_XATTR
+ 	.listxattr	= shmem_listxattr,
+ 	.set_acl	= simple_set_acl,
++	.fileattr_get	= shmem_fileattr_get,
++	.fileattr_set	= shmem_fileattr_set,
+ #endif
+ };
+ 
+@@ -3844,6 +3903,8 @@ static const struct inode_operations shm
+ #endif
+ #ifdef CONFIG_TMPFS_XATTR
+ 	.listxattr	= shmem_listxattr,
++	.fileattr_get	= shmem_fileattr_get,
++	.fileattr_set	= shmem_fileattr_set,
+ #endif
+ #ifdef CONFIG_TMPFS_POSIX_ACL
+ 	.setattr	= shmem_setattr,
+_
