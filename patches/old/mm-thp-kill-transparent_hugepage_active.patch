@@ -1,6 +1,6 @@
 From: Yang Shi <shy828301@gmail.com>
 Subject: mm: thp: kill transparent_hugepage_active()
-Date: Wed, 15 Jun 2022 10:29:23 -0700
+Date: Thu, 16 Jun 2022 10:48:37 -0700
 
 The transparent_hugepage_active() was introduced to show THP eligibility
 bit in smaps in proc, smaps is the only user.  But it actually does the
@@ -10,25 +10,27 @@ transparent_hugepage_active().
 
 This patch also fixed the wrong behavior for VM_NO_KHUGEPAGED vmas.
 
-Also move hugepage_vma_check() to huge_memory.c and huge_mm.h since it is
-not only for khugepaged anymore.
+Also move hugepage_vma_check() to huge_memory.c and huge_mm.h since it
+is not only for khugepaged anymore.
 
-Link: https://lkml.kernel.org/r/20220615172926.546974-5-shy828301@gmail.com
+[akpm@linux-foundation.org: check vma->vm_mm, per Zach]
+[akpm@linux-foundation.org: add comment to vdso check]
+Link: https://lkml.kernel.org/r/20220616174840.1202070-5-shy828301@gmail.com
 Signed-off-by: Yang Shi <shy828301@gmail.com>
+Reviewed-by: Zach O'Keefe <zokeefe@google.com>
 Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Zach O'Keefe <zokeefe@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/proc/task_mmu.c         |    2 -
- include/linux/huge_mm.h    |   11 +++++++
+ include/linux/huge_mm.h    |   16 ++++++----
  include/linux/khugepaged.h |    2 -
- mm/huge_memory.c           |   50 ++++++++++++++++++++++++++++-------
- mm/khugepaged.c            |   48 ++-------------------------------
- 5 files changed, 56 insertions(+), 57 deletions(-)
+ mm/huge_memory.c           |   53 +++++++++++++++++++++++++++++------
+ mm/khugepaged.c            |   48 ++-----------------------------
+ 5 files changed, 59 insertions(+), 62 deletions(-)
 
 --- a/fs/proc/task_mmu.c~mm-thp-kill-transparent_hugepage_active
 +++ a/fs/proc/task_mmu.c
@@ -54,7 +56,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #define transparent_hugepage_use_zero_page()				\
  	(transparent_hugepage_flags &					\
-@@ -367,6 +369,13 @@ static inline bool transhuge_vma_enabled
+@@ -351,11 +353,6 @@ static inline bool __transparent_hugepag
+ 	return false;
+ }
+ 
+-static inline bool transparent_hugepage_active(struct vm_area_struct *vma)
+-{
+-	return false;
+-}
+-
+ static inline bool transhuge_vma_suitable(struct vm_area_struct *vma,
+ 		unsigned long addr)
+ {
+@@ -367,6 +364,13 @@ static inline bool transhuge_vma_enabled
  {
  	return false;
  }
@@ -81,7 +95,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  extern void khugepaged_enter_vma(struct vm_area_struct *vma,
 --- a/mm/huge_memory.c~mm-thp-kill-transparent_hugepage_active
 +++ a/mm/huge_memory.c
-@@ -69,21 +69,53 @@ static atomic_t huge_zero_refcount;
+@@ -69,21 +69,56 @@ static atomic_t huge_zero_refcount;
  struct page *huge_zero_page __read_mostly;
  unsigned long huge_zero_pfn __read_mostly = ~0UL;
  
@@ -92,23 +106,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	/* The addr is used to check if the vma size fits */
 -	unsigned long addr = (vma->vm_end & HPAGE_PMD_MASK) - HPAGE_PMD_SIZE;
++	if (!vma->vm_mm)		/* vdso */
++		return false;
++
 +	if (!transhuge_vma_enabled(vma, vm_flags))
 +		return false;
 +
 +	if (vm_flags & VM_NO_KHUGEPAGED)
 +		return false;
-+
-+	/* Don't run khugepaged against DAX vma */
-+	if (vma_is_dax(vma))
-+		return false;
  
 -	if (!transhuge_vma_suitable(vma, addr))
-+	/* Check alignment for file vma and size for both file and anon vma */
-+	if (!transhuge_vma_suitable(vma, (vma->vm_end - HPAGE_PMD_SIZE)))
++	/* Don't run khugepaged against DAX vma */
++	if (vma_is_dax(vma))
  		return false;
 -	if (vma_is_anonymous(vma))
 -		return __transparent_hugepage_enabled(vma);
 -	if (vma_is_shmem(vma))
++
++	/* Check alignment for file vma and size for both file and anon vma */
++	if (!transhuge_vma_suitable(vma, (vma->vm_end - HPAGE_PMD_SIZE)))
++		return false;
 +
 +	/* Enabled via shmem mount options or sysfs settings. */
 +	if (shmem_file(vma->vm_file))
@@ -202,7 +219,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			__khugepaged_enter(vma->vm_mm);
  	}
  }
-@@ -952,7 +912,7 @@ static int hugepage_vma_revalidate(struc
+@@ -956,7 +916,7 @@ static int hugepage_vma_revalidate(struc
  
  	if (!transhuge_vma_suitable(vma, address))
  		return SCAN_ADDRESS_RANGE;
@@ -211,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return SCAN_VMA_CHECK;
  	/*
  	 * Anon VMA expected, the address may be unmapped then
-@@ -1438,7 +1398,7 @@ void collapse_pte_mapped_thp(struct mm_s
+@@ -1441,7 +1401,7 @@ void collapse_pte_mapped_thp(struct mm_s
  	 * the valid THP. Add extra VM_HUGEPAGE so hugepage_vma_check()
  	 * will not fail the vma for missing VM_HUGEPAGE
  	 */
@@ -220,7 +237,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return;
  
  	/* Keep pmd pgtable for uffd-wp; see comment in retract_page_tables() */
-@@ -2132,7 +2092,7 @@ static unsigned int khugepaged_scan_mm_s
+@@ -2131,7 +2091,7 @@ static unsigned int khugepaged_scan_mm_s
  			progress++;
  			break;
  		}
