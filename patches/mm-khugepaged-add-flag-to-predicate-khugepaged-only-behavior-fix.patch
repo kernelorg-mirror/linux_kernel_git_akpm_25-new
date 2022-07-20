@@ -1,0 +1,164 @@
+From: "Zach O'Keefe" <zokeefe@google.com>
+Subject: mm/khugepaged: consistently order cc->is_khugepaged and pte_* checks
+Date: Wed, 20 Jul 2022 07:06:01 -0700
+
+cc->is_khugepaged is used to predicate the khugepaged-only behavior of
+enforcing khugepaged heuristics limited by the sysfs knobs
+khugepaged_max_ptes_[none|swap|shared].
+
+In branches where khugepaged_max_ptes_* is checked, consistently check
+cc->is_khugepaged first.  Also, local counters (for comparison vs
+khugepaged_max_ptes_* limits) were previously incremented in the
+comparison expression.  Some of these counters (unmapped) are additionally
+used outside of khugepaged_max_ptes_* enforcement, and all counters are
+communicated in tracepoints.  Move the correct accounting of these
+counters before branching statements to avoid future errors due to C's
+short-circuiting evaluation.
+
+Link: https://lkml.kernel.org/r/20220720140603.1958773-3-zokeefe@google.com
+Link: https://lore.kernel.org/linux-mm/Ys2qJm6FaOQcxkha@google.com/
+Fixes: 9fab4752a181 ("mm/khugepaged: add flag to predicate khugepaged-only behavior")
+Signed-off-by: Zach O'Keefe <zokeefe@google.com>
+Cc: Alex Shi <alex.shi@linux.alibaba.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Chris Kennelly <ckennelly@google.com>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Dan Carpenter <dan.carpenter@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: James Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: kernel test robot <lkp@intel.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Pavel Begunkov <asml.silence@gmail.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rongwei Wang <rongwei.wang@linux.alibaba.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: "Souptick Joarder (HPE)" <jrdr.linux@gmail.com>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |   49 +++++++++++++++++++++++++++-------------------
+ 1 file changed, 29 insertions(+), 20 deletions(-)
+
+--- a/mm/khugepaged.c~mm-khugepaged-add-flag-to-predicate-khugepaged-only-behavior-fix
++++ a/mm/khugepaged.c
+@@ -574,9 +574,10 @@ static int __collapse_huge_page_isolate(
+ 		pte_t pteval = *_pte;
+ 		if (pte_none(pteval) || (pte_present(pteval) &&
+ 				is_zero_pfn(pte_pfn(pteval)))) {
++			++none_or_zero;
+ 			if (!userfaultfd_armed(vma) &&
+-			    (++none_or_zero <= khugepaged_max_ptes_none ||
+-			     !cc->is_khugepaged)) {
++			    (!cc->is_khugepaged ||
++			     none_or_zero <= khugepaged_max_ptes_none)) {
+ 				continue;
+ 			} else {
+ 				result = SCAN_EXCEED_NONE_PTE;
+@@ -596,11 +597,14 @@ static int __collapse_huge_page_isolate(
+ 
+ 		VM_BUG_ON_PAGE(!PageAnon(page), page);
+ 
+-		if (cc->is_khugepaged && page_mapcount(page) > 1 &&
+-		    ++shared > khugepaged_max_ptes_shared) {
+-			result = SCAN_EXCEED_SHARED_PTE;
+-			count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
+-			goto out;
++		if (page_mapcount(page) > 1) {
++			++shared;
++			if (cc->is_khugepaged &&
++			    shared > khugepaged_max_ptes_shared) {
++				result = SCAN_EXCEED_SHARED_PTE;
++				count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
++				goto out;
++			}
+ 		}
+ 
+ 		if (PageCompound(page)) {
+@@ -1130,8 +1134,9 @@ static int khugepaged_scan_pmd(struct mm
+ 	     _pte++, _address += PAGE_SIZE) {
+ 		pte_t pteval = *_pte;
+ 		if (is_swap_pte(pteval)) {
+-			if (++unmapped <= khugepaged_max_ptes_swap ||
+-			    !cc->is_khugepaged) {
++			++unmapped;
++			if (!cc->is_khugepaged ||
++			    unmapped <= khugepaged_max_ptes_swap) {
+ 				/*
+ 				 * Always be strict with uffd-wp
+ 				 * enabled swap entries.  Please see
+@@ -1149,9 +1154,10 @@ static int khugepaged_scan_pmd(struct mm
+ 			}
+ 		}
+ 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
++			++none_or_zero;
+ 			if (!userfaultfd_armed(vma) &&
+-			    (++none_or_zero <= khugepaged_max_ptes_none ||
+-			     !cc->is_khugepaged)) {
++			    (!cc->is_khugepaged ||
++			     none_or_zero <= khugepaged_max_ptes_none)) {
+ 				continue;
+ 			} else {
+ 				result = SCAN_EXCEED_NONE_PTE;
+@@ -1181,12 +1187,14 @@ static int khugepaged_scan_pmd(struct mm
+ 			goto out_unmap;
+ 		}
+ 
+-		if (cc->is_khugepaged &&
+-		    page_mapcount(page) > 1 &&
+-		    ++shared > khugepaged_max_ptes_shared) {
+-			result = SCAN_EXCEED_SHARED_PTE;
+-			count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
+-			goto out_unmap;
++		if (page_mapcount(page) > 1) {
++			++shared;
++			if (cc->is_khugepaged &&
++			    shared > khugepaged_max_ptes_shared) {
++				result = SCAN_EXCEED_SHARED_PTE;
++				count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
++				goto out_unmap;
++			}
+ 		}
+ 
+ 		page = compound_head(page);
+@@ -1922,8 +1930,9 @@ static int khugepaged_scan_file(struct m
+ 			continue;
+ 
+ 		if (xa_is_value(page)) {
++			++swap;
+ 			if (cc->is_khugepaged &&
+-			    ++swap > khugepaged_max_ptes_swap) {
++			    swap > khugepaged_max_ptes_swap) {
+ 				result = SCAN_EXCEED_SWAP_PTE;
+ 				count_vm_event(THP_SCAN_EXCEED_SWAP_PTE);
+ 				break;
+@@ -1974,8 +1983,8 @@ static int khugepaged_scan_file(struct m
+ 	rcu_read_unlock();
+ 
+ 	if (result == SCAN_SUCCEED) {
+-		if (present < HPAGE_PMD_NR - khugepaged_max_ptes_none &&
+-		    cc->is_khugepaged) {
++		if (cc->is_khugepaged &&
++		    present < HPAGE_PMD_NR - khugepaged_max_ptes_none) {
+ 			result = SCAN_EXCEED_NONE_PTE;
+ 			count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
+ 		} else {
+_
