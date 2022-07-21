@@ -2,6 +2,104 @@ From: Yang Shi <shy828301@gmail.com>
 Subject: mm: khugepaged: don't carry huge page to the next loop for !CONFIG_NUMA
 Date: Wed, 6 Jul 2022 16:59:20 -0700
 
+Patch series "mm: userspace hugepage collapse", v7.
+
+Introduction
+--------------------------------
+
+This series provides a mechanism for userspace to induce a collapse of
+eligible ranges of memory into transparent hugepages in process context,
+thus permitting users to more tightly control their own hugepage
+utilization policy at their own expense.
+
+This idea was introduced by David Rientjes[5].
+
+Interface
+--------------------------------
+
+The proposed interface adds a new madvise(2) mode, MADV_COLLAPSE, and
+leverages the new process_madvise(2) call.
+
+process_madvise(2)
+
+	Performs a synchronous collapse of the native pages
+	mapped by the list of iovecs into transparent hugepages.
+
+	This operation is independent of the system THP sysfs settings,
+	but attempts to collapse VMAs marked VM_NOHUGEPAGE will still fail.
+
+	THP allocation may enter direct reclaim and/or compaction.
+
+	When a range spans multiple VMAs, the semantics of the collapse
+	over of each VMA is independent from the others.
+
+	Caller must have CAP_SYS_ADMIN if not acting on self.
+
+	Return value follows existing process_madvise(2) conventions.  A
+	“success” indicates that all hugepage-sized/aligned regions
+	covered by the provided range were either successfully
+	collapsed, or were already pmd-mapped THPs.
+
+madvise(2)
+
+	Equivalent to process_madvise(2) on self, with 0 returned on
+	“success”.
+
+Current Use-Cases
+--------------------------------
+
+(1)	Immediately back executable text by THPs.  Current support provided
+	by CONFIG_READ_ONLY_THP_FOR_FS may take a long time on a large
+	system which might impair services from serving at their full rated
+	load after (re)starting.  Tricks like mremap(2)'ing text onto
+	anonymous memory to immediately realize iTLB performance prevents
+	page sharing and demand paging, both of which increase steady state
+	memory footprint.  With MADV_COLLAPSE, we get the best of both
+	worlds: Peak upfront performance and lower RAM footprints.  Note
+	that subsequent support for file-backed memory is required here.
+
+(2)	malloc() implementations that manage memory in hugepage-sized
+	chunks, but sometimes subrelease memory back to the system in
+	native-sized chunks via MADV_DONTNEED; zapping the pmd.  Later,
+	when the memory is hot, the implementation could
+	madvise(MADV_COLLAPSE) to re-back the memory by THPs to regain
+	hugepage coverage and dTLB performance.  TCMalloc is such an
+	implementation that could benefit from this[6].  A prior study of
+	Google internal workloads during evaluation of Temeraire, a
+	hugepage-aware enhancement to TCMalloc, showed that nearly 20% of
+	all cpu cycles were spent in dTLB stalls, and that increasing
+	hugepage coverage by even small amount can help with that[7].
+
+(3)	userfaultfd-based live migration of virtual machines satisfy UFFD
+	faults by fetching native-sized pages over the network (to avoid
+	latency of transferring an entire hugepage).  However, after guest
+	memory has been fully copied to the new host, MADV_COLLAPSE can
+	be used to immediately increase guest performance.  Note that
+	subsequent support for file/shmem-backed memory is required here.
+
+(4)	HugeTLB high-granularity mapping allows HugeTLB a HugeTLB page to
+	be mapped at different levels in the page tables[8].  As it's not
+	"transparent" like THP, HugeTLB high-granularity mappings require
+	an explicit user API. It is intended that MADV_COLLAPSE be co-opted
+	for this use case[9].  Note that subsequent support for HugeTLB
+	memory is required here.
+
+Future work
+--------------------------------
+
+Only private anonymous memory is supported by this series. File and
+shmem memory support will be added later.
+
+One possible user of this functionality is a userspace agent that
+attempts to optimize THP utilization system-wide by allocating THPs
+based on, for example, task priority, task performance requirements, or
+heatmaps.  For the latter, one idea that has already surfaced is using
+DAMON to identify hot regions, and driving THP collapse through a new
+DAMOS_COLLAPSE scheme[10].
+
+
+This patch (of 17):
+
 The khugepaged has optimization to reduce huge page allocation calls for
 !CONFIG_NUMA by carrying the allocated but failed to collapse huge page to
 the next loop.  CONFIG_NUMA doesn't do so since the next loop may try to
@@ -28,6 +126,7 @@ keeping nowadays since:
     stored on the per-cpu lists"), THP could be cached by pcp.  This actually
     somehow does the job done by the optimization.
 
+Link: https://lkml.kernel.org/r/20220706235936.2197195-1-zokeefe@google.com
 Link: https://lkml.kernel.org/r/20220706235936.2197195-3-zokeefe@google.com
 Signed-off-by: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Zach O'Keefe <zokeefe@google.com>
@@ -62,7 +161,6 @@ Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Zi Yan <ziy@nvidia.com>
 Cc: Dan Carpenter <dan.carpenter@oracle.com>
-Cc: kernel test robot <lkp@intel.com>
 Cc: "Souptick Joarder (HPE)" <jrdr.linux@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
@@ -181,7 +279,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  /*
   * If mmap_lock temporarily dropped, revalidate vma
-@@ -1148,8 +1067,10 @@ static void collapse_huge_page(struct mm
+@@ -1150,8 +1069,10 @@ static void collapse_huge_page(struct mm
  out_up_write:
  	mmap_write_unlock(mm);
  out_nolock:
@@ -193,7 +291,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	trace_mm_collapse_huge_page(mm, isolated, result);
  	return;
  }
-@@ -1951,8 +1872,10 @@ xa_unlocked:
+@@ -1953,8 +1874,10 @@ xa_unlocked:
  	unlock_page(new_page);
  out:
  	VM_BUG_ON(!list_empty(&pagelist));
@@ -205,7 +303,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* TODO: tracepoints */
  }
  
-@@ -2197,10 +2120,7 @@ static void khugepaged_do_scan(void)
+@@ -2199,10 +2122,7 @@ static void khugepaged_do_scan(void)
  
  	lru_add_drain_all();
  
@@ -217,7 +315,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		cond_resched();
  
  		if (unlikely(kthread_should_stop() || try_to_freeze()))
-@@ -2216,10 +2136,22 @@ static void khugepaged_do_scan(void)
+@@ -2218,10 +2138,22 @@ static void khugepaged_do_scan(void)
  		else
  			progress = pages;
  		spin_unlock(&khugepaged_mm_lock);
