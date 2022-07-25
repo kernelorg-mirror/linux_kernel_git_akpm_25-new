@@ -1,0 +1,96 @@
+From: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Subject: mm: memcontrol: fix potential oom_lock recursion deadlock
+Date: Fri, 22 Jul 2022 19:45:39 +0900
+
+syzbot is reporting GFP_KERNEL allocation with oom_lock held when
+reporting memcg OOM [1].  Such allocation request might deadlock the
+system, for __alloc_pages_may_oom() cannot invoke global OOM killer due to
+oom_lock being already held by the caller.
+
+Fix this problem by removing the allocation from memory_stat_format()
+completely, and pass static buffer when calling from memcg OOM path.
+
+Link: https://syzkaller.appspot.com/bug?extid=2d2aeadc6ce1e1f11d45 [1]
+Link: https://lkml.kernel.org/r/86afb39f-8c65-bec2-6cfc-c5e3cd600c0b@I-love.SAKURA.ne.jp
+Fixes: c8713d0b23123759 ("mm: memcontrol: dump memory.stat during cgroup OOM")
+Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Reported-by: syzbot <syzbot+2d2aeadc6ce1e1f11d45@syzkaller.appspotmail.com>
+Suggested-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol.c |   22 +++++++++-------------
+ 1 file changed, 9 insertions(+), 13 deletions(-)
+
+--- a/mm/memcontrol.c~mm-memcontrol-fix-potential-oom_lock-recursion-deadlock
++++ a/mm/memcontrol.c
+@@ -1490,14 +1490,12 @@ static const unsigned int memcg_vm_event
+ #endif
+ };
+ 
+-static char *memory_stat_format(struct mem_cgroup *memcg)
++static void memory_stat_format(struct mem_cgroup *memcg, char *buf, int bufsize)
+ {
+ 	struct seq_buf s;
+ 	int i;
+ 
+-	seq_buf_init(&s, kmalloc(PAGE_SIZE, GFP_KERNEL), PAGE_SIZE);
+-	if (!s.buffer)
+-		return NULL;
++	seq_buf_init(&s, buf, bufsize);
+ 
+ 	/*
+ 	 * Provide statistics on the state of the memory subsystem as
+@@ -1539,8 +1537,6 @@ static char *memory_stat_format(struct m
+ 
+ 	/* The above should easily fit into one page */
+ 	WARN_ON_ONCE(seq_buf_has_overflowed(&s));
+-
+-	return s.buffer;
+ }
+ 
+ #define K(x) ((x) << (PAGE_SHIFT-10))
+@@ -1576,7 +1572,10 @@ void mem_cgroup_print_oom_context(struct
+  */
+ void mem_cgroup_print_oom_meminfo(struct mem_cgroup *memcg)
+ {
+-	char *buf;
++	/* Use static buffer, for the caller is holding oom_lock. */
++	static char buf[PAGE_SIZE];
++
++	lockdep_assert_held(&oom_lock);
+ 
+ 	pr_info("memory: usage %llukB, limit %llukB, failcnt %lu\n",
+ 		K((u64)page_counter_read(&memcg->memory)),
+@@ -1597,11 +1596,8 @@ void mem_cgroup_print_oom_meminfo(struct
+ 	pr_info("Memory cgroup stats for ");
+ 	pr_cont_cgroup_path(memcg->css.cgroup);
+ 	pr_cont(":");
+-	buf = memory_stat_format(memcg);
+-	if (!buf)
+-		return;
++	memory_stat_format(memcg, buf, sizeof(buf));
+ 	pr_info("%s", buf);
+-	kfree(buf);
+ }
+ 
+ /*
+@@ -6405,11 +6401,11 @@ static int memory_events_local_show(stru
+ static int memory_stat_show(struct seq_file *m, void *v)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+-	char *buf;
++	char *buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+ 
+-	buf = memory_stat_format(memcg);
+ 	if (!buf)
+ 		return -ENOMEM;
++	memory_stat_format(memcg, buf, PAGE_SIZE);
+ 	seq_puts(m, buf);
+ 	kfree(buf);
+ 	return 0;
+_
