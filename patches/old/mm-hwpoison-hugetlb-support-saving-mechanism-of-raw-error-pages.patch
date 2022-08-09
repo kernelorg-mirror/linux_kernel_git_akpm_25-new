@@ -1,6 +1,6 @@
 From: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Subject: mm, hwpoison, hugetlb: support saving mechanism of raw error pages
-Date: Fri, 8 Jul 2022 14:36:48 +0900
+Date: Thu, 14 Jul 2022 13:24:15 +0900
 
 When handling memory error on a hugetlb page, the error handler tries to
 dissolve and turn it into 4kB pages.  If it's successfully dissolved,
@@ -22,12 +22,12 @@ If we failed to save raw error info, the hwpoison hugepage has errors on
 unknown subpage, then this new saving mechanism does not work any more, so
 disable saving new raw error info and freeing hwpoison hugepages.
 
-Link: https://lkml.kernel.org/r/20220708053653.964464-4-naoya.horiguchi@linux.dev
+Link: https://lkml.kernel.org/r/20220714042420.1847125-4-naoya.horiguchi@linux.dev
 Signed-off-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Reported-by: kernel test robot <lkp@intel.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Liu Shixin <liushixin2@huawei.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Oscar Salvador <osalvador@suse.de>
@@ -35,9 +35,9 @@ Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/hugetlb.h |   18 ++++++++
- mm/hugetlb.c            |   32 +++++++++++----
- mm/memory-failure.c     |   79 ++++++++++++++++++++++++++++++++++++--
+ include/linux/hugetlb.h |   17 ++++++-
+ mm/hugetlb.c            |   23 +++++----
+ mm/memory-failure.c     |   89 ++++++++++++++++++++++++++++++++++++--
  3 files changed, 116 insertions(+), 13 deletions(-)
 
 --- a/include/linux/hugetlb.h~mm-hwpoison-hugetlb-support-saving-mechanism-of-raw-error-pages
@@ -86,16 +86,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #ifdef CONFIG_HUGETLB_PAGE
  
-@@ -796,6 +803,15 @@ extern int dissolve_free_huge_page(struc
+@@ -796,6 +803,14 @@ extern int dissolve_free_huge_page(struc
  extern int dissolve_free_huge_pages(unsigned long start_pfn,
  				    unsigned long end_pfn);
  
 +#ifdef CONFIG_MEMORY_FAILURE
-+extern int hugetlb_clear_page_hwpoison(struct page *hpage);
++extern void hugetlb_clear_page_hwpoison(struct page *hpage);
 +#else
-+static inline int hugetlb_clear_page_hwpoison(struct page *hpage)
++static inline void hugetlb_clear_page_hwpoison(struct page *hpage)
 +{
-+	return 0;
 +}
 +#endif
 +
@@ -104,23 +103,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline bool arch_hugetlb_migration_supported(struct hstate *h)
 --- a/mm/hugetlb.c~mm-hwpoison-hugetlb-support-saving-mechanism-of-raw-error-pages
 +++ a/mm/hugetlb.c
-@@ -1443,6 +1443,15 @@ static void __remove_hugetlb_page(struct
- 	}
- 
- 	/*
-+	 * This leaves HPageRawHwpUnreliable pages as leaked hugepages, not
-+	 * as leaked generic-compound pages.  Otherwise page_mapped() or
-+	 * folio_mapped() gets slow because for-loop for each subpage is
-+	 * called.
-+	 */
-+	if (HPageRawHwpUnreliable(page))
-+		return;
-+
-+	/*
- 	 * Very subtle
- 	 *
- 	 * For non-gigantic pages set the destructor to the normal compound
-@@ -1535,6 +1544,13 @@ static void __update_and_free_page(struc
+@@ -1535,6 +1535,13 @@ static void __update_and_free_page(struc
  	if (hstate_is_gigantic(h) && !gigantic_page_runtime_supported())
  		return;
  
@@ -134,7 +117,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (hugetlb_vmemmap_restore(h, page)) {
  		spin_lock_irq(&hugetlb_lock);
  		/*
-@@ -1547,6 +1563,13 @@ static void __update_and_free_page(struc
+@@ -1547,6 +1554,13 @@ static void __update_and_free_page(struc
  		return;
  	}
  
@@ -148,7 +131,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	for (i = 0; i < pages_per_huge_page(h);
  	     i++, subpage = mem_map_next(subpage, page, i)) {
  		subpage->flags &= ~(1 << PG_locked | 1 << PG_error |
-@@ -2109,15 +2132,6 @@ retry:
+@@ -2109,15 +2123,6 @@ retry:
  		 */
  		rc = hugetlb_vmemmap_restore(h, head);
  		if (!rc) {
@@ -166,7 +149,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			spin_lock_irq(&hugetlb_lock);
 --- a/mm/memory-failure.c~mm-hwpoison-hugetlb-support-saving-mechanism-of-raw-error-pages
 +++ a/mm/memory-failure.c
-@@ -1664,6 +1664,80 @@ unlock:
+@@ -1662,6 +1662,90 @@ unlock:
  EXPORT_SYMBOL_GPL(mf_dax_kill_procs);
  #endif /* CONFIG_FS_DAX */
  
@@ -184,6 +167,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static inline struct llist_head *raw_hwp_list_head(struct page *hpage)
 +{
 +	return (struct llist_head *)&page_private(hpage + SUBPAGE_INDEX_HWPOISON);
++}
++
++static void __free_raw_hwp_pages(struct page *hpage)
++{
++	struct llist_head *head;
++	struct llist_node *t, *tnode;
++
++	head = raw_hwp_list_head(hpage);
++	llist_for_each_safe(tnode, t, head->first) {
++		struct raw_hwp_page *p = container_of(tnode, struct raw_hwp_page, node);
++
++		SetPageHWPoison(p->page);
++		kfree(p);
++	}
++	llist_del_all(head);
 +}
 +
 +static int hugetlb_set_page_hwpoison(struct page *hpage, struct page *page)
@@ -222,32 +220,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * this hwpoisoned hugepage.
 +		 */
 +		SetHPageRawHwpUnreliable(hpage);
++		/*
++		 * Once HPageRawHwpUnreliable is set, raw_hwp_page is not
++		 * used any more, so free it.
++		 */
++		__free_raw_hwp_pages(hpage);
 +	}
 +	return ret;
 +}
 +
-+int hugetlb_clear_page_hwpoison(struct page *hpage)
++void hugetlb_clear_page_hwpoison(struct page *hpage)
 +{
-+	struct llist_head *head;
-+	struct llist_node *t, *tnode;
-+
-+	if (!HPageRawHwpUnreliable(hpage))
-+		ClearPageHWPoison(hpage);
-+	head = raw_hwp_list_head(hpage);
-+	llist_for_each_safe(tnode, t, head->first) {
-+		struct raw_hwp_page *p = container_of(tnode, struct raw_hwp_page, node);
-+
-+		SetPageHWPoison(p->page);
-+		kfree(p);
-+	}
-+	llist_del_all(head);
-+	return 0;
++	if (HPageRawHwpUnreliable(hpage))
++		return;
++	ClearPageHWPoison(hpage);
++	__free_raw_hwp_pages(hpage);
 +}
 +
  /*
   * Called from hugetlb code with hugetlb_lock held.
   *
-@@ -1698,7 +1772,7 @@ int __get_huge_page_for_hwpoison(unsigne
+@@ -1696,7 +1780,7 @@ int __get_huge_page_for_hwpoison(unsigne
  		goto out;
  	}
  
@@ -256,7 +249,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		ret = -EHWPOISON;
  		goto out;
  	}
-@@ -1710,7 +1784,6 @@ out:
+@@ -1708,7 +1792,6 @@ out:
  	return ret;
  }
  
@@ -264,7 +257,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Taking refcount of hugetlb pages needs extra care about race conditions
   * with basic operations like hugepage allocation/free/demotion.
-@@ -1751,7 +1824,7 @@ retry:
+@@ -1749,7 +1832,7 @@ retry:
  	lock_page(head);
  
  	if (hwpoison_filter(p)) {
