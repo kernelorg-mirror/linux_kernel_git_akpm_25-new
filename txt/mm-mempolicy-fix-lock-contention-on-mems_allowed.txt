@@ -1,0 +1,76 @@
+From: Abel Wu <wuyun.abel@bytedance.com>
+Subject: mm/mempolicy: fix lock contention on mems_allowed
+Date: Thu, 11 Aug 2022 20:41:57 +0800
+
+The mems_allowed field can be modified by other tasks, so it isn't safe to
+access it with alloc_lock unlocked even in the current process context.
+
+Say there are two tasks: A from cpusetA is performing set_mempolicy(2),
+and B is changing cpusetA's cpuset.mems:
+
+  A (set_mempolicy)		B (echo xx > cpuset.mems)
+  -------------------------------------------------------
+  pol = mpol_new();
+				update_tasks_nodemask(cpusetA) {
+				  foreach t in cpusetA {
+				    cpuset_change_task_nodemask(t) {
+  mpol_set_nodemask(pol) {
+				      task_lock(t); // t could be A
+    new = f(A->mems_allowed);
+				      update t->mems_allowed;
+    pol.create(pol, new);
+				      task_unlock(t);
+  }
+				    }
+				  }
+				}
+  task_lock(A);
+  A->mempolicy = pol;
+  task_unlock(A);
+
+In this case A's pol->nodes is computed by old mems_allowed, and could
+be inconsistent with A's new mems_allowed.
+
+While it is different when replacing vmas' policy: the pol->nodes is
+gone wild only when current_cpuset_is_being_rebound():
+
+  A (mbind)			B (echo xx > cpuset.mems)
+  -------------------------------------------------------
+  pol = mpol_new();
+  mmap_write_lock(A->mm);
+				cpuset_being_rebound = cpusetA;
+				update_tasks_nodemask(cpusetA) {
+				  foreach t in cpusetA {
+				    cpuset_change_task_nodemask(t) {
+  mpol_set_nodemask(pol) {
+				      task_lock(t); // t could be A
+    mask = f(A->mems_allowed);
+				      update t->mems_allowed;
+    pol.create(pol, mask);
+				      task_unlock(t);
+  }
+				    }
+  foreach v in A->mm {
+    if (cpuset_being_rebound == cpusetA)
+      pol.rebind(pol, cpuset.mems);
+    v->vma_policy = pol;
+  }
+  mmap_write_unlock(A->mm);
+				    mmap_write_lock(t->mm);
+				    mpol_rebind_mm(t->mm);
+				    mmap_write_unlock(t->mm);
+				  }
+				}
+				cpuset_being_rebound = NULL;
+
+In this case, the cpuset.mems, which has already done updating, is finally
+used for calculating pol->nodes, rather than A->mems_allowed.  So it is OK
+to call mpol_set_nodemask() with alloc_lock unlocked when doing mbind(2).
+
+Link: https://lkml.kernel.org/r/20220811124157.74888-1-wuyun.abel@bytedance.com
+Fixes: 78b132e9bae9 ("mm/mempolicy: remove or narrow the lock on current")
+Signed-off-by: Abel Wu <wuyun.abel@bytedance.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>, Michal Hocko <mhocko@kernel.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Wei Yang <richard.weiyang@linux.alibaba.com>
