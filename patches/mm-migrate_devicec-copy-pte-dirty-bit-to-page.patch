@@ -1,0 +1,120 @@
+From: Alistair Popple <apopple@nvidia.com>
+Subject: mm/migrate_device.c: copy pte dirty bit to page
+Date: Tue, 16 Aug 2022 17:39:24 +1000
+
+migrate_vma_setup() has a fast path in migrate_vma_collect_pmd() that
+installs migration entries directly if it can lock the migrating page. 
+When removing a dirty pte the dirty bit is supposed to be carried over to
+the underlying page to prevent it being lost.
+
+Currently migrate_vma_*() can only be used for private anonymous mappings.
+That means loss of the dirty bit usually doesn't result in data loss
+because these pages are typically not file-backed.  However pages may be
+backed by swap storage which can result in data loss if an attempt is made
+to migrate a dirty page that doesn't yet have the PageDirty flag set.
+
+In this case migration will fail due to unexpected references but the
+dirty pte bit will be lost.  If the page is subsequently reclaimed data
+won't be written back to swap storage as it is considered uptodate,
+resulting in data loss if the page is subsequently accessed.
+
+Prevent this by copying the dirty bit to the page when removing the pte to
+match what try_to_migrate_one() does.
+
+Link: https://lkml.kernel.org/r/6e77914685ede036c419fa65b6adc27f25a6c3e9.1660635033.git-series.apopple@nvidia.com
+Fixes: 8c3328f1f36a ("mm/migrate: migrate_vma() unmap page from vma while collecting pages")
+Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Reported-by: Huang Ying <ying.huang@intel.com>
+Reviewed-by: Huang Ying <ying.huang@intel.com>
+Cc: Alex Sierra <alex.sierra@amd.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Felix Kuehling <felix.kuehling@amd.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Paul Mackerras <paulus@ozlabs.org>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/migrate_device.c |   21 ++++++++-------------
+ 1 file changed, 8 insertions(+), 13 deletions(-)
+
+--- a/mm/migrate_device.c~mm-migrate_devicec-copy-pte-dirty-bit-to-page
++++ a/mm/migrate_device.c
+@@ -7,6 +7,7 @@
+ #include <linux/export.h>
+ #include <linux/memremap.h>
+ #include <linux/migrate.h>
++#include <linux/mm.h>
+ #include <linux/mm_inline.h>
+ #include <linux/mmu_notifier.h>
+ #include <linux/oom.h>
+@@ -61,7 +62,7 @@ static int migrate_vma_collect_pmd(pmd_t
+ 	struct migrate_vma *migrate = walk->private;
+ 	struct vm_area_struct *vma = walk->vma;
+ 	struct mm_struct *mm = vma->vm_mm;
+-	unsigned long addr = start, unmapped = 0;
++	unsigned long addr = start;
+ 	spinlock_t *ptl;
+ 	pte_t *ptep;
+ 
+@@ -193,11 +194,10 @@ again:
+ 			bool anon_exclusive;
+ 			pte_t swp_pte;
+ 
++			flush_cache_page(vma, addr, pte_pfn(*ptep));
++			pte = ptep_clear_flush(vma, addr, ptep);
+ 			anon_exclusive = PageAnon(page) && PageAnonExclusive(page);
+ 			if (anon_exclusive) {
+-				flush_cache_page(vma, addr, pte_pfn(*ptep));
+-				ptep_clear_flush(vma, addr, ptep);
+-
+ 				if (page_try_share_anon_rmap(page)) {
+ 					set_pte_at(mm, addr, ptep, pte);
+ 					unlock_page(page);
+@@ -205,12 +205,14 @@ again:
+ 					mpfn = 0;
+ 					goto next;
+ 				}
+-			} else {
+-				ptep_get_and_clear(mm, addr, ptep);
+ 			}
+ 
+ 			migrate->cpages++;
+ 
++			/* Set the dirty flag on the folio now the pte is gone. */
++			if (pte_dirty(pte))
++				folio_mark_dirty(page_folio(page));
++
+ 			/* Setup special migration page table entry */
+ 			if (mpfn & MIGRATE_PFN_WRITE)
+ 				entry = make_writable_migration_entry(
+@@ -242,9 +244,6 @@ again:
+ 			 */
+ 			page_remove_rmap(page, vma, false);
+ 			put_page(page);
+-
+-			if (pte_present(pte))
+-				unmapped++;
+ 		} else {
+ 			put_page(page);
+ 			mpfn = 0;
+@@ -257,10 +256,6 @@ next:
+ 	arch_leave_lazy_mmu_mode();
+ 	pte_unmap_unlock(ptep - 1, ptl);
+ 
+-	/* Only flush the TLB if we actually modified any entries */
+-	if (unmapped)
+-		flush_tlb_range(walk->vma, start, end);
+-
+ 	return 0;
+ }
+ 
+_
