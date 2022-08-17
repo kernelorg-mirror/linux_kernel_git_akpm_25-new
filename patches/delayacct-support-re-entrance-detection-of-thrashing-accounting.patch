@@ -1,0 +1,177 @@
+From: Yang Yang <yang.yang29@zte.com.cn>
+Subject: delayacct: support re-entrance detection of thrashing accounting
+Date: Mon, 15 Aug 2022 07:11:35 +0000
+
+Once upon a time, we only support accounting thrashing of page cache. 
+Then Joonsoo introduced workingset detection for anonymous pages and we
+gained the ability to account thrashing of them[1].
+
+For page cache thrashing accounting, there is no suitable place to do it
+in fs level likes swap_readpage().  So we have to do it in
+folio_wait_bit_common().
+
+Then for anonymous pages thrashing accounting, we have to do it in both
+swap_readpage() and folio_wait_bit_common().  This likes PSI, so we should
+let thrashing accounting supports re-entrance detection.
+
+This patch is to prepare complete thrashing accounting, and is based on
+patch "filemap: make the accounting of thrashing more consistent".
+
+[1] commit aae466b0052e ("mm/swap: implement workingset detection for anonymous LRU")
+
+Link: https://lkml.kernel.org/r/20220815071134.74551-1-yang.yang29@zte.com.cn
+Signed-off-by: Yang Yang <yang.yang29@zte.com.cn>
+Signed-off-by: CGEL ZTE <cgel.zte@gmail.com>
+Reviewed-by: Ran Xiaokai <ran.xiaokai@zte.com.cn>
+Reviewed-by: wangyong <wang.yong12@zte.com.cn>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/delayacct.h |   16 ++++++++--------
+ include/linux/sched.h     |    4 ++++
+ kernel/delayacct.c        |   13 +++++++++++--
+ mm/filemap.c              |   10 ++++++----
+ 4 files changed, 29 insertions(+), 14 deletions(-)
+
+--- a/include/linux/delayacct.h~delayacct-support-re-entrance-detection-of-thrashing-accounting
++++ a/include/linux/delayacct.h
+@@ -73,8 +73,8 @@ extern int delayacct_add_tsk(struct task
+ extern __u64 __delayacct_blkio_ticks(struct task_struct *);
+ extern void __delayacct_freepages_start(void);
+ extern void __delayacct_freepages_end(void);
+-extern void __delayacct_thrashing_start(void);
+-extern void __delayacct_thrashing_end(void);
++extern void __delayacct_thrashing_start(bool *in_thrashing);
++extern void __delayacct_thrashing_end(bool *in_thrashing);
+ extern void __delayacct_swapin_start(void);
+ extern void __delayacct_swapin_end(void);
+ extern void __delayacct_compact_start(void);
+@@ -143,22 +143,22 @@ static inline void delayacct_freepages_e
+ 		__delayacct_freepages_end();
+ }
+ 
+-static inline void delayacct_thrashing_start(void)
++static inline void delayacct_thrashing_start(bool *in_thrashing)
+ {
+ 	if (!static_branch_unlikely(&delayacct_key))
+ 		return;
+ 
+ 	if (current->delays)
+-		__delayacct_thrashing_start();
++		__delayacct_thrashing_start(in_thrashing);
+ }
+ 
+-static inline void delayacct_thrashing_end(void)
++static inline void delayacct_thrashing_end(bool *in_thrashing)
+ {
+ 	if (!static_branch_unlikely(&delayacct_key))
+ 		return;
+ 
+ 	if (current->delays)
+-		__delayacct_thrashing_end();
++		__delayacct_thrashing_end(in_thrashing);
+ }
+ 
+ static inline void delayacct_swapin_start(void)
+@@ -237,9 +237,9 @@ static inline void delayacct_freepages_s
+ {}
+ static inline void delayacct_freepages_end(void)
+ {}
+-static inline void delayacct_thrashing_start(void)
++static inline void delayacct_thrashing_start(bool *in_thrashing)
+ {}
+-static inline void delayacct_thrashing_end(void)
++static inline void delayacct_thrashing_end(bool *in_thrashing)
+ {}
+ static inline void delayacct_swapin_start(void)
+ {}
+--- a/include/linux/sched.h~delayacct-support-re-entrance-detection-of-thrashing-accounting
++++ a/include/linux/sched.h
+@@ -948,6 +948,10 @@ struct task_struct {
+ #ifdef	CONFIG_CPU_SUP_INTEL
+ 	unsigned			reported_split_lock:1;
+ #endif
++#ifdef CONFIG_TASK_DELAY_ACCT
++	/* delay due to memory thrashing */
++	unsigned                        in_thrashing:1;
++#endif
+ 
+ 	unsigned long			atomic_flags; /* Flags requiring atomic access. */
+ 
+--- a/kernel/delayacct.c~delayacct-support-re-entrance-detection-of-thrashing-accounting
++++ a/kernel/delayacct.c
+@@ -214,13 +214,22 @@ void __delayacct_freepages_end(void)
+ 		      &current->delays->freepages_count);
+ }
+ 
+-void __delayacct_thrashing_start(void)
++void __delayacct_thrashing_start(bool *in_thrashing)
+ {
++	*in_thrashing = !!current->in_thrashing;
++	if (*in_thrashing)
++		return;
++
++	current->in_thrashing = 1;
+ 	current->delays->thrashing_start = local_clock();
+ }
+ 
+-void __delayacct_thrashing_end(void)
++void __delayacct_thrashing_end(bool *in_thrashing)
+ {
++	if (*in_thrashing)
++		return;
++
++	current->in_thrashing = 0;
+ 	delayacct_end(&current->delays->lock,
+ 		      &current->delays->thrashing_start,
+ 		      &current->delays->thrashing_delay,
+--- a/mm/filemap.c~delayacct-support-re-entrance-detection-of-thrashing-accounting
++++ a/mm/filemap.c
+@@ -1222,10 +1222,11 @@ static inline int folio_wait_bit_common(
+ 	wait_queue_entry_t *wait = &wait_page.wait;
+ 	bool thrashing = false;
+ 	unsigned long pflags;
++	bool in_thrashing;
+ 
+ 	if (bit_nr == PG_locked &&
+ 	    !folio_test_uptodate(folio) && folio_test_workingset(folio)) {
+-		delayacct_thrashing_start();
++		delayacct_thrashing_start(&in_thrashing);
+ 		psi_memstall_enter(&pflags);
+ 		thrashing = true;
+ 	}
+@@ -1325,7 +1326,7 @@ repeat:
+ 	finish_wait(q, wait);
+ 
+ 	if (thrashing) {
+-		delayacct_thrashing_end();
++		delayacct_thrashing_end(&in_thrashing);
+ 		psi_memstall_leave(&pflags);
+ 	}
+ 
+@@ -1374,12 +1375,13 @@ void migration_entry_wait_on_locked(swp_
+ 	wait_queue_entry_t *wait = &wait_page.wait;
+ 	bool thrashing = false;
+ 	unsigned long pflags;
++	bool in_thrashing;
+ 	wait_queue_head_t *q;
+ 	struct folio *folio = page_folio(pfn_swap_entry_to_page(entry));
+ 
+ 	q = folio_waitqueue(folio);
+ 	if (!folio_test_uptodate(folio) && folio_test_workingset(folio)) {
+-		delayacct_thrashing_start();
++		delayacct_thrashing_start(&in_thrashing);
+ 		psi_memstall_enter(&pflags);
+ 		thrashing = true;
+ 	}
+@@ -1426,7 +1428,7 @@ void migration_entry_wait_on_locked(swp_
+ 	finish_wait(q, wait);
+ 
+ 	if (thrashing) {
+-		delayacct_thrashing_end();
++		delayacct_thrashing_end(&in_thrashing);
+ 		psi_memstall_leave(&pflags);
+ 	}
+ }
+_
