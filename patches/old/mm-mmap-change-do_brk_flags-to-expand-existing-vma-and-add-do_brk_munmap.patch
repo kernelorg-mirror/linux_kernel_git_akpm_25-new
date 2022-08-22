@@ -1,6 +1,6 @@
 From: "Liam R. Howlett" <Liam.Howlett@Oracle.com>
 Subject: mm/mmap: change do_brk_flags() to expand existing VMA and add do_brk_munmap()
-Date: Sun, 17 Jul 2022 02:46:43 +0000
+Date: Wed, 20 Jul 2022 02:17:50 +0000
 
 Avoid allocating a new VMA when it a vma modification can occur.  When a
 brk() can expand or contract a VMA, then the single store operation will
@@ -17,9 +17,11 @@ are met.
 Drop userfaultfd from do_brk_flags() path and only use it in
 vm_brk_flags() path since that is the only place a munmap will happen.
 
+Add a wraper for munmap for the brk case called do_brk_munmap().
+
 Link: https://lkml.kernel.org/r/20220504011345.662299-7-Liam.Howlett@oracle.com
 Link: https://lkml.kernel.org/r/20220621204632.3370049-23-Liam.Howlett@oracle.com
-Link: https://lkml.kernel.org/r/20220717024615.2106835-23-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220720021727.17018-23-Liam.Howlett@oracle.com
 Signed-off-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: David Howells <dhowells@redhat.com>
@@ -28,11 +30,16 @@ Cc: SeongJae Park <sj@kernel.org>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hulk Robot <hulkci@huawei.com>
+Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Yang Yingliang <yangyingliang@huawei.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mmap.c |  294 +++++++++++++++++++++++++++++++++++++++++-----------
- 1 file changed, 235 insertions(+), 59 deletions(-)
+ mm/mmap.c |  241 ++++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 180 insertions(+), 61 deletions(-)
 
 --- a/mm/mmap.c~mm-mmap-change-do_brk_flags-to-expand-existing-vma-and-add-do_brk_munmap
 +++ a/mm/mmap.c
@@ -147,7 +154,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mm->brk = brk;
  
  success:
-@@ -2757,38 +2797,112 @@ out:
+@@ -2757,38 +2797,55 @@ out:
  }
  
  /*
@@ -178,85 +185,30 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	int error;
 -	unsigned long mapped_addr;
 -	validate_mm_mt(mm);
-+	struct mm_struct *mm = vma->vm_mm;
-+	struct vm_area_struct unmap;
-+	unsigned long unmap_pages;
-+	int ret = 1;
-+
-+	arch_unmap(mm, newbrk, oldbrk);
-+
-+	if (likely((vma->vm_end < oldbrk) ||
-+		   ((vma->vm_start == newbrk) && (vma->vm_end == oldbrk)))) {
-+		/* remove entire mapping(s) */
-+		mas_set(mas, newbrk);
-+		if (vma->vm_start != newbrk)
-+			mas_reset(mas); /* cause a re-walk for the first overlap. */
-+		ret = __do_munmap(mm, newbrk, oldbrk - newbrk, uf, true);
-+		goto munmap_full_vma;
-+	}
-+
-+	vma_init(&unmap, mm);
-+	unmap.vm_start = newbrk;
-+	unmap.vm_end = oldbrk;
-+	ret = userfaultfd_unmap_prep(&unmap, newbrk, oldbrk, uf);
-+	if (ret)
-+		return ret;
-+	ret = 1;
- 
+-
 -	/* Until we need other flags, refuse anything except VM_EXEC. */
 -	if ((flags & (~VM_EXEC)) != 0)
 -		return -EINVAL;
 -	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
-+	/* Change the oldbrk of vma to the newbrk of the munmap area */
-+	vma_adjust_trans_huge(vma, vma->vm_start, newbrk, 0);
-+	if (mas_preallocate(mas, vma, GFP_KERNEL))
-+		return -ENOMEM;
- 
+-
 -	mapped_addr = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
 -	if (IS_ERR_VALUE(mapped_addr))
 -		return mapped_addr;
-+	if (vma->anon_vma) {
-+		anon_vma_lock_write(vma->anon_vma);
-+		anon_vma_interval_tree_pre_update_vma(vma);
-+	}
++	struct mm_struct *mm = vma->vm_mm;
++	int ret;
  
 -	error = mlock_future_check(mm, mm->def_flags, len);
 -	if (error)
 -		return error;
-+	vma->vm_end = newbrk;
-+	vma_init(&unmap, mm);
-+	unmap.vm_start = newbrk;
-+	unmap.vm_end = oldbrk;
-+	if (vma->anon_vma)
-+		vma_set_anonymous(&unmap);
++	arch_unmap(mm, newbrk, oldbrk);
++	ret = __do_munmap(mm, newbrk, oldbrk - newbrk, uf, true);
++	validate_mm_mt(mm);
++	return ret;
++}
  
 -	/* Clear old maps, set up prev and uf */
 -	if (munmap_vma_range(mm, addr, len, &prev, uf))
 -		return -ENOMEM;
-+	vma_mas_remove(&unmap, mas);
-+
-+	vmacache_invalidate(vma->vm_mm);
-+	if (vma->anon_vma) {
-+		anon_vma_interval_tree_post_update_vma(vma);
-+		anon_vma_unlock_write(vma->anon_vma);
-+	}
-+
-+	unmap_pages = vma_pages(&unmap);
-+	if (vma->vm_flags & VM_LOCKED)
-+		mm->locked_vm -= unmap_pages;
-+
-+	mmap_write_downgrade(mm);
-+	unmap_region(mm, &unmap, vma, newbrk, oldbrk);
-+	/* Statistics */
-+	vm_stat_account(mm, vma->vm_flags, -unmap_pages);
-+	if (vma->vm_flags & VM_ACCOUNT)
-+		vm_unacct_memory(unmap_pages);
-+
-+munmap_full_vma:
-+	validate_mm_mt(mm);
-+	return ret;
-+}
-+
 +/*
 + * do_brk_flags() - Increase the brk vma if the flags match.
 + * @mas: The maple tree state.
@@ -286,7 +238,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
  		return -ENOMEM;
  
-@@ -2798,30 +2912,56 @@ static int do_brk_flags(unsigned long ad
+@@ -2798,30 +2855,56 @@ static int do_brk_flags(unsigned long ad
  	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
  		return -ENOMEM;
  
@@ -357,7 +309,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  out:
  	perf_event_mmap(vma);
  	mm->total_vm += len >> PAGE_SHIFT;
-@@ -2832,18 +2972,29 @@ out:
+@@ -2832,18 +2915,29 @@ out:
  	validate_mm_mt(mm);
  	return 0;
  
@@ -388,7 +340,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	len = PAGE_ALIGN(request);
  	if (len < request)
-@@ -2854,13 +3005,38 @@ int vm_brk_flags(unsigned long addr, uns
+@@ -2854,13 +2948,38 @@ int vm_brk_flags(unsigned long addr, uns
  	if (mmap_write_lock_killable(mm))
  		return -EINTR;
  
