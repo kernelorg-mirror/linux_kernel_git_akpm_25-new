@@ -1,0 +1,142 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Subject: squashfs: don't call kmalloc in decompressors
+Date: Mon, 22 Aug 2022 22:54:30 +0100
+
+The decompressors may be called while in an atomic section.  So move the
+kmalloc() out of this path, and into the "page actor" init function.
+
+This fixes a regression introduced by commit
+f268eedddf35 ("squashfs: extend "page actor" to handle missing pages")
+
+Link: https://lkml.kernel.org/r/20220822215430.15933-1-phillip@squashfs.org.uk
+Fixes: f268eedddf35 ("squashfs: extend "page actor" to handle missing pages")
+Reported-by: Chris Murphy <lists@colorremedies.com>
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/squashfs/file.c        |    2 +-
+ fs/squashfs/file_direct.c |    2 +-
+ fs/squashfs/page_actor.c  |   34 +++++++++++++++-------------------
+ fs/squashfs/page_actor.h  |    5 +++++
+ 4 files changed, 22 insertions(+), 21 deletions(-)
+
+--- a/fs/squashfs/file.c~squashfs-dont-call-kmalloc-in-decompressors
++++ a/fs/squashfs/file.c
+@@ -593,7 +593,7 @@ static void squashfs_readahead(struct re
+ 
+ 		res = squashfs_read_data(inode->i_sb, block, bsize, NULL, actor);
+ 
+-		kfree(actor);
++		squashfs_page_actor_free(actor);
+ 
+ 		if (res == expected) {
+ 			int bytes;
+--- a/fs/squashfs/file_direct.c~squashfs-dont-call-kmalloc-in-decompressors
++++ a/fs/squashfs/file_direct.c
+@@ -74,7 +74,7 @@ int squashfs_readpage_block(struct page
+ 	/* Decompress directly into the page cache buffers */
+ 	res = squashfs_read_data(inode->i_sb, block, bsize, NULL, actor);
+ 
+-	kfree(actor);
++	squashfs_page_actor_free(actor);
+ 
+ 	if (res < 0)
+ 		goto mark_errored;
+--- a/fs/squashfs/page_actor.c~squashfs-dont-call-kmalloc-in-decompressors
++++ a/fs/squashfs/page_actor.c
+@@ -52,6 +52,7 @@ struct squashfs_page_actor *squashfs_pag
+ 	actor->buffer = buffer;
+ 	actor->pages = pages;
+ 	actor->next_page = 0;
++	actor->tmp_buffer = NULL;
+ 	actor->squashfs_first_page = cache_first_page;
+ 	actor->squashfs_next_page = cache_next_page;
+ 	actor->squashfs_finish_page = cache_finish_page;
+@@ -68,20 +69,9 @@ static void *handle_next_page(struct squ
+ 
+ 	if ((actor->next_page == actor->pages) ||
+ 			(actor->next_index != actor->page[actor->next_page]->index)) {
+-		if (actor->alloc_buffer) {
+-			void *tmp_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+-
+-			if (tmp_buffer) {
+-				actor->tmp_buffer = tmp_buffer;
+-				actor->next_index++;
+-				actor->returned_pages++;
+-				return tmp_buffer;
+-			}
+-		}
+-
+ 		actor->next_index++;
+ 		actor->returned_pages++;
+-		return ERR_PTR(-ENOMEM);
++		return actor->alloc_buffer ? actor->tmp_buffer : ERR_PTR(-ENOMEM);
+ 	}
+ 
+ 	actor->next_index++;
+@@ -96,11 +86,10 @@ static void *direct_first_page(struct sq
+ 
+ static void *direct_next_page(struct squashfs_page_actor *actor)
+ {
+-	if (actor->pageaddr)
++	if (actor->pageaddr) {
+ 		kunmap_local(actor->pageaddr);
+-
+-	kfree(actor->tmp_buffer);
+-	actor->pageaddr = actor->tmp_buffer = NULL;
++		actor->pageaddr = NULL;
++	}
+ 
+ 	return handle_next_page(actor);
+ }
+@@ -109,8 +98,6 @@ static void direct_finish_page(struct sq
+ {
+ 	if (actor->pageaddr)
+ 		kunmap_local(actor->pageaddr);
+-
+-	kfree(actor->tmp_buffer);
+ }
+ 
+ struct squashfs_page_actor *squashfs_page_actor_init_special(struct squashfs_sb_info *msblk,
+@@ -121,6 +108,16 @@ struct squashfs_page_actor *squashfs_pag
+ 	if (actor == NULL)
+ 		return NULL;
+ 
++	if (msblk->decompressor->alloc_buffer) {
++		actor->tmp_buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
++
++		if (actor->tmp_buffer == NULL) {
++			kfree(actor);
++			return NULL;
++		}
++	} else
++		actor->tmp_buffer = NULL;
++
+ 	actor->length = length ? : pages * PAGE_SIZE;
+ 	actor->page = page;
+ 	actor->pages = pages;
+@@ -128,7 +125,6 @@ struct squashfs_page_actor *squashfs_pag
+ 	actor->returned_pages = 0;
+ 	actor->next_index = page[0]->index & ~((1 << (msblk->block_log - PAGE_SHIFT)) - 1);
+ 	actor->pageaddr = NULL;
+-	actor->tmp_buffer = NULL;
+ 	actor->alloc_buffer = msblk->decompressor->alloc_buffer;
+ 	actor->squashfs_first_page = direct_first_page;
+ 	actor->squashfs_next_page = direct_next_page;
+--- a/fs/squashfs/page_actor.h~squashfs-dont-call-kmalloc-in-decompressors
++++ a/fs/squashfs/page_actor.h
+@@ -29,6 +29,11 @@ extern struct squashfs_page_actor *squas
+ extern struct squashfs_page_actor *squashfs_page_actor_init_special(
+ 				struct squashfs_sb_info *msblk,
+ 				struct page **page, int pages, int length);
++static inline void squashfs_page_actor_free(struct squashfs_page_actor *actor)
++{
++	kfree(actor->tmp_buffer);
++	kfree(actor);
++}
+ static inline void *squashfs_first_page(struct squashfs_page_actor *actor)
+ {
+ 	return actor->squashfs_first_page(actor);
+_
