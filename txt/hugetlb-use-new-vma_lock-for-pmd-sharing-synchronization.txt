@@ -1,0 +1,60 @@
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Subject: hugetlb: use new vma_lock for pmd sharing synchronization
+Date: Wed, 24 Aug 2022 10:57:57 -0700
+
+The new hugetlb vma lock (rw semaphore) is used to address this race:
+
+Faulting thread                                 Unsharing thread
+...                                                  ...
+ptep = huge_pte_offset()
+      or
+ptep = huge_pte_alloc()
+...
+                                                i_mmap_lock_write
+                                                lock page table
+ptep invalid   <------------------------        huge_pmd_unshare()
+Could be in a previously                        unlock_page_table
+sharing process or worse                        i_mmap_unlock_write
+...
+
+The vma_lock is used as follows:
+- During fault processing. the lock is acquired in read mode before
+  doing a page table lock and allocation (huge_pte_alloc).  The lock is
+  held until code is finished with the page table entry (ptep).
+- The lock must be held in write mode whenever huge_pmd_unshare is
+  called.
+
+Lock ordering issues come into play when unmapping a page from all
+vmas mapping the page.  The i_mmap_rwsem must be held to search for the
+vmas, and the vma lock must be held before calling unmap which will
+call huge_pmd_unshare.  This is done today in:
+- try_to_migrate_one and try_to_unmap_ for page migration and memory
+  error handling.  In these routines we 'try' to obtain the vma lock and
+  fail to unmap if unsuccessful.  Calling routines already deal with the
+  failure of unmapping.
+- hugetlb_vmdelete_list for truncation and hole punch.  This routine
+  also tries to acquire the vma lock.  If it fails, it skips the
+  unmapping.  However, we can not have file truncation or hole punch
+  fail because of contention.  After hugetlb_vmdelete_list, truncation
+  and hole punch call remove_inode_hugepages.  remove_inode_hugepages
+  check for mapped pages and call hugetlb_unmap_file_page to unmap them.
+  hugetlb_unmap_file_page is designed to drop locks and reacquire in the
+  correct order to guarantee unmap success.
+
+Link: https://lkml.kernel.org/r/20220824175757.20590-9-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: James Houghton <jthoughton@google.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
