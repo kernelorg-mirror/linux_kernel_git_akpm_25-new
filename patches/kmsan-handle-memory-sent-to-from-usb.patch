@@ -1,0 +1,139 @@
+From: Alexander Potapenko <glider@google.com>
+Subject: kmsan: handle memory sent to/from USB
+Date: Fri, 26 Aug 2022 17:07:47 +0200
+
+Depending on the value of is_out kmsan_handle_urb() KMSAN either marks the
+data copied to the kernel from a USB device as initialized, or checks the
+data sent to the device for being initialized.
+
+Link: https://lkml.kernel.org/r/20220826150807.723137-25-glider@google.com
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Konovalov <andreyknvl@google.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Eric Biggers <ebiggers@google.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Ilya Leoshkevich <iii@linux.ibm.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Marco Elver <elver@google.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michael S. Tsirkin <mst@redhat.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vegard Nossum <vegard.nossum@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/usb/core/urb.c |    2 ++
+ include/linux/kmsan.h  |   15 +++++++++++++++
+ mm/kmsan/hooks.c       |   16 ++++++++++++++++
+ 3 files changed, 33 insertions(+)
+
+--- a/drivers/usb/core/urb.c~kmsan-handle-memory-sent-to-from-usb
++++ a/drivers/usb/core/urb.c
+@@ -8,6 +8,7 @@
+ #include <linux/bitops.h>
+ #include <linux/slab.h>
+ #include <linux/log2.h>
++#include <linux/kmsan-checks.h>
+ #include <linux/usb.h>
+ #include <linux/wait.h>
+ #include <linux/usb/hcd.h>
+@@ -426,6 +427,7 @@ int usb_submit_urb(struct urb *urb, gfp_
+ 			URB_SETUP_MAP_SINGLE | URB_SETUP_MAP_LOCAL |
+ 			URB_DMA_SG_COMBINED);
+ 	urb->transfer_flags |= (is_out ? URB_DIR_OUT : URB_DIR_IN);
++	kmsan_handle_urb(urb, is_out);
+ 
+ 	if (xfertype != USB_ENDPOINT_XFER_CONTROL &&
+ 			dev->state < USB_STATE_CONFIGURED)
+--- a/include/linux/kmsan.h~kmsan-handle-memory-sent-to-from-usb
++++ a/include/linux/kmsan.h
+@@ -19,6 +19,7 @@ struct page;
+ struct kmem_cache;
+ struct task_struct;
+ struct scatterlist;
++struct urb;
+ 
+ #ifdef CONFIG_KMSAN
+ 
+@@ -227,6 +228,16 @@ void kmsan_handle_dma(struct page *page,
+ void kmsan_handle_dma_sg(struct scatterlist *sg, int nents,
+ 			 enum dma_data_direction dir);
+ 
++/**
++ * kmsan_handle_urb() - Handle a USB data transfer.
++ * @urb:    struct urb pointer.
++ * @is_out: data transfer direction (true means output to hardware).
++ *
++ * If @is_out is true, KMSAN checks the transfer buffer of @urb. Otherwise,
++ * KMSAN initializes the transfer buffer.
++ */
++void kmsan_handle_urb(const struct urb *urb, bool is_out);
++
+ #else
+ 
+ static inline void kmsan_init_shadow(void)
+@@ -319,6 +330,10 @@ static inline void kmsan_handle_dma_sg(s
+ {
+ }
+ 
++static inline void kmsan_handle_urb(const struct urb *urb, bool is_out)
++{
++}
++
+ #endif
+ 
+ #endif /* _LINUX_KMSAN_H */
+--- a/mm/kmsan/hooks.c~kmsan-handle-memory-sent-to-from-usb
++++ a/mm/kmsan/hooks.c
+@@ -17,6 +17,7 @@
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/usb.h>
+ 
+ #include "../internal.h"
+ #include "../slab.h"
+@@ -244,6 +245,21 @@ void kmsan_copy_to_user(void __user *to,
+ }
+ EXPORT_SYMBOL(kmsan_copy_to_user);
+ 
++/* Helper function to check an URB. */
++void kmsan_handle_urb(const struct urb *urb, bool is_out)
++{
++	if (!urb)
++		return;
++	if (is_out)
++		kmsan_internal_check_memory(urb->transfer_buffer,
++					    urb->transfer_buffer_length,
++					    /*user_addr*/ 0, REASON_SUBMIT_URB);
++	else
++		kmsan_internal_unpoison_memory(urb->transfer_buffer,
++					       urb->transfer_buffer_length,
++					       /*checked*/ false);
++}
++
+ static void kmsan_handle_dma_page(const void *addr, size_t size,
+ 				  enum dma_data_direction dir)
+ {
+_
