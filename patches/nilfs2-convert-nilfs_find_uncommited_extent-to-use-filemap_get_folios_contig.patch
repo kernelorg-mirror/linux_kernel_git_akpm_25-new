@@ -1,0 +1,111 @@
+From: "Vishal Moola (Oracle)" <vishal.moola@gmail.com>
+Subject: nilfs2: convert nilfs_find_uncommited_extent() to use filemap_get_folios_contig()
+Date: Tue, 23 Aug 2022 17:40:21 -0700
+
+Convert function to use folios throughout.  This is in preparation for the
+removal of find_get_pages_contig().  Now also supports large folios.
+
+Also clean up an unnecessary if statement - pvec.pages[0]->index > index
+will always evaluate to false, and filemap_get_folios_contig() returns 0
+if there is no folio found at index.
+
+Link: https://lkml.kernel.org/r/20220824004023.77310-6-vishal.moola@gmail.com
+Signed-off-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Acked-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Chris Mason <clm@fb.com>
+Cc: David Sterba <dsterba@suse.com>
+Cc: David Sterba <dsterb@suse.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/nilfs2/page.c |   45 ++++++++++++++++++---------------------------
+ 1 file changed, 18 insertions(+), 27 deletions(-)
+
+--- a/fs/nilfs2/page.c~nilfs2-convert-nilfs_find_uncommited_extent-to-use-filemap_get_folios_contig
++++ a/fs/nilfs2/page.c
+@@ -480,41 +480,36 @@ unsigned long nilfs_find_uncommitted_ext
+ 					    sector_t start_blk,
+ 					    sector_t *blkoff)
+ {
+-	unsigned int i;
++	unsigned int i, nr_folios;
+ 	pgoff_t index;
+-	unsigned int nblocks_in_page;
+ 	unsigned long length = 0;
+-	sector_t b;
+-	struct pagevec pvec;
+-	struct page *page;
++	struct folio_batch fbatch;
++	struct folio *folio;
+ 
+ 	if (inode->i_mapping->nrpages == 0)
+ 		return 0;
+ 
+ 	index = start_blk >> (PAGE_SHIFT - inode->i_blkbits);
+-	nblocks_in_page = 1U << (PAGE_SHIFT - inode->i_blkbits);
+ 
+-	pagevec_init(&pvec);
++	folio_batch_init(&fbatch);
+ 
+ repeat:
+-	pvec.nr = find_get_pages_contig(inode->i_mapping, index, PAGEVEC_SIZE,
+-					pvec.pages);
+-	if (pvec.nr == 0)
++	nr_folios = filemap_get_folios_contig(inode->i_mapping, &index, ULONG_MAX,
++			&fbatch);
++	if (nr_folios == 0)
+ 		return length;
+ 
+-	if (length > 0 && pvec.pages[0]->index > index)
+-		goto out;
+-
+-	b = pvec.pages[0]->index << (PAGE_SHIFT - inode->i_blkbits);
+ 	i = 0;
+ 	do {
+-		page = pvec.pages[i];
++		folio = fbatch.folios[i];
+ 
+-		lock_page(page);
+-		if (page_has_buffers(page)) {
++		folio_lock(folio);
++		if (folio_buffers(folio)) {
+ 			struct buffer_head *bh, *head;
++			sector_t b;
+ 
+-			bh = head = page_buffers(page);
++			b = folio->index << (PAGE_SHIFT - inode->i_blkbits);
++			bh = head = folio_buffers(folio);
+ 			do {
+ 				if (b < start_blk)
+ 					continue;
+@@ -529,21 +524,17 @@ repeat:
+ 		} else {
+ 			if (length > 0)
+ 				goto out_locked;
+-
+-			b += nblocks_in_page;
+ 		}
+-		unlock_page(page);
++		folio_unlock(folio);
+ 
+-	} while (++i < pagevec_count(&pvec));
++	} while (++i < nr_folios);
+ 
+-	index = page->index + 1;
+-	pagevec_release(&pvec);
++	folio_batch_release(&fbatch);
+ 	cond_resched();
+ 	goto repeat;
+ 
+ out_locked:
+-	unlock_page(page);
+-out:
+-	pagevec_release(&pvec);
++	folio_unlock(folio);
++	folio_batch_release(&fbatch);
+ 	return length;
+ }
+_
