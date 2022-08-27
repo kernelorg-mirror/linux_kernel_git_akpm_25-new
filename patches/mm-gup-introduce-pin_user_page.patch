@@ -1,0 +1,115 @@
+From: John Hubbard <jhubbard@nvidia.com>
+Subject: mm/gup: introduce pin_user_page()
+Date: Sat, 27 Aug 2022 01:36:02 -0700
+
+Paaaatch series "convert most filesystems to pin_user_pages_fast()".
+
+This converts the iomap core and bio_release_pages() to
+pin_user_pages_fast(), also referred to as FOLL_PIN here.
+
+The conversion is temporarily guarded by
+CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO.  In the future (not part of this
+series), when we are certain that all filesystems have converted their
+Direct IO paths to FOLL_PIN, then we can do the final step, which is to
+get rid of CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO and search-and-replace
+the dio_w_*() functions with their final names (see bvec.h changes).
+
+I'd like to get this part committed at some point, because it seems to
+work well already.  And this will help get the remaining items, below,
+converted.
+
+Status: although many filesystems have been converted, some remain to be
+investigated.  These include (you can recreate this list by grepping for
+iov_iter_get_pages):
+
+	cephfs
+	cifs
+	9P
+	RDS
+	net/core: datagram.c, skmsg.c
+	net/tls
+	fs/splice.c
+
+
+This patch (of 6):
+
+pin_user_page() is an externally-usable version of try_grab_page(), but
+with semantics that match get_page(), so that it can act as a drop-in
+replacement for get_page().  Specifically, pin_user_page() has a void
+return type.
+
+pin_user_page() elevates a page's refcount using FOLL_PIN rules.  This
+means that the caller must release the page via unpin_user_page().
+
+Link: https://lkml.kernel.org/r/20220827083607.2345453-1-jhubbard@nvidia.com
+Link: https://lkml.kernel.org/r/20220827083607.2345453-2-jhubbard@nvidia.com
+Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h |    1 +
+ mm/gup.c           |   33 +++++++++++++++++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+--- a/include/linux/mm.h~mm-gup-introduce-pin_user_page
++++ a/include/linux/mm.h
+@@ -1943,6 +1943,7 @@ long pin_user_pages_remote(struct mm_str
+ long get_user_pages(unsigned long start, unsigned long nr_pages,
+ 			    unsigned int gup_flags, struct page **pages,
+ 			    struct vm_area_struct **vmas);
++void pin_user_page(struct page *page);
+ long pin_user_pages(unsigned long start, unsigned long nr_pages,
+ 		    unsigned int gup_flags, struct page **pages,
+ 		    struct vm_area_struct **vmas);
+--- a/mm/gup.c~mm-gup-introduce-pin_user_page
++++ a/mm/gup.c
+@@ -3238,6 +3238,39 @@ long pin_user_pages(unsigned long start,
+ }
+ EXPORT_SYMBOL(pin_user_pages);
+ 
++/**
++ * pin_user_page() - apply a FOLL_PIN reference to a page
++ *
++ * @page: the page to be pinned.
++ *
++ * This is similar to get_user_pages(), except that the page's refcount is
++ * elevated using FOLL_PIN, instead of FOLL_GET.
++ *
++ * IMPORTANT: The caller must release the page via unpin_user_page().
++ *
++ */
++void pin_user_page(struct page *page)
++{
++	struct folio *folio = page_folio(page);
++
++	WARN_ON_ONCE(folio_ref_count(folio) <= 0);
++
++	/*
++	 * Similar to try_grab_page(): be sure to *also*
++	 * increment the normal page refcount field at least once,
++	 * so that the page really is pinned.
++	 */
++	if (folio_test_large(folio)) {
++		folio_ref_add(folio, 1);
++		atomic_add(1, folio_pincount_ptr(folio));
++	} else {
++		folio_ref_add(folio, GUP_PIN_COUNTING_BIAS);
++	}
++
++	node_stat_mod_folio(folio, NR_FOLL_PIN_ACQUIRED, 1);
++}
++EXPORT_SYMBOL(pin_user_page);
++
+ /*
+  * pin_user_pages_unlocked() is the FOLL_PIN variant of
+  * get_user_pages_unlocked(). Behavior is the same, except that this one sets
+_

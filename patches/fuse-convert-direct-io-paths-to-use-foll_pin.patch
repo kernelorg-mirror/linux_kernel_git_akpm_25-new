@@ -1,0 +1,132 @@
+From: John Hubbard <jhubbard@nvidia.com>
+Subject: fuse: convert direct IO paths to use FOLL_PIN
+Date: Sat, 27 Aug 2022 01:36:07 -0700
+
+Convert the fuse filesystem to use pin_user_pages_fast() and
+unpin_user_page(), instead of get_user_pages_fast() and put_page().
+
+Link: https://lkml.kernel.org/r/20220827083607.2345453-7-jhubbard@nvidia.com
+Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/fuse/dev.c    |    8 ++++++--
+ fs/fuse/file.c   |   31 ++++++++++++++++++++-----------
+ fs/fuse/fuse_i.h |    1 +
+ 3 files changed, 27 insertions(+), 13 deletions(-)
+
+--- a/fs/fuse/dev.c~fuse-convert-direct-io-paths-to-use-foll_pin
++++ a/fs/fuse/dev.c
+@@ -675,7 +675,10 @@ static void fuse_copy_finish(struct fuse
+ 			flush_dcache_page(cs->pg);
+ 			set_page_dirty_lock(cs->pg);
+ 		}
+-		put_page(cs->pg);
++		if (cs->pipebufs)
++			put_page(cs->pg);
++		else
++			dio_w_unpin_user_page(cs->pg);
+ 	}
+ 	cs->pg = NULL;
+ }
+@@ -730,7 +733,8 @@ static int fuse_copy_fill(struct fuse_co
+ 		}
+ 	} else {
+ 		size_t off;
+-		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
++		err = dio_w_iov_iter_pin_pages(cs->iter, &page, PAGE_SIZE, 1,
++					       &off);
+ 		if (err < 0)
+ 			return err;
+ 		BUG_ON(!err);
+--- a/fs/fuse/file.c~fuse-convert-direct-io-paths-to-use-foll_pin
++++ a/fs/fuse/file.c
+@@ -625,14 +625,19 @@ void fuse_read_args_fill(struct fuse_io_
+ }
+ 
+ static void fuse_release_user_pages(struct fuse_args_pages *ap,
+-				    bool should_dirty)
++				    bool should_dirty, bool is_kvec)
+ {
+ 	unsigned int i;
+ 
+-	for (i = 0; i < ap->num_pages; i++) {
+-		if (should_dirty)
+-			set_page_dirty_lock(ap->pages[i]);
+-		put_page(ap->pages[i]);
++	if (is_kvec) {
++		for (i = 0; i < ap->num_pages; i++) {
++			if (should_dirty)
++				set_page_dirty_lock(ap->pages[i]);
++			put_page(ap->pages[i]);
++		}
++	} else {
++		dio_w_unpin_user_pages_dirty_lock(ap->pages, ap->num_pages,
++						  should_dirty);
+ 	}
+ }
+ 
+@@ -733,7 +738,7 @@ static void fuse_aio_complete_req(struct
+ 	struct fuse_io_priv *io = ia->io;
+ 	ssize_t pos = -1;
+ 
+-	fuse_release_user_pages(&ia->ap, io->should_dirty);
++	fuse_release_user_pages(&ia->ap, io->should_dirty, io->is_kvec);
+ 
+ 	if (err) {
+ 		/* Nothing */
+@@ -1414,10 +1419,10 @@ static int fuse_get_user_pages(struct fu
+ 	while (nbytes < *nbytesp && ap->num_pages < max_pages) {
+ 		unsigned npages;
+ 		size_t start;
+-		ret = iov_iter_get_pages2(ii, &ap->pages[ap->num_pages],
+-					*nbytesp - nbytes,
+-					max_pages - ap->num_pages,
+-					&start);
++		ret = dio_w_iov_iter_pin_pages(ii, &ap->pages[ap->num_pages],
++					       *nbytesp - nbytes,
++					       max_pages - ap->num_pages,
++					       &start);
+ 		if (ret < 0)
+ 			break;
+ 
+@@ -1483,6 +1488,9 @@ ssize_t fuse_direct_io(struct fuse_io_pr
+ 		fl_owner_t owner = current->files;
+ 		size_t nbytes = min(count, nmax);
+ 
++		/* For use in fuse_release_user_pages(): */
++		io->is_kvec = iov_iter_is_kvec(iter);
++
+ 		err = fuse_get_user_pages(&ia->ap, iter, &nbytes, write,
+ 					  max_pages);
+ 		if (err && !nbytes)
+@@ -1498,7 +1506,8 @@ ssize_t fuse_direct_io(struct fuse_io_pr
+ 		}
+ 
+ 		if (!io->async || nres < 0) {
+-			fuse_release_user_pages(&ia->ap, io->should_dirty);
++			fuse_release_user_pages(&ia->ap, io->should_dirty,
++						io->is_kvec);
+ 			fuse_io_free(ia);
+ 		}
+ 		ia = NULL;
+--- a/fs/fuse/fuse_i.h~fuse-convert-direct-io-paths-to-use-foll_pin
++++ a/fs/fuse/fuse_i.h
+@@ -290,6 +290,7 @@ struct fuse_io_priv {
+ 	struct kiocb *iocb;
+ 	struct completion *done;
+ 	bool blocking;
++	bool is_kvec;
+ };
+ 
+ #define FUSE_IO_PRIV_SYNC(i) \
+_

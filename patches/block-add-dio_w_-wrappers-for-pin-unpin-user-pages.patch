@@ -1,0 +1,138 @@
+From: John Hubbard <jhubbard@nvidia.com>
+Subject: block: add dio_w_*() wrappers for pin, unpin user pages
+Date: Sat, 27 Aug 2022 01:36:03 -0700
+
+Background: The Direct IO part of the block infrastructure is being
+changed to use pin_user_page*() and unpin_user_page*() calls, in place of
+a mix of get_user_pages_fast(), get_page(), and put_page().  These have to
+be changed over all at the same time, for block, bio, and all filesystems.
+However, most filesystems can be changed via iomap and core filesystem
+routines, so let's get that in place, and then continue on with converting
+the remaining filesystems (9P, CIFS) and anything else that feeds pages
+into bio that ultimately get released via bio_release_pages().
+
+Add a new config parameter, CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO, and
+dio_w_*() wrapper functions.  The dio_w_ prefix was chosen for uniqueness,
+so as to ease a subsequent kernel-wide rename via search-and-replace. 
+Together, these allow the developer to choose between these sets of
+routines, for Direct IO code paths:
+
+a) pin_user_pages_fast()
+    pin_user_page()
+    unpin_user_page()
+
+b) get_user_pages_fast()
+    get_page()
+    put_page()
+
+CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO is a temporary setting, and may be
+deleted once the conversion is complete.  In the meantime, developers can
+enable this in order to try out each filesystem.
+
+Please remember that these /proc/vmstat items (below) should normally
+contain the same values as each other, except during the middle of
+pin/unpin operations.  As such, they can be helpful when monitoring test
+runs:
+
+    nr_foll_pin_acquired
+    nr_foll_pin_released
+
+Link: https://lkml.kernel.org/r/20220827083607.2345453-3-jhubbard@nvidia.com
+Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Logan Gunthorpe <logang@deltatee.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ block/Kconfig        |   24 ++++++++++++++++++++++++
+ include/linux/bvec.h |   40 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+--- a/block/Kconfig~block-add-dio_w_-wrappers-for-pin-unpin-user-pages
++++ a/block/Kconfig
+@@ -48,6 +48,30 @@ config BLK_DEV_BSG_COMMON
+ config BLK_ICQ
+ 	bool
+ 
++config BLK_USE_PIN_USER_PAGES_FOR_DIO
++	bool "DEVELOPERS ONLY: Enable pin_user_pages() for Direct IO" if EXPERT
++	default n
++
++	help
++	  For Direct IO code, retain the pages via calls to
++	  pin_user_pages_fast(), instead of via get_user_pages_fast().
++	  Likewise, use pin_user_page() instead of get_page(). And then
++	  release such pages via unpin_user_page(), instead of
++	  put_page().
++
++	  This is a temporary setting, which will be deleted once the
++	  conversion is completed, reviewed, and tested. In the meantime,
++	  developers can enable this in order to try out each filesystem.
++	  For that, it's best to monitor these /proc/vmstat items:
++
++		nr_foll_pin_acquired
++		nr_foll_pin_released
++
++	  ...to ensure that they remain equal, when "at rest".
++
++	  Say yes here ONLY if are actively developing or testing the
++	  block layer or filesystems with pin_user_pages_fast().
++
+ config BLK_DEV_BSGLIB
+ 	bool "Block layer SG support v4 helper lib"
+ 	select BLK_DEV_BSG_COMMON
+--- a/include/linux/bvec.h~block-add-dio_w_-wrappers-for-pin-unpin-user-pages
++++ a/include/linux/bvec.h
+@@ -241,4 +241,44 @@ static inline void *bvec_virt(struct bio
+ 	return page_address(bvec->bv_page) + bvec->bv_offset;
+ }
+ 
++#ifdef CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO
++#define dio_w_pin_user_pages_fast(s, n, p, f)	pin_user_pages_fast(s, n, p, f)
++#define dio_w_pin_user_page(p)			pin_user_page(p)
++#define dio_w_iov_iter_pin_pages(i, p, m, n, s) iov_iter_pin_pages(i, p, m, n, s)
++#define dio_w_iov_iter_pin_pages_alloc(i, p, m, s) iov_iter_pin_pages_alloc(i, p, m, s)
++#define dio_w_unpin_user_page(p)		unpin_user_page(p)
++#define dio_w_unpin_user_pages(p, n)		unpin_user_pages(p, n)
++#define dio_w_unpin_user_pages_dirty_lock(p, n, d) unpin_user_pages_dirty_lock(p, n, d)
++
++#else
++#define dio_w_pin_user_pages_fast(s, n, p, f)	get_user_pages_fast(s, n, p, f)
++#define dio_w_pin_user_page(p)			get_page(p)
++#define dio_w_iov_iter_pin_pages(i, p, m, n, s) iov_iter_get_pages2(i, p, m, n, s)
++#define dio_w_iov_iter_pin_pages_alloc(i, p, m, s) iov_iter_get_pages_alloc2(i, p, m, s)
++#define dio_w_unpin_user_page(p)		put_page(p)
++
++static inline void dio_w_unpin_user_pages(struct page **pages,
++					  unsigned long npages)
++{
++	unsigned long i;
++
++	for (i = 0; i < npages; i++)
++		put_page(pages[i]);
++}
++
++static inline void dio_w_unpin_user_pages_dirty_lock(struct page **pages,
++						     unsigned long npages,
++						     bool make_dirty)
++{
++	unsigned long i;
++
++	for (i = 0; i < npages; i++) {
++		if (make_dirty)
++			set_page_dirty_lock(pages[i]);
++		put_page(pages[i]);
++	}
++}
++
++#endif
++
+ #endif /* __LINUX_BVEC_H */
+_
