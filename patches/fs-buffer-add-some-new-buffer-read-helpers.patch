@@ -1,0 +1,157 @@
+From: Zhang Yi <yi.zhang@huawei.com>
+Subject: fs/buffer: add some new buffer read helpers
+Date: Thu, 1 Sep 2022 21:34:53 +0800
+
+Current ll_rw_block() helper is fragile because it assumes that locked
+buffer means it's under IO which is submitted by some other who holds
+the lock, it skip buffer if it failed to get the lock, so it's only
+safe on the readahead path. Unfortunately, now that most filesystems
+still use this helper mistakenly on the sync metadata read path. There
+is no guarantee that the one who holds the buffer lock always submit IO
+(e.g. buffer_migrate_folio_norefs() after commit 88dbcbb3a484 ("blkdev:
+avoid migration stalls for blkdev pages"), it could lead to false
+positive -EIO when submitting reading IO.
+
+This patch add some friendly buffer read helpers to prepare replacing
+ll_rw_block() and similar calls. We can only call bh_readahead_[]
+helpers for the readahead paths.
+
+Link: https://lkml.kernel.org/r/20220901133505.2510834-3-yi.zhang@huawei.com
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/buffer.c                 |   65 ++++++++++++++++++++++++++++++++++
+ include/linux/buffer_head.h |   38 +++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+--- a/fs/buffer.c~fs-buffer-add-some-new-buffer-read-helpers
++++ a/fs/buffer.c
+@@ -3018,6 +3018,71 @@ int bh_uptodate_or_lock(struct buffer_he
+ EXPORT_SYMBOL(bh_uptodate_or_lock);
+ 
+ /**
++ * __bh_read - Submit read for a locked buffer
++ * @bh: struct buffer_head
++ * @op_flags: appending REQ_OP_* flags besides REQ_OP_READ
++ * @wait: wait until reading finish
++ *
++ * Returns zero on success or don't wait, and -EIO on error.
++ */
++int __bh_read(struct buffer_head *bh, blk_opf_t op_flags, bool wait)
++{
++	int ret = 0;
++
++	BUG_ON(!buffer_locked(bh));
++
++	get_bh(bh);
++	bh->b_end_io = end_buffer_read_sync;
++	submit_bh(REQ_OP_READ | op_flags, bh);
++	if (wait) {
++		wait_on_buffer(bh);
++		if (!buffer_uptodate(bh))
++			ret = -EIO;
++	}
++	return ret;
++}
++EXPORT_SYMBOL(__bh_read);
++
++/**
++ * __bh_read_batch - Submit read for a batch of unlocked buffers
++ * @nr: entry number of the buffer batch
++ * @bhs: a batch of struct buffer_head
++ * @op_flags: appending REQ_OP_* flags besides REQ_OP_READ
++ * @force_lock: force to get a lock on the buffer if set, otherwise drops any
++ *              buffer that cannot lock.
++ *
++ * Returns zero on success or don't wait, and -EIO on error.
++ */
++void __bh_read_batch(int nr, struct buffer_head *bhs[],
++		     blk_opf_t op_flags, bool force_lock)
++{
++	int i;
++
++	for (i = 0; i < nr; i++) {
++		struct buffer_head *bh = bhs[i];
++
++		if (buffer_uptodate(bh))
++			continue;
++
++		if (force_lock)
++			lock_buffer(bh);
++		else
++			if (!trylock_buffer(bh))
++				continue;
++
++		if (buffer_uptodate(bh)) {
++			unlock_buffer(bh);
++			continue;
++		}
++
++		bh->b_end_io = end_buffer_read_sync;
++		get_bh(bh);
++		submit_bh(REQ_OP_READ | op_flags, bh);
++	}
++}
++EXPORT_SYMBOL(__bh_read_batch);
++
++/**
+  * bh_submit_read - Submit a locked buffer for reading
+  * @bh: struct buffer_head
+  *
+--- a/include/linux/buffer_head.h~fs-buffer-add-some-new-buffer-read-helpers
++++ a/include/linux/buffer_head.h
+@@ -232,6 +232,9 @@ void write_boundary_block(struct block_d
+ 			sector_t bblock, unsigned blocksize);
+ int bh_uptodate_or_lock(struct buffer_head *bh);
+ int bh_submit_read(struct buffer_head *bh);
++int __bh_read(struct buffer_head *bh, blk_opf_t op_flags, bool wait);
++void __bh_read_batch(int nr, struct buffer_head *bhs[],
++		     blk_opf_t op_flags, bool force_lock);
+ 
+ extern int buffer_heads_over_limit;
+ 
+@@ -399,6 +402,41 @@ static inline struct buffer_head *__getb
+ 	return __getblk_gfp(bdev, block, size, __GFP_MOVABLE);
+ }
+ 
++static inline void bh_readahead(struct buffer_head *bh, blk_opf_t op_flags)
++{
++	if (!buffer_uptodate(bh) && trylock_buffer(bh)) {
++		if (!buffer_uptodate(bh))
++			__bh_read(bh, op_flags, false);
++		else
++			unlock_buffer(bh);
++	}
++}
++
++static inline void bh_read_nowait(struct buffer_head *bh, blk_opf_t op_flags)
++{
++	if (!bh_uptodate_or_lock(bh))
++		__bh_read(bh, op_flags, false);
++}
++
++/* Returns 1 if buffer uptodated, 0 on success, and -EIO on error. */
++static inline int bh_read(struct buffer_head *bh, blk_opf_t op_flags)
++{
++	if (bh_uptodate_or_lock(bh))
++		return 1;
++	return __bh_read(bh, op_flags, true);
++}
++
++static inline void bh_read_batch(int nr, struct buffer_head *bhs[])
++{
++	__bh_read_batch(nr, bhs, 0, true);
++}
++
++static inline void bh_readahead_batch(int nr, struct buffer_head *bhs[],
++				      blk_opf_t op_flags)
++{
++	__bh_read_batch(nr, bhs, op_flags, false);
++}
++
+ /**
+  *  __bread() - reads a specified block and returns the bh
+  *  @bdev: the block_device to read from
+_

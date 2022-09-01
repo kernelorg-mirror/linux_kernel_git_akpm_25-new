@@ -1,0 +1,95 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: fix PageAnonExclusive clearing racing with concurrent RCU GUP-fast
+Date: Thu, 1 Sep 2022 10:35:59 +0200
+
+commit 6c287605fd56 ("mm: remember exclusively mapped anonymous pages with
+PG_anon_exclusive") made sure that when PageAnonExclusive() has to be
+cleared during temporary unmapping of a page, that the PTE is
+cleared/invalidated and that the TLB is flushed.
+
+What we want to achieve in all cases is that we cannot end up with a pin on
+an anonymous page that may be shared, because such pins would be
+unreliable and could result in memory corruptions when the mapped page
+and the pin go out of sync due to a write fault.
+
+That TLB flush handling was inspired by an outdated comment in
+mm/ksm.c:write_protect_page(), which similarly required the TLB flush in
+the past to synchronize with GUP-fast. However, ever since general RCU GUP
+fast was introduced in commit 2667f50e8b81 ("mm: introduce a general RCU
+get_user_pages_fast()"), a TLB flush is no longer sufficient to handle
+concurrent GUP-fast in all cases -- it only handles traditional IPI-based
+GUP-fast correctly.
+
+Peter Xu (thankfully) questioned whether that TLB flush is really
+required. On architectures that send an IPI broadcast on TLB flush,
+it works as expected. To synchronize with RCU GUP-fast properly, we're
+conceptually fine, however, we have to enforce a certain memory order and
+are missing memory barriers.
+
+Let's document that, avoid the TLB flush where possible and use proper
+explicit memory barriers where required. We shouldn't really care about the
+additional memory barriers here, as we're not on extremely hot paths --
+and we're getting rid of some TLB flushes.
+
+We use a smp_mb() pair for handling concurrent pinning and a
+smp_rmb()/smp_wmb() pair for handling the corner case of only temporary
+PTE changes but permanent PageAnonExclusive changes.
+
+One extreme example, whereby GUP-fast takes a R/O pin and KSM wants to
+convert an exclusive anonymous page to a KSM page, and that page is already
+mapped write-protected (-> no PTE change) would be:
+
+	Thread 0 (KSM)			Thread 1 (GUP-fast)
+
+					(B1) Read the PTE
+					# (B2) skipped without FOLL_WRITE
+	(A1) Clear PTE
+	smp_mb()
+	(A2) Check pinned
+					(B3) Pin the mapped page
+					smp_mb()
+	(A3) Clear PageAnonExclusive
+	smp_wmb()
+	(A4) Restore PTE
+					(B4) Check if the PTE changed
+					smp_rmb()
+					(B5) Check PageAnonExclusive
+
+Thread 1 will properly detect that PageAnonExclusive was cleared and
+back off.
+
+Note that we don't need a memory barrier between checking if the page is
+pinned and clearing PageAnonExclusive, because stores are not
+speculated.
+
+The possible issues due to reordering are of theoretical nature so far
+and attempts to reproduce the race failed.
+
+Especially the "no PTE change" case isn't the common case, because we'd
+need an exclusive anonymous page that's mapped R/O and the PTE is clean
+in KSM code -- and using KSM with page pinning isn't extremely common.
+Further, the clear+TLB flush we used for now implies a memory barrier.
+So the problematic missing part should be the missing memory barrier
+after pinning but before checking if the PTE changed.
+
+Link: https://lkml.kernel.org/r/20220901083559.67446-1-david@redhat.com
+Fixes: 6c287605fd56 ("mm: remember exclusively mapped anonymous pages with PG_anon_exclusive")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Nadav Amit <namit@vmware.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Andrea Parri <parri.andrea@gmail.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: "Paul E. McKenney" <paulmck@kernel.org>
+Cc: Christoph von Recklinghausen <crecklin@redhat.com>
+Cc: Don Dutile <ddutile@redhat.com>
+Cc: <stable@vger.kernel.org>

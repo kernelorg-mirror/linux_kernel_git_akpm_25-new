@@ -1,0 +1,96 @@
+From: Zhang Yi <yi.zhang@huawei.com>
+Subject: jbd2: replace ll_rw_block()
+Date: Thu, 1 Sep 2022 21:34:57 +0800
+
+ll_rw_block() is not safe for the sync read path because it cannot
+guarantee that submitting read IO if the buffer has been locked. We
+could get false positive EIO after wait_on_buffer() if the buffer has
+been locked by others. So stop using ll_rw_block() in
+journal_get_superblock(). We also switch to new bh_readahead_batch()
+for the buffer array readahead path.
+
+Link: https://lkml.kernel.org/r/20220901133505.2510834-7-yi.zhang@huawei.com
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/jbd2/journal.c  |   15 ++++++---------
+ fs/jbd2/recovery.c |   16 ++++++++++------
+ 2 files changed, 16 insertions(+), 15 deletions(-)
+
+--- a/fs/jbd2/journal.c~jbd2-replace-ll_rw_block
++++ a/fs/jbd2/journal.c
+@@ -1893,19 +1893,16 @@ static int journal_get_superblock(journa
+ {
+ 	struct buffer_head *bh;
+ 	journal_superblock_t *sb;
+-	int err = -EIO;
++	int err;
+ 
+ 	bh = journal->j_sb_buffer;
+ 
+ 	J_ASSERT(bh != NULL);
+-	if (!buffer_uptodate(bh)) {
+-		ll_rw_block(REQ_OP_READ, 1, &bh);
+-		wait_on_buffer(bh);
+-		if (!buffer_uptodate(bh)) {
+-			printk(KERN_ERR
+-				"JBD2: IO error reading journal superblock\n");
+-			goto out;
+-		}
++	err = bh_read(bh, 0);
++	if (err < 0) {
++		printk(KERN_ERR
++			"JBD2: IO error reading journal superblock\n");
++		goto out;
+ 	}
+ 
+ 	if (buffer_verified(bh))
+--- a/fs/jbd2/recovery.c~jbd2-replace-ll_rw_block
++++ a/fs/jbd2/recovery.c
+@@ -100,7 +100,7 @@ static int do_readahead(journal_t *journ
+ 		if (!buffer_uptodate(bh) && !buffer_locked(bh)) {
+ 			bufs[nbufs++] = bh;
+ 			if (nbufs == MAXBUF) {
+-				ll_rw_block(REQ_OP_READ, nbufs, bufs);
++				bh_readahead_batch(nbufs, bufs, 0);
+ 				journal_brelse_array(bufs, nbufs);
+ 				nbufs = 0;
+ 			}
+@@ -109,7 +109,7 @@ static int do_readahead(journal_t *journ
+ 	}
+ 
+ 	if (nbufs)
+-		ll_rw_block(REQ_OP_READ, nbufs, bufs);
++		bh_readahead_batch(nbufs, bufs, 0);
+ 	err = 0;
+ 
+ failed:
+@@ -152,9 +152,14 @@ static int jread(struct buffer_head **bh
+ 		return -ENOMEM;
+ 
+ 	if (!buffer_uptodate(bh)) {
+-		/* If this is a brand new buffer, start readahead.
+-                   Otherwise, we assume we are already reading it.  */
+-		if (!buffer_req(bh))
++		/*
++		 * If this is a brand new buffer, start readahead.
++		 * Otherwise, we assume we are already reading it.
++		 */
++		bool need_readahead = !buffer_req(bh);
++
++		bh_read_nowait(bh, 0);
++		if (need_readahead)
+ 			do_readahead(journal, offset);
+ 		wait_on_buffer(bh);
+ 	}
+@@ -687,7 +692,6 @@ static int do_one_pass(journal_t *journa
+ 					mark_buffer_dirty(nbh);
+ 					BUFFER_TRACE(nbh, "marking uptodate");
+ 					++info->nr_replays;
+-					/* ll_rw_block(WRITE, 1, &nbh); */
+ 					unlock_buffer(nbh);
+ 					brelse(obh);
+ 					brelse(nbh);
+_
