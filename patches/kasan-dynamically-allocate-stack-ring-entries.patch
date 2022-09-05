@@ -1,0 +1,143 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: kasan: dynamically allocate stack ring entries
+Date: Mon, 5 Sep 2022 23:05:47 +0200
+
+Instead of using a large static array, allocate the stack ring dynamically
+via memblock_alloc().
+
+The size of the stack ring is controlled by a new kasan.stack_ring_size
+command-line parameter.  When kasan.stack_ring_size is not provided, the
+default value of 32 << 10 is used.
+
+When the stack trace collection is disabled via kasan.stacktrace=off, the
+stack ring is not allocated.
+
+Link: https://lkml.kernel.org/r/03b82ab60db53427e9818e0b0c1971baa10c3cbc.1662411800.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Peter Collingbourne <pcc@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/dev-tools/kasan.rst |    4 +++-
+ mm/kasan/kasan.h                  |    5 ++---
+ mm/kasan/report_tags.c            |    4 ++--
+ mm/kasan/tags.c                   |   25 ++++++++++++++++++++++++-
+ 4 files changed, 31 insertions(+), 7 deletions(-)
+
+--- a/Documentation/dev-tools/kasan.rst~kasan-dynamically-allocate-stack-ring-entries
++++ a/Documentation/dev-tools/kasan.rst
+@@ -112,10 +112,12 @@ parameter can be used to control panic a
+   if ``kasan_multi_shot`` is enabled.
+ 
+ Software and Hardware Tag-Based KASAN modes (see the section about various
+-modes below) support disabling stack trace collection:
++modes below) support altering stack trace collection behavior:
+ 
+ - ``kasan.stacktrace=off`` or ``=on`` disables or enables alloc and free stack
+   traces collection (default: ``on``).
++- ``kasan.stack_ring_size=<number of entries>`` specifies the number of entries
++  in the stack ring (default: ``32768``).
+ 
+ Hardware Tag-Based KASAN mode is intended for use in production as a security
+ mitigation. Therefore, it supports additional boot parameters that allow
+--- a/mm/kasan/kasan.h~kasan-dynamically-allocate-stack-ring-entries
++++ a/mm/kasan/kasan.h
+@@ -252,12 +252,11 @@ struct kasan_stack_ring_entry {
+ 	bool is_free;
+ };
+ 
+-#define KASAN_STACK_RING_SIZE (32 << 10)
+-
+ struct kasan_stack_ring {
+ 	rwlock_t lock;
++	size_t size;
+ 	atomic64_t pos;
+-	struct kasan_stack_ring_entry entries[KASAN_STACK_RING_SIZE];
++	struct kasan_stack_ring_entry *entries;
+ };
+ 
+ #endif /* CONFIG_KASAN_SW_TAGS || CONFIG_KASAN_HW_TAGS */
+--- a/mm/kasan/report_tags.c~kasan-dynamically-allocate-stack-ring-entries
++++ a/mm/kasan/report_tags.c
+@@ -56,11 +56,11 @@ void kasan_complete_mode_report_info(str
+ 	 * entries relevant to the buggy object can be overwritten.
+ 	 */
+ 
+-	for (u64 i = pos - 1; i != pos - 1 - KASAN_STACK_RING_SIZE; i--) {
++	for (u64 i = pos - 1; i != pos - 1 - stack_ring.size; i--) {
+ 		if (alloc_found && free_found)
+ 			break;
+ 
+-		entry = &stack_ring.entries[i % KASAN_STACK_RING_SIZE];
++		entry = &stack_ring.entries[i % stack_ring.size];
+ 
+ 		/* Paired with smp_store_release() in save_stack_info(). */
+ 		ptr = (void *)smp_load_acquire(&entry->ptr);
+--- a/mm/kasan/tags.c~kasan-dynamically-allocate-stack-ring-entries
++++ a/mm/kasan/tags.c
+@@ -10,6 +10,7 @@
+ #include <linux/init.h>
+ #include <linux/kasan.h>
+ #include <linux/kernel.h>
++#include <linux/memblock.h>
+ #include <linux/memory.h>
+ #include <linux/mm.h>
+ #include <linux/static_key.h>
+@@ -19,6 +20,8 @@
+ #include "kasan.h"
+ #include "../slab.h"
+ 
++#define KASAN_STACK_RING_SIZE_DEFAULT (32 << 10)
++
+ enum kasan_arg_stacktrace {
+ 	KASAN_ARG_STACKTRACE_DEFAULT,
+ 	KASAN_ARG_STACKTRACE_OFF,
+@@ -52,6 +55,16 @@ static int __init early_kasan_flag_stack
+ }
+ early_param("kasan.stacktrace", early_kasan_flag_stacktrace);
+ 
++/* kasan.stack_ring_size=<number of entries> */
++static int __init early_kasan_flag_stack_ring_size(char *arg)
++{
++	if (!arg)
++		return -EINVAL;
++
++	return kstrtoul(arg, 0, &stack_ring.size);
++}
++early_param("kasan.stack_ring_size", early_kasan_flag_stack_ring_size);
++
+ void __init kasan_init_tags(void)
+ {
+ 	switch (kasan_arg_stacktrace) {
+@@ -65,6 +78,16 @@ void __init kasan_init_tags(void)
+ 		static_branch_enable(&kasan_flag_stacktrace);
+ 		break;
+ 	}
++
++	if (kasan_stack_collection_enabled()) {
++		if (!stack_ring.size)
++			stack_ring.size = KASAN_STACK_RING_SIZE_DEFAULT;
++		stack_ring.entries = memblock_alloc(
++			sizeof(stack_ring.entries[0]) * stack_ring.size,
++			SMP_CACHE_BYTES);
++		if (WARN_ON(!stack_ring.entries))
++			static_branch_disable(&kasan_flag_stacktrace);
++	}
+ }
+ 
+ static void save_stack_info(struct kmem_cache *cache, void *object,
+@@ -86,7 +109,7 @@ static void save_stack_info(struct kmem_
+ 
+ next:
+ 	pos = atomic64_fetch_add(1, &stack_ring.pos);
+-	entry = &stack_ring.entries[pos % KASAN_STACK_RING_SIZE];
++	entry = &stack_ring.entries[pos % stack_ring.size];
+ 
+ 	/* Detect stack ring entry slots that are being written to. */
+ 	old_ptr = READ_ONCE(entry->ptr);
+_

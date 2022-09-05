@@ -1,0 +1,233 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: kasan: implement stack ring for tag-based modes
+Date: Mon, 5 Sep 2022 23:05:45 +0200
+
+Implement storing stack depot handles for alloc/free stack traces for slab
+objects for the tag-based KASAN modes in a ring buffer.
+
+This ring buffer is referred to as the stack ring.
+
+On each alloc/free of a slab object, the tagged address of the object and
+the current stack trace are recorded in the stack ring.
+
+On each bug report, if the accessed address belongs to a slab object, the
+stack ring is scanned for matching entries.  The newest entries are used
+to print the alloc/free stack traces in the report: one entry for alloc
+and one for free.
+
+The number of entries in the stack ring is fixed in this patch, but one of
+the following patches adds a command-line argument to control it.
+
+Link: https://lkml.kernel.org/r/692de14b6b6a1bc817fd55e4ad92fc1f83c1ab59.1662411799.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Peter Collingbourne <pcc@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/kasan/kasan.h       |   21 +++++++++++
+ mm/kasan/report_tags.c |   71 +++++++++++++++++++++++++++++++++++++++
+ mm/kasan/tags.c        |   50 +++++++++++++++++++++++++++
+ 3 files changed, 142 insertions(+)
+
+--- a/mm/kasan/kasan.h~kasan-implement-stack-ring-for-tag-based-modes
++++ a/mm/kasan/kasan.h
+@@ -2,6 +2,7 @@
+ #ifndef __MM_KASAN_KASAN_H
+ #define __MM_KASAN_KASAN_H
+ 
++#include <linux/atomic.h>
+ #include <linux/kasan.h>
+ #include <linux/kasan-tags.h>
+ #include <linux/kfence.h>
+@@ -233,6 +234,26 @@ struct kasan_free_meta {
+ 
+ #endif /* CONFIG_KASAN_GENERIC */
+ 
++#if defined(CONFIG_KASAN_SW_TAGS) || defined(CONFIG_KASAN_HW_TAGS)
++
++struct kasan_stack_ring_entry {
++	void *ptr;
++	size_t size;
++	u32 pid;
++	depot_stack_handle_t stack;
++	bool is_free;
++};
++
++#define KASAN_STACK_RING_SIZE (32 << 10)
++
++struct kasan_stack_ring {
++	rwlock_t lock;
++	atomic64_t pos;
++	struct kasan_stack_ring_entry entries[KASAN_STACK_RING_SIZE];
++};
++
++#endif /* CONFIG_KASAN_SW_TAGS || CONFIG_KASAN_HW_TAGS */
++
+ #if IS_ENABLED(CONFIG_KASAN_KUNIT_TEST)
+ /* Used in KUnit-compatible KASAN tests. */
+ struct kunit_kasan_status {
+--- a/mm/kasan/report_tags.c~kasan-implement-stack-ring-for-tag-based-modes
++++ a/mm/kasan/report_tags.c
+@@ -4,8 +4,12 @@
+  * Copyright (c) 2020 Google, Inc.
+  */
+ 
++#include <linux/atomic.h>
++
+ #include "kasan.h"
+ 
++extern struct kasan_stack_ring stack_ring;
++
+ static const char *get_bug_type(struct kasan_report_info *info)
+ {
+ 	/*
+@@ -24,5 +28,72 @@ static const char *get_bug_type(struct k
+ 
+ void kasan_complete_mode_report_info(struct kasan_report_info *info)
+ {
++	unsigned long flags;
++	u64 pos;
++	struct kasan_stack_ring_entry *entry;
++	void *ptr;
++	u32 pid;
++	depot_stack_handle_t stack;
++	bool is_free;
++	bool alloc_found = false, free_found = false;
++
+ 	info->bug_type = get_bug_type(info);
++
++	if (!info->cache || !info->object)
++		return;
++	}
++
++	write_lock_irqsave(&stack_ring.lock, flags);
++
++	pos = atomic64_read(&stack_ring.pos);
++
++	/*
++	 * The loop below tries to find stack ring entries relevant to the
++	 * buggy object. This is a best-effort process.
++	 *
++	 * First, another object with the same tag can be allocated in place of
++	 * the buggy object. Also, since the number of entries is limited, the
++	 * entries relevant to the buggy object can be overwritten.
++	 */
++
++	for (u64 i = pos - 1; i != pos - 1 - KASAN_STACK_RING_SIZE; i--) {
++		if (alloc_found && free_found)
++			break;
++
++		entry = &stack_ring.entries[i % KASAN_STACK_RING_SIZE];
++
++		/* Paired with smp_store_release() in save_stack_info(). */
++		ptr = (void *)smp_load_acquire(&entry->ptr);
++
++		if (kasan_reset_tag(ptr) != info->object ||
++		    get_tag(ptr) != get_tag(info->access_addr))
++			continue;
++
++		pid = READ_ONCE(entry->pid);
++		stack = READ_ONCE(entry->stack);
++		is_free = READ_ONCE(entry->is_free);
++
++		if (is_free) {
++			/*
++			 * Second free of the same object.
++			 * Give up on trying to find the alloc entry.
++			 */
++			if (free_found)
++				break;
++
++			info->free_track.pid = pid;
++			info->free_track.stack = stack;
++			free_found = true;
++		} else {
++			/* Second alloc of the same object. Give up. */
++			if (alloc_found)
++				break;
++
++			info->alloc_track.pid = pid;
++			info->alloc_track.stack = stack;
++			alloc_found = true;
++		}
++	}
++
++	write_unlock_irqrestore(&stack_ring.lock, flags);
+ }
+--- a/mm/kasan/tags.c~kasan-implement-stack-ring-for-tag-based-modes
++++ a/mm/kasan/tags.c
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2020 Google, Inc.
+  */
+ 
++#include <linux/atomic.h>
+ #include <linux/init.h>
+ #include <linux/kasan.h>
+ #include <linux/kernel.h>
+@@ -16,11 +17,60 @@
+ #include <linux/types.h>
+ 
+ #include "kasan.h"
++#include "../slab.h"
++
++/* Non-zero, as initial pointer values are 0. */
++#define STACK_RING_BUSY_PTR ((void *)1)
++
++struct kasan_stack_ring stack_ring;
++
++static void save_stack_info(struct kmem_cache *cache, void *object,
++			gfp_t gfp_flags, bool is_free)
++{
++	unsigned long flags;
++	depot_stack_handle_t stack;
++	u64 pos;
++	struct kasan_stack_ring_entry *entry;
++	void *old_ptr;
++
++	stack = kasan_save_stack(gfp_flags, true);
++
++	/*
++	 * Prevent save_stack_info() from modifying stack ring
++	 * when kasan_complete_mode_report_info() is walking it.
++	 */
++	read_lock_irqsave(&stack_ring.lock, flags);
++
++next:
++	pos = atomic64_fetch_add(1, &stack_ring.pos);
++	entry = &stack_ring.entries[pos % KASAN_STACK_RING_SIZE];
++
++	/* Detect stack ring entry slots that are being written to. */
++	old_ptr = READ_ONCE(entry->ptr);
++	if (old_ptr == STACK_RING_BUSY_PTR)
++		goto next; /* Busy slot. */
++	if (!try_cmpxchg(&entry->ptr, &old_ptr, STACK_RING_BUSY_PTR))
++		goto next; /* Busy slot. */
++
++	WRITE_ONCE(entry->size, cache->object_size);
++	WRITE_ONCE(entry->pid, current->pid);
++	WRITE_ONCE(entry->stack, stack);
++	WRITE_ONCE(entry->is_free, is_free);
++
++	/*
++	 * Paired with smp_load_acquire() in kasan_complete_mode_report_info().
++	 */
++	smp_store_release(&entry->ptr, (s64)object);
++
++	read_unlock_irqrestore(&stack_ring.lock, flags);
++}
+ 
+ void kasan_save_alloc_info(struct kmem_cache *cache, void *object, gfp_t flags)
+ {
++	save_stack_info(cache, object, flags, false);
+ }
+ 
+ void kasan_save_free_info(struct kmem_cache *cache, void *object)
+ {
++	save_stack_info(cache, object, GFP_NOWAIT, true);
+ }
+_
