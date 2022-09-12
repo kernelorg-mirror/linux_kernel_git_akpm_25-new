@@ -1,6 +1,6 @@
 From: Axel Rasmussen <axelrasmussen@google.com>
 Subject: userfaultfd: add /dev/userfaultfd for fine grained access control
-Date: Wed, 1 Jun 2022 14:09:47 -0700
+Date: Mon, 8 Aug 2022 10:56:11 -0700
 
 Historically, it has been shown that intercepting kernel faults with
 userfaultfd (thereby forcing the kernel to wait for an arbitrary amount of
@@ -35,10 +35,14 @@ to handle kernel faults, without the caller having any special
 capabilities.  Access to this mechanism is instead restricted using e.g. 
 standard filesystem permissions.
 
-Link: https://lkml.kernel.org/r/20220601210951.3916598-3-axelrasmussen@google.com
+[axelrasmussen@google.com: Handle misc_register() failure properly]
+  Link: https://lkml.kernel.org/r/20220819205201.658693-3-axelrasmussen@google.com
+Link: https://lkml.kernel.org/r/20220808175614.3885028-3-axelrasmussen@google.com
 Signed-off-by: Axel Rasmussen <axelrasmussen@google.com>
+Acked-by: Nadav Amit <namit@vmware.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Acked-by: Mike Rapoport <rppt@linux.ibm.com>
 Cc: Al Viro <viro@zeniv.linux.org.uk>
-Cc: Charan Teja Kalla <charante@codeaurora.org>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Dmitry V. Levin <ldv@altlinux.org>
 Cc: Gleb Fotengauer-Malinovskiy <glebfm@altlinux.org>
@@ -47,19 +51,18 @@ Cc: Jan Kara <jack@suse.cz>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Mel Gorman <mgorman@techsingularity.net>
 Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: Mike Rapoport <rppt@kernel.org>
-Cc: Nadav Amit <namit@vmware.com>
-Cc: Peter Xu <peterx@redhat.com>
+Cc: Shuah Khan <shuah@kernel.org>
 Cc: Shuah Khan <skhan@linuxfoundation.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Zhang Yi <yi.zhang@huawei.com>
+Cc: Mike Rapoport <rppt@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/userfaultfd.c                 |   76 +++++++++++++++++++++++------
+ fs/userfaultfd.c                 |   71 ++++++++++++++++++++++-------
  include/uapi/linux/userfaultfd.h |    4 +
- 2 files changed, 66 insertions(+), 14 deletions(-)
+ 2 files changed, 59 insertions(+), 16 deletions(-)
 
 --- a/fs/userfaultfd.c~userfaultfd-add-dev-userfaultfd-for-fine-grained-access-control
 +++ a/fs/userfaultfd.c
@@ -86,32 +89,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * If it's already released don't get it. This avoids to loop
-@@ -2076,19 +2072,33 @@ static void init_once_userfaultfd_ctx(vo
+@@ -2056,20 +2052,11 @@ static void init_once_userfaultfd_ctx(vo
  	seqcount_spinlock_init(&ctx->refile_seq, &ctx->fault_pending_wqh.lock);
  }
  
 -SYSCALL_DEFINE1(userfaultfd, int, flags)
-+static inline bool userfaultfd_allowed(bool is_syscall, int flags)
-+{
-+	bool kernel_faults = !(flags & UFFD_USER_MODE_ONLY);
-+	bool allow_unprivileged = sysctl_unprivileged_userfaultfd;
-+
-+	/* userfaultfd(2) access is controlled by sysctl + capability. */
-+	if (is_syscall && kernel_faults) {
-+		if (!allow_unprivileged && !capable(CAP_SYS_PTRACE))
-+			return false;
-+	}
-+
-+	/*
-+	 * For /dev/userfaultfd, access is to be controlled using e.g.
-+	 * permissions on the device node. We assume this is correctly
-+	 * configured by userspace, so we simply allow access here.
-+	 */
-+
-+	return true;
-+}
-+
-+static int new_userfaultfd(bool is_syscall, int flags)
++static int new_userfaultfd(int flags)
  {
  	struct userfaultfd_ctx *ctx;
  	int fd;
@@ -122,35 +105,39 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		printk_once(KERN_WARNING "uffd: Set unprivileged_userfaultfd "
 -			"sysctl knob to 1 if kernel faults must be handled "
 -			"without obtaining CAP_SYS_PTRACE capability\n");
-+	if (!userfaultfd_allowed(is_syscall, flags))
- 		return -EPERM;
+-		return -EPERM;
 -	}
- 
+-
  	BUG_ON(!current->mm);
  
-@@ -2107,6 +2117,10 @@ SYSCALL_DEFINE1(userfaultfd, int, flags)
- 	refcount_set(&ctx->refcount, 1);
- 	ctx->flags = flags;
- 	ctx->features = 0;
-+	/*
-+	 * If UFFD_USER_MODE_ONLY is not set, then userfaultfd_allowed() above
-+	 * decided that kernel faults were allowed and should be handled.
-+	 */
- 	ctx->released = false;
- 	atomic_set(&ctx->mmap_changing, 0);
- 	ctx->mm = current->mm;
-@@ -2122,8 +2136,42 @@ SYSCALL_DEFINE1(userfaultfd, int, flags)
+ 	/* Check the UFFD_* constants for consistency.  */
+@@ -2102,8 +2089,60 @@ SYSCALL_DEFINE1(userfaultfd, int, flags)
  	return fd;
  }
  
-+SYSCALL_DEFINE1(userfaultfd, int, flags)
++static inline bool userfaultfd_syscall_allowed(int flags)
 +{
-+	return new_userfaultfd(true, flags);
++	/* Userspace-only page faults are always allowed */
++	if (flags & UFFD_USER_MODE_ONLY)
++		return true;
++
++	/*
++	 * The user is requesting a userfaultfd which can handle kernel faults.
++	 * Privileged users are always allowed to do this.
++	 */
++	if (capable(CAP_SYS_PTRACE))
++		return true;
++
++	/* Otherwise, access to kernel fault handling is sysctl controlled. */
++	return sysctl_unprivileged_userfaultfd;
 +}
 +
-+static int userfaultfd_dev_open(struct inode *inode, struct file *file)
++SYSCALL_DEFINE1(userfaultfd, int, flags)
 +{
-+	return 0;
++	if (!userfaultfd_syscall_allowed(flags))
++		return -EPERM;
++
++	return new_userfaultfd(flags);
 +}
 +
 +static long userfaultfd_dev_ioctl(struct file *file, unsigned int cmd, unsigned long flags)
@@ -158,11 +145,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (cmd != USERFAULTFD_IOC_NEW)
 +		return -EINVAL;
 +
-+	return new_userfaultfd(false, flags);
++	return new_userfaultfd(flags);
 +}
 +
 +static const struct file_operations userfaultfd_dev_fops = {
-+	.open = userfaultfd_dev_open,
 +	.unlocked_ioctl = userfaultfd_dev_ioctl,
 +	.compat_ioctl = userfaultfd_dev_ioctl,
 +	.owner = THIS_MODULE,
@@ -177,7 +163,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  static int __init userfaultfd_init(void)
  {
-+	WARN_ON(misc_register(&userfaultfd_misc));
++	int ret;
++
++	ret = misc_register(&userfaultfd_misc);
++	if (ret)
++		return ret;
 +
  	userfaultfd_ctx_cachep = kmem_cache_create("userfaultfd_ctx_cache",
  						sizeof(struct userfaultfd_ctx),
