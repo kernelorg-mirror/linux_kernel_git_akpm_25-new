@@ -1,6 +1,6 @@
 From: Alexander Potapenko <glider@google.com>
 Subject: mm: kmsan: maintain KMSAN metadata for page operations
-Date: Fri, 26 Aug 2022 17:07:37 +0200
+Date: Mon, 5 Sep 2022 14:24:22 +0200
 
 Insert KMSAN hooks that make the necessary bookkeeping changes:
  - poison page shadow and origins in alloc_pages()/free_page();
@@ -8,7 +8,7 @@ Insert KMSAN hooks that make the necessary bookkeeping changes:
  - copy page metadata in copy_highpage(), wp_page_copy();
  - handle vmap()/vunmap()/iounmap();
 
-Link: https://lkml.kernel.org/r/20220826150807.723137-15-glider@google.com
+Link: https://lkml.kernel.org/r/20220905122452.2258262-15-glider@google.com
 Signed-off-by: Alexander Potapenko <glider@google.com>
 Cc: Alexander Viro <viro@zeniv.linux.org.uk>
 Cc: Alexei Starovoitov <ast@kernel.org>
@@ -30,6 +30,7 @@ Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
 Cc: Kees Cook <keescook@chromium.org>
+Cc: Liu Shixin <liushixin2@huawei.com>
 Cc: Marco Elver <elver@google.com>
 Cc: Mark Rutland <mark.rutland@arm.com>
 Cc: Matthew Wilcox <willy@infradead.org>
@@ -48,14 +49,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/x86/include/asm/page_64.h |    7 +
  arch/x86/mm/ioremap.c          |    3 
  include/linux/highmem.h        |    3 
- include/linux/kmsan.h          |  125 +++++++++++++++++++++++++++++++
+ include/linux/kmsan.h          |  145 +++++++++++++++++++++++++++++++
  mm/internal.h                  |    6 +
- mm/kmsan/hooks.c               |   85 +++++++++++++++++++++
- mm/kmsan/shadow.c              |  113 ++++++++++++++++++++++++++++
+ mm/kmsan/hooks.c               |   86 ++++++++++++++++++
+ mm/kmsan/shadow.c              |  113 ++++++++++++++++++++++++
  mm/memory.c                    |    2 
  mm/page_alloc.c                |   11 ++
- mm/vmalloc.c                   |   20 ++++
- 10 files changed, 373 insertions(+), 2 deletions(-)
+ mm/vmalloc.c                   |   20 +++-
+ 10 files changed, 394 insertions(+), 2 deletions(-)
 
 --- a/arch/x86/include/asm/page_64.h~mm-kmsan-maintain-kmsan-metadata-for-page-operations
 +++ a/arch/x86/include/asm/page_64.h
@@ -125,21 +126,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	kunmap_local(vto);
  	kunmap_local(vfrom);
  }
---- a/include/linux/kmsan.h~mm-kmsan-maintain-kmsan-metadata-for-page-operations
+--- /dev/null
 +++ a/include/linux/kmsan.h
-@@ -14,6 +14,8 @@
- #include <linux/stackdepot.h>
- #include <linux/types.h>
- 
+@@ -0,0 +1,145 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * KMSAN API for subsystems.
++ *
++ * Copyright (C) 2017-2022 Google LLC
++ * Author: Alexander Potapenko <glider@google.com>
++ *
++ */
++#ifndef _LINUX_KMSAN_H
++#define _LINUX_KMSAN_H
++
++#include <linux/gfp.h>
++#include <linux/kmsan-checks.h>
++#include <linux/types.h>
++
 +struct page;
 +
- #ifdef CONFIG_KMSAN
- 
- /* These constants are defined in the MSan LLVM instrumentation pass. */
-@@ -39,6 +41,129 @@ struct kmsan_ctx {
- 	bool allow_reporting;
- };
- 
++#ifdef CONFIG_KMSAN
++
 +/**
 + * kmsan_alloc_page() - Notify KMSAN about an alloc_pages() call.
 + * @page:  struct page pointer returned by alloc_pages().
@@ -263,9 +271,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +}
 +
- #endif
- 
- #endif /* _LINUX_KMSAN_H */
++#endif
++
++#endif /* _LINUX_KMSAN_H */
 --- a/mm/internal.h~mm-kmsan-maintain-kmsan-metadata-for-page-operations
 +++ a/mm/internal.h
 @@ -846,8 +846,14 @@ int vmap_pages_range_noflush(unsigned lo
@@ -285,7 +293,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/kmsan/hooks.c~mm-kmsan-maintain-kmsan-metadata-for-page-operations
 +++ a/mm/kmsan/hooks.c
-@@ -26,6 +26,91 @@
+@@ -11,6 +11,7 @@
+ 
+ #include <linux/cacheflush.h>
+ #include <linux/gfp.h>
++#include <linux/kmsan.h>
+ #include <linux/mm.h>
+ #include <linux/mm_types.h>
+ #include <linux/slab.h>
+@@ -26,6 +27,91 @@
   * skipping effects of functions like memset() inside instrumented code.
   */
  
@@ -506,7 +522,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/ksm.h>
  #include <linux/rmap.h>
  #include <linux/export.h>
-@@ -3136,6 +3137,7 @@ static vm_fault_t wp_page_copy(struct vm
+@@ -3134,6 +3135,7 @@ static vm_fault_t wp_page_copy(struct vm
  			delayacct_wpcopy_end();
  			return 0;
  		}
@@ -532,7 +548,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (unlikely(PageHWPoison(page)) && !order) {
  		/*
-@@ -3819,6 +3821,14 @@ static struct page *rmqueue_pcplist(stru
+@@ -3810,6 +3812,14 @@ static struct page *rmqueue_pcplist(stru
  /*
   * Allocate a page from the given zone. Use pcplists for order-0 allocations.
   */
@@ -547,7 +563,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline
  struct page *rmqueue(struct zone *preferred_zone,
  			struct zone *zone, unsigned int order,
-@@ -5563,6 +5573,7 @@ out:
+@@ -5554,6 +5564,7 @@ out:
  	}
  
  	trace_mm_page_alloc(page, order, alloc_gfp, ac.migratetype);
