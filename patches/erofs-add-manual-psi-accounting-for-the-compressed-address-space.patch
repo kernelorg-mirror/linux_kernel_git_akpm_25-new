@@ -1,0 +1,78 @@
+From: Christoph Hellwig <hch@lst.de>
+Subject: erofs: add manual PSI accounting for the compressed address space
+Date: Thu, 15 Sep 2022 10:41:59 +0100
+
+erofs uses an additional address space for compressed data read from disk
+in addition to the one directly associated with the inode.  Reading into
+the lower address space is open coded using add_to_page_cache_lru instead
+of using the filemap.c helper for page allocation micro-optimizations,
+which means it is not covered by the MM PSI annotations for ->read_folio
+and ->readahead, so add manual ones instead.
+
+Link: https://lkml.kernel.org/r/20220915094200.139713-5-hch@lst.de
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Gao Xiang <hsiangkao@linux.alibaba.com>
+Cc: Chao Yu <chao@kernel.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: David Sterba <dsterba@suse.com>
+Cc: Gao Xiang <xiang@kernel.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/erofs/zdata.c |   13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+--- a/fs/erofs/zdata.c~erofs-add-manual-psi-accounting-for-the-compressed-address-space
++++ a/fs/erofs/zdata.c
+@@ -7,6 +7,7 @@
+ #include "zdata.h"
+ #include "compress.h"
+ #include <linux/prefetch.h>
++#include <linux/psi.h>
+ 
+ #include <trace/events/erofs.h>
+ 
+@@ -1365,6 +1366,8 @@ static void z_erofs_submit_queue(struct
+ 	struct block_device *last_bdev;
+ 	unsigned int nr_bios = 0;
+ 	struct bio *bio = NULL;
++	/* initialize to 1 to make skip psi_memstall_leave unless needed */
++	unsigned long pflags = 1;
+ 
+ 	bi_private = jobqueueset_init(sb, q, fgq, force_fg);
+ 	qtail[JQ_BYPASS] = &q[JQ_BYPASS]->head;
+@@ -1414,10 +1417,15 @@ static void z_erofs_submit_queue(struct
+ 			if (bio && (cur != last_index + 1 ||
+ 				    last_bdev != mdev.m_bdev)) {
+ submit_bio_retry:
++				if (!pflags)
++					psi_memstall_leave(&pflags);
+ 				submit_bio(bio);
+ 				bio = NULL;
+ 			}
+ 
++			if (unlikely(PageWorkingset(page)))
++				psi_memstall_enter(&pflags);
++
+ 			if (!bio) {
+ 				bio = bio_alloc(mdev.m_bdev, BIO_MAX_VECS,
+ 						REQ_OP_READ, GFP_NOIO);
+@@ -1445,8 +1453,11 @@ submit_bio_retry:
+ 			move_to_bypass_jobqueue(pcl, qtail, owned_head);
+ 	} while (owned_head != Z_EROFS_PCLUSTER_TAIL);
+ 
+-	if (bio)
++	if (bio) {
++		if (!pflags)
++			psi_memstall_leave(&pflags);
+ 		submit_bio(bio);
++	}
+ 
+ 	/*
+ 	 * although background is preferred, no one is pending for submission.
+_
