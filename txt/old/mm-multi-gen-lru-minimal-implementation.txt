@@ -1,5 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm: multi-gen LRU: minimal implementation
+Date: Mon, 15 Aug 2022 01:13:25 -0600
 
 To avoid confusion, the terms "promotion" and "demotion" will be applied
 to the multi-gen LRU, as a new convention; the terms "activation" and
@@ -9,30 +10,31 @@ The aging produces young generations.  Given an lruvec, it increments
 max_seq when max_seq-min_seq+1 approaches MIN_NR_GENS.  The aging promotes
 hot pages to the youngest generation when it finds them accessed through
 page tables; the demotion of cold pages happens consequently when it
-increments max_seq.  The aging has the complexity O(nr_hot_pages), since
-it is only interested in hot pages.  Promotion in the aging path does not
-require any LRU list operations, only the updates of the gen counter and
+increments max_seq.  Promotion in the aging path does not involve any LRU
+list operations, only the updates of the gen counter and
 lrugen->nr_pages[]; demotion, unless as the result of the increment of
-max_seq, requires LRU list operations, e.g., lru_deactivate_fn().
+max_seq, requires LRU list operations, e.g., lru_deactivate_fn().  The
+aging has the complexity O(nr_hot_pages), since it is only interested in
+hot pages.
 
 The eviction consumes old generations.  Given an lruvec, it increments
-min_seq when the lists indexed by min_seq%MAX_NR_GENS become empty.  A
-feedback loop modeled after the PID controller monitors refaults over anon
-and file types and decides which type to evict when both types are
+min_seq when lrugen->lists[] indexed by min_seq%MAX_NR_GENS becomes empty.
+A feedback loop modeled after the PID controller monitors refaults over
+anon and file types and decides which type to evict when both types are
 available from the same generation.
 
-Each generation is divided into multiple tiers.  Tiers represent different
-ranges of numbers of accesses through file descriptors.  A page accessed N
-times through file descriptors is in tier order_base_2(N).  Tiers do not
-have dedicated lrugen->lists[], only bits in folio->flags.  In contrast to
-moving across generations, which requires the LRU lock, moving across
-tiers only involves operations on folio->flags.  The feedback loop also
-monitors refaults over all tiers and decides when to protect pages in
-which tiers (N>1), using the first tier (N=0,1) as a baseline.  The first
-tier contains single-use unmapped clean pages, which are most likely the
-best choices.  The eviction moves a page to the next generation, i.e.,
-min_seq+1, if the feedback loop decides so.  This approach has the
-following advantages:
+The protection of pages accessed multiple times through file descriptors
+takes place in the eviction path.  Each generation is divided into
+multiple tiers.  A page accessed N times through file descriptors is in
+tier order_base_2(N).  Tiers do not have dedicated lrugen->lists[], only
+bits in folio->flags.  The aforementioned feedback loop also monitors
+refaults over all tiers and decides when to protect pages in which tiers
+(N>1), using the first tier (N=0,1) as a baseline.  The first tier
+contains single-use unmapped clean pages, which are most likely the best
+choices.  In contrast to promotion in the aging path, the protection of a
+page in the eviction path is achieved by moving this page to the next
+generation, i.e., min_seq+1, if the feedback loop decides so.  This
+approach has the following advantages:
 
 1. It removes the cost of activation in the buffered access path by
    inferring whether pages accessed multiple times through file
@@ -48,16 +50,16 @@ following advantages:
 
 Server benchmark results:
   Single workload:
-    fio (buffered I/O): +[40, 42]%
+    fio (buffered I/O): +[30, 32]%
                 IOPS         BW
-      5.18-rc1: 2463k        9621MiB/s
-      patch1-6: 3484k        13.3GiB/s
+      5.19-rc1: 2673k        10.2GiB/s
+      patch1-6: 3491k        13.3GiB/s
 
   Single workload:
-    memcached (anon): +[44, 46]%
+    memcached (anon): -[4, 6]%
                 Ops/sec      KB/sec
-      5.18-rc1: 771403.27    30004.17
-      patch1-6: 1120643.70   43588.06
+      5.19-rc1: 1161501.04   45177.25
+      patch1-6: 1106168.46   43025.04
 
   Configurations:
     CPU: two Xeon 6154
@@ -122,29 +124,29 @@ Server benchmark results:
 
 Client benchmark results:
   kswapd profiles:
-    5.18-rc1
-      40.53%  page_vma_mapped_walk
-      20.37%  lzo1x_1_do_compress (real work)
-       6.99%  do_raw_spin_lock
-       3.93%  _raw_spin_unlock_irq
-       2.08%  vma_interval_tree_subtree_search
-       2.06%  vma_interval_tree_iter_next
-       1.95%  folio_referenced_one
-       1.93%  anon_vma_interval_tree_iter_first
-       1.51%  ptep_clear_flush
-       1.35%  __anon_vma_interval_tree_subtree_search
+    5.19-rc1
+      40.33%  page_vma_mapped_walk (overhead)
+      21.80%  lzo1x_1_do_compress (real work)
+       7.53%  do_raw_spin_lock
+       3.95%  _raw_spin_unlock_irq
+       2.52%  vma_interval_tree_iter_next
+       2.37%  folio_referenced_one
+       2.28%  vma_interval_tree_subtree_search
+       1.97%  anon_vma_interval_tree_iter_first
+       1.60%  ptep_clear_flush
+       1.06%  __zram_bvec_write
 
     patch1-6
-      35.99%  lzo1x_1_do_compress (real work)
-      19.40%  page_vma_mapped_walk
-       6.31%  _raw_spin_unlock_irq
-       3.95%  do_raw_spin_lock
-       2.39%  anon_vma_interval_tree_iter_first
-       2.25%  ptep_clear_flush
-       1.92%  __anon_vma_interval_tree_subtree_search
-       1.70%  folio_referenced_one
-       1.68%  __zram_bvec_write
-       1.43%  anon_vma_interval_tree_iter_next
+      39.03%  lzo1x_1_do_compress (real work)
+      18.47%  page_vma_mapped_walk (overhead)
+       6.74%  _raw_spin_unlock_irq
+       3.97%  do_raw_spin_lock
+       2.49%  ptep_clear_flush
+       2.48%  anon_vma_interval_tree_iter_first
+       1.92%  folio_referenced_one
+       1.88%  __zram_bvec_write
+       1.48%  memmove
+       1.31%  vma_interval_tree_iter_next
 
   Configurations:
     CPU: single Snapdragon 7c
@@ -154,7 +156,7 @@ Client benchmark results:
 
 [1] https://chromium.googlesource.com/chromiumos/platform/tast-tests/
 
-Link: https://lkml.kernel.org/r/20220407031525.2368067-7-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20220815071332.627393-7-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Acked-by: Brian Geffon <bgeffon@google.com>
 Acked-by: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
@@ -168,8 +170,23 @@ Tested-by: Konstantin Kharlamov <Hi-Angel@yandex.ru>
 Tested-by: Shuang Zhai <szhai2@cs.rochester.edu>
 Tested-by: Sofia Trinh <sofia.trinh@edi.works>
 Tested-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
 Cc: Barry Song <baohua@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michael Larabel <Michael@MichaelLarabel.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yang Shi <shy828301@gmail.com>

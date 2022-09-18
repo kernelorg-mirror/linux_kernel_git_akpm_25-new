@@ -1,12 +1,13 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm: multi-gen LRU: optimize multiple memcgs
+Date: Mon, 15 Aug 2022 01:13:28 -0600
 
 When multiple memcgs are available, it is possible to make better choices
 based on generations and tiers and therefore improve the overall
 performance under global memory pressure.  This patch adds a rudimentary
 optimization to select memcgs that can drop single-use unmapped clean
 pages first.  Doing so reduces the chance of going into the aging path or
-swapping.  These two operations can be costly.
+swapping.  These two decisions can be costly.
 
 A typical example that benefits from this optimization is a server running
 mixed types of workloads, e.g., heavy anon workload in one memcg and heavy
@@ -18,26 +19,26 @@ improvements will cover the direct reclaim path.
 
 Server benchmark results:
   Mixed workloads:
-    fio (buffered I/O): +[1, 3]%
+    fio (buffered I/O): +[19, 21]%
                 IOPS         BW
-      patch1-8: 2154k        8415MiB/s
-      patch1-9: 2205k        8613MiB/s
+      patch1-8: 1880k        7343MiB/s
+      patch1-9: 2252k        8796MiB/s
 
-    memcached (anon): +[132, 136]%
+    memcached (anon): +[119, 123]%
                 Ops/sec      KB/sec
-      patch1-8: 819618.49    31838.48
-      patch1-9: 1916516.06   74447.92
+      patch1-8: 862768.65    33514.68
+      patch1-9: 1911022.12   74234.54
 
   Mixed workloads:
-    fio (buffered I/O): +[59, 61]%
+    fio (buffered I/O): +[75, 77]%
                 IOPS         BW
-      5.18-rc1: 1378k        5385MiB/s
-      patch1-9: 2205k        8613MiB/s
+      5.19-rc1: 1279k        4996MiB/s
+      patch1-9: 2252k        8796MiB/s
 
-    memcached (anon): +[229, 233]%
+    memcached (anon): +[13, 15]%
                 Ops/sec      KB/sec
-      5.18-rc1: 578946.00    22489.44
-      patch1-9: 1916516.06   74447.92
+      5.19-rc1: 1673524.04   65008.87
+      patch1-9: 1911022.12   74234.54
 
   Configurations:
     (changes since patch 6)
@@ -77,7 +78,7 @@ Server benchmark results:
 Client benchmark results:
   no change (CONFIG_MEMCG=n)
 
-Link: https://lkml.kernel.org/r/20220407031525.2368067-10-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20220815071332.627393-10-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Acked-by: Brian Geffon <bgeffon@google.com>
 Acked-by: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
@@ -91,20 +92,35 @@ Tested-by: Konstantin Kharlamov <Hi-Angel@yandex.ru>
 Tested-by: Shuang Zhai <szhai2@cs.rochester.edu>
 Tested-by: Sofia Trinh <sofia.trinh@edi.works>
 Tested-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
 Cc: Barry Song <baohua@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michael Larabel <Michael@MichaelLarabel.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vmscan.c |   45 +++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 41 insertions(+), 4 deletions(-)
+ mm/vmscan.c |   55 +++++++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 46 insertions(+), 9 deletions(-)
 
 --- a/mm/vmscan.c~mm-multi-gen-lru-optimize-multiple-memcgs
 +++ a/mm/vmscan.c
-@@ -129,6 +129,13 @@ struct scan_control {
+@@ -131,6 +131,13 @@ struct scan_control {
  	/* Always discard instead of demoting to lower tier memory */
  	unsigned int no_demotion:1;
  
@@ -118,9 +134,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Allocation order */
  	s8 order;
  
-@@ -4324,6 +4331,22 @@ static void lru_gen_age_node(struct pgli
+@@ -4437,6 +4444,22 @@ static void lru_gen_age_node(struct pgli
  
- 	VM_BUG_ON(!current_is_kswapd());
+ 	VM_WARN_ON_ONCE(!current_is_kswapd());
  
 +	/*
 +	 * To reduce the chance of going into the aging path or swapping, which
@@ -138,70 +154,101 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	sc->memcgs_need_swapping = true;
 +	sc->memcgs_avoid_swapping = true;
 +
- 	current->reclaim_state->mm_walk = &pgdat->mm_walk;
+ 	set_mm_walk(pgdat);
  
  	memcg = mem_cgroup_iter(NULL, NULL, NULL);
-@@ -4729,7 +4752,8 @@ static int isolate_folios(struct lruvec
+@@ -4846,7 +4869,8 @@ static int isolate_folios(struct lruvec
  	return scanned;
  }
  
 -static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swappiness)
 +static int evict_folios(struct lruvec *lruvec, struct scan_control *sc, int swappiness,
-+			bool *swapped)
++			bool *need_swapping)
  {
  	int type;
  	int scanned;
-@@ -4795,6 +4819,9 @@ static int evict_folios(struct lruvec *l
+@@ -4909,6 +4933,9 @@ static int evict_folios(struct lruvec *l
  
  	sc->nr_reclaimed += reclaimed;
  
-+	if (type == LRU_GEN_ANON && swapped)
-+		*swapped = true;
++	if (type == LRU_GEN_ANON && need_swapping)
++		*need_swapping = true;
 +
  	return scanned;
  }
  
-@@ -4823,8 +4850,10 @@ static long get_nr_to_scan(struct lruvec
+@@ -4918,10 +4945,9 @@ static int evict_folios(struct lruvec *l
+  *    reclaim.
+  */
+ static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,
+-				    bool can_swap, unsigned long reclaimed)
++				    bool can_swap, unsigned long reclaimed, bool *need_aging)
+ {
+ 	int priority;
+-	bool need_aging;
+ 	unsigned long nr_to_scan;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+ 	DEFINE_MAX_SEQ(lruvec);
+@@ -4936,7 +4962,7 @@ static unsigned long get_nr_to_scan(stru
+ 	    (mem_cgroup_below_low(memcg) && !sc->memcg_low_reclaim))
+ 		return 0;
+ 
+-	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, can_swap, &need_aging);
++	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, can_swap, need_aging);
+ 	if (!nr_to_scan)
+ 		return 0;
+ 
+@@ -4952,7 +4978,7 @@ static unsigned long get_nr_to_scan(stru
  	if (!nr_to_scan)
  		return 0;
  
 -	if (!need_aging)
-+	if (!need_aging) {
-+		sc->memcgs_need_aging = false;
++	if (!*need_aging)
  		return nr_to_scan;
-+	}
  
- 	/* leave the work to lru_gen_age_node() */
- 	if (current_is_kswapd())
-@@ -4846,6 +4875,8 @@ static void lru_gen_shrink_lruvec(struct
+ 	/* skip the aging path at the default priority */
+@@ -4972,6 +4998,8 @@ done:
+ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
  {
  	struct blk_plug plug;
- 	long scanned = 0;
-+	bool swapped = false;
-+	unsigned long reclaimed = sc->nr_reclaimed;
- 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
++	bool need_aging = false;
++	bool need_swapping = false;
+ 	unsigned long scanned = 0;
+ 	unsigned long reclaimed = sc->nr_reclaimed;
  
- 	lru_add_drain();
-@@ -4871,13 +4902,19 @@ static void lru_gen_shrink_lruvec(struct
+@@ -4993,21 +5021,30 @@ static void lru_gen_shrink_lruvec(struct
+ 		else
+ 			swappiness = 0;
+ 
+-		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, reclaimed);
++		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, reclaimed, &need_aging);
  		if (!nr_to_scan)
- 			break;
+-			break;
++			goto done;
  
 -		delta = evict_folios(lruvec, sc, swappiness);
-+		delta = evict_folios(lruvec, sc, swappiness, &swapped);
++		delta = evict_folios(lruvec, sc, swappiness, &need_swapping);
  		if (!delta)
+-			break;
++			goto done;
+ 
+ 		scanned += delta;
+ 		if (scanned >= nr_to_scan)
  			break;
  
-+		if (sc->memcgs_avoid_swapping && swappiness < 200 && swapped)
++		if (sc->memcgs_avoid_swapping && swappiness < 200 && need_swapping)
 +			break;
 +
- 		scanned += delta;
--		if (scanned >= nr_to_scan)
-+		if (scanned >= nr_to_scan) {
-+			if (!swapped && sc->nr_reclaimed - reclaimed >= MIN_LRU_BATCH)
-+				sc->memcgs_need_swapping = false;
- 			break;
-+		}
- 
  		cond_resched();
  	}
+ 
++	/* see the comment in lru_gen_age_node() */
++	if (!need_aging)
++		sc->memcgs_need_aging = false;
++	if (!need_swapping)
++		sc->memcgs_need_swapping = false;
++done:
+ 	clear_mm_walk();
+ 
+ 	blk_finish_plug(&plug);
 _

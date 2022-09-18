@@ -1,5 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm: multi-gen LRU: groundwork
+Date: Mon, 15 Aug 2022 01:13:24 -0600
 
 Evictable pages are divided into multiple generations for each lruvec. 
 The youngest generation number is stored in lrugen->max_seq for both anon
@@ -19,19 +20,17 @@ There are two conceptually independent procedures: "the aging", which
 produces young generations, and "the eviction", which consumes old
 generations.  They form a closed-loop system, i.e., "the page reclaim". 
 Both procedures can be invoked from userspace for the purposes of working
-set estimation and proactive reclaim.  These features are required to
-optimize job scheduling (bin packing) in data centers.  The variable size
-of the sliding window is designed for such use cases [1][2].
+set estimation and proactive reclaim.  These techniques are commonly used
+to optimize job scheduling (bin packing) in data centers [1][2].
 
 To avoid confusion, the terms "hot" and "cold" will be applied to the
-multi-gen LRU, as a new convention; the terms "active" and "inactive" will
-be applied to the active/inactive LRU, as usual.
+multi-gen LRU, as a new convention; the terms "active" and "inactive"
+will be applied to the active/inactive LRU, as usual.
 
-The protection of hot pages and the selection of cold pages are based on
-page access channels and patterns.  There are two access channels: one
-through page tables and the other through file descriptors.  The
+The protection of hot pages and the selection of cold pages are based
+on page access channels and patterns. There are two access channels:
+one through page tables and the other through file descriptors. The
 protection of the former channel is by design stronger because:
-
 1. The uncertainty in determining the access patterns of the former
    channel is higher due to the approximation of the accessed bit.
 2. The cost of evicting the former channel is higher due to the TLB
@@ -39,7 +38,7 @@ protection of the former channel is by design stronger because:
 3. The penalty of underprotecting the former channel is higher because
    applications usually do not prepare themselves for major page
    faults like they do for blocked I/O. E.g., GUI applications
-   commonly use dedicated I/O threads to avoid blocking the rendering
+   commonly use dedicated I/O threads to avoid blocking rendering
    threads.
 
 There are also two access patterns: one with temporal locality and the
@@ -64,7 +63,7 @@ generations, hence MIN_NR_GENS.
 [3] https://lwn.net/Articles/495543/
 [4] https://lwn.net/Articles/815342/
 
-Link: https://lkml.kernel.org/r/20220407031525.2368067-6-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20220815071332.627393-6-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Acked-by: Brian Geffon <bgeffon@google.com>
 Acked-by: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
@@ -78,35 +77,49 @@ Tested-by: Konstantin Kharlamov <Hi-Angel@yandex.ru>
 Tested-by: Shuang Zhai <szhai2@cs.rochester.edu>
 Tested-by: Sofia Trinh <sofia.trinh@edi.works>
 Tested-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
 Cc: Barry Song <baohua@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michael Larabel <Michael@MichaelLarabel.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/fuse/dev.c                     |    3 
- include/linux/mm.h                |    2 
- include/linux/mm_inline.h         |  176 ++++++++++++++++++++++++++++
- include/linux/mmzone.h            |   94 ++++++++++++++
- include/linux/page-flags-layout.h |   11 -
+ include/linux/mm_inline.h         |  175 ++++++++++++++++++++++++++++
+ include/linux/mmzone.h            |  102 ++++++++++++++++
+ include/linux/page-flags-layout.h |   13 +-
  include/linux/page-flags.h        |    4 
  include/linux/sched.h             |    4 
- kernel/bounds.c                   |    7 +
+ kernel/bounds.c                   |    5 
  mm/Kconfig                        |    8 +
  mm/huge_memory.c                  |    3 
  mm/memcontrol.c                   |    2 
- mm/memory.c                       |   25 +++
+ mm/memory.c                       |   25 ++++
  mm/mm_init.c                      |    6 
  mm/mmzone.c                       |    2 
- mm/swap.c                         |    9 +
- mm/vmscan.c                       |   75 +++++++++++
- 16 files changed, 418 insertions(+), 13 deletions(-)
+ mm/swap.c                         |   11 +
+ mm/vmscan.c                       |   75 ++++++++++++
+ 15 files changed, 424 insertions(+), 14 deletions(-)
 
 --- a/fs/fuse/dev.c~mm-multi-gen-lru-groundwork
 +++ a/fs/fuse/dev.c
-@@ -777,7 +777,8 @@ static int fuse_check_page(struct page *
+@@ -776,7 +776,8 @@ static int fuse_check_page(struct page *
  	       1 << PG_active |
  	       1 << PG_workingset |
  	       1 << PG_reclaim |
@@ -116,17 +129,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		dump_page(page, "fuse: trying to steal weird page");
  		return 1;
  	}
---- a/include/linux/mm.h~mm-multi-gen-lru-groundwork
-+++ a/include/linux/mm.h
-@@ -1060,6 +1060,8 @@ vm_fault_t finish_mkwrite_fault(struct v
- #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
- #define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
- #define KASAN_TAG_PGOFF		(LAST_CPUPID_PGOFF - KASAN_TAG_WIDTH)
-+#define LRU_GEN_PGOFF		(KASAN_TAG_PGOFF - LRU_GEN_WIDTH)
-+#define LRU_REFS_PGOFF		(LRU_GEN_PGOFF - LRU_REFS_WIDTH)
- 
- /*
-  * Define the bit shifts to access each section.  For non-existent
 --- a/include/linux/mm_inline.h~mm-multi-gen-lru-groundwork
 +++ a/include/linux/mm_inline.h
 @@ -40,6 +40,9 @@ static __always_inline void __update_lru
@@ -139,7 +141,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	__mod_lruvec_state(lruvec, NR_LRU_BASE + lru, nr_pages);
  	__mod_zone_page_state(&pgdat->node_zones[zid],
  				NR_ZONE_LRU_BASE + lru, nr_pages);
-@@ -101,11 +104,178 @@ static __always_inline enum lru_list fol
+@@ -101,11 +104,177 @@ static __always_inline enum lru_list fol
  	return lru;
  }
  
@@ -160,11 +162,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return seq % MAX_NR_GENS;
 +}
 +
++static inline int folio_lru_gen(struct folio *folio)
++{
++	unsigned long flags = READ_ONCE(folio->flags);
++
++	return ((flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
++}
++
 +static inline bool lru_gen_is_active(struct lruvec *lruvec, int gen)
 +{
 +	unsigned long max_seq = lruvec->lrugen.max_seq;
 +
-+	VM_BUG_ON(gen >= MAX_NR_GENS);
++	VM_WARN_ON_ONCE(gen >= MAX_NR_GENS);
 +
 +	/* see the comment on MIN_NR_GENS */
 +	return gen == lru_gen_from_seq(max_seq) || gen == lru_gen_from_seq(max_seq - 1);
@@ -179,9 +188,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	enum lru_list lru = type * LRU_INACTIVE_FILE;
 +	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 +
-+	VM_BUG_ON(old_gen != -1 && old_gen >= MAX_NR_GENS);
-+	VM_BUG_ON(new_gen != -1 && new_gen >= MAX_NR_GENS);
-+	VM_BUG_ON(old_gen == -1 && new_gen == -1);
++	VM_WARN_ON_ONCE(old_gen != -1 && old_gen >= MAX_NR_GENS);
++	VM_WARN_ON_ONCE(new_gen != -1 && new_gen >= MAX_NR_GENS);
++	VM_WARN_ON_ONCE(old_gen == -1 && new_gen == -1);
 +
 +	if (old_gen >= 0)
 +		WRITE_ONCE(lrugen->nr_pages[old_gen][type][zone],
@@ -209,11 +218,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline bool lru_gen_add_folio(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
 +{
-+	int gen;
-+	unsigned long old_flags, new_flags;
++	unsigned long seq;
++	unsigned long flags;
++	int gen = folio_lru_gen(folio);
 +	int type = folio_is_file_lru(folio);
 +	int zone = folio_zonenum(folio);
 +	struct lru_gen_struct *lrugen = &lruvec->lrugen;
++
++	VM_WARN_ON_ONCE_FOLIO(gen != -1, folio);
 +
 +	if (folio_test_unevictable(folio))
 +		return false;
@@ -227,22 +239,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * 3. Everything else (clean, cold) is added to the oldest generation.
 +	 */
 +	if (folio_test_active(folio))
-+		gen = lru_gen_from_seq(lrugen->max_seq);
++		seq = lrugen->max_seq;
 +	else if ((type == LRU_GEN_ANON && !folio_test_swapcache(folio)) ||
 +		 (folio_test_reclaim(folio) &&
 +		  (folio_test_dirty(folio) || folio_test_writeback(folio))))
-+		gen = lru_gen_from_seq(lrugen->min_seq[type] + 1);
++		seq = lrugen->min_seq[type] + 1;
 +	else
-+		gen = lru_gen_from_seq(lrugen->min_seq[type]);
++		seq = lrugen->min_seq[type];
 +
-+	do {
-+		new_flags = old_flags = READ_ONCE(folio->flags);
-+		VM_BUG_ON_FOLIO(new_flags & LRU_GEN_MASK, folio);
-+
-+		/* see the comment on MIN_NR_GENS */
-+		new_flags &= ~(LRU_GEN_MASK | BIT(PG_active));
-+		new_flags |= (gen + 1UL) << LRU_GEN_PGOFF;
-+	} while (cmpxchg(&folio->flags, old_flags, new_flags) != old_flags);
++	gen = lru_gen_from_seq(seq);
++	flags = (gen + 1UL) << LRU_GEN_PGOFF;
++	/* see the comment on MIN_NR_GENS about PG_active */
++	set_mask_bits(&folio->flags, LRU_GEN_MASK | BIT(PG_active), flags);
 +
 +	lru_gen_update_size(lruvec, folio, -1, gen);
 +	/* for folio_rotate_reclaimable() */
@@ -256,26 +264,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline bool lru_gen_del_folio(struct lruvec *lruvec, struct folio *folio, bool reclaiming)
 +{
-+	int gen;
-+	unsigned long old_flags, new_flags;
++	unsigned long flags;
++	int gen = folio_lru_gen(folio);
 +
-+	do {
-+		new_flags = old_flags = READ_ONCE(folio->flags);
-+		if (!(new_flags & LRU_GEN_MASK))
-+			return false;
++	if (gen < 0)
++		return false;
 +
-+		VM_BUG_ON_FOLIO(folio_test_active(folio), folio);
-+		VM_BUG_ON_FOLIO(folio_test_unevictable(folio), folio);
++	VM_WARN_ON_ONCE_FOLIO(folio_test_active(folio), folio);
++	VM_WARN_ON_ONCE_FOLIO(folio_test_unevictable(folio), folio);
 +
-+		gen = ((new_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
-+
-+		new_flags &= ~LRU_GEN_MASK;
-+		/* for shrink_page_list() */
-+		if (reclaiming)
-+			new_flags &= ~(BIT(PG_referenced) | BIT(PG_reclaim));
-+		else if (lru_gen_is_active(lruvec, gen))
-+			new_flags |= BIT(PG_active);
-+	} while (cmpxchg(&folio->flags, old_flags, new_flags) != old_flags);
++	/* for folio_migrate_flags() */
++	flags = !reclaiming && lru_gen_is_active(lruvec, gen) ? BIT(PG_active) : 0;
++	flags = set_mask_bits(&folio->flags, LRU_GEN_MASK, flags);
++	gen = ((flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
 +
 +	lru_gen_update_size(lruvec, folio, gen, -1);
 +	list_del(&folio->lru);
@@ -283,7 +284,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return true;
 +}
 +
-+#else
++#else /* !CONFIG_LRU_GEN */
 +
 +static inline bool lru_gen_enabled(void)
 +{
@@ -318,7 +319,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	update_lru_size(lruvec, lru, folio_zonenum(folio),
  			folio_nr_pages(folio));
  	if (lru != LRU_UNEVICTABLE)
-@@ -123,6 +293,9 @@ void lruvec_add_folio_tail(struct lruvec
+@@ -123,6 +292,9 @@ void lruvec_add_folio_tail(struct lruvec
  {
  	enum lru_list lru = folio_lru_list(folio);
  
@@ -328,7 +329,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	update_lru_size(lruvec, lru, folio_zonenum(folio),
  			folio_nr_pages(folio));
  	/* This is not expected to be used on LRU_UNEVICTABLE */
-@@ -140,6 +313,9 @@ void lruvec_del_folio(struct lruvec *lru
+@@ -140,6 +312,9 @@ void lruvec_del_folio(struct lruvec *lru
  {
  	enum lru_list lru = folio_lru_list(folio);
  
@@ -340,7 +341,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	update_lru_size(lruvec, lru, folio_zonenum(folio),
 --- a/include/linux/mmzone.h~mm-multi-gen-lru-groundwork
 +++ a/include/linux/mmzone.h
-@@ -317,6 +317,96 @@ enum lruvec_flags {
+@@ -317,6 +317,102 @@ enum lruvec_flags {
  					 */
  };
  
@@ -350,9 +351,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * Evictable pages are divided into multiple generations. The youngest and the
 + * oldest generation numbers, max_seq and min_seq, are monotonically increasing.
 + * They form a sliding window of a variable size [MIN_NR_GENS, MAX_NR_GENS]. An
-+ * offset within MAX_NR_GENS, gen, indexes the LRU list of the corresponding
-+ * generation. The gen counter in folio->flags stores gen+1 while a page is on
-+ * one of lrugen->lists[]. Otherwise it stores 0.
++ * offset within MAX_NR_GENS, i.e., gen, indexes the LRU list of the
++ * corresponding generation. The gen counter in folio->flags stores gen+1 while
++ * a page is on one of lrugen->lists[]. Otherwise it stores 0.
 + *
 + * A page is added to the youngest generation on faulting. The aging needs to
 + * check the accessed bit at least twice before handing this page over to the
@@ -360,16 +361,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * fault; the second check makes sure this page hasn't been used since then.
 + * This process, AKA second chance, requires a minimum of two generations,
 + * hence MIN_NR_GENS. And to maintain ABI compatibility with the active/inactive
-+ * LRU, these two generations are considered active; the rest of generations, if
-+ * they exist, are considered inactive. See lru_gen_is_active(). PG_active is
-+ * always cleared while a page is on one of lrugen->lists[] so that the aging
-+ * needs not to worry about it. And it's set again when a page considered active
-+ * is isolated for non-reclaiming purposes, e.g., migration. See
-+ * lru_gen_add_folio() and lru_gen_del_folio().
++ * LRU, e.g., /proc/vmstat, these two generations are considered active; the
++ * rest of generations, if they exist, are considered inactive. See
++ * lru_gen_is_active().
 + *
-+ * MAX_NR_GENS is set to 4 so that the multi-gen LRU can support twice of the
-+ * categories of the active/inactive LRU when keeping track of accesses through
-+ * page tables. It requires order_base_2(MAX_NR_GENS+1) bits in folio->flags.
++ * PG_active is always cleared while a page is on one of lrugen->lists[] so that
++ * the aging needs not to worry about it. And it's set again when a page
++ * considered active is isolated for non-reclaiming purposes, e.g., migration.
++ * See lru_gen_add_folio() and lru_gen_del_folio().
++ *
++ * MAX_NR_GENS is set to 4 so that the multi-gen LRU can support twice the
++ * number of categories of the active/inactive LRU when keeping track of
++ * accesses through page tables. This requires order_base_2(MAX_NR_GENS+1) bits
++ * in folio->flags.
 + */
 +#define MIN_NR_GENS		2U
 +#define MAX_NR_GENS		4U
@@ -397,16 +401,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * Normally anon and file min_seq are in sync. But if swapping is constrained,
 + * e.g., out of swap space, file min_seq is allowed to advance and leave anon
 + * min_seq behind.
++ *
++ * The number of pages in each generation is eventually consistent and therefore
++ * can be transiently negative.
 + */
 +struct lru_gen_struct {
 +	/* the aging increments the youngest generation number */
 +	unsigned long max_seq;
 +	/* the eviction increments the oldest generation numbers */
 +	unsigned long min_seq[ANON_AND_FILE];
-+	/* the multi-gen LRU lists */
++	/* the multi-gen LRU lists, lazily sorted on eviction */
 +	struct list_head lists[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
-+	/* the sizes of the above lists */
-+	unsigned long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
++	/* the multi-gen LRU sizes, eventually consistent */
++	long nr_pages[MAX_NR_GENS][ANON_AND_FILE][MAX_NR_ZONES];
 +};
 +
 +void lru_gen_init_lruvec(struct lruvec *lruvec);
@@ -437,7 +444,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct lruvec {
  	struct list_head		lists[NR_LRU_LISTS];
  	/* per lruvec lru_lock for memcg */
-@@ -334,6 +424,10 @@ struct lruvec {
+@@ -334,6 +430,10 @@ struct lruvec {
  	unsigned long			refaults[ANON_AND_FILE];
  	/* Various lruvec state flags (enum lruvec_flags) */
  	unsigned long			flags;
@@ -448,9 +455,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_MEMCG
  	struct pglist_data *pgdat;
  #endif
+@@ -749,6 +849,8 @@ static inline bool zone_is_empty(struct
+ #define ZONES_PGOFF		(NODES_PGOFF - ZONES_WIDTH)
+ #define LAST_CPUPID_PGOFF	(ZONES_PGOFF - LAST_CPUPID_WIDTH)
+ #define KASAN_TAG_PGOFF		(LAST_CPUPID_PGOFF - KASAN_TAG_WIDTH)
++#define LRU_GEN_PGOFF		(KASAN_TAG_PGOFF - LRU_GEN_WIDTH)
++#define LRU_REFS_PGOFF		(LRU_GEN_PGOFF - LRU_REFS_WIDTH)
+ 
+ /*
+  * Define the bit shifts to access each section.  For non-existent
 --- a/include/linux/page-flags.h~mm-multi-gen-lru-groundwork
 +++ a/include/linux/page-flags.h
-@@ -1054,7 +1054,7 @@ static __always_inline void __ClearPageA
+@@ -1058,7 +1058,7 @@ static __always_inline void __ClearPageA
  	 1UL << PG_private	| 1UL << PG_private_2	|	\
  	 1UL << PG_writeback	| 1UL << PG_reserved	|	\
  	 1UL << PG_slab		| 1UL << PG_active 	|	\
@@ -459,7 +475,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  /*
   * Flags checked when a page is prepped for return by the page allocator.
-@@ -1065,7 +1065,7 @@ static __always_inline void __ClearPageA
+@@ -1069,7 +1069,7 @@ static __always_inline void __ClearPageA
   * alloc-free cycle to prevent from reusing the page.
   */
  #define PAGE_FLAGS_CHECK_AT_PREP	\
@@ -475,7 +491,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
  
 -#if ZONES_WIDTH + SECTIONS_WIDTH + NODES_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
-+#if ZONES_WIDTH + LRU_GEN_WIDTH + LRU_REFS_WIDTH + SECTIONS_WIDTH + NODES_SHIFT \
++#if ZONES_WIDTH + LRU_GEN_WIDTH + SECTIONS_WIDTH + NODES_SHIFT \
 +	<= BITS_PER_LONG - NR_PAGEFLAGS
  #define NODES_WIDTH		NODES_SHIFT
  #elif defined(CONFIG_SPARSEMEM_VMEMMAP)
@@ -486,22 +502,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -#if ZONES_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + KASAN_TAG_WIDTH + LAST_CPUPID_SHIFT \
 -	<= BITS_PER_LONG - NR_PAGEFLAGS
-+#if ZONES_WIDTH + LRU_GEN_WIDTH + LRU_REFS_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + \
++#if ZONES_WIDTH + LRU_GEN_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + \
 +	KASAN_TAG_WIDTH + LAST_CPUPID_SHIFT <= BITS_PER_LONG - NR_PAGEFLAGS
  #define LAST_CPUPID_WIDTH LAST_CPUPID_SHIFT
  #else
  #define LAST_CPUPID_WIDTH 0
-@@ -100,8 +101,8 @@
+@@ -100,10 +101,12 @@
  #define LAST_CPUPID_NOT_IN_PAGE_FLAGS
  #endif
  
 -#if ZONES_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + KASAN_TAG_WIDTH + LAST_CPUPID_WIDTH \
 -	> BITS_PER_LONG - NR_PAGEFLAGS
-+#if ZONES_WIDTH + LRU_GEN_WIDTH + LRU_REFS_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + \
++#if ZONES_WIDTH + LRU_GEN_WIDTH + SECTIONS_WIDTH + NODES_WIDTH + \
 +	KASAN_TAG_WIDTH + LAST_CPUPID_WIDTH > BITS_PER_LONG - NR_PAGEFLAGS
  #error "Not enough bits in page flags"
  #endif
  
++#define LRU_REFS_WIDTH	0
++
+ #endif
+ #endif /* _LINUX_PAGE_FLAGS_LAYOUT */
 --- a/include/linux/sched.h~mm-multi-gen-lru-groundwork
 +++ a/include/linux/sched.h
 @@ -914,6 +914,10 @@ struct task_struct {
@@ -517,23 +537,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
 --- a/kernel/bounds.c~mm-multi-gen-lru-groundwork
 +++ a/kernel/bounds.c
-@@ -22,6 +22,13 @@ int main(void)
+@@ -22,6 +22,11 @@ int main(void)
  	DEFINE(NR_CPUS_BITS, ilog2(CONFIG_NR_CPUS));
  #endif
  	DEFINE(SPINLOCK_SIZE, sizeof(spinlock_t));
 +#ifdef CONFIG_LRU_GEN
 +	DEFINE(LRU_GEN_WIDTH, order_base_2(MAX_NR_GENS + 1));
-+	DEFINE(LRU_REFS_WIDTH, 0);
 +#else
 +	DEFINE(LRU_GEN_WIDTH, 0);
-+	DEFINE(LRU_REFS_WIDTH, 0);
 +#endif
  	/* End of constants */
  
  	return 0;
 --- a/mm/huge_memory.c~mm-multi-gen-lru-groundwork
 +++ a/mm/huge_memory.c
-@@ -2371,7 +2371,8 @@ static void __split_huge_page_tail(struc
+@@ -2444,7 +2444,8 @@ static void __split_huge_page_tail(struc
  #ifdef CONFIG_64BIT
  			 (1L << PG_arch_2) |
  #endif
@@ -545,15 +563,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
 --- a/mm/Kconfig~mm-multi-gen-lru-groundwork
 +++ a/mm/Kconfig
-@@ -926,6 +926,14 @@ config PTE_MARKER_UFFD_WP
+@@ -1118,6 +1118,14 @@ config PTE_MARKER_UFFD_WP
  	  purposes.  It is required to enable userfaultfd write protection on
  	  file-backed memory types like shmem and hugetlbfs.
  
 +config LRU_GEN
 +	bool "Multi-Gen LRU"
 +	depends on MMU
-+	# the following options can use up the spare bits in page flags
-+	depends on !MAXSMP && (64BIT || !SPARSEMEM || SPARSEMEM_VMEMMAP)
++	# make sure folio->flags has enough spare bits
++	depends on 64BIT || !SPARSEMEM || SPARSEMEM_VMEMMAP
 +	help
 +	  A high performance LRU implementation to overcommit memory.
 +
@@ -562,7 +580,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  endmenu
 --- a/mm/memcontrol.c~mm-multi-gen-lru-groundwork
 +++ a/mm/memcontrol.c
-@@ -5067,6 +5067,7 @@ static void __mem_cgroup_free(struct mem
+@@ -5175,6 +5175,7 @@ static void __mem_cgroup_free(struct mem
  
  static void mem_cgroup_free(struct mem_cgroup *memcg)
  {
@@ -570,7 +588,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	memcg_wb_domain_exit(memcg);
  	__mem_cgroup_free(memcg);
  }
-@@ -5125,6 +5126,7 @@ static struct mem_cgroup *mem_cgroup_all
+@@ -5233,6 +5234,7 @@ static struct mem_cgroup *mem_cgroup_all
  	memcg->deferred_split_queue.split_queue_len = 0;
  #endif
  	idr_replace(&mem_cgroup_idr, memcg, memcg->id.id);
@@ -580,7 +598,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mem_cgroup_id_remove(memcg);
 --- a/mm/memory.c~mm-multi-gen-lru-groundwork
 +++ a/mm/memory.c
-@@ -5074,6 +5074,27 @@ static inline void mm_account_fault(stru
+@@ -5117,6 +5117,27 @@ static inline void mm_account_fault(stru
  		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1, regs, address);
  }
  
@@ -608,7 +626,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * By the time we get here, we already hold the mm semaphore
   *
-@@ -5105,11 +5126,15 @@ vm_fault_t handle_mm_fault(struct vm_are
+@@ -5148,11 +5169,15 @@ vm_fault_t handle_mm_fault(struct vm_are
  	if (flags & FAULT_FLAG_USER)
  		mem_cgroup_enter_user_fault();
  
@@ -658,8 +676,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #if defined(CONFIG_NUMA_BALANCING) && !defined(LAST_CPUPID_NOT_IN_PAGE_FLAGS)
 --- a/mm/swap.c~mm-multi-gen-lru-groundwork
 +++ a/mm/swap.c
-@@ -460,6 +460,11 @@ void folio_add_lru(struct folio *folio)
- 	VM_BUG_ON_FOLIO(folio_test_active(folio) && folio_test_unevictable(folio), folio);
+@@ -484,6 +484,11 @@ void folio_add_lru(struct folio *folio)
+ 			folio_test_unevictable(folio), folio);
  	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
  
 +	/* see the comment in lru_gen_add_folio() */
@@ -668,29 +686,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		folio_set_active(folio);
 +
  	folio_get(folio);
- 	local_lock(&lru_pvecs.lock);
- 	pvec = this_cpu_ptr(&lru_pvecs.lru_add);
-@@ -551,7 +556,7 @@ static void lru_deactivate_file_fn(struc
+ 	local_lock(&cpu_fbatches.lock);
+ 	fbatch = this_cpu_ptr(&cpu_fbatches.lru_add);
+@@ -575,7 +580,7 @@ static void lru_deactivate_file_fn(struc
  
- static void lru_deactivate_fn(struct page *page, struct lruvec *lruvec)
+ static void lru_deactivate_fn(struct lruvec *lruvec, struct folio *folio)
  {
--	if (PageActive(page) && !PageUnevictable(page)) {
-+	if (!PageUnevictable(page) && (PageActive(page) || lru_gen_enabled())) {
- 		int nr_pages = thp_nr_pages(page);
+-	if (folio_test_active(folio) && !folio_test_unevictable(folio)) {
++	if (!folio_test_unevictable(folio) && (folio_test_active(folio) || lru_gen_enabled())) {
+ 		long nr_pages = folio_nr_pages(folio);
  
- 		del_page_from_lru_list(page, lruvec);
-@@ -666,7 +671,7 @@ void deactivate_file_folio(struct folio
-  */
- void deactivate_page(struct page *page)
+ 		lruvec_del_folio(lruvec, folio);
+@@ -688,8 +693,8 @@ void deactivate_page(struct page *page)
  {
--	if (PageLRU(page) && PageActive(page) && !PageUnevictable(page)) {
-+	if (PageLRU(page) && !PageUnevictable(page) && (PageActive(page) || lru_gen_enabled())) {
- 		struct pagevec *pvec;
+ 	struct folio *folio = page_folio(page);
  
- 		local_lock(&lru_pvecs.lock);
+-	if (folio_test_lru(folio) && folio_test_active(folio) &&
+-	    !folio_test_unevictable(folio)) {
++	if (folio_test_lru(folio) && !folio_test_unevictable(folio) &&
++	    (folio_test_active(folio) || lru_gen_enabled())) {
+ 		struct folio_batch *fbatch;
+ 
+ 		folio_get(folio);
 --- a/mm/vmscan.c~mm-multi-gen-lru-groundwork
 +++ a/mm/vmscan.c
-@@ -2983,6 +2983,81 @@ static bool can_age_anon_pages(struct pg
+@@ -3050,6 +3050,81 @@ static bool can_age_anon_pages(struct pg
  	return can_demote(pgdat->node_id, sc);
  }
  
@@ -720,7 +740,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return lruvec;
 +	}
 +#endif
-+	VM_BUG_ON(!mem_cgroup_disabled());
++	VM_WARN_ON_ONCE(!mem_cgroup_disabled());
 +
 +	return pgdat ? &pgdat->__lruvec : NULL;
 +}
@@ -752,8 +772,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	for_each_node(nid) {
 +		struct lruvec *lruvec = get_lruvec(memcg, nid);
 +
-+		VM_BUG_ON(memchr_inv(lruvec->lrugen.nr_pages, 0,
-+				     sizeof(lruvec->lrugen.nr_pages)));
++		VM_WARN_ON_ONCE(memchr_inv(lruvec->lrugen.nr_pages, 0,
++					   sizeof(lruvec->lrugen.nr_pages)));
 +	}
 +}
 +#endif
