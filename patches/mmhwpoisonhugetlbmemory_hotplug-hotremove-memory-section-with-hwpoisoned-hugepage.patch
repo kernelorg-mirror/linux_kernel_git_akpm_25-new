@@ -1,0 +1,129 @@
+From: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Subject: mm,hwpoison,hugetlb,memory_hotplug: hotremove memory section with hwpoisoned hugepage
+Date: Wed, 21 Sep 2022 18:13:56 +0900
+
+Patch series " mm, hwpoison: improve handling workload related to hugetlb
+and memory_hotplug", v3.
+
+This patchset tries to solve the issue among memory_hotplug, hugetlb and
+hwpoison.  Based on the review over v2 by Miaohe (thank you!), 1/4 takes
+another approach to prevent hwpoisoned hugepages to be migrated (i.e.
+the corrupted data is accessed) in memory hotremove.
+
+In this patchset, memory hotplug handles hwpoison pages like below:
+
+  - hwpoison pages should not prevent memory hotremove,
+  - memory block with hwpoison pages should not be onlined.
+
+
+This patch (of 4):
+
+HWPoisoned page is not supposed to be accessed once marked, but currently
+such accesses can happen during memory hotremove because do_migrate_range()
+can be called before dissolve_free_huge_pages() is called.
+
+Clear HPageMigratable for hwpoisoned hugepages to prevent them from being
+migrated.  This should be done in hugetlb_lock to avoid race against
+isolate_hugetlb().
+
+get_hwpoison_huge_page() needs to have a flag to show it's called from
+unpoison to take refcount of hwpoisoned hugepages, so add it.
+
+Link: https://lkml.kernel.org/r/20220921091359.25889-1-naoya.horiguchi@linux.dev
+Link: https://lkml.kernel.org/r/20220921091359.25889-2-naoya.horiguchi@linux.dev
+Signed-off-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Reported-by: Miaohe Lin <linmiaohe@huawei.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/include/linux/hugetlb.h~mmhwpoisonhugetlbmemory_hotplug-hotremove-memory-section-with-hwpoisoned-hugepage
++++ a/include/linux/hugetlb.h
+@@ -183,7 +183,7 @@ bool hugetlb_reserve_pages(struct inode
+ long hugetlb_unreserve_pages(struct inode *inode, long start, long end,
+ 						long freed);
+ int isolate_hugetlb(struct page *page, struct list_head *list);
+-int get_hwpoison_huge_page(struct page *page, bool *hugetlb);
++int get_hwpoison_huge_page(struct page *page, bool *hugetlb, bool unpoison);
+ int get_huge_page_for_hwpoison(unsigned long pfn, int flags);
+ void putback_active_hugepage(struct page *page);
+ void move_hugetlb_state(struct page *oldpage, struct page *newpage, int reason);
+@@ -391,7 +391,7 @@ static inline int isolate_hugetlb(struct
+ 	return -EBUSY;
+ }
+ 
+-static inline int get_hwpoison_huge_page(struct page *page, bool *hugetlb)
++static inline int get_hwpoison_huge_page(struct page *page, bool *hugetlb, bool unpoison)
+ {
+ 	return 0;
+ }
+--- a/mm/hugetlb.c~mmhwpoisonhugetlbmemory_hotplug-hotremove-memory-section-with-hwpoisoned-hugepage
++++ a/mm/hugetlb.c
+@@ -7207,7 +7207,7 @@ unlock:
+ 	return ret;
+ }
+ 
+-int get_hwpoison_huge_page(struct page *page, bool *hugetlb)
++int get_hwpoison_huge_page(struct page *page, bool *hugetlb, bool unpoison)
+ {
+ 	int ret = 0;
+ 
+@@ -7217,7 +7217,7 @@ int get_hwpoison_huge_page(struct page *
+ 		*hugetlb = true;
+ 		if (HPageFreed(page))
+ 			ret = 0;
+-		else if (HPageMigratable(page))
++		else if (HPageMigratable(page) || unpoison)
+ 			ret = get_page_unless_zero(page);
+ 		else
+ 			ret = -EBUSY;
+--- a/mm/memory-failure.c~mmhwpoisonhugetlbmemory_hotplug-hotremove-memory-section-with-hwpoisoned-hugepage
++++ a/mm/memory-failure.c
+@@ -1244,7 +1244,7 @@ static int __get_hwpoison_page(struct pa
+ 	int ret = 0;
+ 	bool hugetlb = false;
+ 
+-	ret = get_hwpoison_huge_page(head, &hugetlb);
++	ret = get_hwpoison_huge_page(head, &hugetlb, false);
+ 	if (hugetlb)
+ 		return ret;
+ 
+@@ -1334,7 +1334,7 @@ static int __get_unpoison_page(struct pa
+ 	int ret = 0;
+ 	bool hugetlb = false;
+ 
+-	ret = get_hwpoison_huge_page(head, &hugetlb);
++	ret = get_hwpoison_huge_page(head, &hugetlb, true);
+ 	if (hugetlb)
+ 		return ret;
+ 
+@@ -1815,6 +1815,13 @@ int __get_huge_page_for_hwpoison(unsigne
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Clearing HPageMigratable for hwpoisoned hugepages to prevent them
++	 * from being migrated by memory hotremove.
++	 */
++	if (count_increased)
++		ClearHPageMigratable(head);
++
+ 	return ret;
+ out:
+ 	if (count_increased)
+@@ -1862,6 +1869,7 @@ retry:
+ 
+ 	if (hwpoison_filter(p)) {
+ 		hugetlb_clear_page_hwpoison(head);
++		SetHPageMigratable(head);
+ 		unlock_page(head);
+ 		if (res == 1)
+ 			put_page(head);
+_
