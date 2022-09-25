@@ -1,0 +1,140 @@
+From: "Zach O'Keefe" <zokeefe@google.com>
+Subject: mm/madvise: add file and shmem support to MADV_COLLAPSE
+Date: Thu, 22 Sep 2022 15:40:39 -0700
+
+Add support for MADV_COLLAPSE to collapse shmem-backed and file-backed
+memory into THPs (requires CONFIG_READ_ONLY_THP_FOR_FS=y).
+
+On success, the backing memory will be a hugepage.  For the memory range
+and process provided, the page tables will synchronously have a huge pmd
+installed, mapping the THP.  Other mappings of the file extent mapped by
+the memory range may be added to a set of entries that khugepaged will
+later process and attempt update their page tables to map the THP by a
+pmd.
+
+This functionality unlocks two important uses:
+
+(1)	Immediately back executable text by THPs.  Current support provided
+	by CONFIG_READ_ONLY_THP_FOR_FS may take a long time on a large
+	system which might impair services from serving at their full rated
+	load after (re)starting.  Tricks like mremap(2)'ing text onto
+	anonymous memory to immediately realize iTLB performance prevents
+	page sharing and demand paging, both of which increase steady state
+	memory footprint.  Now, we can have the best of both worlds: Peak
+	upfront performance and lower RAM footprints.
+
+(2)	userfaultfd-based live migration of virtual machines satisfy UFFD
+	faults by fetching native-sized pages over the network (to avoid
+	latency of transferring an entire hugepage).  However, after guest
+	memory has been fully copied to the new host, MADV_COLLAPSE can
+	be used to immediately increase guest performance.
+
+Since khugepaged is single threaded, this change now introduces
+possibility of collapse contexts racing in file collapse path.  There a
+important few places to consider:
+
+(1)	hpage_collapse_scan_file(), when we xas_pause() and drop RCU.
+	We could have the memory collapsed out from under us, but
+	the next xas_for_each() iteration will correctly pick up the
+	hugepage.  The hugepage might not be up to date (insofar as
+	copying of small page contents might not have completed - the
+	page still may be locked), but regardless what small page index
+	we were iterating over, we'll find the hugepage and identify it
+	as a suitably aligned compound page of order HPAGE_PMD_ORDER.
+
+	In khugepaged path, we locklessly check the value of the pmd,
+	and only add it to deferred collapse array if we find pmd
+	mapping pte table. This is fine, since other values that could
+	have raced in right afterwards denote failure, or that the
+	memory was successfully collapsed, so we don't need further
+	processing.
+
+	In madvise path, we'll take mmap_lock() in write to serialize
+	against page table updates and will know what to do based on the
+	true value of the pmd: recheck all ptes if we point to a pte table,
+	directly install the pmd, if the pmd has been cleared, but
+	memory not yet faulted, or nothing at all if we find a huge pmd.
+
+	It's worth putting emphasis here on how we treat the none pmd
+	here.  If khugepaged has processed this mm's page tables
+	already, it will have left the pmd cleared (ready for refault by
+	the process).  Depending on the VMA flags and sysfs settings,
+	amount of RAM on the machine, and the current load, could be a
+	relatively common occurrence - and as such is one we'd like to
+	handle successfully in MADV_COLLAPSE.  When we see the none pmd
+	in collapse_pte_mapped_thp(), we've locked mmap_lock in write
+	and checked (a) huepaged_vma_check() to see if the backing
+	memory is appropriate still, along with VMA sizing and
+	appropriate hugepage alignment within the file, and (b) we've
+	found a hugepage head of order HPAGE_PMD_ORDER at the offset
+	in the file mapped by our hugepage-aligned virtual address.
+	Even though the common-case is likely race with khugepaged,
+	given these checks (regardless how we got here - we could be
+	operating on a completely different file than originally checked
+	in hpage_collapse_scan_file() for all we know) it should be safe
+	to directly make the pmd a huge pmd pointing to this hugepage.
+
+(2)	collapse_file() is mostly serialized on the same file extent by
+	lock sequence:
+
+		|	lock hupepage
+		|		lock mapping->i_pages
+		|			lock 1st page
+		|		unlock mapping->i_pages
+		|				<page checks>
+		|		lock mapping->i_pages
+		|				page_ref_freeze(3)
+		|				xas_store(hugepage)
+		|		unlock mapping->i_pages
+		|				page_ref_unfreeze(1)
+		|			unlock 1st page
+		V	unlock hugepage
+
+	Once a context (who already has their fresh hugepage locked)
+	locks mapping->i_pages exclusively, it will hold said lock
+	until it locks the first page, and it will hold that lock until
+	the after the hugepage has been added to the page cache (and
+	will unlock the hugepage after page table update, though that
+	isn't important here).
+
+	A racing context that loses the race for mapping->i_pages will
+	then lose the race to locking the first page.  Here - depending
+	on how far the other racing context has gotten - we might find
+	the new hugepage (in which case we'll exit cleanly when we
+	check PageTransCompound()), or we'll find the "old" 1st small
+	page (in which we'll exit cleanly when we discover unexpected
+	refcount of 2 after isolate_lru_page()).  This is assuming we
+	are able to successfully lock the page we find - in shmem path,
+	we could just fail the trylock and exit cleanly anyways.
+
+	Failure path in collapse_file() is similar: once we hold lock
+	on 1st small page, we are serialized against other collapse
+	contexts.  Before the 1st small page is unlocked, we add it
+	back to the pagecache and unfreeze the refcount appropriately.
+	Contexts who lost the race to the 1st small page will then find
+	the same 1st small page with the correct refcount and will be
+	able to proceed.
+
+[shy828301@gmail.com: Delete hugepage_vma_revalidate_anon(), remove
+	check for multi-add in khugepaged_add_pte_mapped_thp()]
+  Link: https://lore.kernel.org/linux-mm/CAHbLzkrtpM=ic7cYAHcqkubah5VTR8N5=k5RT8MTvv5rN1Y91w@mail.gmail.com/
+Link: https://lkml.kernel.org/r/20220907144521.3115321-4-zokeefe@google.com
+Link: https://lkml.kernel.org/r/20220922224046.1143204-4-zokeefe@google.com
+Signed-off-by: Zach O'Keefe <zokeefe@google.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Chris Kennelly <ckennelly@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rongwei Wang <rongwei.wang@linux.alibaba.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
