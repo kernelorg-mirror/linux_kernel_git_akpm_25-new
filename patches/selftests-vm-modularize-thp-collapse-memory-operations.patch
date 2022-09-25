@@ -1,6 +1,6 @@
 From: "Zach O'Keefe" <zokeefe@google.com>
 Subject: selftests/vm: modularize thp collapse memory operations
-Date: Wed, 7 Sep 2022 07:45:17 -0700
+Date: Thu, 22 Sep 2022 15:40:42 -0700
 
 Modularize operations to setup, cleanup, fault, and check for huge pages,
 for a given memory type.  This allows reusing existing tests with
@@ -8,6 +8,7 @@ additional memory types by defining new memory operations.  Following
 patches will add file and shmem memory types.
 
 Link: https://lkml.kernel.org/r/20220907144521.3115321-7-zokeefe@google.com
+Link: https://lkml.kernel.org/r/20220922224046.1143204-7-zokeefe@google.com
 Signed-off-by: Zach O'Keefe <zokeefe@google.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: Chris Kennelly <ckennelly@google.com>
@@ -29,12 +30,10 @@ Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/vm/khugepaged.c |  366 ++++++++++++----------
- 1 file changed, 200 insertions(+), 166 deletions(-)
 
 --- a/tools/testing/selftests/vm/khugepaged.c~selftests-vm-modularize-thp-collapse-memory-operations
 +++ a/tools/testing/selftests/vm/khugepaged.c
-@@ -28,8 +28,16 @@ static int hpage_pmd_nr;
+@@ -29,8 +29,16 @@ static int hpage_pmd_nr;
  #define THP_SYSFS "/sys/kernel/mm/transparent_hugepage/"
  #define PID_SMAPS "/proc/self/smaps"
  
@@ -52,7 +51,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	bool enforce_pte_scan_limits;
  };
  
-@@ -353,11 +361,6 @@ static void save_settings(void)
+@@ -354,11 +362,6 @@ static void save_settings(void)
  	signal(SIGQUIT, restore_settings);
  }
  
@@ -64,7 +63,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #define MAX_LINE_LENGTH 500
  static bool check_swap(void *addr, unsigned long size)
  {
-@@ -431,18 +434,25 @@ static void fill_memory(int *p, unsigned
+@@ -452,18 +455,33 @@ retry:
   * Returns pmd-mapped hugepage in VMA marked VM_HUGEPAGE, filled with
   * validate_memory()'able contents.
   */
@@ -76,10 +75,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -	p = alloc_mapping(1);
 +	ops->fault(p, 0, hpage_pmd_size);
-+	if (madvise(p, hpage_pmd_size, MADV_HUGEPAGE)) {
-+		perror("madvise(MADV_HUGEPAGE)");
-+		exit(EXIT_FAILURE);
-+	}
++
++	/*
++	 * VMA should be neither VM_HUGEPAGE nor VM_NOHUGEPAGE.
++	 * The latter is ineligible for collapse by MADV_COLLAPSE
++	 * while the former might cause MADV_COLLAPSE to race with
++	 * khugepaged on low-load system (like a test machine), which
++	 * would cause MADV_COLLAPSE to fail with EAGAIN.
++	 */
  	printf("Allocate huge page...");
 -	madvise(p, hpage_pmd_size, MADV_HUGEPAGE);
 -	fill_memory(p, 0, hpage_pmd_size);
@@ -87,7 +90,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		success("OK");
 -	else
 -		fail("Fail");
-+	if (madvise(p, hpage_pmd_size, MADV_COLLAPSE)) {
++	if (madvise_collapse_retry(p, hpage_pmd_size)) {
 +		perror("madvise(MADV_COLLAPSE)");
 +		exit(EXIT_FAILURE);
 +	}
@@ -95,11 +98,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		perror("madvise(MADV_COLLAPSE)");
 +		exit(EXIT_FAILURE);
 +	}
++	if (madvise(p, hpage_pmd_size, MADV_HUGEPAGE)) {
++		perror("madvise(MADV_HUGEPAGE)");
++		exit(EXIT_FAILURE);
++	}
 +	success("OK");
  	return p;
  }
  
-@@ -459,18 +469,40 @@ static void validate_memory(int *p, unsi
+@@ -480,18 +498,40 @@ static void validate_memory(int *p, unsi
  	}
  }
  
@@ -147,11 +154,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Prevent khugepaged interference and tests that MADV_COLLAPSE
-@@ -482,9 +514,10 @@ static void madvise_collapse(const char
- 	/* Clear VM_NOHUGEPAGE */
- 	madvise(p, nr_hpages * hpage_pmd_size, MADV_HUGEPAGE);
- 	ret = madvise(p, nr_hpages * hpage_pmd_size, MADV_COLLAPSE);
-+
+@@ -505,7 +545,7 @@ static void madvise_collapse(const char
+ 	ret = madvise_collapse_retry(p, nr_hpages * hpage_pmd_size);
  	if (((bool)ret) == expect)
  		fail("Fail: Bad return value");
 -	else if (check_huge(p, nr_hpages) != expect)
@@ -159,7 +163,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		fail("Fail: check_huge()");
  	else
  		success("OK");
-@@ -492,14 +525,26 @@ static void madvise_collapse(const char
+@@ -513,14 +553,26 @@ static void madvise_collapse(const char
  	pop_settings();
  }
  
@@ -188,7 +192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		printf("Unexpected huge page\n");
  		exit(EXIT_FAILURE);
  	}
-@@ -511,7 +556,7 @@ static bool wait_for_scan(const char *ms
+@@ -532,7 +584,7 @@ static bool wait_for_scan(const char *ms
  
  	printf("%s...", msg);
  	while (timeout--) {
@@ -197,7 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		if (read_num("khugepaged/full_scans") >= full_scans)
  			break;
-@@ -525,19 +570,20 @@ static bool wait_for_scan(const char *ms
+@@ -546,19 +598,20 @@ static bool wait_for_scan(const char *ms
  }
  
  static void khugepaged_collapse(const char *msg, char *p, int nr_hpages,
@@ -223,7 +227,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void alloc_at_fault(void)
-@@ -551,7 +597,7 @@ static void alloc_at_fault(void)
+@@ -572,7 +625,7 @@ static void alloc_at_fault(void)
  	p = alloc_mapping(1);
  	*p = 1;
  	printf("Allocate huge page on fault...");
@@ -232,7 +236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		success("OK");
  	else
  		fail("Fail");
-@@ -560,49 +606,48 @@ static void alloc_at_fault(void)
+@@ -581,49 +634,48 @@ static void alloc_at_fault(void)
  
  	madvise(p, page_size, MADV_DONTNEED);
  	printf("Split huge PMD on MADV_DONTNEED...");
@@ -298,7 +302,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int max_ptes_none = hpage_pmd_nr / 2;
  	struct settings settings = *current_settings();
-@@ -611,30 +656,30 @@ static void collapse_max_ptes_none(struc
+@@ -632,30 +684,30 @@ static void collapse_max_ptes_none(struc
  	settings.khugepaged.max_ptes_none = max_ptes_none;
  	push_settings(&settings);
  
@@ -339,7 +343,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	printf("Swapout one page...");
  	if (madvise(p, page_size, MADV_PAGEOUT)) {
-@@ -648,20 +693,21 @@ static void collapse_swapin_single_pte(s
+@@ -669,20 +721,21 @@ static void collapse_swapin_single_pte(s
  		goto out;
  	}
  
@@ -366,7 +370,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	printf("Swapout %d of %d pages...", max_ptes_swap + 1, hpage_pmd_nr);
  	if (madvise(p, (max_ptes_swap + 1) * page_size, MADV_PAGEOUT)) {
  		perror("madvise(MADV_PAGEOUT)");
-@@ -674,12 +720,12 @@ static void collapse_max_ptes_swap(struc
+@@ -695,12 +748,12 @@ static void collapse_max_ptes_swap(struc
  		goto out;
  	}
  
@@ -381,7 +385,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		printf("Swapout %d of %d pages...", max_ptes_swap,
  		       hpage_pmd_nr);
  		if (madvise(p, max_ptes_swap * page_size, MADV_PAGEOUT)) {
-@@ -694,63 +740,65 @@ static void collapse_max_ptes_swap(struc
+@@ -715,63 +768,65 @@ static void collapse_max_ptes_swap(struc
  		}
  
  		c->collapse("Collapse with max_ptes_swap pages swapped out", p,
@@ -463,7 +467,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			printf("Failed to allocate huge page\n");
  			exit(EXIT_FAILURE);
  		}
-@@ -777,30 +825,30 @@ static void collapse_compound_extreme(st
+@@ -798,30 +853,30 @@ static void collapse_compound_extreme(st
  		}
  	}
  
@@ -503,7 +507,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		success("OK");
  	else
  		fail("Fail");
-@@ -811,17 +859,17 @@ static void collapse_fork(struct collaps
+@@ -832,17 +887,17 @@ static void collapse_fork(struct collaps
  		skip_settings_restore = true;
  		exit_status = 0;
  
@@ -525,7 +529,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		exit(exit_status);
  	}
  
-@@ -829,27 +877,27 @@ static void collapse_fork(struct collaps
+@@ -850,27 +905,27 @@ static void collapse_fork(struct collaps
  	exit_status += WEXITSTATUS(wstatus);
  
  	printf("Check if parent still has small page...");
@@ -558,7 +562,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			success("OK");
  		else
  			fail("Fail");
-@@ -857,20 +905,20 @@ static void collapse_fork_compound(struc
+@@ -878,20 +933,20 @@ static void collapse_fork_compound(struc
  		printf("Split huge page PMD in child process...");
  		madvise(p, page_size, MADV_NOHUGEPAGE);
  		madvise(p, hpage_pmd_size, MADV_NOHUGEPAGE);
@@ -583,7 +587,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		exit(exit_status);
  	}
  
-@@ -878,59 +926,59 @@ static void collapse_fork_compound(struc
+@@ -899,59 +954,59 @@ static void collapse_fork_compound(struc
  	exit_status += WEXITSTATUS(wstatus);
  
  	printf("Check if parent still has huge page...");
@@ -655,7 +659,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		exit(exit_status);
  	}
  
-@@ -938,42 +986,28 @@ static void collapse_max_ptes_shared(str
+@@ -959,42 +1014,28 @@ static void collapse_max_ptes_shared(str
  	exit_status += WEXITSTATUS(wstatus);
  
  	printf("Check if parent still has huge page...");
@@ -709,7 +713,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  int main(int argc, const char **argv)
-@@ -1013,37 +1047,37 @@ int main(int argc, const char **argv)
+@@ -1034,37 +1075,37 @@ int main(int argc, const char **argv)
  		c.collapse = &khugepaged_collapse;
  		c.enforce_pte_scan_limits = true;
  
