@@ -1,6 +1,6 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: mm: drop oom code from exit_mmap
-Date: Mon, 16 May 2022 00:56:18 -0700
+Date: Tue, 31 May 2022 15:30:59 -0700
 
 The primary reason to invoke the oom reaper from the exit_mmap path used
 to be a prevention of an excessive oom killing if the oom victim exit
@@ -23,10 +23,10 @@ evaluated even though it almost never is true.
 [2] 27ae357fa82b ("mm, oom: fix concurrent munlock and oom reaper unmap, v3")
 [3] a213e5cf71cb ("mm/munlock: delete munlock_vma_pages_all(), allow oomreap")
 
-Link: https://lkml.kernel.org/r/20220516075619.1277152-1-surenb@google.com
+[akpm@linux-foundation.org: restore Suren's mmap_read_lock() optimization]
+Link: https://lkml.kernel.org/r/20220531223100.510392-1-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Acked-by: Michal Hocko <mhocko@suse.com>
-Reviewed-by: Shuah Khan <skhan@linuxfoundation.org>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Christian Brauner (Microsoft) <brauner@kernel.org>
 Cc: Christoph Hellwig <hch@infradead.org>
@@ -36,19 +36,21 @@ Cc: Jann Horn <jannh@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Minchan Kim <minchan@kernel.org>
 Cc: Oleg Nesterov <oleg@redhat.com>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Roman Gushchin <guro@fb.com>
 Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/oom.h |    2 --
- mm/mmap.c           |   31 ++++++++++++-------------------
+ mm/mmap.c           |   30 +++++++++++-------------------
  mm/oom_kill.c       |    2 +-
- 3 files changed, 13 insertions(+), 22 deletions(-)
+ 3 files changed, 12 insertions(+), 22 deletions(-)
 
 --- a/include/linux/oom.h~mm-drop-oom-code-from-exit_mmap
 +++ a/include/linux/oom.h
@@ -63,7 +65,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/mmap.c~mm-drop-oom-code-from-exit_mmap
 +++ a/mm/mmap.c
-@@ -3110,30 +3110,13 @@ void exit_mmap(struct mm_struct *mm)
+@@ -3085,30 +3085,13 @@ void exit_mmap(struct mm_struct *mm)
  	/* mm's last user has gone, and its about to be pulled down */
  	mmu_notifier_release(mm);
  
@@ -88,7 +90,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mmap_read_lock(mm);
  	arch_exit_mmap(mm);
  
- 	vma = mm->mmap;
+ 	vma = mas_find(&mas, ULONG_MAX);
  	if (!vma) {
  		/* Can happen if dup_mmap() received an OOM */
 -		mmap_write_unlock(mm);
@@ -96,10 +98,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return;
  	}
  
-@@ -3143,6 +3126,16 @@ void exit_mmap(struct mm_struct *mm)
+@@ -3118,6 +3101,15 @@ void exit_mmap(struct mm_struct *mm)
  	/* update_hiwater_rss(mm) here? but nobody should be looking */
- 	/* Use -1 here to ensure all VMAs in the mm are unmapped */
- 	unmap_vmas(&tlb, vma, 0, -1);
+ 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
+ 	unmap_vmas(&tlb, &mm->mm_mt, vma, 0, ULONG_MAX);
 +	mmap_read_unlock(mm);
 +
 +	/*
@@ -108,11 +110,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * mm_is_oom_victim because setting a bit unconditionally is cheaper.
 +	 */
 +	set_bit(MMF_OOM_SKIP, &mm->flags);
-+
 +	mmap_write_lock(mm);
- 	free_pgtables(&tlb, vma, FIRST_USER_ADDRESS, USER_PGTABLES_CEILING);
+ 	free_pgtables(&tlb, &mm->mm_mt, vma, FIRST_USER_ADDRESS,
+ 		      USER_PGTABLES_CEILING);
  	tlb_finish_mmu(&tlb);
- 
 --- a/mm/oom_kill.c~mm-drop-oom-code-from-exit_mmap
 +++ a/mm/oom_kill.c
 @@ -509,7 +509,7 @@ static DECLARE_WAIT_QUEUE_HEAD(oom_reape

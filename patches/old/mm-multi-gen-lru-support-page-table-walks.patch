@@ -1,6 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm: multi-gen LRU: support page table walks
-Date: Mon, 15 Aug 2022 01:13:27 -0600
+Date: Sun, 18 Sep 2022 02:00:05 -0600
 
 To further exploit spatial locality, the aging prefers to walk page tables
 to search for young PTEs and promote hot pages.  A kill switch will be
@@ -93,7 +93,7 @@ Thanks to the following developers for their efforts [3].
 [2] https://llvm.org/docs/ScudoHardenedAllocator.html
 [3] https://lore.kernel.org/r/202204160827.ekEARWQo-lkp@intel.com/
 
-Link: https://lkml.kernel.org/r/20220815071332.627393-9-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20220918080010.2920238-9-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Acked-by: Brian Geffon <bgeffon@google.com>
 Acked-by: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
@@ -108,7 +108,7 @@ Tested-by: Shuang Zhai <szhai2@cs.rochester.edu>
 Tested-by: Sofia Trinh <sofia.trinh@edi.works>
 Tested-by: Vaibhav Jain <vaibhav@linux.ibm.com>
 Cc: Andi Kleen <ak@linux.intel.com>
-Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
@@ -116,12 +116,14 @@ Cc: Hillf Danton <hdanton@sina.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mel Gorman <mgorman@suse.de>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Michael Larabel <Michael@MichaelLarabel.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mike Rapoport <rppt@linux.ibm.com>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Qi Zheng <zhengqi.arch@bytedance.com>
 Cc: Tejun Heo <tj@kernel.org>
@@ -132,15 +134,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  fs/exec.c                  |    2 
  include/linux/memcontrol.h |    5 
- include/linux/mm_types.h   |   77 ++
+ include/linux/mm_types.h   |   76 ++
  include/linux/mmzone.h     |   56 +
  include/linux/swap.h       |    4 
  kernel/exit.c              |    1 
  kernel/fork.c              |    9 
  kernel/sched/core.c        |    1 
  mm/memcontrol.c            |   25 
- mm/vmscan.c                | 1012 ++++++++++++++++++++++++++++++++++-
- 10 files changed, 1175 insertions(+), 17 deletions(-)
+ mm/vmscan.c                | 1010 ++++++++++++++++++++++++++++++++++-
+ 10 files changed, 1172 insertions(+), 17 deletions(-)
 
 --- a/fs/exec.c~mm-multi-gen-lru-support-page-table-walks
 +++ a/fs/exec.c
@@ -176,23 +178,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/include/linux/mm_types.h~mm-multi-gen-lru-support-page-table-walks
 +++ a/include/linux/mm_types.h
-@@ -3,6 +3,7 @@
- #define _LINUX_MM_TYPES_H
- 
- #include <linux/mm_types_task.h>
-+#include <linux/sched.h>
- 
- #include <linux/auxvec.h>
- #include <linux/kref.h>
-@@ -17,6 +18,7 @@
- #include <linux/page-flags-layout.h>
- #include <linux/workqueue.h>
- #include <linux/seqlock.h>
-+#include <linux/mmdebug.h>
- 
- #include <asm/mmu.h>
- 
-@@ -672,6 +674,22 @@ struct mm_struct {
+@@ -672,6 +672,22 @@ struct mm_struct {
  		 */
  		unsigned long ksm_merging_pages;
  #endif
@@ -215,7 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} __randomize_layout;
  
  	/*
-@@ -698,6 +716,65 @@ static inline cpumask_t *mm_cpumask(stru
+@@ -698,6 +714,66 @@ static inline cpumask_t *mm_cpumask(stru
  	return (struct cpumask *)&mm->cpu_bitmap;
  }
  
@@ -245,11 +231,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline void lru_gen_use_mm(struct mm_struct *mm)
 +{
-+	/* unlikely but not a bug when racing with lru_gen_migrate_mm() */
-+	VM_WARN_ON_ONCE(list_empty(&mm->lru_gen.list));
-+
-+	if (!(current->flags & PF_KTHREAD))
-+		WRITE_ONCE(mm->lru_gen.bitmap, -1);
++	/*
++	 * When the bitmap is set, page reclaim knows this mm_struct has been
++	 * used since the last time it cleared the bitmap. So it might be worth
++	 * walking the page tables of this mm_struct to clear the accessed bit.
++	 */
++	WRITE_ONCE(mm->lru_gen.bitmap, -1);
 +}
 +
 +#else /* !CONFIG_LRU_GEN */
@@ -452,7 +439,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return;
 +
 +	task_lock(task);
-+	if (task->mm && task->mm->owner == task)
++	if (task->mm && READ_ONCE(task->mm->owner) == task)
 +		lru_gen_migrate_mm(task->mm);
 +	task_unlock(task);
 +}
@@ -493,7 +480,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct pglist_data *pgdat = NODE_DATA(nid);
  
-@@ -3128,6 +3130,372 @@ static bool __maybe_unused seq_is_valid(
+@@ -3128,6 +3130,371 @@ static bool __maybe_unused seq_is_valid(
  }
  
  /******************************************************************************
@@ -595,15 +582,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +void lru_gen_migrate_mm(struct mm_struct *mm)
 +{
 +	struct mem_cgroup *memcg;
++	struct task_struct *task = rcu_dereference_protected(mm->owner, true);
 +
-+	lockdep_assert_held(&mm->owner->alloc_lock);
++	VM_WARN_ON_ONCE(task->mm != mm);
++	lockdep_assert_held(&task->alloc_lock);
 +
 +	/* for mm_update_next_owner() */
 +	if (mem_cgroup_disabled())
 +		return;
 +
 +	rcu_read_lock();
-+	memcg = mem_cgroup_from_task(rcu_dereference(mm->owner));
++	memcg = mem_cgroup_from_task(task);
 +	rcu_read_unlock();
 +	if (memcg == mm->lru_gen.memcg)
 +		return;
@@ -750,9 +739,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (size < MIN_LRU_BATCH)
 +		return true;
 +
-+	if (mm_is_oom_victim(mm))
-+		return true;
-+
 +	return !mmget_not_zero(mm);
 +}
 +
@@ -866,7 +852,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *                          refault feedback loop
   ******************************************************************************/
  
-@@ -3277,6 +3645,118 @@ static int folio_inc_gen(struct lruvec *
+@@ -3277,6 +3644,118 @@ static int folio_inc_gen(struct lruvec *
  	return new_gen;
  }
  
@@ -985,7 +971,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static unsigned long get_pte_pfn(pte_t pte, struct vm_area_struct *vma, unsigned long addr)
  {
  	unsigned long pfn = pte_pfn(pte);
-@@ -3295,8 +3775,28 @@ static unsigned long get_pte_pfn(pte_t p
+@@ -3295,8 +3774,28 @@ static unsigned long get_pte_pfn(pte_t p
  	return pfn;
  }
  
@@ -1015,7 +1001,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct folio *folio;
  
-@@ -3311,9 +3811,378 @@ static struct folio *get_pfn_folio(unsig
+@@ -3311,9 +3810,375 @@ static struct folio *get_pfn_folio(unsig
  	if (folio_memcg_rcu(folio) != memcg)
  		return NULL;
  
@@ -1079,7 +1065,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			continue;
 +
 +		if (!ptep_test_and_clear_young(args->vma, addr, pte + i))
-+			continue;
++			VM_WARN_ON_ONCE(true);
 +
 +		young++;
 +		walk->mm_stats[MM_LEAF_YOUNG]++;
@@ -1295,9 +1281,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +		walk_pmd_range(&val, addr, next, args);
 +
-+		if (mm_is_oom_victim(args->mm))
-+			return 1;
-+
 +		/* a racy check to curtail the waiting time */
 +		if (wq_has_sleeper(&walk->lruvec->mm_state.wait))
 +			return 1;
@@ -1394,7 +1377,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void inc_min_seq(struct lruvec *lruvec, int type)
  {
  	struct lru_gen_struct *lrugen = &lruvec->lrugen;
-@@ -3365,7 +4234,7 @@ next:
+@@ -3365,7 +4230,7 @@ next:
  	return success;
  }
  
@@ -1403,17 +1386,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int prev, next;
  	int type, zone;
-@@ -3375,9 +4244,6 @@ static void inc_max_seq(struct lruvec *l
+@@ -3375,9 +4240,6 @@ static void inc_max_seq(struct lruvec *l
  
  	VM_WARN_ON_ONCE(!seq_is_valid(lruvec));
  
 -	if (max_seq != lrugen->max_seq)
 -		goto unlock;
 -
- 	for (type = 0; type < ANON_AND_FILE; type++) {
+ 	for (type = ANON_AND_FILE - 1; type >= 0; type--) {
  		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
  			continue;
-@@ -3415,10 +4281,76 @@ static void inc_max_seq(struct lruvec *l
+@@ -3415,10 +4277,76 @@ static void inc_max_seq(struct lruvec *l
  
  	/* make sure preceding modifications appear */
  	smp_store_release(&lrugen->max_seq, lrugen->max_seq + 1);
@@ -1469,7 +1452,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	} while (mm);
 +done:
 +	if (!success) {
-+		if (sc->priority < DEF_PRIORITY - 2)
++		if (sc->priority <= DEF_PRIORITY - 2)
 +			wait_event_killable(lruvec->mm_state.wait,
 +					    max_seq < READ_ONCE(lrugen->max_seq));
 +
@@ -1488,19 +1471,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return true;
 +}
 +
- static unsigned long get_nr_evictable(struct lruvec *lruvec, unsigned long max_seq,
- 				      unsigned long *min_seq, bool can_swap, bool *need_aging)
+ static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,
+ 			     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)
  {
-@@ -3496,7 +4428,7 @@ static void age_lruvec(struct lruvec *lr
- 	nr_to_scan >>= mem_cgroup_online(memcg) ? sc->priority : 0;
+@@ -3494,7 +4422,7 @@ static void age_lruvec(struct lruvec *lr
  
- 	if (nr_to_scan && need_aging)
+ 	need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, swappiness, &nr_to_scan);
+ 	if (need_aging)
 -		inc_max_seq(lruvec, max_seq, swappiness);
 +		try_to_inc_max_seq(lruvec, max_seq, sc, swappiness);
  }
  
  static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
-@@ -3505,6 +4437,8 @@ static void lru_gen_age_node(struct pgli
+@@ -3503,6 +4431,8 @@ static void lru_gen_age_node(struct pgli
  
  	VM_WARN_ON_ONCE(!current_is_kswapd());
  
@@ -1509,7 +1492,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	memcg = mem_cgroup_iter(NULL, NULL, NULL);
  	do {
  		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
-@@ -3513,11 +4447,16 @@ static void lru_gen_age_node(struct pgli
+@@ -3511,11 +4441,16 @@ static void lru_gen_age_node(struct pgli
  
  		cond_resched();
  	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
@@ -1527,7 +1510,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
  {
-@@ -3526,6 +4465,8 @@ void lru_gen_look_around(struct page_vma
+@@ -3524,6 +4459,8 @@ void lru_gen_look_around(struct page_vma
  	unsigned long start;
  	unsigned long end;
  	unsigned long addr;
@@ -1536,15 +1519,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)] = {};
  	struct folio *folio = pfn_folio(pvmw->pfn);
  	struct mem_cgroup *memcg = folio_memcg(folio);
-@@ -3555,6 +4496,7 @@ void lru_gen_look_around(struct page_vma
- 	}
+@@ -3538,6 +4475,9 @@ void lru_gen_look_around(struct page_vma
+ 	if (spin_is_contended(pvmw->ptl))
+ 		return;
  
- 	pte = pvmw->pte - (pvmw->address - start) / PAGE_SIZE;
++	/* avoid taking the LRU lock under the PTL when possible */
 +	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
++
+ 	start = max(pvmw->address & PMD_MASK, pvmw->vma->vm_start);
+ 	end = min(pvmw->address | ~PMD_MASK, pvmw->vma->vm_end - 1) + 1;
  
- 	rcu_read_lock();
- 	arch_enter_lazy_mmu_mode();
-@@ -3569,13 +4511,15 @@ void lru_gen_look_around(struct page_vma
+@@ -3567,13 +4507,15 @@ void lru_gen_look_around(struct page_vma
  		if (!pte_young(pte[i]))
  			continue;
  
@@ -1554,14 +1539,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			continue;
  
  		if (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))
- 			continue;
+ 			VM_WARN_ON_ONCE(true);
  
 +		young++;
 +
  		if (pte_dirty(pte[i]) && !folio_test_dirty(folio) &&
  		    !(folio_test_anon(folio) && folio_test_swapbacked(folio) &&
  		      !folio_test_swapcache(folio)))
-@@ -3591,7 +4535,11 @@ void lru_gen_look_around(struct page_vma
+@@ -3589,7 +4531,11 @@ void lru_gen_look_around(struct page_vma
  	arch_leave_lazy_mmu_mode();
  	rcu_read_unlock();
  
@@ -1574,7 +1559,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		for_each_set_bit(i, bitmap, MIN_LRU_BATCH) {
  			folio = pfn_folio(pte_pfn(pte[i]));
  			folio_activate(folio);
-@@ -3603,8 +4551,10 @@ void lru_gen_look_around(struct page_vma
+@@ -3601,8 +4547,10 @@ void lru_gen_look_around(struct page_vma
  	if (!mem_cgroup_trylock_pages(memcg))
  		return;
  
@@ -1587,7 +1572,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for_each_set_bit(i, bitmap, MIN_LRU_BATCH) {
  		folio = pfn_folio(pte_pfn(pte[i]));
-@@ -3615,10 +4565,14 @@ void lru_gen_look_around(struct page_vma
+@@ -3613,10 +4561,14 @@ void lru_gen_look_around(struct page_vma
  		if (old_gen < 0 || old_gen == new_gen)
  			continue;
  
@@ -1604,7 +1589,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	mem_cgroup_unlock_pages();
  }
-@@ -3901,6 +4855,7 @@ static int evict_folios(struct lruvec *l
+@@ -3899,6 +4851,7 @@ static int evict_folios(struct lruvec *l
  	struct folio *folio;
  	enum vm_event_item item;
  	struct reclaim_stat stat;
@@ -1612,7 +1597,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
  
-@@ -3937,6 +4892,10 @@ static int evict_folios(struct lruvec *l
+@@ -3935,6 +4888,10 @@ static int evict_folios(struct lruvec *l
  
  	move_pages_to_lru(lruvec, &list);
  
@@ -1623,7 +1608,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
  	if (!cgroup_reclaim(sc))
  		__count_vm_events(item, reclaimed);
-@@ -3953,6 +4912,11 @@ static int evict_folios(struct lruvec *l
+@@ -3951,6 +4908,11 @@ static int evict_folios(struct lruvec *l
  	return scanned;
  }
  
@@ -1633,9 +1618,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *    reclaim.
 + */
  static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,
- 				    bool can_swap, unsigned long reclaimed)
+ 				    bool can_swap)
  {
-@@ -3999,7 +4963,8 @@ static unsigned long get_nr_to_scan(stru
+@@ -3976,7 +4938,8 @@ static unsigned long get_nr_to_scan(stru
  	if (current_is_kswapd())
  		return 0;
  
@@ -1645,7 +1630,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  done:
  	return min_seq[!can_swap] + MIN_NR_GENS <= max_seq ? nr_to_scan : 0;
  }
-@@ -4014,6 +4979,8 @@ static void lru_gen_shrink_lruvec(struct
+@@ -3990,6 +4953,8 @@ static void lru_gen_shrink_lruvec(struct
  
  	blk_start_plug(&plug);
  
@@ -1654,7 +1639,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	while (true) {
  		int delta;
  		int swappiness;
-@@ -4041,6 +5008,8 @@ static void lru_gen_shrink_lruvec(struct
+@@ -4017,6 +4982,8 @@ static void lru_gen_shrink_lruvec(struct
  		cond_resched();
  	}
  
@@ -1663,7 +1648,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	blk_finish_plug(&plug);
  }
  
-@@ -4057,15 +5026,21 @@ void lru_gen_init_lruvec(struct lruvec *
+@@ -4033,15 +5000,21 @@ void lru_gen_init_lruvec(struct lruvec *
  
  	for_each_gen_type_zone(gen, type, zone)
  		INIT_LIST_HEAD(&lrugen->lists[gen][type][zone]);
@@ -1685,7 +1670,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nid;
  
  	for_each_node(nid) {
-@@ -4073,6 +5048,11 @@ void lru_gen_exit_memcg(struct mem_cgrou
+@@ -4049,6 +5022,11 @@ void lru_gen_exit_memcg(struct mem_cgrou
  
  		VM_WARN_ON_ONCE(memchr_inv(lruvec->lrugen.nr_pages, 0,
  					   sizeof(lruvec->lrugen.nr_pages)));

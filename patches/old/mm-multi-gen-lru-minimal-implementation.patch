@@ -1,6 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm: multi-gen LRU: minimal implementation
-Date: Mon, 15 Aug 2022 01:13:25 -0600
+Date: Sun, 18 Sep 2022 02:00:03 -0600
 
 To avoid confusion, the terms "promotion" and "demotion" will be applied
 to the multi-gen LRU, as a new convention; the terms "activation" and
@@ -152,11 +152,11 @@ Client benchmark results:
     CPU: single Snapdragon 7c
     Mem: total 4G
 
-    Chrome OS MemoryPressure [1]
+    ChromeOS MemoryPressure [1]
 
 [1] https://chromium.googlesource.com/chromiumos/platform/tast-tests/
 
-Link: https://lkml.kernel.org/r/20220815071332.627393-7-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20220918080010.2920238-7-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Acked-by: Brian Geffon <bgeffon@google.com>
 Acked-by: Jan Alexander Steffens (heftig) <heftig@archlinux.org>
@@ -171,7 +171,7 @@ Tested-by: Shuang Zhai <szhai2@cs.rochester.edu>
 Tested-by: Sofia Trinh <sofia.trinh@edi.works>
 Tested-by: Vaibhav Jain <vaibhav@linux.ibm.com>
 Cc: Andi Kleen <ak@linux.intel.com>
-Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
@@ -179,12 +179,14 @@ Cc: Hillf Danton <hdanton@sina.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mel Gorman <mgorman@suse.de>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Michael Larabel <Michael@MichaelLarabel.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mike Rapoport <rppt@linux.ibm.com>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Qi Zheng <zhengqi.arch@bytedance.com>
 Cc: Tejun Heo <tj@kernel.org>
@@ -199,9 +201,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  kernel/bounds.c                   |    2 
  mm/Kconfig                        |   11 
  mm/swap.c                         |   39 +
- mm/vmscan.c                       |  815 +++++++++++++++++++++++++++-
+ mm/vmscan.c                       |  792 +++++++++++++++++++++++++++-
  mm/workingset.c                   |  110 +++
- 8 files changed, 1049 insertions(+), 10 deletions(-)
+ 8 files changed, 1025 insertions(+), 11 deletions(-)
 
 --- a/include/linux/mm_inline.h~mm-multi-gen-lru-minimal-implementation
 +++ a/include/linux/mm_inline.h
@@ -291,7 +293,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
 +#define MIN_LRU_BATCH		BITS_PER_LONG
-+#define MAX_LRU_BATCH		(MIN_LRU_BATCH * 128)
++#define MAX_LRU_BATCH		(MIN_LRU_BATCH * 64)
 +
 +/* whether to keep historical stats from evicted generations */
 +#ifdef CONFIG_LRU_GEN_STATS
@@ -471,7 +473,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #define for_each_gen_type_zone(gen, type, zone)				\
  	for ((gen) = 0; (gen) < MAX_NR_GENS; (gen)++)			\
  		for ((type) = 0; (type) < ANON_AND_FILE; (type)++)	\
-@@ -3081,6 +3097,769 @@ static struct lruvec __maybe_unused *get
+@@ -3081,6 +3097,745 @@ static struct lruvec __maybe_unused *get
  	return pgdat ? &pgdat->__lruvec : NULL;
  }
  
@@ -686,7 +688,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (max_seq != lrugen->max_seq)
 +		goto unlock;
 +
-+	for (type = 0; type < ANON_AND_FILE; type++) {
++	for (type = ANON_AND_FILE - 1; type >= 0; type--) {
 +		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
 +			continue;
 +
@@ -727,14 +729,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	spin_unlock_irq(&lruvec->lru_lock);
 +}
 +
-+static unsigned long get_nr_evictable(struct lruvec *lruvec, unsigned long max_seq,
-+				      unsigned long *min_seq, bool can_swap, bool *need_aging)
++static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq, unsigned long *min_seq,
++			     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)
 +{
 +	int gen, type, zone;
 +	unsigned long old = 0;
 +	unsigned long young = 0;
 +	unsigned long total = 0;
 +	struct lru_gen_struct *lrugen = &lruvec->lrugen;
++	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 +
 +	for (type = !can_swap; type < ANON_AND_FILE; type++) {
 +		unsigned long seq;
@@ -750,35 +753,37 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			total += size;
 +			if (seq == max_seq)
 +				young += size;
-+			if (seq + MIN_NR_GENS == max_seq)
++			else if (seq + MIN_NR_GENS == max_seq)
 +				old += size;
 +		}
 +	}
 +
++	/* try to scrape all its memory if this memcg was deleted */
++	*nr_to_scan = mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
++
 +	/*
-+	 * The aging tries to be lazy to reduce the overhead. On the other hand,
-+	 * the eviction stalls when the number of generations reaches
-+	 * MIN_NR_GENS. So ideally, there should be MIN_NR_GENS+1 generations,
-+	 * hence the first two if's.
-+	 *
-+	 * Also it's ideal to spread pages out evenly, meaning 1/(MIN_NR_GENS+1)
-+	 * of the total number of pages for each generation. A reasonable range
-+	 * for this average portion is [1/MIN_NR_GENS, 1/(MIN_NR_GENS+2)]. The
-+	 * eviction cares about the lower bound of cold pages, whereas the aging
-+	 * cares about the upper bound of hot pages.
++	 * The aging tries to be lazy to reduce the overhead, while the eviction
++	 * stalls when the number of generations reaches MIN_NR_GENS. Hence, the
++	 * ideal number of generations is MIN_NR_GENS+1.
 +	 */
 +	if (min_seq[!can_swap] + MIN_NR_GENS > max_seq)
-+		*need_aging = true;
-+	else if (min_seq[!can_swap] + MIN_NR_GENS < max_seq)
-+		*need_aging = false;
-+	else if (young * MIN_NR_GENS > total)
-+		*need_aging = true;
-+	else if (old * (MIN_NR_GENS + 2) < total)
-+		*need_aging = true;
-+	else
-+		*need_aging = false;
++		return true;
++	if (min_seq[!can_swap] + MIN_NR_GENS < max_seq)
++		return false;
 +
-+	return total;
++	/*
++	 * It's also ideal to spread pages out evenly, i.e., 1/(MIN_NR_GENS+1)
++	 * of the total number of pages for each generation. A reasonable range
++	 * for this average portion is [1/MIN_NR_GENS, 1/(MIN_NR_GENS+2)]. The
++	 * aging cares about the upper bound of hot pages, while the eviction
++	 * cares about the lower bound of cold pages.
++	 */
++	if (young * MIN_NR_GENS > total)
++		return true;
++	if (old * (MIN_NR_GENS + 2) < total)
++		return true;
++
++	return false;
 +}
 +
 +static void age_lruvec(struct lruvec *lruvec, struct scan_control *sc)
@@ -797,13 +802,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (mem_cgroup_below_min(memcg))
 +		return;
 +
-+	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, swappiness, &need_aging);
-+	if (!nr_to_scan)
-+		return;
-+
-+	nr_to_scan >>= mem_cgroup_online(memcg) ? sc->priority : 0;
-+
-+	if (nr_to_scan && need_aging)
++	need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, swappiness, &nr_to_scan);
++	if (need_aging)
 +		inc_max_seq(lruvec, max_seq, swappiness);
 +}
 +
@@ -1148,45 +1148,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +static unsigned long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc,
-+				    bool can_swap, unsigned long reclaimed)
++				    bool can_swap)
 +{
-+	int priority;
 +	bool need_aging;
 +	unsigned long nr_to_scan;
 +	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 +	DEFINE_MAX_SEQ(lruvec);
 +	DEFINE_MIN_SEQ(lruvec);
 +
-+	if (fatal_signal_pending(current)) {
-+		sc->nr_reclaimed += MIN_LRU_BATCH;
-+		return 0;
-+	}
-+
 +	if (mem_cgroup_below_min(memcg) ||
 +	    (mem_cgroup_below_low(memcg) && !sc->memcg_low_reclaim))
 +		return 0;
 +
-+	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, can_swap, &need_aging);
-+	if (!nr_to_scan)
-+		return 0;
-+
-+	/* adjust priority if memcg is offline or the target is met */
-+	if (!mem_cgroup_online(memcg))
-+		priority = 0;
-+	else if (sc->nr_reclaimed - reclaimed >= sc->nr_to_reclaim)
-+		priority = DEF_PRIORITY;
-+	else
-+		priority = sc->priority;
-+
-+	nr_to_scan >>= priority;
-+	if (!nr_to_scan)
-+		return 0;
-+
++	need_aging = should_run_aging(lruvec, max_seq, min_seq, sc, can_swap, &nr_to_scan);
 +	if (!need_aging)
 +		return nr_to_scan;
 +
 +	/* skip the aging path at the default priority */
-+	if (priority == DEF_PRIORITY)
++	if (sc->priority == DEF_PRIORITY)
 +		goto done;
 +
 +	/* leave the work to lru_gen_age_node() */
@@ -1202,7 +1181,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct blk_plug plug;
 +	unsigned long scanned = 0;
-+	unsigned long reclaimed = sc->nr_reclaimed;
 +
 +	lru_add_drain();
 +
@@ -1220,7 +1198,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		else
 +			swappiness = 0;
 +
-+		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness, reclaimed);
++		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
 +		if (!nr_to_scan)
 +			break;
 +
@@ -1241,7 +1219,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /******************************************************************************
   *                          initialization
   ******************************************************************************/
-@@ -3123,6 +3902,16 @@ static int __init init_lru_gen(void)
+@@ -3123,6 +3878,16 @@ static int __init init_lru_gen(void)
  };
  late_initcall(init_lru_gen);
  
@@ -1258,7 +1236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif /* CONFIG_LRU_GEN */
  
  static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
-@@ -3136,6 +3925,11 @@ static void shrink_lruvec(struct lruvec
+@@ -3136,6 +3901,11 @@ static void shrink_lruvec(struct lruvec
  	bool proportional_reclaim;
  	struct blk_plug plug;
  
@@ -1270,7 +1248,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	get_scan_count(lruvec, sc, nr);
  
  	/* Record the original scan target for proportional adjustments later */
-@@ -3640,6 +4434,9 @@ static void snapshot_refaults(struct mem
+@@ -3640,6 +4410,9 @@ static void snapshot_refaults(struct mem
  	struct lruvec *target_lruvec;
  	unsigned long refaults;
  
@@ -1280,13 +1258,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	target_lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
  	refaults = lruvec_page_state(target_lruvec, WORKINGSET_ACTIVATE_ANON);
  	target_lruvec->refaults[WORKINGSET_ANON] = refaults;
-@@ -4006,12 +4803,17 @@ unsigned long try_to_free_mem_cgroup_pag
+@@ -4006,12 +4779,16 @@ unsigned long try_to_free_mem_cgroup_pag
  }
  #endif
  
 -static void age_active_anon(struct pglist_data *pgdat,
-+static void kswapd_age_node(struct pglist_data *pgdat,
- 				struct scan_control *sc)
+-				struct scan_control *sc)
++static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  {
  	struct mem_cgroup *memcg;
  	struct lruvec *lruvec;
@@ -1299,7 +1277,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!can_age_anon_pages(pgdat, sc))
  		return;
  
-@@ -4331,12 +5133,11 @@ restart:
+@@ -4331,12 +5108,11 @@ restart:
  		sc.may_swap = !nr_boost_reclaim;
  
  		/*

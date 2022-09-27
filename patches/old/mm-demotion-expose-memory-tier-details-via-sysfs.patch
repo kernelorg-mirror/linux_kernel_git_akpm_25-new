@@ -1,49 +1,52 @@
 From: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
 Subject: mm/demotion: expose memory tier details via sysfs
-Date: Mon, 29 Aug 2022 11:37:45 +0530
+Date: Tue, 30 Aug 2022 13:47:36 +0530
 
-This patch adds /sys/devices/virtual/memory_tiering/ where all memory tier
-related details can be found.  All allocated memory tiers will be listed
-there as /sys/devices/virtual/memory_tiering/memory_tierN/
+Add /sys/devices/virtual/memory_tiering/ where all memory tier related
+details can be found.  All allocated memory tiers will be listed there as
+/sys/devices/virtual/memory_tiering/memory_tierN/
 
 The nodes which are part of a specific memory tier can be listed via
 /sys/devices/virtual/memory_tiering/memory_tierN/nodes
 
-The abstract distance range value of a specific memory tier can be listed
-via /sys/devices/virtual/memory_tiering/memory_tierN/abstract_distance
-
 A directory hierarchy looks like
 :/sys/devices/virtual/memory_tiering$ tree memory_tier4/
 memory_tier4/
-├── abstract_distance
 ├── nodes
 ├── subsystem -> ../../../../bus/memory_tiering
 └── uevent
 
-All toptier nodes are listed via
-/sys/devices/virtual/memory_tiering/toptier_nodes
-
-:/sys/devices/virtual/memory_tiering$ cat toptier_nodes
-0,2
 :/sys/devices/virtual/memory_tiering$ cat memory_tier4/nodes
 0,2
-:/sys/devices/virtual/memory_tiering$ cat memory_tier4/abstract_distance
-512 - 639
 
-Link: https://lkml.kernel.org/r/20220829060745.287468-1-aneesh.kumar@linux.ibm.com
+[aneesh.kumar@linux.ibm.com: drop toptier_nodes from sysfs]
+  Link: https://lkml.kernel.org/r/20220922102201.62168-1-aneesh.kumar@linux.ibm.com
+Link: https://lkml.kernel.org/r/20220830081736.119281-1-aneesh.kumar@linux.ibm.com
 Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
-Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Bharata B Rao <bharata@amd.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Hesham Almatary <hesham.almatary@huawei.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Jagdish Gediya <jvgediya.oss@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Tim Chen <tim.c.chen@intel.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- Documentation/ABI/testing/sysfs-kernel-mm-memory-tiers |   41 ++
- mm/memory-tiers.c                                      |  155 ++++++++--
- 2 files changed, 174 insertions(+), 22 deletions(-)
+ Documentation/ABI/testing/sysfs-kernel-mm-memory-tiers |   25 ++
+ mm/memory-tiers.c                                      |  109 +++++++---
+ 2 files changed, 112 insertions(+), 22 deletions(-)
 
 --- /dev/null
 +++ a/Documentation/ABI/testing/sysfs-kernel-mm-memory-tiers
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,25 @@
 +What:		/sys/devices/virtual/memory_tiering/
 +Date:		August 2022
 +Contact:	Linux memory management mailing list <linux-mm@kvack.org>
@@ -56,7 +59,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +
 +What:		/sys/devices/virtual/memory_tiering/memory_tierN/
-+		/sys/devices/virtual/memory_tiering/memory_tierN/abstract_distance
 +		/sys/devices/virtual/memory_tiering/memory_tierN/nodes
 +Date:		August 2022
 +Contact:	Linux memory management mailing list <linux-mm@kvack.org>
@@ -68,22 +70,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		A smaller value of N implies a higher (faster) memory tier in the
 +		hierarchy.
 +
-+		abstract_distance: The abstract distance range this specific memory
-+		tier maps to.
-+
 +		nodes: NUMA nodes that are part of this memory tier.
-+
-+
-+What:		/sys/devices/virtual/memory_tiering/toptier_nodes
-+Date:		August 2022
-+Contact:	Linux memory management mailing list <linux-mm@kvack.org>
-+Description:	Toptier node mask
-+
-+		A toptier is defined as the memory tier from which memory promotion
-+		is not done by the kernel.
-+
-+		toptier_nodes: NUMA nodes that are part of all the memory tiers
-+		above a topier tier.
 +
 --- a/mm/memory-tiers.c~mm-demotion-expose-memory-tier-details-via-sysfs
 +++ a/mm/memory-tiers.c
@@ -95,12 +82,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* All the nodes that are part of all the lower memory tiers. */
  	nodemask_t lower_tier_mask;
  };
-@@ -36,6 +37,13 @@ static DEFINE_MUTEX(memory_tier_lock);
+@@ -36,6 +37,12 @@ static DEFINE_MUTEX(memory_tier_lock);
  static LIST_HEAD(memory_tiers);
  static struct node_memory_type_map node_memory_types[MAX_NUMNODES];
  static struct memory_dev_type *default_dram_type;
 +
-+#define to_memory_tier(device) container_of(device, struct memory_tier, dev)
 +static struct bus_type memory_tier_subsys = {
 +	.name = "memory_tiering",
 +	.dev_name = "memory_tier",
@@ -109,10 +95,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_MIGRATION
  static int top_tier_adistance;
  /*
-@@ -98,8 +106,73 @@ static int top_tier_adistance;
+@@ -98,8 +105,63 @@ static int top_tier_adistance;
  static struct demotion_nodes *node_demotion __read_mostly;
  #endif /* CONFIG_MIGRATION */
  
++static inline struct memory_tier *to_memory_tier(struct device *device)
++{
++	return container_of(device, struct memory_tier, dev);
++}
++
 +static __always_inline nodemask_t get_memtier_nodemask(struct memory_tier *memtier)
 +{
 +	nodemask_t nodes = NODE_MASK_NONE;
@@ -148,23 +139,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +static DEVICE_ATTR_RO(nodes);
 +
-+static ssize_t abstract_distance_show(struct device *dev,
-+				      struct device_attribute *attr, char *buf)
-+{
-+	int ret;
-+	struct memory_tier *memtier = to_memory_tier(dev);
-+
-+	mutex_lock(&memory_tier_lock);
-+	ret = sysfs_emit(buf, "%d - %d\n", memtier->adistance_start,
-+			 memtier->adistance_start + MEMTIER_CHUNK_SIZE - 1);
-+	mutex_unlock(&memory_tier_lock);
-+	return ret;
-+}
-+static DEVICE_ATTR_RO(abstract_distance);
-+
 +static struct attribute *memtier_dev_attrs[] = {
 +	&dev_attr_nodes.attr,
-+	&dev_attr_abstract_distance.attr,
 +	NULL
 +};
 +
@@ -183,7 +159,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	bool found_slot = false;
  	struct memory_tier *memtier, *new_memtier;
  	int adistance = memtype->adistance;
-@@ -123,15 +196,14 @@ static struct memory_tier *find_create_m
+@@ -123,15 +185,14 @@ static struct memory_tier *find_create_m
  
  	list_for_each_entry(memtier, &memory_tiers, list) {
  		if (adistance == memtier->adistance_start) {
@@ -201,7 +177,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!new_memtier)
  		return ERR_PTR(-ENOMEM);
  
-@@ -142,8 +214,23 @@ static struct memory_tier *find_create_m
+@@ -142,8 +203,23 @@ static struct memory_tier *find_create_m
  		list_add_tail(&new_memtier->list, &memtier->list);
  	else
  		list_add_tail(&new_memtier->list, &memory_tiers);
@@ -227,7 +203,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static struct memory_tier *__node_get_memory_tier(int node)
-@@ -275,17 +362,6 @@ static void disable_all_demotion_targets
+@@ -275,17 +351,6 @@ static void disable_all_demotion_targets
  	synchronize_rcu();
  }
  
@@ -245,7 +221,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Find an automatic demotion target for all memory
   * nodes. Failing here is OK.  It might just indicate
-@@ -432,11 +508,7 @@ static struct memory_tier *set_node_memo
+@@ -433,11 +498,7 @@ static struct memory_tier *set_node_memo
  static void destroy_memory_tier(struct memory_tier *memtier)
  {
  	list_del(&memtier->list);
@@ -258,52 +234,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static bool clear_node_memory_tier(int node)
-@@ -563,11 +635,50 @@ static int __meminit memtier_hotplug_cal
- 	return notifier_from_errno(0);
- }
+@@ -566,9 +627,13 @@ static int __meminit memtier_hotplug_cal
  
-+static ssize_t toptier_nodes_show(struct device *dev,
-+				     struct device_attribute *attr, char *buf)
-+{
-+	int ret;
-+	nodemask_t nmask, top_tier_mask = NODE_MASK_NONE;
-+	struct memory_tier *memtier = to_memory_tier(dev);
-+
-+	mutex_lock(&memory_tier_lock);
-+	list_for_each_entry(memtier, &memory_tiers, list) {
-+		if (memtier->adistance_start >= top_tier_adistance)
-+			break;
-+		nmask = get_memtier_nodemask(memtier);
-+		nodes_or(top_tier_mask, top_tier_mask, nmask);
-+	}
-+
-+	ret = sysfs_emit(buf, "%*pbl\n", nodemask_pr_args(&top_tier_mask));
-+	mutex_unlock(&memory_tier_lock);
-+	return ret;
-+}
-+static DEVICE_ATTR_RO(toptier_nodes);
-+
-+static struct attribute *memtier_subsys_attrs[] = {
-+	&dev_attr_toptier_nodes.attr,
-+	NULL
-+};
-+
-+static const struct attribute_group memtier_subsys_group = {
-+	.attrs = memtier_subsys_attrs,
-+};
-+
-+static const struct attribute_group *memtier_subsys_groups[] = {
-+	&memtier_subsys_group,
-+	NULL
-+};
-+
  static int __init memory_tier_init(void)
  {
 -	int node;
 +	int ret, node;
  	struct memory_tier *memtier;
  
-+	ret = subsys_virtual_register(&memory_tier_subsys, memtier_subsys_groups);
++	ret = subsys_virtual_register(&memory_tier_subsys, NULL);
 +	if (ret)
 +		panic("%s() failed to register memory tier subsystem\n", __func__);
 +

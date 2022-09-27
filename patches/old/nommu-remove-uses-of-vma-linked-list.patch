@@ -1,27 +1,27 @@
 From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
 Subject: nommu: remove uses of VMA linked list
-Date: Mon, 22 Aug 2022 15:06:32 +0000
+Date: Tue, 6 Sep 2022 19:49:05 +0000
 
 Use the maple tree or VMA iterator instead.  This is faster and will allow
 us to shrink the VMA.
 
-Link: https://lkml.kernel.org/r/20220822150128.1562046-66-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20220906194824.2110408-66-Liam.Howlett@oracle.com
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
 Signed-off-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Tested-by: Yu Zhao <yuzhao@google.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: David Howells <dhowells@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Sven Schnelle <svens@linux.ibm.com>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yu Zhao <yuzhao@google.com>
-Cc: Davidlohr Bueso <dave@stgolabs.net>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/nommu.c |  135 ++++++++++++++++++++++++++++++++++++++-------------
- 1 file changed, 101 insertions(+), 34 deletions(-)
+ mm/nommu.c |  146 ++++++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 109 insertions(+), 37 deletions(-)
 
 --- a/mm/nommu.c~nommu-remove-uses-of-vma-linked-list
 +++ a/mm/nommu.c
@@ -205,7 +205,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* we're only permitted to split anonymous regions (these should have
  	 * only a single usage on the region) */
-@@ -1333,7 +1382,6 @@ int split_vma(struct mm_struct *mm, stru
+@@ -1312,9 +1361,13 @@ int split_vma(struct mm_struct *mm, stru
+ 		return -ENOMEM;
+ 
+ 	new = vm_area_dup(vma);
+-	if (!new) {
+-		kmem_cache_free(vm_region_jar, region);
+-		return -ENOMEM;
++	if (!new)
++		goto err_vma_dup;
++
++	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
++		pr_warn("Allocation of vma tree for process %d failed\n",
++			current->pid);
++		goto err_mas_preallocate;
+ 	}
+ 
+ 	/* most fields are the same, copy all, and then fixup */
+@@ -1333,7 +1386,6 @@ int split_vma(struct mm_struct *mm, stru
  	if (new->vm_ops && new->vm_ops->open)
  		new->vm_ops->open(new);
  
@@ -213,17 +230,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	down_write(&nommu_region_sem);
  	delete_nommu_region(vma->vm_region);
  	if (new_below) {
-@@ -1346,8 +1394,17 @@ int split_vma(struct mm_struct *mm, stru
+@@ -1346,9 +1398,19 @@ int split_vma(struct mm_struct *mm, stru
  	add_nommu_region(vma->vm_region);
  	add_nommu_region(new->vm_region);
  	up_write(&nommu_region_sem);
 -	add_vma_to_mm(mm, vma);
 -	add_vma_to_mm(mm, new);
-+	if (mas_preallocate(&mas, vma, GFP_KERNEL)) {
-+		pr_warn("Allocation of vma tree for process %d failed\n",
-+		       current->pid);
-+		return -ENOMEM;
-+	}
 +
 +	setup_vma_to_mm(vma, mm);
 +	setup_vma_to_mm(new, mm);
@@ -231,9 +243,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mas_store(&mas, vma);
 +	vma_mas_store(new, &mas);
  	return 0;
++
++err_mas_preallocate:
++	vm_area_free(new);
++err_vma_dup:
++	kmem_cache_free(vm_region_jar, region);
++	return -ENOMEM;
  }
  
-@@ -1363,12 +1420,14 @@ static int shrink_vma(struct mm_struct *
+ /*
+@@ -1363,12 +1425,14 @@ static int shrink_vma(struct mm_struct *
  
  	/* adjust the VMA's pointers, which may reposition it in the MM's tree
  	 * and list */
@@ -250,7 +269,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* cut the backing region down to size */
  	region = vma->vm_region;
-@@ -1396,9 +1455,10 @@ static int shrink_vma(struct mm_struct *
+@@ -1396,9 +1460,10 @@ static int shrink_vma(struct mm_struct *
   */
  int do_munmap(struct mm_struct *mm, unsigned long start, size_t len, struct list_head *uf)
  {
@@ -262,7 +281,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	len = PAGE_ALIGN(len);
  	if (len == 0)
-@@ -1407,7 +1467,7 @@ int do_munmap(struct mm_struct *mm, unsi
+@@ -1407,7 +1472,7 @@ int do_munmap(struct mm_struct *mm, unsi
  	end = start + len;
  
  	/* find the first potentially overlapping VMA */
@@ -271,7 +290,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!vma) {
  		static int limit;
  		if (limit < 5) {
-@@ -1426,7 +1486,7 @@ int do_munmap(struct mm_struct *mm, unsi
+@@ -1426,7 +1491,7 @@ int do_munmap(struct mm_struct *mm, unsi
  				return -EINVAL;
  			if (end == vma->vm_end)
  				goto erase_whole_vma;
@@ -280,7 +299,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		} while (vma);
  		return -EINVAL;
  	} else {
-@@ -1448,9 +1508,10 @@ int do_munmap(struct mm_struct *mm, unsi
+@@ -1448,9 +1513,10 @@ int do_munmap(struct mm_struct *mm, unsi
  	}
  
  erase_whole_vma:
@@ -293,7 +312,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  int vm_munmap(unsigned long addr, size_t len)
-@@ -1475,6 +1536,7 @@ SYSCALL_DEFINE2(munmap, unsigned long, a
+@@ -1475,6 +1541,7 @@ SYSCALL_DEFINE2(munmap, unsigned long, a
   */
  void exit_mmap(struct mm_struct *mm)
  {
@@ -301,7 +320,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct vm_area_struct *vma;
  
  	if (!mm)
-@@ -1482,13 +1544,18 @@ void exit_mmap(struct mm_struct *mm)
+@@ -1482,13 +1549,18 @@ void exit_mmap(struct mm_struct *mm)
  
  	mm->total_vm = 0;
  
