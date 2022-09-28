@@ -1,16 +1,23 @@
 From: John Hubbard <jhubbard@nvidia.com>
 Subject: fuse: convert direct IO paths to use FOLL_PIN
-Date: Sat, 27 Aug 2022 01:36:07 -0700
+Date: Tue, 30 Aug 2022 21:18:43 -0700
 
 Convert the fuse filesystem to use pin_user_pages_fast() and
 unpin_user_page(), instead of get_user_pages_fast() and put_page().
 
-Link: https://lkml.kernel.org/r/20220827083607.2345453-7-jhubbard@nvidia.com
+The user of pin_user_pages_fast() depends upon:
+
+1) CONFIG_BLK_USE_PIN_USER_PAGES_FOR_DIO, and
+
+2) User-space-backed pages or ITER_BVEC pages.
+
+Link: https://lkml.kernel.org/r/20220831041843.973026-8-jhubbard@nvidia.com
 Signed-off-by: John Hubbard <jhubbard@nvidia.com>
 Cc: Alexander Viro <viro@zeniv.linux.org.uk>
 Cc: Anna Schumaker <anna@kernel.org>
 Cc: Christoph Hellwig <hch@infradead.org>
-Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Logan Gunthorpe <logang@deltatee.com>
@@ -19,30 +26,33 @@ Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/fuse/dev.c    |    8 ++++++--
- fs/fuse/file.c   |   31 ++++++++++++++++++++-----------
+ fs/fuse/dev.c    |   11 +++++++++--
+ fs/fuse/file.c   |   32 +++++++++++++++++++++-----------
  fs/fuse/fuse_i.h |    1 +
- 3 files changed, 27 insertions(+), 13 deletions(-)
+ 3 files changed, 31 insertions(+), 13 deletions(-)
 
 --- a/fs/fuse/dev.c~fuse-convert-direct-io-paths-to-use-foll_pin
 +++ a/fs/fuse/dev.c
-@@ -675,7 +675,10 @@ static void fuse_copy_finish(struct fuse
+@@ -675,7 +675,12 @@ static void fuse_copy_finish(struct fuse
  			flush_dcache_page(cs->pg);
  			set_page_dirty_lock(cs->pg);
  		}
 -		put_page(cs->pg);
-+		if (cs->pipebufs)
-+			put_page(cs->pg);
-+		else
++		if (!cs->pipebufs &&
++		    (user_backed_iter(cs->iter) || iov_iter_is_bvec(cs->iter)))
 +			dio_w_unpin_user_page(cs->pg);
++
++		else
++			put_page(cs->pg);
  	}
  	cs->pg = NULL;
  }
-@@ -730,7 +733,8 @@ static int fuse_copy_fill(struct fuse_co
+@@ -730,7 +735,9 @@ static int fuse_copy_fill(struct fuse_co
  		}
  	} else {
  		size_t off;
 -		err = iov_iter_get_pages2(cs->iter, &page, PAGE_SIZE, 1, &off);
++
 +		err = dio_w_iov_iter_pin_pages(cs->iter, &page, PAGE_SIZE, 1,
 +					       &off);
  		if (err < 0)
@@ -55,7 +65,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static void fuse_release_user_pages(struct fuse_args_pages *ap,
 -				    bool should_dirty)
-+				    bool should_dirty, bool is_kvec)
++				    bool should_dirty, bool is_user_or_bvec)
  {
  	unsigned int i;
  
@@ -63,15 +73,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (should_dirty)
 -			set_page_dirty_lock(ap->pages[i]);
 -		put_page(ap->pages[i]);
-+	if (is_kvec) {
++	if (is_user_or_bvec) {
++		dio_w_unpin_user_pages_dirty_lock(ap->pages, ap->num_pages,
++						  should_dirty);
++	} else {
 +		for (i = 0; i < ap->num_pages; i++) {
 +			if (should_dirty)
 +				set_page_dirty_lock(ap->pages[i]);
 +			put_page(ap->pages[i]);
 +		}
-+	} else {
-+		dio_w_unpin_user_pages_dirty_lock(ap->pages, ap->num_pages,
-+						  should_dirty);
  	}
  }
  
@@ -80,7 +90,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	ssize_t pos = -1;
  
 -	fuse_release_user_pages(&ia->ap, io->should_dirty);
-+	fuse_release_user_pages(&ia->ap, io->should_dirty, io->is_kvec);
++	fuse_release_user_pages(&ia->ap, io->should_dirty, io->is_user_or_bvec);
  
  	if (err) {
  		/* Nothing */
@@ -99,23 +109,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (ret < 0)
  			break;
  
-@@ -1483,6 +1488,9 @@ ssize_t fuse_direct_io(struct fuse_io_pr
+@@ -1483,6 +1488,10 @@ ssize_t fuse_direct_io(struct fuse_io_pr
  		fl_owner_t owner = current->files;
  		size_t nbytes = min(count, nmax);
  
 +		/* For use in fuse_release_user_pages(): */
-+		io->is_kvec = iov_iter_is_kvec(iter);
++		io->is_user_or_bvec = user_backed_iter(iter) ||
++				      iov_iter_is_bvec(iter);
 +
  		err = fuse_get_user_pages(&ia->ap, iter, &nbytes, write,
  					  max_pages);
  		if (err && !nbytes)
-@@ -1498,7 +1506,8 @@ ssize_t fuse_direct_io(struct fuse_io_pr
+@@ -1498,7 +1507,8 @@ ssize_t fuse_direct_io(struct fuse_io_pr
  		}
  
  		if (!io->async || nres < 0) {
 -			fuse_release_user_pages(&ia->ap, io->should_dirty);
 +			fuse_release_user_pages(&ia->ap, io->should_dirty,
-+						io->is_kvec);
++						io->is_user_or_bvec);
  			fuse_io_free(ia);
  		}
  		ia = NULL;
@@ -125,7 +136,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct kiocb *iocb;
  	struct completion *done;
  	bool blocking;
-+	bool is_kvec;
++	bool is_user_or_bvec;
  };
  
  #define FUSE_IO_PRIV_SYNC(i) \
