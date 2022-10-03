@@ -1,6 +1,6 @@
 From: Alexander Potapenko <glider@google.com>
 Subject: kmsan: add KMSAN runtime core
-Date: Mon, 5 Sep 2022 14:24:19 +0200
+Date: Thu, 15 Sep 2022 17:03:45 +0200
 
 For each memory location KernelMemorySanitizer maintains two types of
 metadata:
@@ -41,7 +41,7 @@ certain memory regions as uninitialized or initialized (this is called
 "poisoning" and "unpoisoning") or check that a particular region is
 initialized.
 
-Link: https://lkml.kernel.org/r/20220905122452.2258262-12-glider@google.com
+Link: https://lkml.kernel.org/r/20220915150417.722975-12-glider@google.com
 Signed-off-by: Alexander Potapenko <glider@google.com>
 Acked-by: Marco Elver <elver@google.com>
 Cc: Alexander Viro <viro@zeniv.linux.org.uk>
@@ -56,6 +56,7 @@ Cc: Christoph Lameter <cl@linux.com>
 Cc: David Rientjes <rientjes@google.com>
 Cc: Dmitry Vyukov <dvyukov@google.com>
 Cc: Eric Biggers <ebiggers@google.com>
+Cc: Eric Biggers <ebiggers@kernel.org>
 Cc: Eric Dumazet <edumazet@google.com>
 Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Cc: Herbert Xu <herbert@gondor.apana.org.au>
@@ -64,13 +65,13 @@ Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
 Cc: Kees Cook <keescook@chromium.org>
-Cc: Liu Shixin <liushixin2@huawei.com>
 Cc: Mark Rutland <mark.rutland@arm.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Michael S. Tsirkin <mst@redhat.com>
 Cc: Pekka Enberg <penberg@kernel.org>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Petr Mladek <pmladek@suse.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
 Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Thomas Gleixner <tglx@linutronix.de>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
@@ -88,15 +89,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  lib/Kconfig.kmsan            |   50 +++
  mm/Makefile                  |    1 
  mm/kmsan/Makefile            |   23 +
- mm/kmsan/core.c              |  448 +++++++++++++++++++++++++++++++++
+ mm/kmsan/core.c              |  440 +++++++++++++++++++++++++++++++++
  mm/kmsan/hooks.c             |   66 ++++
- mm/kmsan/instrumentation.c   |  307 ++++++++++++++++++++++
- mm/kmsan/kmsan.h             |  203 ++++++++++++++
- mm/kmsan/report.c            |  211 +++++++++++++++
- mm/kmsan/shadow.c            |  147 ++++++++++
+ mm/kmsan/instrumentation.c   |  307 +++++++++++++++++++++++
+ mm/kmsan/kmsan.h             |  204 +++++++++++++++
+ mm/kmsan/report.c            |  219 ++++++++++++++++
+ mm/kmsan/shadow.c            |  147 +++++++++++
  scripts/Makefile.kmsan       |    8 
  scripts/Makefile.lib         |    9 
- 17 files changed, 1591 insertions(+)
+ 17 files changed, 1592 insertions(+)
 
 --- /dev/null
 +++ a/include/linux/kmsan-checks.h
@@ -205,7 +206,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#endif /* _LINUX_KMSAN_TYPES_H */
 --- a/include/linux/mm_types.h~kmsan-add-kmsan-runtime-core
 +++ a/include/linux/mm_types.h
-@@ -225,6 +225,18 @@ struct page {
+@@ -224,6 +224,18 @@ struct page {
  					   not kmapped, ie. highmem) */
  #endif /* WANT_PAGE_VIRTUAL */
  
@@ -320,7 +321,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  include-$(CONFIG_RANDSTRUCT)	+= scripts/Makefile.randstruct
 --- /dev/null
 +++ a/mm/kmsan/core.c
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,440 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * KMSAN runtime library.
@@ -351,13 +352,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +#include "../slab.h"
 +#include "kmsan.h"
-+
-+/*
-+ * Avoid creating too long origin chains, these are unlikely to participate in
-+ * real reports.
-+ */
-+#define MAX_CHAIN_DEPTH 7
-+#define NUM_SKIPPED_TO_WARN 10000
 +
 +bool kmsan_enabled __read_mostly;
 +
@@ -542,23 +536,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * Make sure we have enough spare bits in @id to hold the UAF bit and
 +	 * the chain depth.
 +	 */
-+	BUILD_BUG_ON((1 << STACK_DEPOT_EXTRA_BITS) <= (MAX_CHAIN_DEPTH << 1));
++	BUILD_BUG_ON(
++		(1 << STACK_DEPOT_EXTRA_BITS) <= (KMSAN_MAX_ORIGIN_DEPTH << 1));
 +
 +	extra_bits = stack_depot_get_extra_bits(id);
 +	depth = kmsan_depth_from_eb(extra_bits);
 +	uaf = kmsan_uaf_from_eb(extra_bits);
 +
-+	if (depth >= MAX_CHAIN_DEPTH) {
-+		static atomic_long_t kmsan_skipped_origins;
-+		long skipped = atomic_long_inc_return(&kmsan_skipped_origins);
-+
-+		if (skipped % NUM_SKIPPED_TO_WARN == 0) {
-+			pr_warn("not chained %ld origins\n", skipped);
-+			dump_stack();
-+			kmsan_print_origin(id);
-+		}
++	/*
++	 * Stop chaining origins once the depth reached KMSAN_MAX_ORIGIN_DEPTH.
++	 * This mostly happens in the case structures with uninitialized padding
++	 * are copied around many times. Origin chains for such structures are
++	 * usually periodic, and it does not make sense to fully store them.
++	 */
++	if (depth == KMSAN_MAX_ORIGIN_DEPTH)
 +		return id;
-+	}
++
 +	depth++;
 +	extra_bits = kmsan_extra_bits(depth, uaf);
 +
@@ -1150,7 +1143,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +EXPORT_SYMBOL(__msan_get_context_state);
 --- /dev/null
 +++ a/mm/kmsan/kmsan.h
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,204 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Functions used by the KMSAN runtime.
@@ -1180,6 +1173,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define KMSAN_POISON_FREE 0x2
 +
 +#define KMSAN_ORIGIN_SIZE 4
++#define KMSAN_MAX_ORIGIN_DEPTH 7
 +
 +#define KMSAN_STACK_DEPTH 64
 +
@@ -1382,7 +1376,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +CFLAGS_shadow.o := $(CC_FLAGS_KMSAN_RUNTIME)
 --- /dev/null
 +++ a/mm/kmsan/report.c
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,219 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * KMSAN error reporting routines.
@@ -1474,12 +1468,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	depot_stack_handle_t head;
 +	unsigned long magic;
 +	char *descr = NULL;
++	unsigned int depth;
 +
 +	if (!origin)
 +		return;
 +
 +	while (true) {
 +		nr_entries = stack_depot_fetch(origin, &entries);
++		depth = kmsan_depth_from_eb(stack_depot_get_extra_bits(origin));
 +		magic = nr_entries ? entries[0] : 0;
 +		if ((nr_entries == 4) && (magic == KMSAN_ALLOCA_MAGIC_ORIGIN)) {
 +			descr = (char *)entries[1];
@@ -1494,6 +1490,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			break;
 +		}
 +		if ((nr_entries == 3) && (magic == KMSAN_CHAIN_MAGIC_ORIGIN)) {
++			/*
++			 * Origin chains deeper than KMSAN_MAX_ORIGIN_DEPTH are
++			 * not stored, so the output may be incomplete.
++			 */
++			if (depth == KMSAN_MAX_ORIGIN_DEPTH)
++				pr_err("<Zero or more stacks not recorded to save memory>\n\n");
 +			head = entries[1];
 +			origin = entries[2];
 +			pr_err("Uninit was stored to memory at:\n");

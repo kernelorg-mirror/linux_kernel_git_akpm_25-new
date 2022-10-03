@@ -1,14 +1,26 @@
 From: Mike Kravetz <mike.kravetz@oracle.com>
 Subject: hugetlb: add vma based lock for pmd sharing
-Date: Wed, 24 Aug 2022 10:57:55 -0700
+Date: Wed, 14 Sep 2022 15:18:07 -0700
 
-Allocate a rw semaphore and hang off vm_private_data for synchronization
-use by vmas that could be involved in pmd sharing.  Only add
-infrastructure for the new lock here.  Actual use will be added in
-subsequent patch.
+Allocate a new hugetlb_vma_lock structure and hang off vm_private_data for
+synchronization use by vmas that could be involved in pmd sharing.  This
+data structure contains a rw semaphore that is the primary tool used for
+synchronization.
 
-Link: https://lkml.kernel.org/r/20220824175757.20590-7-mike.kravetz@oracle.com
+This new structure is ref counted, so that it can exist when NOT attached
+to a vma.  This is only helpful in resolving lock ordering issues where
+code may need to obtain the vma_lock while there are no guarantees the vma
+may go away.  By obtaining a ref on the structure, it can be guaranteed
+that at least the rw semaphore will not go away.
+
+Only add infrastructure for the new lock here.  Actual use will be added
+in subsequent patches.
+
+[mike.kravetz@oracle.com: fix build issue for missing hugetlb_vma_lock_release]
+  Link: https://lkml.kernel.org/r/YyNUtA1vRASOE4+M@monkey
+Link: https://lkml.kernel.org/r/20220914221810.95771-7-mike.kravetz@oracle.com
 Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
@@ -16,7 +28,6 @@ Cc: David Hildenbrand <david@redhat.com>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: James Houghton <jthoughton@google.com>
 Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mina Almasry <almasrymina@google.com>
 Cc: Muchun Song <songmuchun@bytedance.com>
@@ -24,18 +35,32 @@ Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/hugetlb.h |   36 +++++++-
+ include/linux/hugetlb.h |   43 +++++++
  kernel/fork.c           |    6 -
- mm/hugetlb.c            |  170 ++++++++++++++++++++++++++++++++++----
+ mm/hugetlb.c            |  207 ++++++++++++++++++++++++++++++++++----
  mm/rmap.c               |    8 +
- 4 files changed, 197 insertions(+), 23 deletions(-)
+ 4 files changed, 240 insertions(+), 24 deletions(-)
 
 --- a/include/linux/hugetlb.h~hugetlb-add-vma-based-lock-for-pmd-sharing
 +++ a/include/linux/hugetlb.h
-@@ -126,7 +126,7 @@ struct hugepage_subpool *hugepage_new_su
+@@ -115,6 +115,12 @@ struct file_region {
+ #endif
+ };
+ 
++struct hugetlb_vma_lock {
++	struct kref refs;
++	struct rw_semaphore rw_sema;
++	struct vm_area_struct *vma;
++};
++
+ extern struct resv_map *resv_map_alloc(void);
+ void resv_map_release(struct kref *ref);
+ 
+@@ -127,7 +133,7 @@ struct hugepage_subpool *hugepage_new_su
  						long min_hpages);
  void hugepage_put_subpool(struct hugepage_subpool *spool);
  
@@ -44,7 +69,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  void clear_vma_resv_huge_pages(struct vm_area_struct *vma);
  int hugetlb_sysctl_handler(struct ctl_table *, int, void *, size_t *, loff_t *);
  int hugetlb_overcommit_handler(struct ctl_table *, int, void *, size_t *,
-@@ -214,6 +214,13 @@ struct page *follow_huge_pud(struct mm_s
+@@ -215,6 +221,14 @@ struct page *follow_huge_pud(struct mm_s
  struct page *follow_huge_pgd(struct mm_struct *mm, unsigned long address,
  			     pgd_t *pgd, int flags);
  
@@ -54,11 +79,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +void hugetlb_vma_unlock_write(struct vm_area_struct *vma);
 +int hugetlb_vma_trylock_write(struct vm_area_struct *vma);
 +void hugetlb_vma_assert_locked(struct vm_area_struct *vma);
++void hugetlb_vma_lock_release(struct kref *kref);
 +
  int pmd_huge(pmd_t pmd);
  int pud_huge(pud_t pud);
  unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
-@@ -225,7 +232,7 @@ void hugetlb_unshare_all_pmds(struct vm_
+@@ -226,7 +240,7 @@ void hugetlb_unshare_all_pmds(struct vm_
  
  #else /* !CONFIG_HUGETLB_PAGE */
  
@@ -67,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  }
  
-@@ -336,6 +343,31 @@ static inline int prepare_hugepage_range
+@@ -337,6 +351,31 @@ static inline int prepare_hugepage_range
  	return -EINVAL;
  }
  
@@ -127,7 +153,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static inline bool subpool_is_free(struct hugepage_subpool *spool)
  {
-@@ -1008,12 +1010,25 @@ static int is_vma_resv_set(struct vm_are
+@@ -859,7 +861,7 @@ __weak unsigned long vma_mmu_pagesize(st
+  * faults in a MAP_PRIVATE mapping. Only the process that called mmap()
+  * is guaranteed to have their future faults succeed.
+  *
+- * With the exception of reset_vma_resv_huge_pages() which is called at fork(),
++ * With the exception of hugetlb_dup_vma_private() which is called at fork(),
+  * the reserve counters are updated with the hugetlb_lock held. It is safe
+  * to reset the VMA at fork() time as it is not in use yet and there is no
+  * chance of the global counters getting corrupted as a result of the values.
+@@ -1006,12 +1008,20 @@ static int is_vma_resv_set(struct vm_are
  	return (get_vma_private_data(vma) & flag) != 0;
  }
  
@@ -142,21 +177,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 *   not apply to children.  Faults generated by the children are
 +	 *   not guaranteed to succeed, even if read-only.
 +	 * - For shared mappings this is a per-vma semaphore that may be
-+	 *   allocated below.
++	 *   allocated in a subsequent call to hugetlb_vm_op_open.
 +	 */
 +	vma->vm_private_data = (void *)0;
  	if (!(vma->vm_flags & VM_MAYSHARE))
 -		vma->vm_private_data = (void *)0;
 +		return;
-+
-+	/*
-+	 * Allocate semaphore if pmd sharing is possible.
-+	 */
-+	hugetlb_vma_lock_alloc(vma);
  }
  
  /*
-@@ -1044,7 +1059,7 @@ void clear_vma_resv_huge_pages(struct vm
+@@ -1042,7 +1052,7 @@ void clear_vma_resv_huge_pages(struct vm
  		kref_put(&reservations->refs, resv_map_release);
  	}
  
@@ -165,7 +195,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /* Returns true if the VMA has associated reserve pages */
-@@ -4623,16 +4638,21 @@ static void hugetlb_vm_op_open(struct vm
+@@ -4623,16 +4633,21 @@ static void hugetlb_vm_op_open(struct vm
  		resv_map_dup_hugetlb_cgroup_uncharge_info(resv);
  		kref_get(&resv->refs);
  	}
@@ -188,7 +218,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!resv || !is_vma_resv_set(vma, HPAGE_RESV_OWNER))
  		return;
  
-@@ -6451,6 +6471,11 @@ bool hugetlb_reserve_pages(struct inode
+@@ -6440,6 +6455,11 @@ bool hugetlb_reserve_pages(struct inode
  	}
  
  	/*
@@ -200,7 +230,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * Only apply hugepage reservation if asked. At fault time, an
  	 * attempt will be made for VM_NORESERVE to allocate a page
  	 * without using reserves
-@@ -6473,12 +6498,11 @@ bool hugetlb_reserve_pages(struct inode
+@@ -6462,12 +6482,11 @@ bool hugetlb_reserve_pages(struct inode
  		resv_map = inode_resv_map(inode);
  
  		chg = region_chg(resv_map, from, to, &regions_needed);
@@ -214,7 +244,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		chg = to - from;
  
-@@ -6573,6 +6597,7 @@ out_uncharge_cgroup:
+@@ -6562,6 +6581,7 @@ out_uncharge_cgroup:
  	hugetlb_cgroup_uncharge_cgroup_rsvd(hstate_index(h),
  					    chg * pages_per_huge_page(h), h_cg);
  out_err:
@@ -222,7 +252,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!vma || vma->vm_flags & VM_MAYSHARE)
  		/* Only call region_abort if the region_chg succeeded but the
  		 * region_add failed or didn't run.
-@@ -6652,14 +6677,34 @@ static unsigned long page_table_shareabl
+@@ -6641,14 +6661,34 @@ static unsigned long page_table_shareabl
  }
  
  static bool __vma_aligned_range_pmd_shareable(struct vm_area_struct *vma,
@@ -261,7 +291,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static bool vma_addr_pmd_shareable(struct vm_area_struct *vma,
-@@ -6668,15 +6713,11 @@ static bool vma_addr_pmd_shareable(struc
+@@ -6657,15 +6697,11 @@ static bool vma_addr_pmd_shareable(struc
  	unsigned long start = addr & PUD_MASK;
  	unsigned long end = start + PUD_SIZE;
  
@@ -278,7 +308,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return vma_addr_pmd_shareable(vma, addr);
  }
  
-@@ -6707,6 +6748,95 @@ void adjust_range_if_pmd_sharing_possibl
+@@ -6696,6 +6732,130 @@ void adjust_range_if_pmd_sharing_possibl
  		*end = ALIGN(*end, PUD_SIZE);
  }
  
@@ -290,62 +320,95 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +void hugetlb_vma_lock_read(struct vm_area_struct *vma)
 +{
-+	if (__vma_shareable_flags_pmd(vma))
-+		down_read((struct rw_semaphore *)vma->vm_private_data);
++	if (__vma_shareable_flags_pmd(vma)) {
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		down_read(&vma_lock->rw_sema);
++	}
 +}
 +
 +void hugetlb_vma_unlock_read(struct vm_area_struct *vma)
 +{
-+	if (__vma_shareable_flags_pmd(vma))
-+		up_read((struct rw_semaphore *)vma->vm_private_data);
++	if (__vma_shareable_flags_pmd(vma)) {
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		up_read(&vma_lock->rw_sema);
++	}
 +}
 +
 +void hugetlb_vma_lock_write(struct vm_area_struct *vma)
 +{
-+	if (__vma_shareable_flags_pmd(vma))
-+		down_write((struct rw_semaphore *)vma->vm_private_data);
++	if (__vma_shareable_flags_pmd(vma)) {
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		down_write(&vma_lock->rw_sema);
++	}
 +}
 +
 +void hugetlb_vma_unlock_write(struct vm_area_struct *vma)
 +{
-+	if (__vma_shareable_flags_pmd(vma))
-+		up_write((struct rw_semaphore *)vma->vm_private_data);
++	if (__vma_shareable_flags_pmd(vma)) {
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		up_write(&vma_lock->rw_sema);
++	}
 +}
 +
 +int hugetlb_vma_trylock_write(struct vm_area_struct *vma)
 +{
++	struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
 +	if (!__vma_shareable_flags_pmd(vma))
 +		return 1;
 +
-+	return down_write_trylock((struct rw_semaphore *)vma->vm_private_data);
++	return down_write_trylock(&vma_lock->rw_sema);
 +}
 +
 +void hugetlb_vma_assert_locked(struct vm_area_struct *vma)
 +{
-+	if (__vma_shareable_flags_pmd(vma))
-+		lockdep_assert_held((struct rw_semaphore *)
-+				vma->vm_private_data);
++	if (__vma_shareable_flags_pmd(vma)) {
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		lockdep_assert_held(&vma_lock->rw_sema);
++	}
++}
++
++void hugetlb_vma_lock_release(struct kref *kref)
++{
++	struct hugetlb_vma_lock *vma_lock = container_of(kref,
++			struct hugetlb_vma_lock, refs);
++
++	kfree(vma_lock);
 +}
 +
 +static void hugetlb_vma_lock_free(struct vm_area_struct *vma)
 +{
 +	/*
 +	 * Only present in sharable vmas.  See comment in
-+	 * __unmap_hugepage_range_final about the neeed to check both
-+	 * VM_SHARED and VM_MAYSHARE in free path
++	 * __unmap_hugepage_range_final about how VM_SHARED could
++	 * be set without VM_MAYSHARE.  As a result, we need to
++	 * check if either is set in the free path.
 +	 */
 +	if (!vma || !(vma->vm_flags & (VM_MAYSHARE | VM_SHARED)))
 +		return;
 +
 +	if (vma->vm_private_data) {
-+		kfree(vma->vm_private_data);
++		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
++
++		/*
++		 * vma_lock structure may or not be released, but it
++		 * certainly will no longer be attached to vma so clear
++		 * pointer.
++		 */
++		vma_lock->vma = NULL;
++		kref_put(&vma_lock->refs, hugetlb_vma_lock_release);
 +		vma->vm_private_data = NULL;
 +	}
 +}
 +
 +static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma)
 +{
-+	struct rw_semaphore *vma_sema;
++	struct hugetlb_vma_lock *vma_lock;
 +
 +	/* Only establish in (flags) sharable vmas */
 +	if (!vma || !(vma->vm_flags & VM_MAYSHARE))
@@ -359,25 +422,32 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (!vma_pmd_shareable(vma))
 +		return;
 +
-+	vma_sema = kmalloc(sizeof(*vma_sema), GFP_KERNEL);
-+	if (!vma_sema)
++	vma_lock = kmalloc(sizeof(*vma_lock), GFP_KERNEL);
++	if (!vma_lock)
 +		/*
-+		 * If we can not allocate semaphore, then vma can not
++		 * If we can not allocate structure, then vma can not
 +		 * participate in pmd sharing.
 +		 */
 +		return;
 +
-+	init_rwsem(vma_sema);
-+	vma->vm_private_data = vma_sema;
++	kref_init(&vma_lock->refs);
++	init_rwsem(&vma_lock->rw_sema);
++	vma_lock->vma = vma;
++	vma->vm_private_data = vma_lock;
 +}
 +
  /*
   * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
   * and returns the corresponding pte. While this is not necessary for the
-@@ -6793,6 +6923,14 @@ int huge_pmd_unshare(struct mm_struct *m
+@@ -6782,6 +6942,19 @@ int huge_pmd_unshare(struct mm_struct *m
  }
  
  #else /* !CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
++
++void hugetlb_vma_lock_release(struct kref *kref)
++{
++}
++
 +static void hugetlb_vma_lock_free(struct vm_area_struct *vma)
 +{
 +}
