@@ -1,0 +1,190 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Subject: mm/memremap_pages: initialize all ZONE_DEVICE pages to start at refcount 0
+Date: Fri, 14 Oct 2022 16:59:12 -0700
+
+The initial memremap_pages() implementation inherited the
+__init_single_page() default of pages starting life with an elevated
+reference count.  This originally allowed for the page->pgmap pointer to
+alias with the storage for page->lru since a page was only allowed to be
+on an lru list when its reference count was zero.
+
+Since then, 'struct page' definition cleanups have arranged for dedicated
+space for the ZONE_DEVICE page metadata, the
+MEMORY_DEVICE_{PRIVATE,COHERENT} work has arranged for the 1 -> 0
+page->_refcount transition to route the page to free_zone_device_page()
+and not the core-mm page-free, and MEMORY_DEVICE_{PRIVATE,COHERENT} now
+arranges for its ZONE_DEVICE pages to start at _refcount 0.  With those
+cleanups in place and with filesystem-dax and device-dax now converted to
+take and drop references at map and truncate time, it is possible to start
+MEMORY_DEVICE_FS_DAX and MEMORY_DEVICE_GENERIC reference counts at 0 as
+well.
+
+This conversion also unifies all @pgmap accounting to be relative to
+pgmap_request_folio() and the paired folio_put() calls for those requested
+folios.  This allows pgmap_release_folios() to be simplified to just a
+folio_put() helper.
+
+Link: https://lkml.kernel.org/r/166579195218.2236710.8731183545033177929.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/dax/mapping.c    |    2 +-
+ include/linux/dax.h      |    2 +-
+ include/linux/memremap.h |    6 ++----
+ mm/memremap.c            |   36 ++++++++++++++++--------------------
+ mm/page_alloc.c          |    9 +--------
+ 5 files changed, 21 insertions(+), 34 deletions(-)
+
+--- a/drivers/dax/mapping.c~mm-memremap_pages-initialize-all-zone_device-pages-to-start-at-refcount-0
++++ a/drivers/dax/mapping.c
+@@ -691,7 +691,7 @@ static struct page *dax_zap_pages(struct
+ 
+ 	dax_for_each_folio(entry, folio, i) {
+ 		if (zap)
+-			pgmap_release_folios(folio_pgmap(folio), folio, 1);
++			pgmap_release_folios(folio, 1);
+ 		if (!ret && !dax_folio_idle(folio))
+ 			ret = folio_page(folio, 0);
+ 	}
+--- a/include/linux/dax.h~mm-memremap_pages-initialize-all-zone_device-pages-to-start-at-refcount-0
++++ a/include/linux/dax.h
+@@ -235,7 +235,7 @@ static inline void dax_unlock_mapping_en
+  */
+ static inline bool dax_page_idle(struct page *page)
+ {
+-	return page_ref_count(page) == 1;
++	return page_ref_count(page) == 0;
+ }
+ 
+ static inline bool dax_folio_idle(struct folio *folio)
+--- a/include/linux/memremap.h~mm-memremap_pages-initialize-all-zone_device-pages-to-start-at-refcount-0
++++ a/include/linux/memremap.h
+@@ -195,8 +195,7 @@ struct dev_pagemap *get_dev_pagemap(unsi
+ 				    struct dev_pagemap *pgmap);
+ bool pgmap_request_folios(struct dev_pagemap *pgmap, struct folio *folio,
+ 			  int nr_folios);
+-void pgmap_release_folios(struct dev_pagemap *pgmap, struct folio *folio,
+-			  int nr_folios);
++void pgmap_release_folios(struct folio *folio, int nr_folios);
+ bool pgmap_pfn_valid(struct dev_pagemap *pgmap, unsigned long pfn);
+ 
+ unsigned long vmem_altmap_offset(struct vmem_altmap *altmap);
+@@ -238,8 +237,7 @@ static inline bool pgmap_request_folios(
+ 	return false;
+ }
+ 
+-static inline void pgmap_release_folios(struct dev_pagemap *pgmap,
+-					struct folio *folio, int nr_folios)
++static inline void pgmap_release_folios(struct folio *folio, int nr_folios)
+ {
+ }
+ 
+--- a/mm/memremap.c~mm-memremap_pages-initialize-all-zone_device-pages-to-start-at-refcount-0
++++ a/mm/memremap.c
+@@ -469,8 +469,10 @@ EXPORT_SYMBOL_GPL(get_dev_pagemap);
+ 
+ void free_zone_device_page(struct page *page)
+ {
+-	if (WARN_ON_ONCE(!page->pgmap->ops || !page->pgmap->ops->page_free))
+-		return;
++	struct dev_pagemap *pgmap = page->pgmap;
++
++	/* wake filesystem 'break dax layouts' waiters */
++	wake_up_var(page);
+ 
+ 	mem_cgroup_uncharge(page_folio(page));
+ 
+@@ -505,17 +507,9 @@ void free_zone_device_page(struct page *
+ 	 * to clear page->mapping.
+ 	 */
+ 	page->mapping = NULL;
+-	page->pgmap->ops->page_free(page);
+-
+-	if (page->pgmap->type != MEMORY_DEVICE_PRIVATE &&
+-	    page->pgmap->type != MEMORY_DEVICE_COHERENT)
+-		/*
+-		 * Reset the page count to 1 to prepare for handing out the page
+-		 * again.
+-		 */
+-		set_page_count(page, 1);
+-	else
+-		put_dev_pagemap(page->pgmap);
++	if (pgmap->ops && pgmap->ops->page_free)
++		pgmap->ops->page_free(page);
++	put_dev_pagemap(page->pgmap);
+ }
+ 
+ static bool folio_span_valid(struct dev_pagemap *pgmap, struct folio *folio,
+@@ -576,17 +570,19 @@ bool pgmap_request_folios(struct dev_pag
+ }
+ EXPORT_SYMBOL_GPL(pgmap_request_folios);
+ 
+-void pgmap_release_folios(struct dev_pagemap *pgmap, struct folio *folio, int nr_folios)
++/*
++ * A symmetric helper to undo the page references acquired by
++ * pgmap_request_folios(), but the caller can also just arrange
++ * folio_put() on all the folios it acquired previously for the same
++ * effect.
++ */
++void pgmap_release_folios(struct folio *folio, int nr_folios)
+ {
+ 	struct folio *iter;
+ 	int i;
+ 
+-	for (iter = folio, i = 0; i < nr_folios; iter = folio_next(iter), i++) {
+-		if (!put_devmap_managed_page(&iter->page))
+-			folio_put(iter);
+-		if (!folio_ref_count(iter))
+-			put_dev_pagemap(pgmap);
+-	}
++	for (iter = folio, i = 0; i < nr_folios; iter = folio_next(folio), i++)
++		folio_put(iter);
+ }
+ 
+ #ifdef CONFIG_FS_DAX
+--- a/mm/page_alloc.c~mm-memremap_pages-initialize-all-zone_device-pages-to-start-at-refcount-0
++++ a/mm/page_alloc.c
+@@ -6791,6 +6791,7 @@ static void __ref __init_zone_device_pag
+ {
+ 
+ 	__init_single_page(page, pfn, zone_idx, nid);
++	set_page_count(page, 0);
+ 
+ 	/*
+ 	 * Mark page reserved as it will need to wait for onlining
+@@ -6823,14 +6824,6 @@ static void __ref __init_zone_device_pag
+ 		set_pageblock_migratetype(page, MIGRATE_MOVABLE);
+ 		cond_resched();
+ 	}
+-
+-	/*
+-	 * ZONE_DEVICE pages are released directly to the driver page allocator
+-	 * which will set the page count to 1 when allocating the page.
+-	 */
+-	if (pgmap->type == MEMORY_DEVICE_PRIVATE ||
+-	    pgmap->type == MEMORY_DEVICE_COHERENT)
+-		set_page_count(page, 0);
+ }
+ 
+ /*
+_

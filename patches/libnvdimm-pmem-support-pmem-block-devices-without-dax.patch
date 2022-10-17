@@ -1,0 +1,135 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Subject: libnvdimm/pmem: support pmem block devices without dax
+Date: Fri, 14 Oct 2022 16:58:26 -0700
+
+In preparation for CONFIG_DAX growing a CONFIG_MMU dependency add support
+for pmem to skip dax-device registration in the CONFIG_DAX=n case.
+
+alloc_dax() returns NULL in the CONFIG_DAX=n case, ERR_PTR() in the
+failure case, and a dax-device in the success case.
+
+dax_remove_host(), kill_dax() and put_dax() are safe to call if
+setup_dax() returns 0 because it suceeded, or 0 because CONFIG_DAX=n.
+
+Link: https://lkml.kernel.org/r/166579190607.2236710.1230996282258115812.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/nvdimm/Kconfig |    2 -
+ drivers/nvdimm/pmem.c  |   47 ++++++++++++++++++++++++---------------
+ 2 files changed, 31 insertions(+), 18 deletions(-)
+
+--- a/drivers/nvdimm/Kconfig~libnvdimm-pmem-support-pmem-block-devices-without-dax
++++ a/drivers/nvdimm/Kconfig
+@@ -19,7 +19,7 @@ if LIBNVDIMM
+ config BLK_DEV_PMEM
+ 	tristate "PMEM: Persistent memory block device support"
+ 	default LIBNVDIMM
+-	select DAX
++	select DAX if MMU
+ 	select ND_BTT if BTT
+ 	select ND_PFN if NVDIMM_PFN
+ 	help
+--- a/drivers/nvdimm/pmem.c~libnvdimm-pmem-support-pmem-block-devices-without-dax
++++ a/drivers/nvdimm/pmem.c
+@@ -468,6 +468,32 @@ static const struct dev_pagemap_ops fsda
+ 	.memory_failure		= pmem_pagemap_memory_failure,
+ };
+ 
++static int setup_dax(struct pmem_device *pmem, struct gendisk *disk,
++		     struct nd_region *nd_region)
++{
++	struct dax_device *dax_dev;
++	int rc;
++
++	dax_dev = alloc_dax(pmem, &pmem_dax_ops);
++	if (IS_ERR(dax_dev))
++		return PTR_ERR(dax_dev);
++	if (!dax_dev)
++		return 0;
++	set_dax_nocache(dax_dev);
++	set_dax_nomc(dax_dev);
++	if (is_nvdimm_sync(nd_region))
++		set_dax_synchronous(dax_dev);
++	rc = dax_add_host(dax_dev, disk);
++	if (rc) {
++		kill_dax(dax_dev);
++		put_dax(dax_dev);
++		return rc;
++	}
++	dax_write_cache(dax_dev, nvdimm_has_cache(nd_region));
++	pmem->dax_dev = dax_dev;
++	return 0;
++}
++
+ static int pmem_attach_disk(struct device *dev,
+ 		struct nd_namespace_common *ndns)
+ {
+@@ -477,7 +503,6 @@ static int pmem_attach_disk(struct devic
+ 	struct resource *res = &nsio->res;
+ 	struct range bb_range;
+ 	struct nd_pfn *nd_pfn = NULL;
+-	struct dax_device *dax_dev;
+ 	struct nd_pfn_sb *pfn_sb;
+ 	struct pmem_device *pmem;
+ 	struct request_queue *q;
+@@ -578,24 +603,13 @@ static int pmem_attach_disk(struct devic
+ 	nvdimm_badblocks_populate(nd_region, &pmem->bb, &bb_range);
+ 	disk->bb = &pmem->bb;
+ 
+-	dax_dev = alloc_dax(pmem, &pmem_dax_ops);
+-	if (IS_ERR(dax_dev)) {
+-		rc = PTR_ERR(dax_dev);
+-		goto out;
+-	}
+-	set_dax_nocache(dax_dev);
+-	set_dax_nomc(dax_dev);
+-	if (is_nvdimm_sync(nd_region))
+-		set_dax_synchronous(dax_dev);
+-	rc = dax_add_host(dax_dev, disk);
++	rc = setup_dax(pmem, disk, nd_region);
+ 	if (rc)
+-		goto out_cleanup_dax;
+-	dax_write_cache(dax_dev, nvdimm_has_cache(nd_region));
+-	pmem->dax_dev = dax_dev;
++		goto out;
+ 
+ 	rc = device_add_disk(dev, disk, pmem_attribute_groups);
+ 	if (rc)
+-		goto out_remove_host;
++		goto out_dax;
+ 	if (devm_add_action_or_reset(dev, pmem_release_disk, pmem))
+ 		return -ENOMEM;
+ 
+@@ -607,9 +621,8 @@ static int pmem_attach_disk(struct devic
+ 		dev_warn(dev, "'badblocks' notification disabled\n");
+ 	return 0;
+ 
+-out_remove_host:
++out_dax:
+ 	dax_remove_host(pmem->disk);
+-out_cleanup_dax:
+ 	kill_dax(pmem->dax_dev);
+ 	put_dax(pmem->dax_dev);
+ out:
+_

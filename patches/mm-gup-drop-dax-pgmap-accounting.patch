@@ -1,0 +1,388 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Subject: mm/gup: drop DAX pgmap accounting
+Date: Fri, 14 Oct 2022 16:59:23 -0700
+
+Now that pgmap accounting is handled at pgmap_request_folios() time, it
+can be dropped from gup time.
+
+A hurdle still remains that filesystem-DAX huge pages are not compound
+pages which still requires infrastructure like __gup_device_huge_p{m,u}d()
+to stick around.
+
+Additionally, ZONE_DEVICE pages with this change are still not suitable to
+be returned from vm_normal_page(), so this cleanup is limited to deleting
+pgmap reference manipulation.  This is an incremental step on the path to
+removing pte_devmap() altogether.
+
+Note that follow_pmd_devmap() can be deleted entirely since a few
+additions of pmd_devmap() allows the transparent huge page path to be
+reused.
+
+Link: https://lkml.kernel.org/r/166579196364.2236710.8984717005481314942.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reported-by: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/huge_mm.h |   12 -----
+ mm/gup.c                |   83 ++++++++------------------------------
+ mm/huge_memory.c        |   48 ---------------------
+ 3 files changed, 22 insertions(+), 121 deletions(-)
+
+--- a/include/linux/huge_mm.h~mm-gup-drop-dax-pgmap-accounting
++++ a/include/linux/huge_mm.h
+@@ -266,10 +266,8 @@ static inline bool folio_test_pmd_mappab
+ 	return folio_order(folio) >= HPAGE_PMD_ORDER;
+ }
+ 
+-struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
+-		pmd_t *pmd, int flags, struct dev_pagemap **pgmap);
+ struct page *follow_devmap_pud(struct vm_area_struct *vma, unsigned long addr,
+-		pud_t *pud, int flags, struct dev_pagemap **pgmap);
++		pud_t *pud, int flags);
+ 
+ vm_fault_t do_huge_pmd_numa_page(struct vm_fault *vmf);
+ 
+@@ -428,14 +426,8 @@ static inline void mm_put_huge_zero_page
+ 	return;
+ }
+ 
+-static inline struct page *follow_devmap_pmd(struct vm_area_struct *vma,
+-	unsigned long addr, pmd_t *pmd, int flags, struct dev_pagemap **pgmap)
+-{
+-	return NULL;
+-}
+-
+ static inline struct page *follow_devmap_pud(struct vm_area_struct *vma,
+-	unsigned long addr, pud_t *pud, int flags, struct dev_pagemap **pgmap)
++	unsigned long addr, pud_t *pud, int flags)
+ {
+ 	return NULL;
+ }
+--- a/mm/gup.c~mm-gup-drop-dax-pgmap-accounting
++++ a/mm/gup.c
+@@ -25,7 +25,6 @@
+ #include "internal.h"
+ 
+ struct follow_page_context {
+-	struct dev_pagemap *pgmap;
+ 	unsigned int page_mask;
+ };
+ 
+@@ -522,8 +521,7 @@ static inline bool can_follow_write_pte(
+ }
+ 
+ static struct page *follow_page_pte(struct vm_area_struct *vma,
+-		unsigned long address, pmd_t *pmd, unsigned int flags,
+-		struct dev_pagemap **pgmap)
++		unsigned long address, pmd_t *pmd, unsigned int flags)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	struct page *page;
+@@ -574,17 +572,13 @@ retry:
+ 		goto out;
+ 	}
+ 
+-	if (!page && pte_devmap(pte) && (flags & (FOLL_GET | FOLL_PIN))) {
++	if (!page && pte_devmap(pte)) {
+ 		/*
+-		 * Only return device mapping pages in the FOLL_GET or FOLL_PIN
+-		 * case since they are only valid while holding the pgmap
+-		 * reference.
++		 * ZONE_DEVICE pages are not yet treated as vm_normal_page()
++		 * instances, with respect to mapcount and compound-page
++		 * metadata
+ 		 */
+-		*pgmap = get_dev_pagemap(pte_pfn(pte), *pgmap);
+-		if (*pgmap)
+-			page = pte_page(pte);
+-		else
+-			goto no_page;
++		page = pte_page(pte);
+ 	} else if (unlikely(!page)) {
+ 		if (flags & FOLL_DUMP) {
+ 			/* Avoid special (like zero) pages in core dumps */
+@@ -688,15 +682,8 @@ retry:
+ 			return no_page_table(vma, flags);
+ 		goto retry;
+ 	}
+-	if (pmd_devmap(pmdval)) {
+-		ptl = pmd_lock(mm, pmd);
+-		page = follow_devmap_pmd(vma, address, pmd, flags, &ctx->pgmap);
+-		spin_unlock(ptl);
+-		if (page)
+-			return page;
+-	}
+-	if (likely(!pmd_trans_huge(pmdval)))
+-		return follow_page_pte(vma, address, pmd, flags, &ctx->pgmap);
++	if (likely(!(pmd_trans_huge(pmdval) || pmd_devmap(pmdval))))
++		return follow_page_pte(vma, address, pmd, flags);
+ 
+ 	if (pmd_protnone(pmdval) && !gup_can_follow_protnone(flags))
+ 		return no_page_table(vma, flags);
+@@ -714,9 +701,9 @@ retry_locked:
+ 		pmd_migration_entry_wait(mm, pmd);
+ 		goto retry_locked;
+ 	}
+-	if (unlikely(!pmd_trans_huge(*pmd))) {
++	if (unlikely(!(pmd_trans_huge(*pmd) || pmd_devmap(pmdval)))) {
+ 		spin_unlock(ptl);
+-		return follow_page_pte(vma, address, pmd, flags, &ctx->pgmap);
++		return follow_page_pte(vma, address, pmd, flags);
+ 	}
+ 	if (flags & FOLL_SPLIT_PMD) {
+ 		int ret;
+@@ -734,7 +721,7 @@ retry_locked:
+ 		}
+ 
+ 		return ret ? ERR_PTR(ret) :
+-			follow_page_pte(vma, address, pmd, flags, &ctx->pgmap);
++			follow_page_pte(vma, address, pmd, flags);
+ 	}
+ 	page = follow_trans_huge_pmd(vma, address, pmd, flags);
+ 	spin_unlock(ptl);
+@@ -757,7 +744,7 @@ static struct page *follow_pud_mask(stru
+ 		return no_page_table(vma, flags);
+ 	if (pud_devmap(*pud)) {
+ 		ptl = pud_lock(mm, pud);
+-		page = follow_devmap_pud(vma, address, pud, flags, &ctx->pgmap);
++		page = follow_devmap_pud(vma, address, pud, flags);
+ 		spin_unlock(ptl);
+ 		if (page)
+ 			return page;
+@@ -795,9 +782,6 @@ static struct page *follow_p4d_mask(stru
+  *
+  * @flags can have FOLL_ flags set, defined in <linux/mm.h>
+  *
+- * When getting pages from ZONE_DEVICE memory, the @ctx->pgmap caches
+- * the device's dev_pagemap metadata to avoid repeating expensive lookups.
+- *
+  * When getting an anonymous page and the caller has to trigger unsharing
+  * of a shared anonymous page first, -EMLINK is returned. The caller should
+  * trigger a fault with FAULT_FLAG_UNSHARE set. Note that unsharing is only
+@@ -845,7 +829,7 @@ static struct page *follow_page_mask(str
+ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
+ 			 unsigned int foll_flags)
+ {
+-	struct follow_page_context ctx = { NULL };
++	struct follow_page_context ctx = { 0 };
+ 	struct page *page;
+ 
+ 	if (vma_is_secretmem(vma))
+@@ -855,8 +839,6 @@ struct page *follow_page(struct vm_area_
+ 		return NULL;
+ 
+ 	page = follow_page_mask(vma, address, foll_flags, &ctx);
+-	if (ctx.pgmap)
+-		put_dev_pagemap(ctx.pgmap);
+ 	return page;
+ }
+ 
+@@ -1105,7 +1087,7 @@ static long __get_user_pages(struct mm_s
+ {
+ 	long ret = 0, i = 0;
+ 	struct vm_area_struct *vma = NULL;
+-	struct follow_page_context ctx = { NULL };
++	struct follow_page_context ctx = { 0 };
+ 
+ 	if (!nr_pages)
+ 		return 0;
+@@ -1220,8 +1202,6 @@ next_page:
+ 		nr_pages -= page_increm;
+ 	} while (nr_pages);
+ out:
+-	if (ctx.pgmap)
+-		put_dev_pagemap(ctx.pgmap);
+ 	return i ? i : ret;
+ }
+ 
+@@ -2364,9 +2344,8 @@ static int gup_pte_range(pmd_t pmd, pmd_
+ 			 unsigned long end, unsigned int flags,
+ 			 struct page **pages, int *nr)
+ {
+-	struct dev_pagemap *pgmap = NULL;
+-	int nr_start = *nr, ret = 0;
+ 	pte_t *ptep, *ptem;
++	int ret = 0;
+ 
+ 	ptem = ptep = pte_offset_map(&pmd, addr);
+ 	do {
+@@ -2383,12 +2362,6 @@ static int gup_pte_range(pmd_t pmd, pmd_
+ 		if (pte_devmap(pte)) {
+ 			if (unlikely(flags & FOLL_LONGTERM))
+ 				goto pte_unmap;
+-
+-			pgmap = get_dev_pagemap(pte_pfn(pte), pgmap);
+-			if (unlikely(!pgmap)) {
+-				undo_dev_pagemap(nr, nr_start, flags, pages);
+-				goto pte_unmap;
+-			}
+ 		} else if (pte_special(pte))
+ 			goto pte_unmap;
+ 
+@@ -2436,8 +2409,6 @@ static int gup_pte_range(pmd_t pmd, pmd_
+ 	ret = 1;
+ 
+ pte_unmap:
+-	if (pgmap)
+-		put_dev_pagemap(pgmap);
+ 	pte_unmap(ptem);
+ 	return ret;
+ }
+@@ -2465,28 +2436,17 @@ static int __gup_device_huge(unsigned lo
+ 			     unsigned long end, unsigned int flags,
+ 			     struct page **pages, int *nr)
+ {
+-	int nr_start = *nr;
+-	struct dev_pagemap *pgmap = NULL;
+-
+ 	do {
+ 		struct page *page = pfn_to_page(pfn);
+ 
+-		pgmap = get_dev_pagemap(pfn, pgmap);
+-		if (unlikely(!pgmap)) {
+-			undo_dev_pagemap(nr, nr_start, flags, pages);
+-			break;
+-		}
+ 		SetPageReferenced(page);
+ 		pages[*nr] = page;
+-		if (unlikely(!try_grab_page(page, flags))) {
+-			undo_dev_pagemap(nr, nr_start, flags, pages);
++		if (unlikely(!try_grab_page(page, flags)))
+ 			break;
+-		}
+ 		(*nr)++;
+ 		pfn++;
+ 	} while (addr += PAGE_SIZE, addr != end);
+ 
+-	put_dev_pagemap(pgmap);
+ 	return addr == end;
+ }
+ 
+@@ -2495,16 +2455,14 @@ static int __gup_device_huge_pmd(pmd_t o
+ 				 struct page **pages, int *nr)
+ {
+ 	unsigned long fault_pfn;
+-	int nr_start = *nr;
+ 
+ 	fault_pfn = pmd_pfn(orig) + ((addr & ~PMD_MASK) >> PAGE_SHIFT);
+ 	if (!__gup_device_huge(fault_pfn, addr, end, flags, pages, nr))
+ 		return 0;
+ 
+-	if (unlikely(pmd_val(orig) != pmd_val(*pmdp))) {
+-		undo_dev_pagemap(nr, nr_start, flags, pages);
++	if (unlikely(pmd_val(orig) != pmd_val(*pmdp)))
+ 		return 0;
+-	}
++
+ 	return 1;
+ }
+ 
+@@ -2513,16 +2471,13 @@ static int __gup_device_huge_pud(pud_t o
+ 				 struct page **pages, int *nr)
+ {
+ 	unsigned long fault_pfn;
+-	int nr_start = *nr;
+ 
+ 	fault_pfn = pud_pfn(orig) + ((addr & ~PUD_MASK) >> PAGE_SHIFT);
+ 	if (!__gup_device_huge(fault_pfn, addr, end, flags, pages, nr))
+ 		return 0;
+ 
+-	if (unlikely(pud_val(orig) != pud_val(*pudp))) {
+-		undo_dev_pagemap(nr, nr_start, flags, pages);
++	if (unlikely(pud_val(orig) != pud_val(*pudp)))
+ 		return 0;
+-	}
+ 	return 1;
+ }
+ #else
+--- a/mm/huge_memory.c~mm-gup-drop-dax-pgmap-accounting
++++ a/mm/huge_memory.c
+@@ -1029,49 +1029,6 @@ static void touch_pmd(struct vm_area_str
+ 		update_mmu_cache_pmd(vma, addr, pmd);
+ }
+ 
+-struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
+-		pmd_t *pmd, int flags, struct dev_pagemap **pgmap)
+-{
+-	unsigned long pfn = pmd_pfn(*pmd);
+-	struct mm_struct *mm = vma->vm_mm;
+-	struct page *page;
+-
+-	assert_spin_locked(pmd_lockptr(mm, pmd));
+-
+-	/* FOLL_GET and FOLL_PIN are mutually exclusive. */
+-	if (WARN_ON_ONCE((flags & (FOLL_PIN | FOLL_GET)) ==
+-			 (FOLL_PIN | FOLL_GET)))
+-		return NULL;
+-
+-	if (flags & FOLL_WRITE && !pmd_write(*pmd))
+-		return NULL;
+-
+-	if (pmd_present(*pmd) && pmd_devmap(*pmd))
+-		/* pass */;
+-	else
+-		return NULL;
+-
+-	if (flags & FOLL_TOUCH)
+-		touch_pmd(vma, addr, pmd, flags & FOLL_WRITE);
+-
+-	/*
+-	 * device mapped pages can only be returned if the
+-	 * caller will manage the page reference count.
+-	 */
+-	if (!(flags & (FOLL_GET | FOLL_PIN)))
+-		return ERR_PTR(-EEXIST);
+-
+-	pfn += (addr & ~PMD_MASK) >> PAGE_SHIFT;
+-	*pgmap = get_dev_pagemap(pfn, *pgmap);
+-	if (!*pgmap)
+-		return ERR_PTR(-EFAULT);
+-	page = pfn_to_page(pfn);
+-	if (!try_grab_page(page, flags))
+-		page = ERR_PTR(-ENOMEM);
+-
+-	return page;
+-}
+-
+ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+ 		  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
+ 		  struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma)
+@@ -1188,7 +1145,7 @@ static void touch_pud(struct vm_area_str
+ }
+ 
+ struct page *follow_devmap_pud(struct vm_area_struct *vma, unsigned long addr,
+-		pud_t *pud, int flags, struct dev_pagemap **pgmap)
++			       pud_t *pud, int flags)
+ {
+ 	unsigned long pfn = pud_pfn(*pud);
+ 	struct mm_struct *mm = vma->vm_mm;
+@@ -1222,9 +1179,6 @@ struct page *follow_devmap_pud(struct vm
+ 		return ERR_PTR(-EEXIST);
+ 
+ 	pfn += (addr & ~PUD_MASK) >> PAGE_SHIFT;
+-	*pgmap = get_dev_pagemap(pfn, *pgmap);
+-	if (!*pgmap)
+-		return ERR_PTR(-EFAULT);
+ 	page = pfn_to_page(pfn);
+ 	if (!try_grab_page(page, flags))
+ 		page = ERR_PTR(-ENOMEM);
+_

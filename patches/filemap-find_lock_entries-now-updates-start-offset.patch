@@ -1,0 +1,179 @@
+From: "Vishal Moola (Oracle)" <vishal.moola@gmail.com>
+Subject: filemap: find_lock_entries() now updates start offset
+Date: Thu, 13 Oct 2022 15:57:07 -0700
+
+Patch series "Rework find_get_entries() and find_lock_entries()", v2.
+
+Originally the callers of find_get_entries() and find_lock_entries() were
+keeping track of the start index themselves as they traverse the search
+range.
+
+This resulted in hacky code such as in shmem_undo_range():
+
+			index = folio->index + folio_nr_pages(folio) - 1;
+
+where the - 1 is only present to stay in the right spot after incrementing
+index later.  This sort of calculation was also being done on every folio
+despite not even using index later within that function.
+
+These patches change find_get_entries() and find_lock_entries() to
+calculate the new index instead of leaving it to the callers so we can
+avoid all these complications.
+
+
+This patch (of 2):
+			
+Initially, find_lock_entries() was being passed in the start offset as a
+value.  That left the calculation of the offset to the callers.  This led
+to complexity in the callers trying to keep track of the index.
+
+Now find_lock_entries() takes in a pointer to the start offset and updates
+the value to be directly after the last entry found.  If no entry is
+found, the offset is not changed.  This gets rid of multiple hacky
+calculations that kept track of the start offset.
+
+Link: https://lkml.kernel.org/r/20221013225708.1879-1-vishal.moola@gmail.com
+Link: https://lkml.kernel.org/r/20221013225708.1879-2-vishal.moola@gmail.com
+Signed-off-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Hugh Dickins <hughd@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c  |   17 +++++++++++++----
+ mm/internal.h |    2 +-
+ mm/shmem.c    |    8 ++------
+ mm/truncate.c |   11 +++--------
+ 4 files changed, 19 insertions(+), 19 deletions(-)
+
+--- a/mm/filemap.c~filemap-find_lock_entries-now-updates-start-offset
++++ a/mm/filemap.c
+@@ -2085,16 +2085,16 @@ unsigned find_get_entries(struct address
+  *
+  * Return: The number of entries which were found.
+  */
+-unsigned find_lock_entries(struct address_space *mapping, pgoff_t start,
++unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
+ 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices)
+ {
+-	XA_STATE(xas, &mapping->i_pages, start);
++	XA_STATE(xas, &mapping->i_pages, *start);
+ 	struct folio *folio;
+ 
+ 	rcu_read_lock();
+ 	while ((folio = find_get_entry(&xas, end, XA_PRESENT))) {
+ 		if (!xa_is_value(folio)) {
+-			if (folio->index < start)
++			if (folio->index < *start)
+ 				goto put;
+ 			if (folio->index + folio_nr_pages(folio) - 1 > end)
+ 				goto put;
+@@ -2115,8 +2115,17 @@ unlock:
+ put:
+ 		folio_put(folio);
+ 	}
+-	rcu_read_unlock();
+ 
++	if (folio_batch_count(fbatch)) {
++		unsigned long nr = 1;
++		int idx = folio_batch_count(fbatch) - 1;
++
++		folio = fbatch->folios[idx];
++		if (!xa_is_value(folio) && !folio_test_hugetlb(folio))
++			nr = folio_nr_pages(folio);
++		*start = indices[idx] + nr;
++	}
++	rcu_read_unlock();
+ 	return folio_batch_count(fbatch);
+ }
+ 
+--- a/mm/internal.h~filemap-find_lock_entries-now-updates-start-offset
++++ a/mm/internal.h
+@@ -106,7 +106,7 @@ static inline void force_page_cache_read
+ 	force_page_cache_ra(&ractl, nr_to_read);
+ }
+ 
+-unsigned find_lock_entries(struct address_space *mapping, pgoff_t start,
++unsigned find_lock_entries(struct address_space *mapping, pgoff_t *start,
+ 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
+ unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
+ 		pgoff_t end, struct folio_batch *fbatch, pgoff_t *indices);
+--- a/mm/shmem.c~filemap-find_lock_entries-now-updates-start-offset
++++ a/mm/shmem.c
+@@ -922,21 +922,18 @@ static void shmem_undo_range(struct inod
+ 
+ 	folio_batch_init(&fbatch);
+ 	index = start;
+-	while (index < end && find_lock_entries(mapping, index, end - 1,
++	while (index < end && find_lock_entries(mapping, &index, end - 1,
+ 			&fbatch, indices)) {
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+ 			folio = fbatch.folios[i];
+ 
+-			index = indices[i];
+-
+ 			if (xa_is_value(folio)) {
+ 				if (unfalloc)
+ 					continue;
+ 				nr_swaps_freed += !shmem_free_swap(mapping,
+-								index, folio);
++							indices[i], folio);
+ 				continue;
+ 			}
+-			index += folio_nr_pages(folio) - 1;
+ 
+ 			if (!unfalloc || !folio_test_uptodate(folio))
+ 				truncate_inode_folio(mapping, folio);
+@@ -945,7 +942,6 @@ static void shmem_undo_range(struct inod
+ 		folio_batch_remove_exceptionals(&fbatch);
+ 		folio_batch_release(&fbatch);
+ 		cond_resched();
+-		index++;
+ 	}
+ 
+ 	same_folio = (lstart >> PAGE_SHIFT) == (lend >> PAGE_SHIFT);
+--- a/mm/truncate.c~filemap-find_lock_entries-now-updates-start-offset
++++ a/mm/truncate.c
+@@ -361,9 +361,8 @@ void truncate_inode_pages_range(struct a
+ 
+ 	folio_batch_init(&fbatch);
+ 	index = start;
+-	while (index < end && find_lock_entries(mapping, index, end - 1,
++	while (index < end && find_lock_entries(mapping, &index, end - 1,
+ 			&fbatch, indices)) {
+-		index = indices[folio_batch_count(&fbatch) - 1] + 1;
+ 		truncate_folio_batch_exceptionals(mapping, &fbatch, indices);
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++)
+ 			truncate_cleanup_folio(fbatch.folios[i]);
+@@ -510,20 +509,17 @@ unsigned long invalidate_mapping_pagevec
+ 	int i;
+ 
+ 	folio_batch_init(&fbatch);
+-	while (find_lock_entries(mapping, index, end, &fbatch, indices)) {
++	while (find_lock_entries(mapping, &index, end, &fbatch, indices)) {
+ 		for (i = 0; i < folio_batch_count(&fbatch); i++) {
+ 			struct folio *folio = fbatch.folios[i];
+ 
+ 			/* We rely upon deletion not changing folio->index */
+-			index = indices[i];
+ 
+ 			if (xa_is_value(folio)) {
+ 				count += invalidate_exceptional_entry(mapping,
+-								      index,
+-								      folio);
++							     indices[i], folio);
+ 				continue;
+ 			}
+-			index += folio_nr_pages(folio) - 1;
+ 
+ 			ret = mapping_evict_folio(mapping, folio);
+ 			folio_unlock(folio);
+@@ -542,7 +538,6 @@ unsigned long invalidate_mapping_pagevec
+ 		folio_batch_remove_exceptionals(&fbatch);
+ 		folio_batch_release(&fbatch);
+ 		cond_resched();
+-		index++;
+ 	}
+ 	return count;
+ }
+_

@@ -1,0 +1,65 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Subject: fsdax: wait for pinned pages during truncate_inode_pages_final()
+Date: Fri, 14 Oct 2022 16:57:25 -0700
+
+The fsdax truncate vs page pinning solution is incomplete.  The initial
+solution landed in v4.17 and covered typical truncate invoked through
+truncate(2) and fallocate(2), i.e.  the truncate_inode_pages() called on
+open files.  However, that enabling left truncate_inode_pages_final(),
+called after iput_final() to free the inode, unprotected.  Thankfully that
+v4.17 enabling also left a warning in place to fire if any truncate is
+attempted while a DAX page is still pinned:
+
+commit d2c997c0f145 ("fs, dax: use page->mapping to warn if truncate collides with a busy page")
+
+While a lore search indicates no reports of that firing, the hole is there
+nonetheless.  The concern is that if/when that warning fires it indicates
+a use-after-free condition whereby the filesystem has lost the ability to
+arbitrate access to its storage blocks.  For example, in the worst case,
+DMA may be ongoing while the filesystem thinks the block is free to be
+reallocated to another inode.
+
+This patch is based on an observation from Dave that during iput_final()
+there is no need to hold filesystem locks like the explicit truncate path.
+The wait can occur from within dax_delete_mapping_entry() called by
+truncate_folio_batch_exceptionals().
+
+This solution trades off fixing the use-after-free with a theoretical
+deadlock scenario.  If the agent holding the page pin triggers inode
+reclaim and that reclaim waits for the pin to drop it will deadlock.  Two
+observations make this approach still worth pursuing:
+
+1/ Any existing scenarios where that happens would have triggered the
+   warning referenced above which has shipped upstream for ~5 years
+   without a bug report on lore.
+
+2/ Most I/O drivers only hold page pins in their fast paths and new
+   __GFP_FS allocations are unlikely in a driver fast path. I.e. if the
+   deadlock triggers the likely fix would be in the offending driver, not
+   new band-aids in fsdax.
+
+So, update the DAX core to notice that the inode->i_mapping is in the
+exiting state and use that as a signal that the inode is unreferenced
+await page-pins to drain.
+
+Link: https://lkml.kernel.org/r/166579184544.2236710.791897642091142558.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Reported-by: Dave Chinner <david@fromorbit.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>

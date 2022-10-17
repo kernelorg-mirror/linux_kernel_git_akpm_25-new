@@ -1,0 +1,124 @@
+From: Dan Williams <dan.j.williams@intel.com>
+Subject: fsdax: update dax_insert_entry() calling convention to return an error
+Date: Fri, 14 Oct 2022 16:57:43 -0700
+
+In preparation for teaching dax_insert_entry() to take live @pgmap
+references, enable it to return errors.  Given the observation that all
+callers overwrite the passed in entry with the return value, just update
+@entry in place and convert the return code to a vm_fault_t status.
+
+Link: https://lkml.kernel.org/r/166579186334.2236710.388332274317019999.stgit@dwillia2-xfh.jf.intel.com
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alex Deucher <alexander.deucher@amd.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Ben Skeggs <bskeggs@redhat.com>
+Cc: "Christian König" <christian.koenig@amd.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: David Airlie <airlied@linux.ie>
+Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+Cc: Jerome Glisse <jglisse@redhat.com>
+Cc: Karol Herbst <kherbst@redhat.com>
+Cc: kernel test robot <lkp@intel.com>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: "Pan, Xinhui" <Xinhui.Pan@amd.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c |   28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+--- a/fs/dax.c~fsdax-update-dax_insert_entry-calling-convention-to-return-an-error
++++ a/fs/dax.c
+@@ -907,14 +907,15 @@ static bool dax_fault_is_cow(const struc
+  * already in the tree, we will skip the insertion and just dirty the PMD as
+  * appropriate.
+  */
+-static void *dax_insert_entry(struct xa_state *xas, struct vm_fault *vmf,
+-		const struct iomap_iter *iter, void *entry, pfn_t pfn,
+-		unsigned long flags)
++static vm_fault_t dax_insert_entry(struct xa_state *xas, struct vm_fault *vmf,
++				   const struct iomap_iter *iter, void **pentry,
++				   pfn_t pfn, unsigned long flags)
+ {
+ 	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+ 	void *new_entry = dax_make_entry(pfn, flags);
+ 	bool dirty = !dax_fault_is_synchronous(iter, vmf->vma);
+ 	bool cow = dax_fault_is_cow(iter);
++	void *entry = *pentry;
+ 
+ 	if (dirty)
+ 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+@@ -960,7 +961,9 @@ static void *dax_insert_entry(struct xa_
+ 		xas_set_mark(xas, PAGECACHE_TAG_TOWRITE);
+ 
+ 	xas_unlock_irq(xas);
+-	return entry;
++
++	*pentry = entry;
++	return 0;
+ }
+ 
+ static int dax_writeback_one(struct xa_state *xas, struct dax_device *dax_dev,
+@@ -1206,9 +1209,12 @@ static vm_fault_t dax_load_hole(struct x
+ 	pfn_t pfn = pfn_to_pfn_t(my_zero_pfn(vaddr));
+ 	vm_fault_t ret;
+ 
+-	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn, DAX_ZERO_PAGE);
++	ret = dax_insert_entry(xas, vmf, iter, entry, pfn, DAX_ZERO_PAGE);
++	if (ret)
++		goto out;
+ 
+ 	ret = vmf_insert_mixed(vmf->vma, vaddr, pfn);
++out:
+ 	trace_dax_load_hole(inode, vmf, ret);
+ 	return ret;
+ }
+@@ -1225,6 +1231,7 @@ static vm_fault_t dax_pmd_load_hole(stru
+ 	struct page *zero_page;
+ 	spinlock_t *ptl;
+ 	pmd_t pmd_entry;
++	vm_fault_t ret;
+ 	pfn_t pfn;
+ 
+ 	zero_page = mm_get_huge_zero_page(vmf->vma->vm_mm);
+@@ -1233,8 +1240,10 @@ static vm_fault_t dax_pmd_load_hole(stru
+ 		goto fallback;
+ 
+ 	pfn = page_to_pfn_t(zero_page);
+-	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn,
+-				  DAX_PMD | DAX_ZERO_PAGE);
++	ret = dax_insert_entry(xas, vmf, iter, entry, pfn,
++			       DAX_PMD | DAX_ZERO_PAGE);
++	if (ret)
++		return ret;
+ 
+ 	if (arch_needs_pgtable_deposit()) {
+ 		pgtable = pte_alloc_one(vma->vm_mm);
+@@ -1590,6 +1599,7 @@ static vm_fault_t dax_fault_iter(struct
+ 	bool write = iter->flags & IOMAP_WRITE;
+ 	unsigned long entry_flags = pmd ? DAX_PMD : 0;
+ 	int err = 0, id;
++	vm_fault_t ret;
+ 	pfn_t pfn;
+ 	void *kaddr;
+ 
+@@ -1616,8 +1626,10 @@ static vm_fault_t dax_fault_iter(struct
+ 		return pmd ? VM_FAULT_FALLBACK : dax_fault_return(err);
+ 	}
+ 
+-	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn, entry_flags);
++	ret = dax_insert_entry(xas, vmf, iter, entry, pfn, entry_flags);
+ 	dax_read_unlock(id);
++	if (ret)
++		return ret;
+ 
+ 	if (write &&
+ 	    srcmap->type != IOMAP_HOLE && srcmap->addr != iomap->addr) {
+_
