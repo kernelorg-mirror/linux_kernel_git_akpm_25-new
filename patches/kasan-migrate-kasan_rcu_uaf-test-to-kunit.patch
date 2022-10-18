@@ -1,0 +1,136 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: kasan: migrate kasan_rcu_uaf test to kunit
+Date: Tue, 27 Sep 2022 19:09:10 +0200
+
+Migrate the kasan_rcu_uaf test to the KUnit framework.
+
+Changes to the implementation of the test:
+
+- Call rcu_barrier() after call_rcu() to make that the RCU callbacks get
+  triggered before the test is over.
+
+- Cast pointer passed to rcu_dereference_protected as __rcu to get rid of
+  the Sparse warning.
+
+- Check that KASAN prints a report via KUNIT_EXPECT_KASAN_FAIL.
+
+Initially, this test was intended to check that Generic KASAN prints
+auxiliary stack traces for RCU objects. Nevertheless, the test is enabled
+for all modes to make that KASAN reports bad accesses in RCU callbacks.
+
+The presence of auxiliary stack traces for the Generic mode needs to be
+inspected manually.
+
+Link: https://lkml.kernel.org/r/897ee08d6cd0ba7e8a4fbfd9d8502823a2f922e6.1664298455.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Reviewed-by: Marco Elver <elver@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/kasan/kasan_test.c        |   37 +++++++++++++++++++++++++++++++++
+ mm/kasan/kasan_test_module.c |   30 --------------------------
+ 2 files changed, 37 insertions(+), 30 deletions(-)
+
+--- a/mm/kasan/kasan_test.c~kasan-migrate-kasan_rcu_uaf-test-to-kunit
++++ a/mm/kasan/kasan_test.c
+@@ -1141,6 +1141,42 @@ static void kmalloc_double_kzfree(struct
+ 	KUNIT_EXPECT_KASAN_FAIL(test, kfree_sensitive(ptr));
+ }
+ 
++static struct kasan_rcu_info {
++	int i;
++	struct rcu_head rcu;
++} *global_rcu_ptr;
++
++static void rcu_uaf_reclaim(struct rcu_head *rp)
++{
++	struct kasan_rcu_info *fp =
++		container_of(rp, struct kasan_rcu_info, rcu);
++
++	kfree(fp);
++	((volatile struct kasan_rcu_info *)fp)->i;
++}
++
++/*
++ * Check that Generic KASAN prints auxiliary stack traces for RCU callbacks.
++ * The report needs to be inspected manually.
++ *
++ * This test is still enabled for other KASAN modes to make sure that all modes
++ * report bad accesses in tested scenarios.
++ */
++static void rcu_uaf(struct kunit *test)
++{
++	struct kasan_rcu_info *ptr;
++
++	ptr = kmalloc(sizeof(struct kasan_rcu_info), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
++
++	global_rcu_ptr = rcu_dereference_protected(
++				(struct kasan_rcu_info __rcu *)ptr, NULL);
++
++	KUNIT_EXPECT_KASAN_FAIL(test,
++		call_rcu(&global_rcu_ptr->rcu, rcu_uaf_reclaim);
++		rcu_barrier());
++}
++
+ static void vmalloc_helpers_tags(struct kunit *test)
+ {
+ 	void *ptr;
+@@ -1472,6 +1508,7 @@ static struct kunit_case kasan_kunit_tes
+ 	KUNIT_CASE(kasan_bitops_generic),
+ 	KUNIT_CASE(kasan_bitops_tags),
+ 	KUNIT_CASE(kmalloc_double_kzfree),
++	KUNIT_CASE(rcu_uaf),
+ 	KUNIT_CASE(vmalloc_helpers_tags),
+ 	KUNIT_CASE(vmalloc_oob),
+ 	KUNIT_CASE(vmap_tags),
+--- a/mm/kasan/kasan_test_module.c~kasan-migrate-kasan_rcu_uaf-test-to-kunit
++++ a/mm/kasan/kasan_test_module.c
+@@ -62,35 +62,6 @@ static noinline void __init copy_user_te
+ 	kfree(kmem);
+ }
+ 
+-static struct kasan_rcu_info {
+-	int i;
+-	struct rcu_head rcu;
+-} *global_rcu_ptr;
+-
+-static noinline void __init kasan_rcu_reclaim(struct rcu_head *rp)
+-{
+-	struct kasan_rcu_info *fp = container_of(rp,
+-						struct kasan_rcu_info, rcu);
+-
+-	kfree(fp);
+-	((volatile struct kasan_rcu_info *)fp)->i;
+-}
+-
+-static noinline void __init kasan_rcu_uaf(void)
+-{
+-	struct kasan_rcu_info *ptr;
+-
+-	pr_info("use-after-free in kasan_rcu_reclaim\n");
+-	ptr = kmalloc(sizeof(struct kasan_rcu_info), GFP_KERNEL);
+-	if (!ptr) {
+-		pr_err("Allocation failed\n");
+-		return;
+-	}
+-
+-	global_rcu_ptr = rcu_dereference_protected(ptr, NULL);
+-	call_rcu(&global_rcu_ptr->rcu, kasan_rcu_reclaim);
+-}
+-
+ static noinline void __init kasan_workqueue_work(struct work_struct *work)
+ {
+ 	kfree(work);
+@@ -130,7 +101,6 @@ static int __init test_kasan_module_init
+ 	bool multishot = kasan_save_enable_multi_shot();
+ 
+ 	copy_user_test();
+-	kasan_rcu_uaf();
+ 	kasan_workqueue_uaf();
+ 
+ 	kasan_restore_multi_shot(multishot);
+_
