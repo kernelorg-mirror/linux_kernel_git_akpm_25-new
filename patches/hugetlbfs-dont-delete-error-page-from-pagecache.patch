@@ -1,0 +1,108 @@
+From: James Houghton <jthoughton@google.com>
+Subject: hugetlbfs: don't delete error page from pagecache
+Date: Tue, 18 Oct 2022 20:01:25 +0000
+
+This change is very similar to the change that was made for shmem [1], and
+it solves the same problem but for HugeTLBFS instead.
+
+Currently, when poison is found in a HugeTLB page, the page is removed
+from the page cache.  That means that attempting to map or read that
+hugepage in the future will result in a new hugepage being allocated
+instead of notifying the user that the page was poisoned.  As [1] states,
+this is effectively memory corruption.
+
+The fix is to leave the page in the page cache.  If the user attempts to
+use a poisoned HugeTLB page with a syscall, the syscall will fail with
+EIO, the same error code that shmem uses.  For attempts to map the page,
+the thread will get a BUS_MCEERR_AR SIGBUS.
+
+[1]: commit a76054266661 ("mm: shmem: don't truncate page if memory failure happens")
+
+Link: https://lkml.kernel.org/r/20221018200125.848471-1-jthoughton@google.com
+Signed-off-by: James Houghton <jthoughton@google.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c |   13 ++++++-------
+ mm/hugetlb.c         |    4 ++++
+ mm/memory-failure.c  |    5 ++++-
+ 3 files changed, 14 insertions(+), 8 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~hugetlbfs-dont-delete-error-page-from-pagecache
++++ a/fs/hugetlbfs/inode.c
+@@ -328,6 +328,12 @@ static ssize_t hugetlbfs_read_iter(struc
+ 		} else {
+ 			unlock_page(page);
+ 
++			if (PageHWPoison(page)) {
++				put_page(page);
++				retval = -EIO;
++				break;
++			}
++
+ 			/*
+ 			 * We have the page, copy it to user space buffer.
+ 			 */
+@@ -1111,13 +1117,6 @@ static int hugetlbfs_migrate_folio(struc
+ static int hugetlbfs_error_remove_page(struct address_space *mapping,
+ 				struct page *page)
+ {
+-	struct inode *inode = mapping->host;
+-	pgoff_t index = page->index;
+-
+-	hugetlb_delete_from_page_cache(page_folio(page));
+-	if (unlikely(hugetlb_unreserve_pages(inode, index, index + 1, 1)))
+-		hugetlb_fix_reserve_counts(inode);
+-
+ 	return 0;
+ }
+ 
+--- a/mm/hugetlb.c~hugetlbfs-dont-delete-error-page-from-pagecache
++++ a/mm/hugetlb.c
+@@ -6101,6 +6101,10 @@ int hugetlb_mcopy_atomic_pte(struct mm_s
+ 
+ 	ptl = huge_pte_lock(h, dst_mm, dst_pte);
+ 
++	ret = -EIO;
++	if (PageHWPoison(page))
++		goto out_release_unlock;
++
+ 	/*
+ 	 * We allow to overwrite a pte marker: consider when both MISSING|WP
+ 	 * registered, we firstly wr-protect a none pte which has no page cache
+--- a/mm/memory-failure.c~hugetlbfs-dont-delete-error-page-from-pagecache
++++ a/mm/memory-failure.c
+@@ -1080,6 +1080,7 @@ static int me_huge_page(struct page_stat
+ 	int res;
+ 	struct page *hpage = compound_head(p);
+ 	struct address_space *mapping;
++	bool extra_pins = false;
+ 
+ 	if (!PageHuge(hpage))
+ 		return MF_DELAYED;
+@@ -1087,6 +1088,8 @@ static int me_huge_page(struct page_stat
+ 	mapping = page_mapping(hpage);
+ 	if (mapping) {
+ 		res = truncate_error_page(hpage, page_to_pfn(p), mapping);
++		/* The page is kept in page cache. */
++		extra_pins = true;
+ 		unlock_page(hpage);
+ 	} else {
+ 		unlock_page(hpage);
+@@ -1104,7 +1107,7 @@ static int me_huge_page(struct page_stat
+ 		}
+ 	}
+ 
+-	if (has_extra_refcount(ps, p, false))
++	if (has_extra_refcount(ps, p, extra_pins))
+ 		res = MF_FAILED;
+ 
+ 	return res;
+_
