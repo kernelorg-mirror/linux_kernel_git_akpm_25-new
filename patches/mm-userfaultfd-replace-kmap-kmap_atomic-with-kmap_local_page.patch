@@ -6,8 +6,42 @@ kmap() and kmap_atomic() are being deprecated in favor of
 kmap_local_page() which is appropriate for any thread local context.[1]
 
 A recent locking bug report with userfaultfd showed that the conversion of
-these kmap_atomic()'s required care with regard to the prevention of
-deadlock.[2]
+the kmap_atomic()'s in those code flows requires care with regard to the
+prevention of deadlock.[2]
+
+git archaeology implied that the recursion may not be an actual bug.[3]
+However, depending on the implementation of the mmap_lock and the
+condition of the call there may still be a deadlock.[4] So this is not
+purely a lockdep issue.  Considering a single threaded call stack there
+are 3 options.
+
+	1) Different mm's are in play (no issue)
+	2) Readlock implementation is recursive and same mm is in play
+	   (no issue)
+	3) Readlock implementation is _not_ recursive (issue)
+
+The mmap_lock is recursive so with a single thread there is no issue.
+
+However, Matthew pointed out a deadlock scenario when you consider
+additional process' and threads thusly.
+
+"The readlock implementation is only recursive if nobody else has taken a
+write lock.  If you have a multithreaded process, one of the other threads
+can call mmap() and that will prevent recursion (due to fairness).  Even
+if it's a different process that you're trying to acquire the mmap read
+lock on, you can still get into a deadly embrace.  eg:
+
+process A thread 1 takes read lock on own mmap_lock
+process A thread 2 calls mmap, blocks taking write lock
+process B thread 1 takes page fault, read lock on own mmap lock
+process B thread 2 calls mmap, blocks taking write lock
+process A thread 1 blocks taking read lock on process B
+process B thread 1 blocks taking read lock on process A
+
+Now all four threads are blocked waiting for each other."
+
+Regardless using pagefault_disable() ensures that no matter what locking
+implementation is used a deadlock will not occur.
 
 Complete kmap conversion in userfaultfd by replacing the kmap() and
 kmap_atomic() calls with kmap_local_page().  When replacing the
@@ -17,6 +51,8 @@ the requirement.
 
 [1] https://lore.kernel.org/all/20220813220034.806698-1-ira.weiny@intel.com/
 [2] https://lore.kernel.org/all/Y1Mh2S7fUGQ%2FiKFR@iweiny-desk3/
+[3] https://lore.kernel.org/all/Y1MymJ%2FINb45AdaY@iweiny-desk3/
+[4] https://lore.kernel.org/lkml/Y1bXBtGTCym77%2FoD@casper.infradead.org/
 
 Link: https://lkml.kernel.org/r/20221024043452.1491677-1-ira.weiny@intel.com
 Signed-off-by: Ira Weiny <ira.weiny@intel.com>
@@ -28,8 +64,6 @@ Cc: Axel Rasmussen <axelrasmussen@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/userfaultfd.c |   15 +++++++++++----
- 1 file changed, 11 insertions(+), 4 deletions(-)
 
 --- a/mm/userfaultfd.c~mm-userfaultfd-replace-kmap-kmap_atomic-with-kmap_local_page
 +++ a/mm/userfaultfd.c
