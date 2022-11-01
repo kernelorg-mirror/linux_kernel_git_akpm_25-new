@@ -1,6 +1,6 @@
 From: Mike Kravetz <mike.kravetz@oracle.com>
 Subject: hugetlb: don't delete vma_lock in hugetlb MADV_DONTNEED processing
-Date: Sat, 22 Oct 2022 19:50:47 -0700
+Date: Mon, 31 Oct 2022 15:34:40 -0700
 
 madvise(MADV_DONTNEED) ends up calling zap_page_range() to clear the page
 tables associated with the address range.  For hugetlb vmas,
@@ -21,19 +21,23 @@ appeared anonymous in a VM_SHARED vma and triggered the BUG.
 
 Create a new routine clear_hugetlb_page_range() that can be called from
 madvise(MADV_DONTNEED) for hugetlb vmas.  It has the same setup as
-zap_page_range, but does not delete the vma_lock.
+zap_page_range, but does not delete the vma_lock.  Also, add a new zap
+flag ZAP_FLAG_UNMAP to indicate an unmap call from unmap_vmas().  This is
+used to indicate the 'final' unmapping of a vma.  The routine
+__unmap_hugepage_range to take a notification_needed argument.  This is
+used to prevent duplicate notifications.
 
 [1] https://lore.kernel.org/lkml/CAO4mrfdLMXsao9RF4fUE8-Wfde8xmjsKrTNMNC9wjUb6JudD0g@mail.gmail.com/
 
-Link: https://lkml.kernel.org/r/20221023025047.470646-1-mike.kravetz@oracle.com
+Link: https://lkml.kernel.org/r/20221031223440.285187-1-mike.kravetz@oracle.com
 Fixes: 90e7e7f5ef3f ("mm: enable MADV_DONTNEED for hugetlb mappings")
 Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
 Reported-by: Wei Chen <harperchen1110@gmail.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Cc: Mina Almasry <almasrymina@google.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
 Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Rik van Riel <riel@surriel.com>
@@ -42,10 +46,11 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/hugetlb.h |    7 ++++
- mm/hugetlb.c            |   62 ++++++++++++++++++++++++++++++--------
- mm/madvise.c            |    5 ++-
- 3 files changed, 61 insertions(+), 13 deletions(-)
+ include/linux/hugetlb.h |    7 +++
+ include/linux/mm.h      |    3 +
+ mm/hugetlb.c            |   80 ++++++++++++++++++++++++++++----------
+ mm/memory.c             |   18 +++++---
+ 4 files changed, 82 insertions(+), 26 deletions(-)
 
 --- a/include/linux/hugetlb.h~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
 +++ a/include/linux/hugetlb.h
@@ -70,9 +75,49 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline vm_fault_t hugetlb_fault(struct mm_struct *mm,
  			struct vm_area_struct *vma, unsigned long address,
  			unsigned int flags)
+--- a/include/linux/mm.h~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
++++ a/include/linux/mm.h
+@@ -3475,4 +3475,7 @@ madvise_set_anon_name(struct mm_struct *
+  */
+ #define  ZAP_FLAG_DROP_MARKER        ((__force zap_flags_t) BIT(0))
+ 
++/* Set in unmap_vmas() to indicate an unmap call.  Only used by hugetlb */
++#define  ZAP_FLAG_UNMAP              ((__force zap_flags_t) BIT(1))
++
+ #endif /* _LINUX_MM_H */
 --- a/mm/hugetlb.c~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
 +++ a/mm/hugetlb.c
-@@ -5194,28 +5194,66 @@ static void __unmap_hugepage_range(struc
+@@ -5064,7 +5064,6 @@ static void __unmap_hugepage_range(struc
+ 	struct page *page;
+ 	struct hstate *h = hstate_vma(vma);
+ 	unsigned long sz = huge_page_size(h);
+-	struct mmu_notifier_range range;
+ 	unsigned long last_addr_mask;
+ 	bool force_flush = false;
+ 
+@@ -5079,13 +5078,6 @@ static void __unmap_hugepage_range(struc
+ 	tlb_change_page_size(tlb, sz);
+ 	tlb_start_vma(tlb, vma);
+ 
+-	/*
+-	 * If sharing possible, alert mmu notifiers of worst case.
+-	 */
+-	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, vma, mm, start,
+-				end);
+-	adjust_range_if_pmd_sharing_possible(vma, &range.start, &range.end);
+-	mmu_notifier_invalidate_range_start(&range);
+ 	last_addr_mask = hugetlb_mask_last_page(h);
+ 	address = start;
+ 	for (; address < end; address += sz) {
+@@ -5174,7 +5166,6 @@ static void __unmap_hugepage_range(struc
+ 		if (ref_page)
+ 			break;
+ 	}
+-	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_end_vma(tlb, vma);
+ 
+ 	/*
+@@ -5194,37 +5185,86 @@ static void __unmap_hugepage_range(struc
  		tlb_flush_mmu_tlbonly(tlb);
  }
  
@@ -80,9 +125,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static void __unmap_hugepage_range_locking(struct mmu_gather *tlb,
  			  struct vm_area_struct *vma, unsigned long start,
  			  unsigned long end, struct page *ref_page,
--			  zap_flags_t zap_flags)
-+			  zap_flags_t zap_flags, bool final)
+ 			  zap_flags_t zap_flags)
  {
++	bool final = zap_flags & ZAP_FLAG_UNMAP;
++
  	hugetlb_vma_lock_write(vma);
  	i_mmap_lock_write(vma->vm_file->f_mapping);
  
@@ -121,7 +167,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			  zap_flags_t zap_flags)
 +{
 +	__unmap_hugepage_range_locking(tlb, vma, start, end, ref_page,
-+					zap_flags, true);
++					zap_flags);
 +}
 +
 +#ifdef CONFIG_ADVISE_SYSCALLS
@@ -138,12 +184,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,
 +				start, end);
++	adjust_range_if_pmd_sharing_possible(vma, &range.start, &range.end);
 +	tlb_gather_mmu(&tlb, vma->vm_mm);
 +	update_hiwater_rss(vma->vm_mm);
-+
-+	__unmap_hugepage_range_locking(&tlb, vma, start, end, NULL, 0, false);
++	mmu_notifier_invalidate_range_start(&range);
  
 -	i_mmap_unlock_write(vma->vm_file->f_mapping);
++	__unmap_hugepage_range_locking(&tlb, vma, start, end, NULL, 0);
++
 +	mmu_notifier_invalidate_range_end(&range);
 +	tlb_finish_mmu(&tlb);
  }
@@ -151,18 +199,58 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  void unmap_hugepage_range(struct vm_area_struct *vma, unsigned long start,
  			  unsigned long end, struct page *ref_page,
---- a/mm/madvise.c~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
-+++ a/mm/madvise.c
-@@ -790,7 +790,10 @@ static int madvise_free_single_vma(struc
- static long madvise_dontneed_single_vma(struct vm_area_struct *vma,
- 					unsigned long start, unsigned long end)
+ 			  zap_flags_t zap_flags)
  {
--	zap_page_range(vma, start, end - start);
-+	if (!is_vm_hugetlb_page(vma))
-+		zap_page_range(vma, start, end - start);
-+	else
-+		clear_hugetlb_page_range(vma, start, end);
- 	return 0;
++	struct mmu_notifier_range range;
+ 	struct mmu_gather tlb;
+ 
++	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, vma, vma->vm_mm,
++				start, end);
++	adjust_range_if_pmd_sharing_possible(vma, &range.start, &range.end);
+ 	tlb_gather_mmu(&tlb, vma->vm_mm);
++
+ 	__unmap_hugepage_range(&tlb, vma, start, end, ref_page, zap_flags);
++
++	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_finish_mmu(&tlb);
+ }
+ 
+--- a/mm/memory.c~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
++++ a/mm/memory.c
+@@ -1720,7 +1720,7 @@ void unmap_vmas(struct mmu_gather *tlb,
+ {
+ 	struct mmu_notifier_range range;
+ 	struct zap_details details = {
+-		.zap_flags = ZAP_FLAG_DROP_MARKER,
++		.zap_flags = ZAP_FLAG_DROP_MARKER | ZAP_FLAG_UNMAP,
+ 		/* Careful - we need to zap private pages too! */
+ 		.even_cows = true,
+ 	};
+@@ -1753,15 +1753,21 @@ void zap_page_range(struct vm_area_struc
+ 	MA_STATE(mas, mt, vma->vm_end, vma->vm_end);
+ 
+ 	lru_add_drain();
+-	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,
+-				start, start + size);
+ 	tlb_gather_mmu(&tlb, vma->vm_mm);
+ 	update_hiwater_rss(vma->vm_mm);
+-	mmu_notifier_invalidate_range_start(&range);
+ 	do {
+-		unmap_single_vma(&tlb, vma, start, range.end, NULL);
++		mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma,
++				vma->vm_mm,
++				max(start, vma->vm_start),
++				min(start + size, vma->vm_end));
++		if (is_vm_hugetlb_page(vma))
++			adjust_range_if_pmd_sharing_possible(vma,
++				&range.start,
++				&range.end);
++		mmu_notifier_invalidate_range_start(&range);
++		unmap_single_vma(&tlb, vma, start, start + size, NULL);
++		mmu_notifier_invalidate_range_end(&range);
+ 	} while ((vma = mas_find(&mas, end - 1)) != NULL);
+-	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_finish_mmu(&tlb);
  }
  
 _
