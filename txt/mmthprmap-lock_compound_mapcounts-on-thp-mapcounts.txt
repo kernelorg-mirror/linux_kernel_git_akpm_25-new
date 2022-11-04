@@ -1,0 +1,63 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm,thp,rmap: lock_compound_mapcounts() on THP mapcounts
+Date: Wed, 2 Nov 2022 18:53:45 -0700 (PDT)
+
+Fix the races in maintaining compound_mapcount, subpages_mapcount and
+subpage _mapcount by using PG_locked in the first tail of any compound
+page for a bit_spin_lock() on such modifications; skipping the usual
+atomic operations on those fields in this case.
+
+Bring page_remove_file_rmap() and page_remove_anon_compound_rmap() back
+into page_remove_rmap() itself.  Rearrange page_add_anon_rmap() and
+page_add_file_rmap() and page_remove_rmap() to follow the same "if
+(compound) {lock} else if (PageCompound) {lock} else {atomic}" pattern
+(with a PageTransHuge in the compound test, like before, to avoid BUG_ONs
+and optimize away that block when THP is not configured).  Move all the
+stats updates outside, after the bit_spin_locked section, so that it is
+sure to be a leaf lock.
+
+Add page_dup_compound_rmap() to manage compound locking versus atomics in
+sync with the rest.  In particular, hugetlb pages are still using the
+atomics: to avoid unnecessary interference there, and because they never
+have subpage mappings; but this exception can easily be changed. 
+Conveniently, page_dup_compound_rmap() turns out to suit an anon THP's
+__split_huge_pmd_locked() too.
+
+bit_spin_lock() is not popular with PREEMPT_RT folks: but PREEMPT_RT
+sensibly excludes TRANSPARENT_HUGEPAGE already, so its only exposure is to
+the non-hugetlb non-THP pte-mapped compound pages (with large folios being
+currently dependent on TRANSPARENT_HUGEPAGE).  There is never any scan of
+subpages in this case; but we have chosen to use PageCompound tests rather
+than PageTransCompound tests to gate the use of lock_compound_mapcounts(),
+so that page_mapped() is correct on all compound pages, whether or not
+TRANSPARENT_HUGEPAGE is enabled: could that be a problem for PREEMPT_RT,
+when there is contention on the lock - under heavy concurrent forking for
+example?  If so, then it can be turned into a sleeping lock (like
+folio_lock()) when PREEMPT_RT.
+
+A simple 100 X munmap(mmap(2GB, MAP_SHARED|MAP_POPULATE, tmpfs), 2GB) took
+18 seconds on small pages, and used to take 1 second on huge pages, but
+now takes 115 milliseconds on huge pages.  Mapping by pmds a second time
+used to take 860ms and now takes 86ms; mapping by pmds after mapping by
+ptes (when the scan is needed) used to take 870ms and now takes 495ms. 
+Mapping huge pages by ptes is largely unaffected but variable: between 5%
+faster and 5% slower in what I've recorded.  Contention on the lock is
+likely to behave worse than contention on the atomics behaved.
+
+Link: https://lkml.kernel.org/r/1b42bd1a-8223-e827-602f-d466c2db7d3c@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zach O'Keefe <zokeefe@google.com>

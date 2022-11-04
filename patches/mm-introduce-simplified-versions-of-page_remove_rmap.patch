@@ -1,0 +1,153 @@
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Subject: mm: introduce simplified versions of 'page_remove_rmap()'
+Date: Sun Oct 30 13:26:07 2022 -0700
+
+The rmap handling is proving a bit problematic, and part of it comes from
+the complexities of all the different cases of our implementation of
+'page_remove_rmap()'.
+
+And a large part of that complexity comes from the fact that while we have
+multiple different versions of _adding_ an rmap, this 'remove rmap'
+function tries to deal with all possible cases.
+
+So we have these specific versions for page_add_anon_rmap(),
+page_add_new_anon_rmap() and page_add_file_rmap() which all do slightly
+different things, but then 'page_remove_rmap()' has to handle all the
+cases.
+
+That's particularly annoying for 'zap_pte_range()', which already knows
+which special case it's dealing with.  It already checked for its own
+reasons whether it's an anonymous page, and it already knows it's not the
+compound page case and passed in an unconditional 'false' argument.
+
+So this introduces the specialized versions of 'page_remove_rmap()' for
+the cases that zap_pte_range() wants.  We also make it the job of the
+caller to do the munlock_vma_page(), which is really unrelated and is the
+only thing that cares about the 'vma'.
+
+This just means that we end up with several simplifications:
+
+ - there's no 'vma' argument any more, because it's not used
+
+ - there's no 'compound' argument any more, because it was always false
+
+ - we can get rid of the tests for 'compound' and 'PageAnon()' since we
+   know what they are
+
+and so instead of having that fairly complicated page_remove_rmap()
+function, we end up with a couple of specialized functions that are _much_
+simpler.
+
+There is supposed to be no semantic difference from this change, although
+this does end up simplifying the code further by moving the
+atomic_add_negative() on the PageAnon mapcount to outside the memcg
+locking.
+
+That locking protects other data structures (the page state statistics),
+and this avoids not only an ugly 'goto', but means that we don't need to
+take and release the lock when we're not actually doing anything with the
+state statistics.
+
+We also remove the test for PageTransCompound(), since this is only called
+for the final pte level from zap_pte_range().
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Aneesh Kumar <aneesh.kumar@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Nick Piggin <npiggin@gmail.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/rmap.h |    2 +
+ mm/memory.c          |    6 +++--
+ mm/rmap.c            |   42 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 48 insertions(+), 2 deletions(-)
+
+--- a/include/linux/rmap.h~mm-introduce-simplified-versions-of-page_remove_rmap
++++ a/include/linux/rmap.h
+@@ -196,6 +196,8 @@ void page_add_new_anon_rmap(struct page
+ 		unsigned long address);
+ void page_add_file_rmap(struct page *, struct vm_area_struct *,
+ 		bool compound);
++void page_zap_file_rmap(struct page *);
++void page_zap_anon_rmap(struct page *);
+ void page_remove_rmap(struct page *, struct vm_area_struct *,
+ 		bool compound);
+ 
+--- a/mm/memory.c~mm-introduce-simplified-versions-of-page_remove_rmap
++++ a/mm/memory.c
+@@ -1402,9 +1402,11 @@ again:
+ 				if (pte_young(ptent) &&
+ 				    likely(!(vma->vm_flags & VM_SEQ_READ)))
+ 					mark_page_accessed(page);
+-			}
++				page_zap_file_rmap(page);
++			} else
++				page_zap_anon_rmap(page);
++			munlock_vma_page(page, vma, false);
+ 			rss[mm_counter(page)]--;
+-			page_remove_rmap(page, vma, false);
+ 			if (unlikely(page_mapcount(page) < 0))
+ 				print_bad_pte(vma, addr, ptent, page);
+ 			if (unlikely(__tlb_remove_page(tlb, page))) {
+--- a/mm/rmap.c~mm-introduce-simplified-versions-of-page_remove_rmap
++++ a/mm/rmap.c
+@@ -1413,6 +1413,48 @@ static void page_remove_anon_compound_rm
+ }
+ 
+ /**
++ * page_zap_file_rmap - take down non-anon pte mapping from a page
++ * @page:	page to remove mapping from
++ *
++ * This is the simplified form of page_remove_rmap(), with:
++ *  - we've already checked for '!PageAnon(page)'
++ *  - 'compound' is always false
++ *  - the caller does 'munlock_vma_page(page, vma, compound)' separately
++ * which allows for a much simpler calling convention.
++ *
++ * The caller holds the pte lock.
++ */
++void page_zap_file_rmap(struct page *page)
++{
++	lock_page_memcg(page);
++	page_remove_file_rmap(page, false);
++	unlock_page_memcg(page);
++}
++
++/**
++ * page_zap_anon_rmap(page) - take down non-anon pte mapping from a page
++ * @page:	page to remove mapping from
++ *
++ * This is the simplified form of page_remove_rmap(), with:
++ *  - we've already checked for 'PageAnon(page)'
++ *  - 'compound' is always false
++ *  - the caller does 'munlock_vma_page(page, vma, compound)' separately
++ * which allows for a much simpler calling convention.
++ *
++ * The caller holds the pte lock.
++ */
++void page_zap_anon_rmap(struct page *page)
++{
++	/* page still mapped by someone else? */
++	if (!atomic_add_negative(-1, &page->_mapcount))
++		return;
++
++	lock_page_memcg(page);
++	__dec_lruvec_page_state(page, NR_ANON_MAPPED);
++	unlock_page_memcg(page);
++}
++
++/**
+  * page_remove_rmap - take down pte mapping from a page
+  * @page:	page to remove mapping from
+  * @vma:	the vm area from which the mapping is removed
+_

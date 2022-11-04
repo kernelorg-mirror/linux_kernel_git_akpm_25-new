@@ -1,0 +1,60 @@
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Subject: mm: delay rmap removal until after TLB flush
+Date: Sat Oct 29 11:45:07 2022 -0700
+
+When we remove a page table entry, we are very careful to only free the
+page after we have flushed the TLB, because other CPUs could still be
+using the page through stale TLB entries until after the flush.
+
+However, we have removed the rmap entry for that page early, which means
+that functions like folio_mkclean() would end up not serializing with the
+page table lock because the page had already been made invisible to rmap.
+
+And that is a problem, because while the TLB entry exists, we could end up
+with the following situation:
+
+ (a) one CPU could come in and clean it, never seeing our mapping of
+     the page
+
+ (b) another CPU could continue to use the stale and dirty TLB entry
+     and continue to write to said page
+
+resulting in a page that has been dirtied, but then marked clean again,
+all while another CPU might have dirtied it some more.
+
+End result: possibly lost dirty data.
+
+This commit uses the same old TLB gather array that we use to delay the
+freeing of the page to also say 'remove from rmap after flush', so that we
+can keep the rmap entries alive until all TLB entries have been flushed.
+
+It might be worth noting that this means that the page_zap_pte_rmap() is
+now called outside the page table lock.  That was never mutual exclusion
+(since the same page could be mapped under multiple different page
+tables), but it does mean that it needs to use the more careful version of
+dec_lruvec_page_state() that doesn't depend on being called in a
+non-preemptable context.
+
+NOTE!  While the "possibly lost dirty data" sounds catastrophic, for this
+all to happen you need to have a user thread doing either madvise() with
+MADV_DONTNEED or a full re-mmap() of the area concurrently with another
+thread continuing to use said mapping.
+
+So arguably this is about user space doing crazy things, but from a VM
+consistency standpoint it's better if we track the dirty bit properly even
+when user space goes off the rails.
+
+Reported-by: Nadav Amit <nadav.amit@gmail.com>
+Link: https://lore.kernel.org/all/B88D3073-440A-41C7-95F4-895D3F657EF2@gmail.com/
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Acked-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com> # s390
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar <aneesh.kumar@linux.ibm.com>
+Cc: Nick Piggin <npiggin@gmail.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
