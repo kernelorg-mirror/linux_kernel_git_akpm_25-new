@@ -1,8 +1,8 @@
 From: Mike Kravetz <mike.kravetz@oracle.com>
 Subject: hugetlb: don't delete vma_lock in hugetlb MADV_DONTNEED processing
-Date: Mon, 31 Oct 2022 15:34:40 -0700
+Date: Tue, 1 Nov 2022 18:31:00 -0700
 
-madvise(MADV_DONTNEED) ends up calling zap_page_range() to clear the page
+madvise(MADV_DONTNEED) ends up calling zap_page_range() to clear page
 tables associated with the address range.  For hugetlb vmas,
 zap_page_range will call __unmap_hugepage_range_final.  However,
 __unmap_hugepage_range_final assumes the passed vma is about to be removed
@@ -19,23 +19,26 @@ VM_MAYSHARE indicates a sharable vma, but was not set so page_mapping was
 not set in new pages added to the page table.  This resulted in pages that
 appeared anonymous in a VM_SHARED vma and triggered the BUG.
 
-Create a new routine clear_hugetlb_page_range() that can be called from
-madvise(MADV_DONTNEED) for hugetlb vmas.  It has the same setup as
-zap_page_range, but does not delete the vma_lock.  Also, add a new zap
-flag ZAP_FLAG_UNMAP to indicate an unmap call from unmap_vmas().  This is
-used to indicate the 'final' unmapping of a vma.  The routine
-__unmap_hugepage_range to take a notification_needed argument.  This is
-used to prevent duplicate notifications.
+Address issue by:
+- Add a new zap flag ZAP_FLAG_UNMAP to indicate an unmap call from
+  unmap_vmas().  This is used to indicate the 'final' unmapping of a vma.
+  When called via MADV_DONTNEED, this flag is not set and the vm_lock is
+  not deleted.
+- mmu notification is removed from __unmap_hugepage_range to avoid
+  duplication, and notification is added to the other calling routine
+  (unmap_hugepage_range).
+- notification calls are updated in zap_page range to take into account
+  the possibility of multiple vmas.
 
 [1] https://lore.kernel.org/lkml/CAO4mrfdLMXsao9RF4fUE8-Wfde8xmjsKrTNMNC9wjUb6JudD0g@mail.gmail.com/
-
-Link: https://lkml.kernel.org/r/20221031223440.285187-1-mike.kravetz@oracle.com
+Link: https://lkml.kernel.org/r/20221102013100.455139-1-mike.kravetz@oracle.com
 Fixes: 90e7e7f5ef3f ("mm: enable MADV_DONTNEED for hugetlb mappings")
 Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
 Reported-by: Wei Chen <harperchen1110@gmail.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Cc: Mina Almasry <almasrymina@google.com>
 Cc: Nadav Amit <nadav.amit@gmail.com>
 Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
@@ -46,35 +49,11 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/hugetlb.h |    7 +++
- include/linux/mm.h      |    3 +
- mm/hugetlb.c            |   80 ++++++++++++++++++++++++++++----------
- mm/memory.c             |   18 +++++---
- 4 files changed, 82 insertions(+), 26 deletions(-)
+ include/linux/mm.h |    3 ++
+ mm/hugetlb.c       |   45 +++++++++++++++++++++++++------------------
+ mm/memory.c        |   21 ++++++++++++++------
+ 3 files changed, 45 insertions(+), 24 deletions(-)
 
---- a/include/linux/hugetlb.h~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
-+++ a/include/linux/hugetlb.h
-@@ -156,6 +156,8 @@ long follow_hugetlb_page(struct mm_struc
- void unmap_hugepage_range(struct vm_area_struct *,
- 			  unsigned long, unsigned long, struct page *,
- 			  zap_flags_t);
-+void clear_hugetlb_page_range(struct vm_area_struct *vma,
-+			unsigned long start, unsigned long end);
- void __unmap_hugepage_range_final(struct mmu_gather *tlb,
- 			  struct vm_area_struct *vma,
- 			  unsigned long start, unsigned long end,
-@@ -460,6 +462,11 @@ static inline void __unmap_hugepage_rang
- 	BUG();
- }
- 
-+static void __maybe_unused clear_hugetlb_page_range(struct vm_area_struct *vma,
-+			unsigned long start, unsigned long end)
-+{
-+}
-+
- static inline vm_fault_t hugetlb_fault(struct mm_struct *mm,
- 			struct vm_area_struct *vma, unsigned long address,
- 			unsigned int flags)
 --- a/include/linux/mm.h~hugetlb-dont-delete-vma_lock-in-hugetlb-madv_dontneed-processing
 +++ a/include/linux/mm.h
 @@ -3475,4 +3475,7 @@ madvise_set_anon_name(struct mm_struct *
@@ -117,13 +96,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	tlb_end_vma(tlb, vma);
  
  	/*
-@@ -5194,37 +5185,86 @@ static void __unmap_hugepage_range(struc
- 		tlb_flush_mmu_tlbonly(tlb);
- }
- 
--void __unmap_hugepage_range_final(struct mmu_gather *tlb,
-+static void __unmap_hugepage_range_locking(struct mmu_gather *tlb,
- 			  struct vm_area_struct *vma, unsigned long start,
+@@ -5199,32 +5190,50 @@ void __unmap_hugepage_range_final(struct
  			  unsigned long end, struct page *ref_page,
  			  zap_flags_t zap_flags)
  {
@@ -134,15 +107,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	__unmap_hugepage_range(tlb, vma, start, end, ref_page, zap_flags);
  
--	/*
+ 	/*
 -	 * Unlock and free the vma lock before releasing i_mmap_rwsem.  When
 -	 * the vma_lock is freed, this makes the vma ineligible for pmd
 -	 * sharing.  And, i_mmap_rwsem is required to set up pmd sharing.
 -	 * This is important as page tables for this unmapped range will
 -	 * be asynchrously deleted.  If the page tables are shared, there
 -	 * will be issues when accessed by someone else.
--	 */
++	 * When called via zap_page_range (MADV_DONTNEED), this is not the
++	 * final unmap of the vma, and we do not want to delete the vma_lock.
+ 	 */
 -	__hugetlb_vma_unlock_write_free(vma);
+-
+-	i_mmap_unlock_write(vma->vm_file->f_mapping);
 +	if (final) {
 +		/*
 +		 * Unlock and free the vma lock before releasing i_mmap_rwsem.
@@ -159,43 +136,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		i_mmap_unlock_write(vma->vm_file->f_mapping);
 +		hugetlb_vma_unlock_write(vma);
 +	}
-+}
-+
-+void __unmap_hugepage_range_final(struct mmu_gather *tlb,
-+			  struct vm_area_struct *vma, unsigned long start,
-+			  unsigned long end, struct page *ref_page,
-+			  zap_flags_t zap_flags)
-+{
-+	__unmap_hugepage_range_locking(tlb, vma, start, end, ref_page,
-+					zap_flags);
-+}
-+
-+#ifdef CONFIG_ADVISE_SYSCALLS
-+/*
-+ * Similar setup as in zap_page_range().  madvise(MADV_DONTNEED) can not call
-+ * zap_page_range for hugetlb vmas as __unmap_hugepage_range_final will delete
-+ * the associated vma_lock.
-+ */
-+void clear_hugetlb_page_range(struct vm_area_struct *vma, unsigned long start,
-+				unsigned long end)
-+{
-+	struct mmu_notifier_range range;
-+	struct mmu_gather tlb;
-+
-+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, vma->vm_mm,
-+				start, end);
-+	adjust_range_if_pmd_sharing_possible(vma, &range.start, &range.end);
-+	tlb_gather_mmu(&tlb, vma->vm_mm);
-+	update_hiwater_rss(vma->vm_mm);
-+	mmu_notifier_invalidate_range_start(&range);
- 
--	i_mmap_unlock_write(vma->vm_file->f_mapping);
-+	__unmap_hugepage_range_locking(&tlb, vma, start, end, NULL, 0);
-+
-+	mmu_notifier_invalidate_range_end(&range);
-+	tlb_finish_mmu(&tlb);
  }
-+#endif
  
  void unmap_hugepage_range(struct vm_area_struct *vma, unsigned long start,
  			  unsigned long end, struct page *ref_page,
@@ -226,7 +167,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/* Careful - we need to zap private pages too! */
  		.even_cows = true,
  	};
-@@ -1753,15 +1753,21 @@ void zap_page_range(struct vm_area_struc
+@@ -1753,15 +1753,24 @@ void zap_page_range(struct vm_area_struc
  	MA_STATE(mas, mt, vma->vm_end, vma->vm_end);
  
  	lru_add_drain();
@@ -238,15 +179,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	do {
 -		unmap_single_vma(&tlb, vma, start, range.end, NULL);
 +		mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma,
-+				vma->vm_mm,
-+				max(start, vma->vm_start),
-+				min(start + size, vma->vm_end));
++					vma->vm_mm,
++					max(start, vma->vm_start),
++					min(end, vma->vm_end));
 +		if (is_vm_hugetlb_page(vma))
 +			adjust_range_if_pmd_sharing_possible(vma,
-+				&range.start,
-+				&range.end);
++						&range.start, &range.end);
 +		mmu_notifier_invalidate_range_start(&range);
-+		unmap_single_vma(&tlb, vma, start, start + size, NULL);
++		/*
++		 * unmap 'start-end' not 'range.start-range.end' as range
++		 * could have been expanded for pmd sharing.
++		 */
++		unmap_single_vma(&tlb, vma, start, end, NULL);
 +		mmu_notifier_invalidate_range_end(&range);
  	} while ((vma = mas_find(&mas, end - 1)) != NULL);
 -	mmu_notifier_invalidate_range_end(&range);
