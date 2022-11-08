@@ -1,0 +1,141 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: zswap: fix writeback lock ordering for zsmalloc
+Date: Tue, 8 Nov 2022 11:32:03 -0800
+
+Patch series "Implement writeback for zsmalloc", v3.
+
+Unlike other zswap allocators such as zbud or z3fold, zsmalloc currently
+lacks the writeback mechanism.  This means that when the zswap pool is
+full, it will simply reject further allocations, and the pages will be
+written directly to swap.
+
+This series of patches implements writeback for zsmalloc.  When the zswap
+pool becomes full, zsmalloc will attempt to evict all the compressed
+objects in the least-recently used zspages.
+
+
+This patch (of 3):
+
+zswap's customary lock order is tree->lock before pool->lock, because the
+tree->lock protects the entries' refcount, and the free callbacks in the
+backends acquire their respective pool locks to dispatch the backing
+object.  zsmalloc's map callback takes the pool lock, so zswap must not
+grab the tree->lock while a handle is mapped.  This currently only happens
+during writeback, which isn't implemented for zsmalloc.  In preparation
+for it, move the tree->lock section out of the mapped entry section
+
+Link: https://lkml.kernel.org/r/20221108193207.3297327-1-nphamcs@gmail.com
+Link: https://lkml.kernel.org/r/20221108193207.3297327-2-nphamcs@gmail.com
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   37 ++++++++++++++++++++-----------------
+ 1 file changed, 20 insertions(+), 17 deletions(-)
+
+--- a/mm/zswap.c~zswap-fix-writeback-lock-ordering-for-zsmalloc
++++ a/mm/zswap.c
+@@ -958,7 +958,7 @@ static int zswap_writeback_entry(struct
+ 	};
+ 
+ 	if (!zpool_can_sleep_mapped(pool)) {
+-		tmp = kmalloc(PAGE_SIZE, GFP_ATOMIC);
++		tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+ 		if (!tmp)
+ 			return -ENOMEM;
+ 	}
+@@ -968,6 +968,7 @@ static int zswap_writeback_entry(struct
+ 	swpentry = zhdr->swpentry; /* here */
+ 	tree = zswap_trees[swp_type(swpentry)];
+ 	offset = swp_offset(swpentry);
++	zpool_unmap_handle(pool, handle);
+ 
+ 	/* find and ref zswap entry */
+ 	spin_lock(&tree->lock);
+@@ -975,20 +976,12 @@ static int zswap_writeback_entry(struct
+ 	if (!entry) {
+ 		/* entry was invalidated */
+ 		spin_unlock(&tree->lock);
+-		zpool_unmap_handle(pool, handle);
+ 		kfree(tmp);
+ 		return 0;
+ 	}
+ 	spin_unlock(&tree->lock);
+ 	BUG_ON(offset != entry->offset);
+ 
+-	src = (u8 *)zhdr + sizeof(struct zswap_header);
+-	if (!zpool_can_sleep_mapped(pool)) {
+-		memcpy(tmp, src, entry->length);
+-		src = tmp;
+-		zpool_unmap_handle(pool, handle);
+-	}
+-
+ 	/* try to allocate swap cache page */
+ 	switch (zswap_get_swap_cache_page(swpentry, &page)) {
+ 	case ZSWAP_SWAPCACHE_FAIL: /* no memory or invalidate happened */
+@@ -1006,6 +999,14 @@ static int zswap_writeback_entry(struct
+ 		acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+ 		dlen = PAGE_SIZE;
+ 
++		zhdr = zpool_map_handle(pool, handle, ZPOOL_MM_RO);
++		src = (u8 *)zhdr + sizeof(struct zswap_header);
++		if (!zpool_can_sleep_mapped(pool)) {
++			memcpy(tmp, src, entry->length);
++			src = tmp;
++			zpool_unmap_handle(pool, handle);
++		}
++
+ 		mutex_lock(acomp_ctx->mutex);
+ 		sg_init_one(&input, src, entry->length);
+ 		sg_init_table(&output, 1);
+@@ -1015,6 +1016,11 @@ static int zswap_writeback_entry(struct
+ 		dlen = acomp_ctx->req->dlen;
+ 		mutex_unlock(acomp_ctx->mutex);
+ 
++		if (!zpool_can_sleep_mapped(pool))
++			kfree(tmp);
++		else
++			zpool_unmap_handle(pool, handle);
++
+ 		BUG_ON(ret);
+ 		BUG_ON(dlen != PAGE_SIZE);
+ 
+@@ -1045,7 +1051,11 @@ static int zswap_writeback_entry(struct
+ 		zswap_entry_put(tree, entry);
+ 	spin_unlock(&tree->lock);
+ 
+-	goto end;
++	return ret;
++
++fail:
++	if (!zpool_can_sleep_mapped(pool))
++		kfree(tmp);
+ 
+ 	/*
+ 	* if we get here due to ZSWAP_SWAPCACHE_EXIST
+@@ -1054,17 +1064,10 @@ static int zswap_writeback_entry(struct
+ 	* if we free the entry in the following put
+ 	* it is also okay to return !0
+ 	*/
+-fail:
+ 	spin_lock(&tree->lock);
+ 	zswap_entry_put(tree, entry);
+ 	spin_unlock(&tree->lock);
+ 
+-end:
+-	if (zpool_can_sleep_mapped(pool))
+-		zpool_unmap_handle(pool, handle);
+-	else
+-		kfree(tmp);
+-
+ 	return ret;
+ }
+ 
+_
