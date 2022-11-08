@@ -1,0 +1,102 @@
+From: Nadav Amit <namit@vmware.com>
+Subject: mm/mprotect: allow clean exclusive anon pages to be writable
+Date: Tue, 8 Nov 2022 18:46:46 +0100
+
+Patch series "mm/autonuma: replace savedwrite infrastructure", v2.
+
+As discussed in my talk at LPC, we can reuse the same mechanism for
+deciding whether to map a pte writable when upgrading permissions via
+mprotect() -- e.g., PROT_READ -> PROT_READ|PROT_WRITE -- to replace the
+savedwrite infrastructure used for NUMA hinting faults (e.g., PROT_NONE ->
+PROT_READ|PROT_WRITE).
+
+Instead of maintaining previous write permissions for a pte/pmd, we
+re-determine if the pte/pmd can be writable.  The big benefit is that we
+have a common logic for deciding whether we can map a pte/pmd writable on
+protection changes.
+
+For private mappings, there should be no difference -- from what I
+understand, that is what autonuma benchmarks care about.
+
+I ran autonumabench for v1 on a system with 2 NUMA nodes, 96 GiB each via:
+	perf stat --null --repeat 10
+The numa01 benchmark is quite noisy in my environment and I failed to
+reduce the noise so far.
+
+numa01:
+	mm-unstable:   146.88 +- 6.54 seconds time elapsed  ( +-  4.45% )
+	mm-unstable++: 147.45 +- 13.39 seconds time elapsed  ( +-  9.08% )
+
+numa02:
+	mm-unstable:   16.0300 +- 0.0624 seconds time elapsed  ( +-  0.39% )
+	mm-unstable++: 16.1281 +- 0.0945 seconds time elapsed  ( +-  0.59% )
+
+It is worth noting that for shared writable mappings that require
+writenotify, we will only avoid write faults if the pte/pmd is dirty
+(inherited from the older mprotect logic).  If we ever care about
+optimizing that further, we'd need a different mechanism to identify
+whether the FS still needs to get notified on the next write access.
+
+In any case, such an optimiztion will then not be autonuma-specific, but
+mprotect() permission upgrades would similarly benefit from it.
+
+
+This patch (of 7):
+
+Anonymous pages might have the dirty bit clear, but this should not
+prevent mprotect from making them writable if they are exclusive. 
+Therefore, skip the test whether the page is dirty in this case.
+
+Note that there are already other ways to get a writable PTE mapping an
+anonymous page that is clean: for example, via MADV_FREE.  In an ideal
+world, we'd have a different indication from the FS whether writenotify is
+still required.
+
+[david@redhat.com: return directly; update description]
+Link: https://lkml.kernel.org/r/20221108174652.198904-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20221108174652.198904-2-david@redhat.com
+Signed-off-by: Nadav Amit <namit@vmware.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mprotect.c |    7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+--- a/mm/mprotect.c~mm-mprotect-allow-clean-exclusive-anon-pages-to-be-writable
++++ a/mm/mprotect.c
+@@ -46,7 +46,7 @@ static inline bool can_change_pte_writab
+ 
+ 	VM_BUG_ON(!(vma->vm_flags & VM_WRITE) || pte_write(pte));
+ 
+-	if (pte_protnone(pte) || !pte_dirty(pte))
++	if (pte_protnone(pte))
+ 		return false;
+ 
+ 	/* Do we need write faults for softdirty tracking? */
+@@ -65,11 +65,10 @@ static inline bool can_change_pte_writab
+ 		 * the PT lock.
+ 		 */
+ 		page = vm_normal_page(vma, addr, pte);
+-		if (!page || !PageAnon(page) || !PageAnonExclusive(page))
+-			return false;
++		return page && PageAnon(page) && PageAnonExclusive(page);
+ 	}
+ 
+-	return true;
++	return pte_dirty(pte);
+ }
+ 
+ static unsigned long change_pte_range(struct mmu_gather *tlb,
+_
