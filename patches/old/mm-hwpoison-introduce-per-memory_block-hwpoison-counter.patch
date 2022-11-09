@@ -1,32 +1,28 @@
 From: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Subject: mm/hwpoison: introduce per-memory_block hwpoison counter
-Date: Wed, 21 Sep 2022 18:13:59 +0900
+Date: Mon, 24 Oct 2022 15:20:12 +0900
 
 Currently PageHWPoison flag does not behave well when experiencing memory
 hotremove/hotplug.  Any data field in struct page is unreliable when the
 associated memory is offlined, and the current mechanism can't tell
-whether a memory section is onlined because a new memory devices is
+whether a memory block is onlined because a new memory devices is
 installed or because previous failed offline operations are undone. 
 Especially if there's a hwpoisoned memory, it's unclear what the best
 option is.
 
 So introduce a new mechanism to make struct memory_block remember that a
 memory block has hwpoisoned memory inside it.  And make any online event
-fail if the onlined memory block contains hwpoison.  struct memory_block
+fail if the onlining memory block contains hwpoison.  struct memory_block
 is freed and reallocated over ACPI-based hotremove/hotplug, but not over
-sysfs-based hotremove/hotplug.  So it's desirable to implement hwpoison
-counter on this struct.
+sysfs-based hotremove/hotplug.  So the new counter can distinguish these
+cases.
 
-Note that clear_hwpoisoned_pages() is relocated to be called earlier than
-now, just before unregistering struct memory_block.  Otherwise, the
-per-memory_block hwpoison counter is freed and we fail to adjust global
-hwpoison counter properly.
-
-Link: https://lkml.kernel.org/r/20220921091359.25889-5-naoya.horiguchi@linux.dev
+Link: https://lkml.kernel.org/r/20221024062012.1520887-5-naoya.horiguchi@linux.dev
 Signed-off-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Reported-by: kernel test robot <lkp@intel.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Jane Chu <jane.chu@oracle.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Oscar Salvador <osalvador@suse.de>
@@ -34,41 +30,56 @@ Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/base/memory.c  |   36 ++++++++++++++++++++++++++++++++++++
+ drivers/base/memory.c  |   38 ++++++++++++++++++++++++++++++++++++++
  include/linux/memory.h |    3 +++
- include/linux/mm.h     |    8 ++++++++
+ include/linux/mm.h     |   20 +++++++++++++++++++-
  mm/internal.h          |    8 --------
- mm/memory-failure.c    |   31 ++++++++++---------------------
+ mm/memory-failure.c    |   36 +++++++++++-------------------------
  mm/sparse.c            |    2 --
- 6 files changed, 57 insertions(+), 31 deletions(-)
+ 6 files changed, 71 insertions(+), 36 deletions(-)
 
 --- a/drivers/base/memory.c~mm-hwpoison-introduce-per-memory_block-hwpoison-counter
 +++ a/drivers/base/memory.c
-@@ -183,6 +183,9 @@ static int memory_block_online(struct me
+@@ -175,6 +175,15 @@ int memory_notify(unsigned long val, voi
+ 	return blocking_notifier_call_chain(&memory_chain, val, v);
+ }
+ 
++#if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_MEMORY_HOTPLUG)
++static unsigned long memblk_nr_poison(struct memory_block *mem);
++#else
++static inline unsigned long memblk_nr_poison(struct memory_block *mem)
++{
++	return 0;
++}
++#endif
++
+ static int memory_block_online(struct memory_block *mem)
+ {
+ 	unsigned long start_pfn = section_nr_to_pfn(mem->start_section_nr);
+@@ -183,6 +192,9 @@ static int memory_block_online(struct me
  	struct zone *zone;
  	int ret;
  
-+	if (atomic_long_read(&mem->nr_hwpoison))
++	if (memblk_nr_poison(mem))
 +		return -EHWPOISON;
 +
  	zone = zone_for_pfn_range(mem->online_type, mem->nid, mem->group,
  				  start_pfn, nr_pages);
  
-@@ -864,6 +867,7 @@ void remove_memory_block_devices(unsigne
+@@ -864,6 +876,7 @@ void remove_memory_block_devices(unsigne
  		mem = find_memory_block_by_id(block_id);
  		if (WARN_ON_ONCE(!mem))
  			continue;
-+		clear_hwpoisoned_pages(atomic_long_read(&mem->nr_hwpoison));
++		num_poisoned_pages_sub(-1UL, memblk_nr_poison(mem));
  		unregister_memory_block_under_nodes(mem);
  		remove_memory_block(mem);
  	}
-@@ -1164,3 +1168,35 @@ int walk_dynamic_memory_groups(int nid,
+@@ -1164,3 +1177,28 @@ int walk_dynamic_memory_groups(int nid,
  	}
  	return ret;
  }
 +
-+#ifdef CONFIG_MEMORY_FAILURE
-+
++#if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_MEMORY_HOTPLUG)
 +void memblk_nr_poison_inc(unsigned long pfn)
 +{
 +	const unsigned long block_id = pfn_to_block_id(pfn);
@@ -87,24 +98,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		atomic_long_sub(i, &mem->nr_hwpoison);
 +}
 +
-+unsigned long memblk_nr_poison(unsigned long pfn)
++static unsigned long memblk_nr_poison(struct memory_block *mem)
 +{
-+	const unsigned long block_id = pfn_to_block_id(pfn);
-+	struct memory_block *mem = find_memory_block_by_id(block_id);
-+
-+	if (mem)
-+		return atomic_long_read(&mem->nr_hwpoison);
-+	return 0;
++	return atomic_long_read(&mem->nr_hwpoison);
 +}
-+
 +#endif
 --- a/include/linux/memory.h~mm-hwpoison-introduce-per-memory_block-hwpoison-counter
 +++ a/include/linux/memory.h
-@@ -85,6 +85,9 @@ struct memory_block {
+@@ -84,6 +84,9 @@ struct memory_block {
  	unsigned long nr_vmemmap_pages;
  	struct memory_group *group;	/* group (if any) for this block */
  	struct list_head group_next;	/* next block inside memory group */
-+#ifdef CONFIG_MEMORY_FAILURE
++#if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_MEMORY_HOTPLUG)
 +	atomic_long_t nr_hwpoison;
 +#endif
  };
@@ -112,23 +117,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int arch_get_memory_phys_device(unsigned long start_pfn);
 --- a/include/linux/mm.h~mm-hwpoison-introduce-per-memory_block-hwpoison-counter
 +++ a/include/linux/mm.h
-@@ -3280,6 +3280,10 @@ extern int soft_offline_page(unsigned lo
+@@ -3279,7 +3279,8 @@ extern int soft_offline_page(unsigned lo
  #ifdef CONFIG_MEMORY_FAILURE
- extern int __get_huge_page_for_hwpoison(unsigned long pfn, int flags);
- extern void num_poisoned_pages_inc(unsigned long pfn);
-+extern void memblk_nr_poison_inc(unsigned long pfn);
-+extern void memblk_nr_poison_sub(unsigned long pfn, long i);
-+extern unsigned long memblk_nr_poison(unsigned long pfn);
-+extern void clear_hwpoisoned_pages(long nr_poison);
+ extern int __get_huge_page_for_hwpoison(unsigned long pfn, int flags,
+ 					bool *migratable_cleared);
+-extern void num_poisoned_pages_inc(unsigned long pfn);
++void num_poisoned_pages_inc(unsigned long pfn);
++void num_poisoned_pages_sub(unsigned long pfn, long i);
  #else
- static inline int __get_huge_page_for_hwpoison(unsigned long pfn, int flags)
- {
-@@ -3289,6 +3293,10 @@ static inline int __get_huge_page_for_hw
+ static inline int __get_huge_page_for_hwpoison(unsigned long pfn, int flags,
+ 					bool *migratable_cleared)
+@@ -3290,6 +3291,23 @@ static inline int __get_huge_page_for_hw
  static inline void num_poisoned_pages_inc(unsigned long pfn)
  {
  }
 +
-+static inline void clear_hwpoisoned_pages(long nr_poison)
++static inline void num_poisoned_pages_sub(unsigned long pfn, long i)
++{
++}
++#endif
++
++#if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_MEMORY_HOTPLUG)
++extern void memblk_nr_poison_inc(unsigned long pfn);
++extern void memblk_nr_poison_sub(unsigned long pfn, long i);
++#else
++static inline void memblk_nr_poison_inc(unsigned long pfn)
++{
++}
++
++static inline void memblk_nr_poison_sub(unsigned long pfn, long i)
 +{
 +}
  #endif
@@ -153,18 +170,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
          unsigned long, unsigned long);
 --- a/mm/memory-failure.c~mm-hwpoison-introduce-per-memory_block-hwpoison-counter
 +++ a/mm/memory-failure.c
-@@ -74,14 +74,17 @@ atomic_long_t num_poisoned_pages __read_
- 
- static bool hw_memory_failure __read_mostly = false;
- 
--static inline void num_poisoned_pages_inc(unsigned long pfn)
-+void num_poisoned_pages_inc(unsigned long pfn)
+@@ -77,11 +77,14 @@ static bool hw_memory_failure __read_mos
+ inline void num_poisoned_pages_inc(unsigned long pfn)
  {
  	atomic_long_inc(&num_poisoned_pages);
 +	memblk_nr_poison_inc(pfn);
  }
  
- static inline void num_poisoned_pages_sub(unsigned long pfn, long i)
+-static inline void num_poisoned_pages_sub(unsigned long pfn, long i)
++inline void num_poisoned_pages_sub(unsigned long pfn, long i)
  {
  	atomic_long_sub(i, &num_poisoned_pages);
 +	if (pfn != -1UL)
@@ -172,24 +186,56 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -2414,6 +2417,10 @@ int unpoison_memory(unsigned long pfn)
+@@ -1706,6 +1709,8 @@ static unsigned long __free_raw_hwp_page
+ 
+ 		if (move_flag)
+ 			SetPageHWPoison(p->page);
++		else
++			num_poisoned_pages_sub(page_to_pfn(p->page), 1);
+ 		kfree(p);
+ 		count++;
+ 	}
+@@ -2332,6 +2337,7 @@ int unpoison_memory(unsigned long pfn)
+ 	int ret = -EBUSY;
+ 	int freeit = 0;
+ 	unsigned long count = 1;
++	bool huge = false;
+ 	static DEFINE_RATELIMIT_STATE(unpoison_rs, DEFAULT_RATELIMIT_INTERVAL,
+ 					DEFAULT_RATELIMIT_BURST);
+ 
+@@ -2380,6 +2386,7 @@ int unpoison_memory(unsigned long pfn)
+ 	ret = get_hwpoison_page(p, MF_UNPOISON);
+ 	if (!ret) {
+ 		if (PageHuge(p)) {
++			huge = true;
+ 			count = free_raw_hwp_pages(page, false);
+ 			if (count == 0) {
+ 				ret = -EBUSY;
+@@ -2395,6 +2402,7 @@ int unpoison_memory(unsigned long pfn)
+ 					 pfn, &unpoison_rs);
+ 	} else {
+ 		if (PageHuge(p)) {
++			huge = true;
+ 			count = free_raw_hwp_pages(page, false);
+ 			if (count == 0) {
+ 				ret = -EBUSY;
+@@ -2414,7 +2422,8 @@ int unpoison_memory(unsigned long pfn)
  unlock_mutex:
  	mutex_unlock(&mf_mutex);
  	if (!ret || freeit) {
-+		/*
-+		 * TODO: per-memory_block counter might break when the page
-+		 * size to be unpoisoned is larger than a memory_block.
-+		 */
- 		num_poisoned_pages_sub(pfn, count);
+-		num_poisoned_pages_sub(pfn, count);
++		if (!huge)
++			num_poisoned_pages_sub(pfn, 1);
  		unpoison_pr_info("Unpoison: Software-unpoisoned page %#lx\n",
  				 page_to_pfn(p), &unpoison_rs);
-@@ -2618,25 +2625,7 @@ retry:
+ 	}
+@@ -2609,26 +2618,3 @@ retry:
+ 
  	return ret;
  }
- 
+-
 -void clear_hwpoisoned_pages(struct page *memmap, int nr_pages)
-+void clear_hwpoisoned_pages(long nr_poison)
- {
+-{
 -	int i, total = 0;
 -
 -	/*
@@ -208,9 +254,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		}
 -	}
 -	if (total)
--		num_poisoned_pages_sub(total);
-+	num_poisoned_pages_sub(-1UL, nr_poison);
- }
+-		num_poisoned_pages_sub(0, total);
+-}
 --- a/mm/sparse.c~mm-hwpoison-introduce-per-memory_block-hwpoison-counter
 +++ a/mm/sparse.c
 @@ -926,8 +926,6 @@ void sparse_remove_section(struct mem_se
