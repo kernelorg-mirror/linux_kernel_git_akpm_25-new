@@ -1,6 +1,6 @@
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Subject: zram: introduce recompress sysfs knob
-Date: Sun, 9 Oct 2022 18:07:16 +0900
+Date: Tue, 18 Oct 2022 13:55:28 +0900
 
 Allow zram to recompress (using secondary compression streams) pages.  We
 support three modes:
@@ -10,8 +10,8 @@ support three modes:
 	echo idle > /sys/block/zram0/recompress
 
 2) Since there may be many idle pages user-space may pass a size
-   watermark value and we will recompress IDLE pages only of equal or
-   greater size:
+   watermark value (in bytes) and we will recompress IDLE pages only of
+   equal or greater size:
 
 	echo 888 > /sys/block/zram0/recompress
 
@@ -23,21 +23,21 @@ support three modes:
 
 	echo huge_idle > /sys/block/zram0/recompress
 
-Link: https://lkml.kernel.org/r/20221009090720.1040633-5-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20221018045533.2396670-5-senozhatsky@chromium.org
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 Cc: Minchan Kim <minchan@kernel.org>
 Cc: Nitin Gupta <ngupta@vflare.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/block/zram/Kconfig    |   12 +
- drivers/block/zram/zram_drv.c |  194 +++++++++++++++++++++++++++++++-
+ drivers/block/zram/Kconfig    |   15 ++
+ drivers/block/zram/zram_drv.c |  196 +++++++++++++++++++++++++++++++-
  drivers/block/zram/zram_drv.h |    2 
- 3 files changed, 205 insertions(+), 3 deletions(-)
+ 3 files changed, 210 insertions(+), 3 deletions(-)
 
 --- a/drivers/block/zram/Kconfig~zram-introduce-recompress-sysfs-knob
 +++ a/drivers/block/zram/Kconfig
-@@ -78,3 +78,15 @@ config ZRAM_MEMORY_TRACKING
+@@ -78,3 +78,18 @@ config ZRAM_MEMORY_TRACKING
  	  /sys/kernel/debug/zram/zramX/block_state.
  
  	  See Documentation/admin-guide/blockdev/zram.rst for more information.
@@ -53,9 +53,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +          echo TIMEOUT > /sys/block/zramX/idle
 +          echo SIZE > /sys/block/zramX/recompress
++
++	SIZE (in bytes) parameter sets the object size watermark: idle
++	objects that are of a smaller size will not get recompressed.
 --- a/drivers/block/zram/zram_drv.c~zram-introduce-recompress-sysfs-knob
 +++ a/drivers/block/zram/zram_drv.c
-@@ -1282,6 +1282,12 @@ static void zram_free_page(struct zram *
+@@ -1279,6 +1279,12 @@ static void zram_free_page(struct zram *
  		atomic64_dec(&zram->stats.huge_pages);
  	}
  
@@ -68,7 +71,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (zram_test_flag(zram, index, ZRAM_WB)) {
  		zram_clear_flag(zram, index, ZRAM_WB);
  		free_block_bdev(zram, zram_get_element(zram, index));
-@@ -1343,6 +1349,7 @@ static int zram_read_from_zspool(struct
+@@ -1340,6 +1346,7 @@ static int zram_read_from_zspool(struct
  	unsigned long handle;
  	unsigned int size;
  	void *src, *dst;
@@ -76,7 +79,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int ret;
  
  	handle = zram_get_handle(zram, index);
-@@ -1359,8 +1366,13 @@ static int zram_read_from_zspool(struct
+@@ -1356,8 +1363,13 @@ static int zram_read_from_zspool(struct
  
  	size = zram_get_obj_size(zram, index);
  
@@ -92,7 +95,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
  	if (size == PAGE_SIZE) {
-@@ -1372,7 +1384,7 @@ static int zram_read_from_zspool(struct
+@@ -1369,7 +1381,7 @@ static int zram_read_from_zspool(struct
  		dst = kmap_atomic(page);
  		ret = zcomp_decompress(zstrm, src, size, dst);
  		kunmap_atomic(dst);
@@ -101,7 +104,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	zs_unmap_object(zram->mem_pool, handle);
  	return ret;
-@@ -1603,6 +1615,180 @@ out:
+@@ -1600,6 +1612,182 @@ out:
  	return ret;
  }
  
@@ -113,15 +116,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *
 + * Corresponding ZRAM slot should be locked.
 + */
-+static int zram_recompress(struct zram *zram,
-+			   u32 index,
-+			   struct page *page,
++static int zram_recompress(struct zram *zram, u32 index, struct page *page,
 +			   int size_watermark)
 +{
 +	unsigned long handle_prev;
 +	unsigned long handle_next;
 +	unsigned int comp_len_next;
-+	unsigned int  comp_len_prev;
++	unsigned int comp_len_prev;
 +	struct zcomp_strm *zstrm;
 +	void *src, *dst;
 +	int ret;
@@ -149,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/*
 +	 * Either a compression error or we failed to compressed the object
 +	 * in a way that will save us memory. Mark the object so that we
-+	 * don't attemp to re-compress it again (RECOMP_SKIP).
++	 * don't attempt to re-compress it again (RECOMP_SKIP).
 +	 */
 +	if (comp_len_next >= huge_class_size ||
 +	    comp_len_next >= comp_len_prev ||
@@ -163,8 +164,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/*
 +	 * No direct reclaim (slow path) for handle allocation and no
 +	 * re-compression attempt (unlike in __zram_bvec_write()) since
-+	 * we already stored that object in zsmalloc. If we cannot alloc
-+	 * memory then me bail out.
++	 * we already have stored that object in zsmalloc. If we cannot
++	 * alloc memory for recompressed object then we bail out and
++	 * simply keep the old (existing) object in zsmalloc.
 +	 */
 +	handle_next = zs_malloc(zram->mem_pool, comp_len_next,
 +				__GFP_KSWAPD_RECLAIM |
@@ -173,7 +175,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				__GFP_MOVABLE);
 +	if (IS_ERR((void *)handle_next)) {
 +		zcomp_stream_put(zram->comps[ZRAM_SECONDARY_ZCOMP]);
-+		return -ENOMEM;
++		return PTR_ERR((void *)handle_next);
 +	}
 +
 +	dst = zs_map_object(zram->mem_pool, handle_next, ZS_MM_WO);
@@ -198,14 +200,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static ssize_t recompress_store(struct device *dev,
 +				struct device_attribute *attr,
-+				const char *buf,
-+				size_t len)
++				const char *buf, size_t len)
 +{
 +	struct zram *zram = dev_to_zram(dev);
 +	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
 +	unsigned long index;
 +	struct page *page;
-+	ssize_t ret = 0;
++	ssize_t ret;
 +	int mode, size_watermark = 0;
 +
 +	if (sysfs_streq(buf, "idle")) {
@@ -226,7 +227,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	}
 +
 +	if (size_watermark > PAGE_SIZE)
-+		return ret;
++		return -EINVAL;
 +
 +	down_read(&zram->init_lock);
 +	if (!init_done(zram)) {
@@ -240,7 +241,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		goto release_init_lock;
 +	}
 +
++	ret = len;
 +	for (index = 0; index < nr_pages; index++) {
++		int err = 0;
++
 +		zram_slot_lock(zram, index);
 +
 +		if (!zram_allocated(zram, index))
@@ -261,16 +265,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		    zram_test_flag(zram, index, ZRAM_RECOMP_SKIP))
 +			goto next;
 +
-+		ret = zram_recompress(zram, index, page, size_watermark);
++		err = zram_recompress(zram, index, page, size_watermark);
 +next:
 +		zram_slot_unlock(zram, index);
-+		if (ret)
++		if (err) {
++			ret = err;
 +			break;
++		}
 +
 +		cond_resched();
 +	}
 +
-+	ret = len;
 +	__free_page(page);
 +
 +release_init_lock:
@@ -282,7 +287,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * zram_bio_discard - handler on discard request
   * @index: physical block index in PAGE_SIZE units
-@@ -1983,6 +2169,7 @@ static DEVICE_ATTR_RW(writeback_limit_en
+@@ -1980,6 +2168,7 @@ static DEVICE_ATTR_RW(writeback_limit_en
  #endif
  #ifdef CONFIG_ZRAM_MULTI_COMP
  static DEVICE_ATTR_RW(recomp_algorithm);
@@ -290,7 +295,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
  
  static struct attribute *zram_disk_attrs[] = {
-@@ -2009,6 +2196,7 @@ static struct attribute *zram_disk_attrs
+@@ -2006,6 +2195,7 @@ static struct attribute *zram_disk_attrs
  	&dev_attr_debug_stat.attr,
  #ifdef CONFIG_ZRAM_MULTI_COMP
  	&dev_attr_recomp_algorithm.attr,
