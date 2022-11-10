@@ -1,0 +1,169 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm,thp,rmap: handle the normal !PageCompound case first
+Date: Wed, 9 Nov 2022 18:18:49 -0800 (PST)
+
+Commit ("mm,thp,rmap: lock_compound_mapcounts() on THP mapcounts")
+propagated the "if (compound) {lock} else if (PageCompound) {lock} else
+{atomic}" pattern throughout; but Linus hated the way that gives primacy
+to the uncommon case: switch to "if (!PageCompound) {atomic} else if
+(compound) {lock} else {lock}" throughout.  Linus has a bigger idea for
+how to improve it all, but here just make that rearrangement.
+
+Link: https://lkml.kernel.org/r/fca2f694-2098-b0ef-d4e-f1d8b94d318c@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mina Almasry <almasrymina@google.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/rmap.c |   54 ++++++++++++++++++++++++++--------------------------
+ 1 file changed, 27 insertions(+), 27 deletions(-)
+
+--- a/mm/rmap.c~mmthprmap-handle-the-normal-pagecompound-case-first
++++ a/mm/rmap.c
+@@ -1311,7 +1311,11 @@ void page_add_anon_rmap(struct page *pag
+ 	else
+ 		VM_BUG_ON_PAGE(!PageLocked(page), page);
+ 
+-	if (compound && PageTransHuge(page)) {
++	if (likely(!PageCompound(page))) {
++		first = atomic_inc_and_test(&page->_mapcount);
++		nr = first;
++
++	} else if (compound && PageTransHuge(page)) {
+ 		lock_compound_mapcounts(page, &mapcounts);
+ 		first = !mapcounts.compound_mapcount;
+ 		mapcounts.compound_mapcount++;
+@@ -1321,8 +1325,7 @@ void page_add_anon_rmap(struct page *pag
+ 				nr = nr_subpages_unmapped(page, nr_pmdmapped);
+ 		}
+ 		unlock_compound_mapcounts(page, &mapcounts);
+-
+-	} else if (PageCompound(page)) {
++	} else {
+ 		struct page *head = compound_head(page);
+ 
+ 		lock_compound_mapcounts(head, &mapcounts);
+@@ -1330,10 +1333,6 @@ void page_add_anon_rmap(struct page *pag
+ 		first = subpage_mapcount_inc(page);
+ 		nr = first && !mapcounts.compound_mapcount;
+ 		unlock_compound_mapcounts(head, &mapcounts);
+-
+-	} else {
+-		first = atomic_inc_and_test(&page->_mapcount);
+-		nr = first;
+ 	}
+ 
+ 	VM_BUG_ON_PAGE(!first && (flags & RMAP_EXCLUSIVE), page);
+@@ -1373,20 +1372,23 @@ void page_add_anon_rmap(struct page *pag
+ void page_add_new_anon_rmap(struct page *page,
+ 	struct vm_area_struct *vma, unsigned long address)
+ {
+-	const bool compound = PageCompound(page);
+-	int nr = compound ? thp_nr_pages(page) : 1;
++	int nr;
+ 
+ 	VM_BUG_ON_VMA(address < vma->vm_start || address >= vma->vm_end, vma);
+ 	__SetPageSwapBacked(page);
+-	if (compound) {
++
++	if (likely(!PageCompound(page))) {
++		/* increment count (starts at -1) */
++		atomic_set(&page->_mapcount, 0);
++		nr = 1;
++	} else {
+ 		VM_BUG_ON_PAGE(!PageTransHuge(page), page);
+ 		/* increment count (starts at -1) */
+ 		atomic_set(compound_mapcount_ptr(page), 0);
++		nr = thp_nr_pages(page);
+ 		__mod_lruvec_page_state(page, NR_ANON_THPS, nr);
+-	} else {
+-		/* increment count (starts at -1) */
+-		atomic_set(&page->_mapcount, 0);
+ 	}
++
+ 	__mod_lruvec_page_state(page, NR_ANON_MAPPED, nr);
+ 	__page_set_anon_rmap(page, vma, address, 1);
+ }
+@@ -1409,7 +1411,11 @@ void page_add_file_rmap(struct page *pag
+ 	VM_BUG_ON_PAGE(compound && !PageTransHuge(page), page);
+ 	lock_page_memcg(page);
+ 
+-	if (compound && PageTransHuge(page)) {
++	if (likely(!PageCompound(page))) {
++		first = atomic_inc_and_test(&page->_mapcount);
++		nr = first;
++
++	} else if (compound && PageTransHuge(page)) {
+ 		lock_compound_mapcounts(page, &mapcounts);
+ 		first = !mapcounts.compound_mapcount;
+ 		mapcounts.compound_mapcount++;
+@@ -1419,8 +1425,7 @@ void page_add_file_rmap(struct page *pag
+ 				nr = nr_subpages_unmapped(page, nr_pmdmapped);
+ 		}
+ 		unlock_compound_mapcounts(page, &mapcounts);
+-
+-	} else if (PageCompound(page)) {
++	} else {
+ 		struct page *head = compound_head(page);
+ 
+ 		lock_compound_mapcounts(head, &mapcounts);
+@@ -1428,10 +1433,6 @@ void page_add_file_rmap(struct page *pag
+ 		first = subpage_mapcount_inc(page);
+ 		nr = first && !mapcounts.compound_mapcount;
+ 		unlock_compound_mapcounts(head, &mapcounts);
+-
+-	} else {
+-		first = atomic_inc_and_test(&page->_mapcount);
+-		nr = first;
+ 	}
+ 
+ 	if (nr_pmdmapped)
+@@ -1471,7 +1472,11 @@ void page_remove_rmap(struct page *page,
+ 	lock_page_memcg(page);
+ 
+ 	/* page still mapped by someone else? */
+-	if (compound && PageTransHuge(page)) {
++	if (likely(!PageCompound(page))) {
++		last = atomic_add_negative(-1, &page->_mapcount);
++		nr = last;
++
++	} else if (compound && PageTransHuge(page)) {
+ 		lock_compound_mapcounts(page, &mapcounts);
+ 		mapcounts.compound_mapcount--;
+ 		last = !mapcounts.compound_mapcount;
+@@ -1481,8 +1486,7 @@ void page_remove_rmap(struct page *page,
+ 				nr = nr_subpages_unmapped(page, nr_pmdmapped);
+ 		}
+ 		unlock_compound_mapcounts(page, &mapcounts);
+-
+-	} else if (PageCompound(page)) {
++	} else {
+ 		struct page *head = compound_head(page);
+ 
+ 		lock_compound_mapcounts(head, &mapcounts);
+@@ -1490,10 +1494,6 @@ void page_remove_rmap(struct page *page,
+ 		last = subpage_mapcount_dec(page);
+ 		nr = last && !mapcounts.compound_mapcount;
+ 		unlock_compound_mapcounts(head, &mapcounts);
+-
+-	} else {
+-		last = atomic_add_negative(-1, &page->_mapcount);
+-		nr = last;
+ 	}
+ 
+ 	if (nr_pmdmapped) {
+_
