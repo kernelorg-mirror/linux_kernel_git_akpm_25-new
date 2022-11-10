@@ -4,7 +4,60 @@ Date: Fri, 14 Oct 2022 16:57:02 -0700
 
 Patch series "Fix the DAX-gup mistake", v3.
 
+ZONE_DEVICE was created to allow for get_user_pages() on DAX mappings.  It
+has since grown other users, but the main motivation was gup and
+synchronizing device shutdown events with pinned pages.  Memory device
+shutdown triggers driver ->remove(), and ->remove() always succeeds, so
+ZONE_DEVICE needed a mechanism to stop new page references from being
+taken, and await existing references to drain before allowing device
+removal to proceed.  This is the origin of 'struct dev_pagemap' and its
+percpu_ref.
 
+The original ZONE_DEVICE implementation started by noticing that 'struct
+page' initialization, for typical page allocator pages, started pages at a
+refcount of 1.  Later those pages are 'onlined' by freeing them to the
+page allocator via put_page() to drop that initial reference and populate
+the free page lists.  ZONE_DEVICE abused that "initialized but never
+freed" state to both avoid leaking ZONE_DEVICE pages into places that were
+not ready for them, and add some metadata to the unused (because refcount
+was never 0) page->lru space.
+
+As more users of ZONE_DEVICE arrived that special casing became more and
+more unnecessary, and more and more expensive.  The 'struct page'
+modernization eliminated the need for the ->lru hack.  The folio work had
+to remember to sprinkle special case ZONE_DEVICE accounting in the right
+places.  The MEMORY_DEVICE_PRIVATE use case spearheaded much of the work
+to support typical reference counting for ZONE_DEVICE pages and allow them
+to be used in more kernel code paths.  All the while the DAX case kept its
+tech debt in place, until now.
+
+However, while fixing the DAX page refcount semantics and arranging for
+free_zone_device_page() to be the common end of life of all ZONE_DEVICE
+pages, the mitigation for truncate() vs pinned DAX pages was found to be
+incomplete.  Unlike typical pages that surprisingly can remain pinned for
+DMA after they have been truncated from a file, the DAX core must enforce
+that nobody has access to a page after truncate() has disconnected it from
+inode->i_pages.  I.e.  the file block that is identical to the page still
+remains an extent of the file.  The existing mitigation handled explicit
+truncate while the inode was alive, but not the implicit truncate right
+before the inode is freed.
+
+So, in addition to moving DAX pages to be refcount-0 at idle, and add
+'break_layouts' wakeups to free_zone_device_page(), this series also
+introduces another occurrence of 'break_layouts' to the inode freeing
+path.  Recall that 'break_layouts' for DAX is the mechanism to await code
+paths that previously arbitrated page access to drop their interest /
+page-pins.  This new synchronization point is implemented by special
+casing dax_delete_mapping_entry(), called by truncate_inode_pages_final(),
+to await page pins when mapping_exiting() is true.
+
+Thanks to Jason for the nudge to get this fixed up properly and the review
+on v1, Dave, Jan, and Jason for the discussion on what to do about the
+inode end-of-life-truncate problem, and Alistair for cleaning up the last
+of the refcount-1 assumptions in the MEMORY_DEVICE_PRIVATE users.
+
+
+This patch (of 25):
 
 The __wait_var_event facility calculates a wait queue from a hash of the
 address of the variable being passed.  Use the @page argument directly as
