@@ -1,0 +1,79 @@
+From: Jan Kara <jack@suse.cz>
+Subject: mm: make drop_caches keep reclaiming on all nodes
+Date: Tue, 15 Nov 2022 13:32:55 +0100
+
+Currently, drop_caches are reclaiming node-by-node, looping on each node
+until reclaim could not make progress.  This can however leave quite some
+slab entries (such as filesystem inodes) unreclaimed if objects say on
+node 1 keep objects on node 0 pinned.  So move the "loop until no
+progress" loop to the node-by-node iteration to retry reclaim also on
+other nodes if reclaim on some nodes made progress.  This fixes problem
+when drop_caches was not reclaiming lots of otherwise perfectly fine to
+reclaim inodes.
+
+Link: https://lkml.kernel.org/r/20221115123255.12559-1-jack@suse.cz
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reported-by: You Zhou <you.zhou@intel.com>
+Reported-by: Pengfei Xu <pengfei.xu@intel.com>
+Tested-by: Pengfei Xu <pengfei.xu@intel.com>
+Reviewed-by: Shakeel Butt <shakeelb@google.com>
+Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmscan.c |   33 ++++++++++++++++++---------------
+ 1 file changed, 18 insertions(+), 15 deletions(-)
+
+--- a/mm/vmscan.c~mm-make-drop_caches-keep-reclaiming-on-all-nodes
++++ a/mm/vmscan.c
+@@ -1021,31 +1021,34 @@ out:
+ 	return freed;
+ }
+ 
+-static void drop_slab_node(int nid)
++static unsigned long drop_slab_node(int nid)
+ {
+-	unsigned long freed;
+-	int shift = 0;
++	unsigned long freed = 0;
++	struct mem_cgroup *memcg = NULL;
+ 
++	memcg = mem_cgroup_iter(NULL, NULL, NULL);
+ 	do {
+-		struct mem_cgroup *memcg = NULL;
+-
+-		if (fatal_signal_pending(current))
+-			return;
++		freed += shrink_slab(GFP_KERNEL, nid, memcg, 0);
++	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)) != NULL);
+ 
+-		freed = 0;
+-		memcg = mem_cgroup_iter(NULL, NULL, NULL);
+-		do {
+-			freed += shrink_slab(GFP_KERNEL, nid, memcg, 0);
+-		} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)) != NULL);
+-	} while ((freed >> shift++) > 1);
++	return freed;
+ }
+ 
+ void drop_slab(void)
+ {
+ 	int nid;
++	int shift = 0;
++	unsigned long freed;
++
++	do {
++		freed = 0;
++		for_each_online_node(nid) {
++			if (fatal_signal_pending(current))
++				return;
+ 
+-	for_each_online_node(nid)
+-		drop_slab_node(nid);
++			freed += drop_slab_node(nid);
++		}
++	} while ((freed >> shift++) > 1);
+ }
+ 
+ static int reclaimer_offset(void)
+_
