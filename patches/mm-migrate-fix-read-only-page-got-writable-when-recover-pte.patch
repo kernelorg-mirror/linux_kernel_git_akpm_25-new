@@ -1,0 +1,66 @@
+From: Peter Xu <peterx@redhat.com>
+Subject: mm/migrate: fix read-only page got writable when recover pte
+Date: Sun, 13 Nov 2022 19:04:46 -0500
+
+Ives van Hoorne from codesandbox.io reported an issue regarding possible
+data loss of uffd-wp when applied to memfds on heavily loaded systems. 
+The symptom is some read page got data mismatch from the snapshot child
+VMs.
+
+Here I can also reproduce with a Rust reproducer that was provided by Ives
+that keeps taking snapshot of a 256MB VM, on a 32G system when I initiate
+80 instances I can trigger the issues in ten minutes.
+
+It turns out that we got some pages write-through even if uffd-wp is
+applied to the pte.
+
+The problem is, when removing migration entries, we didn't really worry
+about write bit as long as we know it's not a write migration entry.  That
+may not be true, for some memory types (e.g.  writable shmem) mk_pte can
+return a pte with write bit set, then to recover the migration entry to
+its original state we need to explicit wr-protect the pte or it'll has the
+write bit set if it's a read migration entry.  For uffd it can cause
+write-through.
+
+The relevant code on uffd was introduced in the anon support, which is
+commit f45ec5ff16a7 ("userfaultfd: wp: support swap and page migration",
+2020-04-07).  However anon shouldn't suffer from this problem because anon
+should already have the write bit cleared always, so that may not be a
+proper Fixes target, while I'm adding the Fixes to be uffd shmem support.
+
+Link: https://lkml.kernel.org/r/20221114000447.1681003-2-peterx@redhat.com
+Fixes: b1f9e876862d ("mm/uffd: enable write protection for shmem & hugetlbfs")
+Reported-by: Ives van Hoorne <ives@codesandbox.io>
+Reviewed-by: Alistair Popple <apopple@nvidia.com>
+Tested-by: Ives van Hoorne <ives@codesandbox.io>
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/migrate.c |    8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/mm/migrate.c~mm-migrate-fix-read-only-page-got-writable-when-recover-pte
++++ a/mm/migrate.c
+@@ -213,8 +213,14 @@ static bool remove_migration_pte(struct
+ 			pte = pte_mkdirty(pte);
+ 		if (is_writable_migration_entry(entry))
+ 			pte = maybe_mkwrite(pte, vma);
+-		else if (pte_swp_uffd_wp(*pvmw.pte))
++		else
++			/* NOTE: mk_pte can have write bit set */
++			pte = pte_wrprotect(pte);
++
++		if (pte_swp_uffd_wp(*pvmw.pte)) {
++			WARN_ON_ONCE(pte_write(pte));
+ 			pte = pte_mkuffd_wp(pte);
++		}
+ 
+ 		if (folio_test_anon(folio) && !is_readable_migration_entry(entry))
+ 			rmap_flags |= RMAP_EXCLUSIVE;
+_
