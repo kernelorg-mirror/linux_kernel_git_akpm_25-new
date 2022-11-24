@@ -1,17 +1,19 @@
 From: Nhat Pham <nphamcs@gmail.com>
 Subject: zsmalloc: implement writeback mechanism for zsmalloc
-Date: Tue, 8 Nov 2022 11:32:07 -0800
+Date: Fri, 18 Nov 2022 16:15:36 -0800
 
 This commit adds the writeback mechanism for zsmalloc, analogous to the
 zbud allocator.  Zsmalloc will attempt to determine the coldest zspage
 (i.e least recently used) in the pool, and attempt to write back all the
 stored compressed objects via the pool's evict handler.
 
-Link: https://lkml.kernel.org/r/20221108193207.3297327-6-nphamcs@gmail.com
+[nphamcs@gmail.com: use get_first_page(), and add cond_resched() in retry loop]
+  Link: https://lkml.kernel.org/r/20221123191703.2902079-3-nphamcs@gmail.com
+Link: https://lkml.kernel.org/r/20221119001536.2086599-7-nphamcs@gmail.com
 Signed-off-by: Nhat Pham <nphamcs@gmail.com>
 Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Minchan Kim <minchan@kernel.org>
 Cc: Dan Streetman <ddstreet@ieee.org>
-Cc: Minchan Kim <minchan@kernel.org>
 Cc: Nitin Gupta <ngupta@vflare.org>
 Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
 Cc: Seth Jennings <sjenning@redhat.com>
@@ -19,20 +21,20 @@ Cc: Vitaly Wool <vitaly.wool@konsulko.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zsmalloc.c |  200 ++++++++++++++++++++++++++++++++++++++++++++----
- 1 file changed, 185 insertions(+), 15 deletions(-)
+ mm/zsmalloc.c |  194 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 183 insertions(+), 11 deletions(-)
 
 --- a/mm/zsmalloc.c~zsmalloc-implement-writeback-mechanism-for-zsmalloc
 +++ a/mm/zsmalloc.c
-@@ -271,10 +271,13 @@ struct zspage {
+@@ -271,12 +271,13 @@ struct zspage {
+ #ifdef CONFIG_ZPOOL
  	/* links the zspage to the lru list in the pool */
  	struct list_head lru;
- 
 +	bool under_reclaim;
-+
 +	/* list of unfreed handles whose objects have been reclaimed */
 +	unsigned long *deferred_handles;
-+
+ #endif
+ 
  	struct zs_pool *pool;
 -#ifdef CONFIG_COMPACTION
  	rwlock_t lock;
@@ -40,7 +42,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  struct mapping_area {
-@@ -295,10 +298,11 @@ static bool ZsHugePage(struct zspage *zs
+@@ -297,10 +298,11 @@ static bool ZsHugePage(struct zspage *zs
  	return zspage->huge;
  }
  
@@ -53,7 +55,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void migrate_write_lock(struct zspage *zspage);
  static void migrate_write_lock_nested(struct zspage *zspage);
  static void migrate_write_unlock(struct zspage *zspage);
-@@ -306,9 +310,6 @@ static void kick_deferred_free(struct zs
+@@ -308,9 +310,6 @@ static void kick_deferred_free(struct zs
  static void init_deferred_free(struct zs_pool *pool);
  static void SetZsPageMovable(struct zs_pool *pool, struct zspage *zspage);
  #else
@@ -63,7 +65,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void migrate_write_lock(struct zspage *zspage) {}
  static void migrate_write_lock_nested(struct zspage *zspage) {}
  static void migrate_write_unlock(struct zspage *zspage) {}
-@@ -439,6 +440,27 @@ static void zs_zpool_free(void *pool, un
+@@ -413,6 +412,27 @@ static void zs_zpool_free(void *pool, un
  	zs_free(pool, handle);
  }
  
@@ -91,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void *zs_zpool_map(void *pool, unsigned long handle,
  			enum zpool_mapmode mm)
  {
-@@ -477,6 +499,7 @@ static struct zpool_driver zs_zpool_driv
+@@ -451,6 +471,7 @@ static struct zpool_driver zs_zpool_driv
  	.malloc_support_movable = true,
  	.malloc =		  zs_zpool_malloc,
  	.free =			  zs_zpool_free,
@@ -99,10 +101,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	.map =			  zs_zpool_map,
  	.unmap =		  zs_zpool_unmap,
  	.total_size =		  zs_zpool_total_size,
-@@ -953,6 +976,21 @@ unlock:
+@@ -924,6 +945,25 @@ unlock:
  	return 0;
  }
  
++#ifdef CONFIG_ZPOOL
 +/*
 + * Free all the deferred handles whose objects are freed in zs_free.
 + */
@@ -117,11 +120,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		handle = nxt_handle;
 +	}
 +}
++#else
++static inline void free_handles(struct zs_pool *pool, struct zspage *zspage) {}
++#endif
 +
  static void __free_zspage(struct zs_pool *pool, struct size_class *class,
  				struct zspage *zspage)
  {
-@@ -967,6 +1005,9 @@ static void __free_zspage(struct zs_pool
+@@ -938,6 +978,9 @@ static void __free_zspage(struct zs_pool
  	VM_BUG_ON(get_zspage_inuse(zspage));
  	VM_BUG_ON(fg != ZS_EMPTY);
  
@@ -131,42 +137,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	next = page = get_first_page(zspage);
  	do {
  		VM_BUG_ON_PAGE(!PageLocked(page), page);
-@@ -1049,6 +1090,8 @@ static void init_zspage(struct size_clas
- 	}
+@@ -1023,6 +1066,8 @@ static void init_zspage(struct size_clas
  
+ #ifdef CONFIG_ZPOOL
  	INIT_LIST_HEAD(&zspage->lru);
 +	zspage->under_reclaim = false;
 +	zspage->deferred_handles = NULL;
+ #endif
  
  	set_freeobj(zspage, 0);
- }
-@@ -1491,11 +1534,8 @@ unsigned long zs_malloc(struct zs_pool *
- 		fix_fullness_group(class, zspage);
- 		record_obj(handle, obj);
- 		class_stat_inc(class, OBJ_USED, 1);
--		/* Move the zspage to front of pool's LRU */
--		move_to_front(pool, zspage);
--		spin_unlock(&pool->lock);
- 
--		return handle;
-+		goto out;
- 	}
- 
- 	spin_unlock(&pool->lock);
-@@ -1519,6 +1559,8 @@ unsigned long zs_malloc(struct zs_pool *
- 
- 	/* We completely set up zspage so mark them as movable */
- 	SetZsPageMovable(pool, zspage);
-+
-+out:
- 	/* Move the zspage to front of pool's LRU */
- 	move_to_front(pool, zspage);
- 	spin_unlock(&pool->lock);
-@@ -1576,12 +1618,24 @@ void zs_free(struct zs_pool *pool, unsig
+@@ -1572,12 +1617,26 @@ void zs_free(struct zs_pool *pool, unsig
  
  	obj_free(class->size, obj);
  	class_stat_dec(class, OBJ_USED, 1);
 +
++#ifdef CONFIG_ZPOOL
 +	if (zspage->under_reclaim) {
 +		/*
 +		 * Reclaim needs the handles during writeback. It'll free
@@ -180,6 +165,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		spin_unlock(&pool->lock);
 +		return;
 +	}
++#endif
  	fullness = fix_fullness_group(class, zspage);
 -	if (fullness != ZS_EMPTY)
 -		goto out;
@@ -191,7 +177,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	spin_unlock(&pool->lock);
  	cache_free_handle(pool, handle);
  }
-@@ -1781,7 +1835,7 @@ static enum fullness_group putback_zspag
+@@ -1777,7 +1836,7 @@ static enum fullness_group putback_zspag
  	return fullness;
  }
  
@@ -200,7 +186,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * To prevent zspage destroy during migration, zspage freeing should
   * hold locks of all pages in the zspage.
-@@ -1823,6 +1877,24 @@ static void lock_zspage(struct zspage *z
+@@ -1819,6 +1878,24 @@ static void lock_zspage(struct zspage *z
  	}
  	migrate_read_unlock(zspage);
  }
@@ -225,7 +211,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static void migrate_lock_init(struct zspage *zspage)
  {
-@@ -1839,6 +1911,7 @@ static void migrate_read_unlock(struct z
+@@ -1835,6 +1912,7 @@ static void migrate_read_unlock(struct z
  	read_unlock(&zspage->lock);
  }
  
@@ -233,7 +219,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void migrate_write_lock(struct zspage *zspage)
  {
  	write_lock(&zspage->lock);
-@@ -2419,6 +2492,103 @@ void zs_destroy_pool(struct zs_pool *poo
+@@ -2399,6 +2477,100 @@ void zs_destroy_pool(struct zs_pool *poo
  }
  EXPORT_SYMBOL_GPL(zs_destroy_pool);
  
@@ -245,9 +231,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct zspage *zspage;
 +	struct page *page;
 +	enum fullness_group fullness;
-+
-+	if (retries == 0 || !pool->ops || !pool->ops->evict)
-+		return -EINVAL;
 +
 +	/* Lock LRU and fullness list */
 +	spin_lock(&pool->lock);
@@ -272,12 +255,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		remove_zspage(class, zspage, fullness);
 +
 +		spin_unlock(&pool->lock);
++		cond_resched();
 +
 +		/* Lock backing pages into place */
 +		lock_zspage(zspage);
 +
 +		obj_idx = 0;
-+		page = zspage->first_page;
++		page = get_first_page(zspage);
 +		while (1) {
 +			handle = find_alloced_obj(class, page, &obj_idx);
 +			if (!handle) {
@@ -289,8 +273,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			}
 +
 +			/*
-+			 * This will write the object and call
-+			 * zs_free.
++			 * This will write the object and call zs_free.
 +			 *
 +			 * zs_free will free the object, but the
 +			 * under_reclaim flag prevents it from freeing
@@ -299,7 +282,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			 * zspage potentially after the last object
 +			 * has been freed.
 +			 */
-+			ret = pool->ops->evict(pool, handle);
++			ret = pool->zpool_ops->evict(pool->zpool, handle);
 +			if (ret)
 +				goto next;
 +
