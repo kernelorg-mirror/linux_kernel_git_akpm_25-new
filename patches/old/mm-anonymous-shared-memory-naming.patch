@@ -1,16 +1,36 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
 Subject: mm: anonymous shared memory naming
-Date: Mon, 7 Nov 2022 18:47:15 +0000
+Date: Tue, 15 Nov 2022 02:06:01 +0000
 
 Since commit 9a10064f5625 ("mm: add a field to store names for private
 anonymous memory"), name for private anonymous memory, but not shared
-anonymous, can be set.  However, naming shared anonymous memory is just
-as useful for tracking purposes.
+anonymous, can be set.  However, naming shared anonymous memory just as
+useful for tracking purposes.
 
 Extend the functionality to be able to set names for shared anon.
 
+There are two ways to create anonymous shared memory, using memfd or
+directly via mmap():
+1. fd = memfd_create(...)
+   mem = mmap(..., MAP_SHARED, fd, ...)
+2. mem = mmap(..., MAP_SHARED | MAP_ANONYMOUS, -1, ...)
+
+In both cases the anonymous shared memory is created the same way by
+mapping an unlinked file on tmpfs.
+
+The memfd way allows to give a name for anonymous shared memory, but
+not useful when parts of shared memory require to have distinct names.
+
+Example use case: The VMM maps VM memory as anonymous shared memory (not
+private because VMM is sandboxed and drivers are running in their own
+processes).  However, the VM tells back to the VMM how parts of the memory
+are actually used by the guest, how each of the segments should be backed
+(i.e.  4K pages, 2M pages), and some other information about the segments.
+The naming allows us to monitor the effective memory footprint for each
+of these segments from the host without looking inside the guest.
+
 Sample output:
-  /* Create shared anonymous segment */
+  /* Create shared anonymous segmenet */
   anon_shmem = mmap(NULL, SIZE, PROT_READ | PROT_WRITE,
                     MAP_SHARED | MAP_ANONYMOUS, -1, 0);
   /* Name the segment: "MY-NAME" */
@@ -20,18 +40,21 @@ Sample output:
 cat /proc/<pid>/maps (and smaps):
 7fc8e2b4c000-7fc8f2b4c000 rw-s 00000000 00:01 1024 [anon_shmem:MY-NAME]
 
-Link: https://lkml.kernel.org/r/20221107184715.3950621-1-pasha.tatashin@soleen.com
+If the segment is not named, the output is:
+7fc8e2b4c000-7fc8f2b4c000 rw-s 00000000 00:01 1024 /dev/zero (deleted)
+
+Link: https://lkml.kernel.org/r/20221115020602.804224-1-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Arnd Bergmann <arnd@arndb.de>
 Cc: Bagas Sanjaya <bagasdotme@gmail.com>
 Cc: Colin Cross <ccross@google.com>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
 Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
 Cc: Peter Xu <peterx@redhat.com>
@@ -44,13 +67,13 @@ Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- Documentation/filesystems/proc.rst |    8 +++++---
- fs/proc/task_mmu.c                 |   14 ++++++++++----
- include/linux/mm.h                 |    2 ++
- include/linux/mm_types.h           |   27 +++++++++++++--------------
- mm/madvise.c                       |    7 ++-----
- mm/shmem.c                         |   20 ++++++++++++++++++--
- 6 files changed, 50 insertions(+), 28 deletions(-)
+ Documentation/filesystems/proc.rst |    8 ++++---
+ fs/proc/task_mmu.c                 |   15 ++++++++++---
+ include/linux/mm.h                 |    2 +
+ include/linux/mm_types.h           |   26 +++++++++++-------------
+ mm/madvise.c                       |    7 +-----
+ mm/shmem.c                         |   29 +++++++++++++++++++++++----
+ 6 files changed, 57 insertions(+), 30 deletions(-)
 
 --- a/Documentation/filesystems/proc.rst~mm-anonymous-shared-memory-naming
 +++ a/Documentation/filesystems/proc.rst
@@ -76,23 +99,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/fs/proc/task_mmu.c~mm-anonymous-shared-memory-naming
 +++ a/fs/proc/task_mmu.c
-@@ -277,6 +277,7 @@ show_map_vma(struct seq_file *m, struct
+@@ -274,6 +274,7 @@ static void show_vma_header_prefix(struc
+ static void
+ show_map_vma(struct seq_file *m, struct vm_area_struct *vma)
+ {
++	struct anon_vma_name *anon_name = NULL;
  	struct mm_struct *mm = vma->vm_mm;
  	struct file *file = vma->vm_file;
  	vm_flags_t flags = vma->vm_flags;
-+	struct anon_vma_name *anon_name;
- 	unsigned long ino = 0;
- 	unsigned long long pgoff = 0;
- 	unsigned long start, end;
-@@ -293,6 +294,7 @@ show_map_vma(struct seq_file *m, struct
+@@ -293,6 +294,8 @@ show_map_vma(struct seq_file *m, struct
  	start = vma->vm_start;
  	end = vma->vm_end;
  	show_vma_header_prefix(m, start, end, flags, pgoff, dev, ino);
-+	anon_name = anon_vma_name(vma);
++	if (mm)
++		anon_name = anon_vma_name(vma);
  
  	/*
  	 * Print the dentry name for named mappings, and a
-@@ -300,7 +302,14 @@ show_map_vma(struct seq_file *m, struct
+@@ -300,7 +303,14 @@ show_map_vma(struct seq_file *m, struct
  	 */
  	if (file) {
  		seq_pad(m, ' ');
@@ -108,7 +132,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto done;
  	}
  
-@@ -312,8 +321,6 @@ show_map_vma(struct seq_file *m, struct
+@@ -312,8 +322,6 @@ show_map_vma(struct seq_file *m, struct
  
  	name = arch_vma_name(vma);
  	if (!name) {
@@ -117,7 +141,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!mm) {
  			name = "[vdso]";
  			goto done;
-@@ -330,7 +337,6 @@ show_map_vma(struct seq_file *m, struct
+@@ -330,7 +338,6 @@ show_map_vma(struct seq_file *m, struct
  			goto done;
  		}
  
@@ -140,7 +164,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int vma_is_stack_for_current(struct vm_area_struct *vma);
 --- a/include/linux/mm_types.h~mm-anonymous-shared-memory-naming
 +++ a/include/linux/mm_types.h
-@@ -517,21 +517,11 @@ struct vm_area_struct {
+@@ -549,21 +549,11 @@ struct vm_area_struct {
  	 * For areas with an address space and backing store,
  	 * linkage into the address_space->i_mmap interval tree.
  	 *
@@ -166,15 +190,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
-@@ -541,6 +531,7 @@ struct vm_area_struct {
- 	 */
- 	struct list_head anon_vma_chain; /* Serialized by mmap_lock &
- 					  * page_table_lock */
-+
- 	struct anon_vma *anon_vma;	/* Serialized by page_table_lock */
- 
- 	/* Function pointers to deal with this struct. */
-@@ -552,6 +543,14 @@ struct vm_area_struct {
+@@ -584,6 +574,14 @@ struct vm_area_struct {
  	struct file * vm_file;		/* File we map to (can be NULL). */
  	void * vm_private_data;		/* was vm_pte (shared mem) */
  
@@ -240,7 +256,30 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static LIST_HEAD(shmem_swaplist);
-@@ -3988,6 +3994,15 @@ static const struct vm_operations_struct
+@@ -2263,7 +2269,8 @@ out_nomem:
+ 
+ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+-	struct shmem_inode_info *info = SHMEM_I(file_inode(file));
++	struct inode *inode = file_inode(file);
++	struct shmem_inode_info *info = SHMEM_I(inode);
+ 	int ret;
+ 
+ 	ret = seal_check_future_write(info->seals, vma);
+@@ -2274,7 +2281,11 @@ static int shmem_mmap(struct file *file,
+ 	vma->vm_flags |= VM_MTE_ALLOWED;
+ 
+ 	file_accessed(file);
+-	vma->vm_ops = &shmem_vm_ops;
++	/* This is anonymous shared memory if it is unlinked at the time of mmap */
++	if (inode->i_nlink)
++		vma->vm_ops = &shmem_vm_ops;
++	else
++		vma->vm_ops = &shmem_anon_vm_ops;
+ 	return 0;
+ }
+ 
+@@ -3988,6 +3999,15 @@ static const struct vm_operations_struct
  #endif
  };
  
@@ -256,7 +295,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int shmem_init_fs_context(struct fs_context *fc)
  {
  	struct shmem_options *ctx;
-@@ -4163,6 +4178,7 @@ void shmem_truncate_range(struct inode *
+@@ -4163,6 +4183,7 @@ void shmem_truncate_range(struct inode *
  EXPORT_SYMBOL_GPL(shmem_truncate_range);
  
  #define shmem_vm_ops				generic_file_vm_ops
@@ -264,7 +303,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #define shmem_file_operations			ramfs_file_operations
  #define shmem_get_inode(sb, dir, mode, dev, flags)	ramfs_get_inode(sb, dir, mode, dev)
  #define shmem_acct_size(flags, size)		0
-@@ -4268,7 +4284,7 @@ int shmem_zero_setup(struct vm_area_stru
+@@ -4268,7 +4289,7 @@ int shmem_zero_setup(struct vm_area_stru
  	if (vma->vm_file)
  		fput(vma->vm_file);
  	vma->vm_file = file;

@@ -1,15 +1,8 @@
 From: Hugh Dickins <hughd@google.com>
 Subject: mm,thp,rmap: subpages_mapcount of PTE-mapped subpages
-Date: Fri, 18 Nov 2022 01:12:03 -0800 (PST)
+Date: Tue, 22 Nov 2022 01:42:04 -0800 (PST)
 
-Patch series "mm,thp,rmap: rework the use of subpages_mapcount".
-
-Linus was underwhelmed by the earlier compound mapcounts series
-"mm,huge,rmap: unify and speed up compound mapcounts".
-
-This series builds on top of it to follow up on his suggestions - except
-rmap.c still using lock_page_memcg(), since I hesitate to steal the
-pleasure of deletion from Johannes.
+Patch series "mm,thp,rmap: rework the use of subpages_mapcount", v2.
 
 
 This patch (of 3):
@@ -37,11 +30,12 @@ implementation for most cases; but significantly faster in the (now
 scanless) pmds after ptes case, which started out at 870ms and was brought
 down to 495ms by the previous series, now takes around 105ms.
 
-Link: https://lkml.kernel.org/r/c4b8485b-1f26-1a5f-bdf-c6c22611f610@google.com
-Link: https://lkml.kernel.org/r/78fa518-85b5-32c0-ee92-537fa46131f6@google.com
+Link: https://lkml.kernel.org/r/a5849eca-22f1-3517-bf29-95d982242742@google.com
+Link: https://lkml.kernel.org/r/eec17e16-4e1-7c59-f1bc-5bca90dac919@google.com
 Signed-off-by: Hugh Dickins <hughd@google.com>
 Suggested-by: Linus Torvalds <torvalds@linux-foundation.org>
 Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Dan Carpenter <error27@gmail.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: James Houghton <jthoughton@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
@@ -56,16 +50,17 @@ Cc: Peter Xu <peterx@redhat.com>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/mm/transhuge.rst |    3 
  include/linux/mm.h             |   52 ++++++----
- include/linux/rmap.h           |    8 -
+ include/linux/rmap.h           |    9 -
  mm/huge_memory.c               |    2 
- mm/rmap.c                      |  155 +++++++++++++------------------
- 5 files changed, 103 insertions(+), 117 deletions(-)
+ mm/rmap.c                      |  160 +++++++++++++------------------
+ 5 files changed, 107 insertions(+), 119 deletions(-)
 
 --- a/Documentation/mm/transhuge.rst~mmthprmap-subpages_mapcount-of-pte-mapped-subpages
 +++ a/Documentation/mm/transhuge.rst
@@ -163,7 +158,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline struct page *virt_to_head_page(const void *x)
 --- a/include/linux/rmap.h~mmthprmap-subpages_mapcount-of-pte-mapped-subpages
 +++ a/include/linux/rmap.h
-@@ -204,14 +204,14 @@ void hugepage_add_anon_rmap(struct page
+@@ -204,14 +204,15 @@ void hugepage_add_anon_rmap(struct page
  void hugepage_add_new_anon_rmap(struct page *, struct vm_area_struct *,
  		unsigned long address);
  
@@ -175,7 +170,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (PageCompound(page))
 -		page_dup_compound_rmap(page, compound);
 -	else
-+	if (likely(!compound /* page is mapped by PTE */))
++	/* Is page being mapped by PTE? */
++	if (likely(!compound))
  		atomic_inc(&page->_mapcount);
 +	else
 +		page_dup_compound_rmap(page);
@@ -184,7 +180,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
 --- a/mm/huge_memory.c~mmthprmap-subpages_mapcount-of-pte-mapped-subpages
 +++ a/mm/huge_memory.c
-@@ -2175,7 +2175,7 @@ static void __split_huge_pmd_locked(stru
+@@ -2221,7 +2221,7 @@ static void __split_huge_pmd_locked(stru
  		BUG_ON(!pte_none(*pte));
  		set_pte_at(mm, addr, pte, entry);
  		if (!pmd_migration)
@@ -270,7 +266,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Hugetlb pages could use lock_compound_mapcounts(), like THPs do;
-@@ -1176,20 +1157,16 @@ void page_dup_compound_rmap(struct page
+@@ -1176,20 +1157,15 @@ void page_dup_compound_rmap(struct page
  	 * Note that hugetlb does not call page_add_file_rmap():
  	 * here is where hugetlb shared page mapcount is raised.
  	 */
@@ -280,13 +276,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	}
 +	if (PageHuge(head)) {
 +		atomic_inc(compound_mapcount_ptr(head));
++	} else if (PageTransHuge(head)) {
++		/* That test is redundant: it's for safety or to optimize out */
  
 -	head = compound_head(page);
 -	lock_compound_mapcounts(head, &mapcounts);
 -	if (compound) {
-+	} else if (PageTransHuge(head)) {
-+		/* That test is redundant: it's for safety or to optimize out */
-+
 +		lock_compound_mapcounts(head, &mapcounts);
  		mapcounts.compound_mapcount++;
 -	} else {
@@ -298,7 +293,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -1308,31 +1285,29 @@ void page_add_anon_rmap(struct page *pag
+@@ -1304,35 +1280,34 @@ void page_add_anon_rmap(struct page *pag
+ 	struct compound_mapcounts mapcounts;
+ 	int nr = 0, nr_pmdmapped = 0;
+ 	bool compound = flags & RMAP_COMPOUND;
+-	bool first;
++	bool first = true;
  
  	if (unlikely(PageKsm(page)))
  		lock_page_memcg(page);
@@ -306,7 +306,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		VM_BUG_ON_PAGE(!PageLocked(page), page);
  
 -	if (likely(!PageCompound(page))) {
-+	if (likely(!compound /* page is mapped by PTE */)) {
++	/* Is page being mapped by PTE? Is this its first map to be added? */
++	if (likely(!compound)) {
  		first = atomic_inc_and_test(&page->_mapcount);
  		nr = first;
 +		if (first && PageCompound(page)) {
@@ -343,12 +344,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	VM_BUG_ON_PAGE(!first && (flags & RMAP_EXCLUSIVE), page);
-@@ -1411,28 +1386,28 @@ void page_add_file_rmap(struct page *pag
+@@ -1411,28 +1386,29 @@ void page_add_file_rmap(struct page *pag
  	VM_BUG_ON_PAGE(compound && !PageTransHuge(page), page);
  	lock_page_memcg(page);
  
 -	if (likely(!PageCompound(page))) {
-+	if (likely(!compound /* page is mapped by PTE */)) {
++	/* Is page being mapped by PTE? Is this its first map to be added? */
++	if (likely(!compound)) {
  		first = atomic_inc_and_test(&page->_mapcount);
  		nr = first;
 +		if (first && PageCompound(page)) {
@@ -385,12 +387,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	if (nr_pmdmapped)
-@@ -1472,28 +1447,28 @@ void page_remove_rmap(struct page *page,
+@@ -1471,29 +1447,29 @@ void page_remove_rmap(struct page *page,
+ 
  	lock_page_memcg(page);
  
- 	/* page still mapped by someone else? */
+-	/* page still mapped by someone else? */
 -	if (likely(!PageCompound(page))) {
-+	if (likely(!compound /* page is mapped by PTE */)) {
++	/* Is page being unmapped by PTE? Is this its last map to be removed? */
++	if (likely(!compound)) {
  		last = atomic_add_negative(-1, &page->_mapcount);
  		nr = last;
 +		if (last && PageCompound(page)) {

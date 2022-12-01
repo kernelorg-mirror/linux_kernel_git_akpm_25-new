@@ -1,6 +1,6 @@
 From: Hugh Dickins <hughd@google.com>
 Subject: mm,thp,rmap: subpages_mapcount COMPOUND_MAPPED if PMD-mapped
-Date: Fri, 18 Nov 2022 01:14:17 -0800 (PST)
+Date: Tue, 22 Nov 2022 01:49:36 -0800 (PST)
 
 Can the lock_compound_mapcount() bit_spin_lock apparatus be removed now? 
 Yes.  Not by atomic64_t or cmpxchg games, those get difficult on 32-bit;
@@ -25,9 +25,10 @@ Evidence is that this way goes slightly faster than the previous
 implementation in all cases (pmds after ptes now taking around 103ms); and
 relieves us of worrying about contention on the bit_spin_lock.
 
-Link: https://lkml.kernel.org/r/25a09a7a-81a9-e9c2-7567-c94ce18ac2@google.com
+Link: https://lkml.kernel.org/r/3978f3ca-5473-55a7-4e14-efea5968d892@google.com
 Signed-off-by: Hugh Dickins <hughd@google.com>
 Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Dan Carpenter <error27@gmail.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: James Houghton <jthoughton@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
@@ -43,16 +44,17 @@ Cc: Peter Xu <peterx@redhat.com>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/mm/transhuge.rst |    7 -
  include/linux/mm.h             |   19 ++++
- include/linux/rmap.h           |   12 +--
- mm/debug.c                     |    2 
- mm/rmap.c                      |  124 ++++++-------------------------
- 5 files changed, 52 insertions(+), 112 deletions(-)
+ include/linux/rmap.h           |   13 +--
+ mm/page_alloc.c                |    2 
+ mm/rmap.c                      |  121 ++++++-------------------------
+ 5 files changed, 51 insertions(+), 111 deletions(-)
 
 --- a/Documentation/mm/transhuge.rst~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
 +++ a/Documentation/mm/transhuge.rst
@@ -77,11 +79,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  page to the tail pages before clearing all PG_head/tail bits from the page
 --- a/include/linux/mm.h~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
 +++ a/include/linux/mm.h
-@@ -837,7 +837,16 @@ static inline int head_compound_mapcount
+@@ -837,12 +837,21 @@ static inline int head_compound_mapcount
  }
  
  /*
-- * Number of sub-pages mapped by PTE, does not include compound mapcount.
 + * If a 16GB hugetlb page were mapped by PTEs of all of its 4kB sub-pages,
 + * its subpages_mapcount would be 0x400000: choose the COMPOUND_MAPPED bit
 + * above that range, instead of 2*(PMD_SIZE/PAGE_SIZE).  Hugetlb currently
@@ -91,10 +92,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define SUBPAGES_MAPPED	(COMPOUND_MAPPED - 1)
 +
 +/*
-+ * Number of sub-pages mapped by PTE, plus COMPOUND_MAPPED if compound mapped.
+  * Number of sub-pages mapped by PTE, does not include compound mapcount.
   * Must be called only on head of compound page.
   */
  static inline int head_subpages_mapcount(struct page *head)
+ {
+-	return atomic_read(subpages_mapcount_ptr(head));
++	return atomic_read(subpages_mapcount_ptr(head)) & SUBPAGES_MAPPED;
+ }
+ 
+ /*
 @@ -902,8 +911,12 @@ static inline int total_mapcount(struct
  
  static inline bool folio_large_is_mapped(struct folio *folio)
@@ -105,14 +112,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * Reading folio_mapcount_ptr() below could be omitted if hugetlb
 +	 * participated in incrementing subpages_mapcount when compound mapped.
 +	 */
-+	return atomic_read(folio_mapcount_ptr(folio)) >= 0 ||
-+		atomic_read(folio_subpages_mapcount_ptr(folio)) > 0;
++	return atomic_read(folio_subpages_mapcount_ptr(folio)) > 0 ||
++		atomic_read(folio_mapcount_ptr(folio)) >= 0;
  }
  
  /**
 --- a/include/linux/rmap.h~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
 +++ a/include/linux/rmap.h
-@@ -204,14 +204,14 @@ void hugepage_add_anon_rmap(struct page
+@@ -204,15 +204,14 @@ void hugepage_add_anon_rmap(struct page
  void hugepage_add_new_anon_rmap(struct page *, struct vm_area_struct *,
  		unsigned long address);
  
@@ -124,7 +131,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static inline void page_dup_file_rmap(struct page *page, bool compound)
  {
--	if (likely(!compound /* page is mapped by PTE */))
+-	/* Is page being mapped by PTE? */
+-	if (likely(!compound))
 -		atomic_inc(&page->_mapcount);
 -	else
 -		page_dup_compound_rmap(page);
@@ -132,7 +140,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -260,7 +260,7 @@ static inline int page_try_dup_anon_rmap
+@@ -261,7 +260,7 @@ static inline int page_try_dup_anon_rmap
  	 * the page R/O into both processes.
  	 */
  dup:
@@ -141,17 +149,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return 0;
  }
  
---- a/mm/debug.c~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
-+++ a/mm/debug.c
-@@ -97,7 +97,7 @@ static void __dump_page(struct page *pag
- 		pr_warn("head:%p order:%u compound_mapcount:%d subpages_mapcount:%d compound_pincount:%d\n",
- 				head, compound_order(head),
- 				head_compound_mapcount(head),
--				head_subpages_mapcount(head),
-+				head_subpages_mapcount(head) & SUBPAGES_MAPPED,
- 				head_compound_pincount(head));
- 	}
- 
+--- a/mm/page_alloc.c~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
++++ a/mm/page_alloc.c
+@@ -1330,7 +1330,7 @@ static int free_tail_pages_check(struct
+ 			bad_page(page, "nonzero compound_mapcount");
+ 			goto out;
+ 		}
+-		if (unlikely(head_subpages_mapcount(head_page))) {
++		if (unlikely(atomic_read(subpages_mapcount_ptr(head_page)))) {
+ 			bad_page(page, "nonzero subpages_mapcount");
+ 			goto out;
+ 		}
 --- a/mm/rmap.c~mmthprmap-subpages_mapcount-compound_mapped-if-pmd-mapped
 +++ a/mm/rmap.c
 @@ -1085,38 +1085,6 @@ int pfn_mkclean_range(unsigned long pfn,
@@ -193,16 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int total_compound_mapcount(struct page *head)
  {
  	int mapcount = head_compound_mapcount(head);
-@@ -1124,7 +1092,7 @@ int total_compound_mapcount(struct page
- 	int i;
- 
- 	/* In the common case, avoid the loop when no subpages mapped by PTE */
--	if (head_subpages_mapcount(head) == 0)
-+	if ((head_subpages_mapcount(head) & SUBPAGES_MAPPED) == 0)
- 		return mapcount;
- 	/*
- 	 * Add all the PTE mappings of those subpages mapped by PTE.
-@@ -1140,35 +1108,6 @@ int total_compound_mapcount(struct page
+@@ -1140,34 +1108,6 @@ int total_compound_mapcount(struct page
  	return mapcount;
  }
  
@@ -225,7 +224,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 */
 -	if (PageHuge(head)) {
 -		atomic_inc(compound_mapcount_ptr(head));
--
 -	} else if (PageTransHuge(head)) {
 -		/* That test is redundant: it's for safety or to optimize out */
 -
@@ -238,7 +236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * page_move_anon_rmap - move a page to our anon_vma
   * @page:	the page to move to our anon_vma
-@@ -1278,7 +1217,7 @@ static void __page_check_anon_rmap(struc
+@@ -1277,7 +1217,7 @@ static void __page_check_anon_rmap(struc
  void page_add_anon_rmap(struct page *page,
  	struct vm_area_struct *vma, unsigned long address, rmap_t flags)
  {
@@ -247,7 +245,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nr = 0, nr_pmdmapped = 0;
  	bool compound = flags & RMAP_COMPOUND;
  	bool first = true;
-@@ -1290,24 +1229,20 @@ void page_add_anon_rmap(struct page *pag
+@@ -1290,24 +1230,20 @@ void page_add_anon_rmap(struct page *pag
  		first = atomic_inc_and_test(&page->_mapcount);
  		nr = first;
  		if (first && PageCompound(page)) {
@@ -279,7 +277,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	VM_BUG_ON_PAGE(!first && (flags & RMAP_EXCLUSIVE), page);
-@@ -1360,6 +1295,7 @@ void page_add_new_anon_rmap(struct page
+@@ -1360,6 +1296,7 @@ void page_add_new_anon_rmap(struct page
  		VM_BUG_ON_PAGE(!PageTransHuge(page), page);
  		/* increment count (starts at -1) */
  		atomic_set(compound_mapcount_ptr(page), 0);
@@ -287,7 +285,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		nr = thp_nr_pages(page);
  		__mod_lruvec_page_state(page, NR_ANON_THPS, nr);
  	}
-@@ -1379,7 +1315,7 @@ void page_add_new_anon_rmap(struct page
+@@ -1379,7 +1316,7 @@ void page_add_new_anon_rmap(struct page
  void page_add_file_rmap(struct page *page,
  	struct vm_area_struct *vma, bool compound)
  {
@@ -296,7 +294,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nr = 0, nr_pmdmapped = 0;
  	bool first;
  
-@@ -1390,24 +1326,20 @@ void page_add_file_rmap(struct page *pag
+@@ -1391,24 +1328,20 @@ void page_add_file_rmap(struct page *pag
  		first = atomic_inc_and_test(&page->_mapcount);
  		nr = first;
  		if (first && PageCompound(page)) {
@@ -328,7 +326,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	if (nr_pmdmapped)
-@@ -1431,7 +1363,7 @@ void page_add_file_rmap(struct page *pag
+@@ -1432,7 +1365,7 @@ void page_add_file_rmap(struct page *pag
  void page_remove_rmap(struct page *page,
  	struct vm_area_struct *vma, bool compound)
  {
@@ -337,7 +335,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nr = 0, nr_pmdmapped = 0;
  	bool last;
  
-@@ -1451,24 +1383,20 @@ void page_remove_rmap(struct page *page,
+@@ -1452,24 +1385,20 @@ void page_remove_rmap(struct page *page,
  		last = atomic_add_negative(-1, &page->_mapcount);
  		nr = last;
  		if (last && PageCompound(page)) {
