@@ -1,0 +1,76 @@
+From: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Subject: fsdax: invalidate pages when CoW
+Date: Thu, 1 Dec 2022 15:28:52 +0000
+
+CoW changes the share state of a dax page, but the share count of the page
+isn't updated.  The next time access this page, it should have been a
+newly accessed, but old association exists.  So, we need to clear the
+share state when CoW happens, in both dax_iomap_rw() and dax_zero_iter().
+
+Link: https://lkml.kernel.org/r/1669908538-55-3-git-send-email-ruansy.fnst@fujitsu.com
+Signed-off-by: Shiyang Ruan <ruansy.fnst@fujitsu.com>
+Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c |   17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+--- a/fs/dax.c~fsdax-invalidate-pages-when-cow
++++ a/fs/dax.c
+@@ -1264,6 +1264,15 @@ static s64 dax_zero_iter(struct iomap_it
+ 	if (srcmap->type == IOMAP_HOLE || srcmap->type == IOMAP_UNWRITTEN)
+ 		return length;
+ 
++	/*
++	 * invalidate the pages whose sharing state is to be changed
++	 * because of CoW.
++	 */
++	if (iomap->flags & IOMAP_F_SHARED)
++		invalidate_inode_pages2_range(iter->inode->i_mapping,
++					      pos >> PAGE_SHIFT,
++					      (pos + length - 1) >> PAGE_SHIFT);
++
+ 	do {
+ 		unsigned offset = offset_in_page(pos);
+ 		unsigned size = min_t(u64, PAGE_SIZE - offset, length);
+@@ -1324,12 +1333,13 @@ static loff_t dax_iomap_iter(const struc
+ 		struct iov_iter *iter)
+ {
+ 	const struct iomap *iomap = &iomi->iomap;
+-	const struct iomap *srcmap = &iomi->srcmap;
++	const struct iomap *srcmap = iomap_iter_srcmap(iomi);
+ 	loff_t length = iomap_length(iomi);
+ 	loff_t pos = iomi->pos;
+ 	struct dax_device *dax_dev = iomap->dax_dev;
+ 	loff_t end = pos + length, done = 0;
+ 	bool write = iov_iter_rw(iter) == WRITE;
++	bool cow = write && iomap->flags & IOMAP_F_SHARED;
+ 	ssize_t ret = 0;
+ 	size_t xfer;
+ 	int id;
+@@ -1356,7 +1366,7 @@ static loff_t dax_iomap_iter(const struc
+ 	 * into page tables. We have to tear down these mappings so that data
+ 	 * written by write(2) is visible in mmap.
+ 	 */
+-	if (iomap->flags & IOMAP_F_NEW) {
++	if (iomap->flags & IOMAP_F_NEW || cow) {
+ 		invalidate_inode_pages2_range(iomi->inode->i_mapping,
+ 					      pos >> PAGE_SHIFT,
+ 					      (end - 1) >> PAGE_SHIFT);
+@@ -1390,8 +1400,7 @@ static loff_t dax_iomap_iter(const struc
+ 			break;
+ 		}
+ 
+-		if (write &&
+-		    srcmap->type != IOMAP_HOLE && srcmap->addr != iomap->addr) {
++		if (cow) {
+ 			ret = dax_iomap_cow_copy(pos, length, PAGE_SIZE, srcmap,
+ 						 kaddr);
+ 			if (ret)
+_
