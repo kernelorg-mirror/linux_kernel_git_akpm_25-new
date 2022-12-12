@@ -1,168 +1,64 @@
 From: David Hildenbrand <david@redhat.com>
 Subject: mm/ksm: fix KSM COW breaking with userfaultfd-wp via FAULT_FLAG_UNSHARE
-Date: Fri, 30 Sep 2022 16:19:28 +0200
+Date: Fri, 21 Oct 2022 12:11:37 +0200
 
 Let's stop breaking COW via a fake write fault and let's use
 FAULT_FLAG_UNSHARE instead.  This avoids any wrong side effects of the
 fake write fault, such as mapping the PTE writable and marking the pte
 dirty/softdirty.
 
-Also, this fixes KSM interaction with userfaultfd-wp: when we have a KSM
-page that's write-protected by userfaultfd, break_ksm()->handle_mm_fault()
-will fail with VM_FAULT_SIGBUS and will simpy return in break_ksm() with
-0.  The warning in dmesg indicates this wrong handling:
-
-[  230.096368] FAULT_FLAG_ALLOW_RETRY missing 881
-[  230.100822] CPU: 1 PID: 1643 Comm: ksm-uffd-wp [...]
-[  230.110124] Hardware name: [...]
-[  230.117775] Call Trace:
-[  230.120227]  <TASK>
-[  230.122334]  dump_stack_lvl+0x44/0x5c
-[  230.126010]  handle_userfault.cold+0x14/0x19
-[  230.130281]  ? tlb_finish_mmu+0x65/0x170
-[  230.134207]  ? uffd_wp_range+0x65/0xa0
-[  230.137959]  ? _raw_spin_unlock+0x15/0x30
-[  230.141972]  ? do_wp_page+0x50/0x590
-[  230.145551]  __handle_mm_fault+0x9f5/0xf50
-[  230.149652]  ? mmput+0x1f/0x40
-[  230.152712]  handle_mm_fault+0xb9/0x2a0
-[  230.156550]  break_ksm+0x141/0x180
-[  230.159964]  unmerge_ksm_pages+0x60/0x90
-[  230.163890]  ksm_madvise+0x3c/0xb0
-[  230.167295]  do_madvise.part.0+0x10c/0xeb0
-[  230.171396]  ? do_syscall_64+0x67/0x80
-[  230.175157]  __x64_sys_madvise+0x5a/0x70
-[  230.179082]  do_syscall_64+0x58/0x80
-[  230.182661]  ? do_syscall_64+0x67/0x80
-[  230.186413]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
-
---------------------------------------------------------------------------
-
- #include <stdio.h>
- #include <stdlib.h>
- #include <string.h>
- #include <fcntl.h>
- #include <unistd.h>
- #include <errno.h>
- #include <sys/mman.h>
- #include <sys/syscall.h>
- #include <sys/ioctl.h>
- #include <linux/userfaultfd.h>
-
- #define MMAP_SIZE (2 * 1024 * 1024u)
-
- static char *map;
- int uffd;
-
- static int setup_uffd(void)
- {
- 	struct uffdio_api uffdio_api;
- 	struct uffdio_register uffdio_register;
- 	struct uffdio_writeprotect uffd_writeprotect;
- 	struct uffdio_range uffd_range;
-
- 	uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
- 	if (uffd < 0) {
- 		fprintf(stderr, "syscall() failed: %d\n", errno);
- 		return -errno;
- 	}
-
- 	uffdio_api.api = UFFD_API;
- 	uffdio_api.features = UFFD_FEATURE_PAGEFAULT_FLAG_WP;
- 	if (ioctl(uffd, UFFDIO_API, &uffdio_api) < 0) {
- 		fprintf(stderr, "UFFDIO_API failed: %d\n", errno);
- 		return -errno;
- 	}
-
- 	if (!(uffdio_api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
- 		fprintf(stderr, "UFFD_FEATURE_WRITEPROTECT missing\n");
- 		return -ENOSYS;
- 	}
-
- 	/* Register UFFD-WP */
- 	uffdio_register.range.start = (unsigned long) map;
- 	uffdio_register.range.len = MMAP_SIZE;
- 	uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
- 	if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) < 0) {
- 		fprintf(stderr, "UFFDIO_REGISTER failed: %d\n", errno);
- 		return -errno;
- 	}
-
- 	/* Writeprotect the range. */
- 	uffd_writeprotect.range.start = (unsigned long) map;
- 	uffd_writeprotect.range.len = MMAP_SIZE;
- 	uffd_writeprotect.mode = UFFDIO_WRITEPROTECT_MODE_WP;
- 	if (ioctl(uffd, UFFDIO_WRITEPROTECT, &uffd_writeprotect)) {
- 		fprintf(stderr, "UFFDIO_WRITEPROTECT failed: %d\n", errno);
- 		return -errno;
- 	}
-
- 	return 0;
- }
-
- int main(int argc, char **argv)
- {
- 	int ksm_fd, ret;
-
- 	ksm_fd = open("/sys/kernel/mm/ksm/run", O_RDWR);
- 	if (ksm_fd < 0) {
- 		fprintf(stderr, "KSM not available\n");
- 		return -errno;
- 	}
-
- 	map = mmap(NULL, MMAP_SIZE, PROT_READ|PROT_WRITE,
- 		   MAP_PRIVATE|MAP_ANON, -1, 0);
- 	if (map == MAP_FAILED) {
- 		fprintf(stderr, "mmap() failed\n");
- 		return -errno;
- 	}
- 	ret = madvise(map, MMAP_SIZE, MADV_NOHUGEPAGE);
- 	if (ret) {
- 		fprintf(stderr, "MADV_NOHUGEPAGE failed\n");
- 		return -errno;
- 	}
-
- 	/* Fill with same value and trigger merging. */
- 	memset(map, 0xff, MMAP_SIZE);
- 	ret = madvise(map, MMAP_SIZE, MADV_MERGEABLE);
- 	if (ret) {
- 		fprintf(stderr, "MADV_MERGEABLE failed\n");
- 		return -errno;
- 	}
-
- 	/*
- 	 * Run KSM to trigger merging and wait a bit until merging should be
- 	 * done.
- 	 */
- 	if (write(ksm_fd, "1", 1) != 1) {
- 		fprintf(stderr, "Running KSM failed\n");
- 	}
- 	sleep(10);
-
- 	/* Write-protect the range with UFFD. */
- 	if (setup_uffd())
- 		return 1;
-
- 	/* Trigger unsharing. */
- 	ret = madvise(map, MMAP_SIZE, MADV_UNMERGEABLE);
- 	if (ret) {
- 		fprintf(stderr, "MADV_UNMERGEABLE failed\n");
- 		return -errno;
- 	}
-
- 	return 0;
- }
-
---------------------------------------------------------------------------
-
 Consequently, we will no longer trigger a fake write fault and break COW
 without any such side-effects.
+
+Also, this fixes KSM interaction with userfaultfd-wp: when we have a KSM
+page that's write-protected by userfaultfd, break_ksm()->handle_mm_fault()
+will fail with VM_FAULT_SIGBUS and will simply return in break_ksm() with
+0 instead of actually breaking COW.
+
+For now, the KSM unmerge tests can trigger that:
+    $ sudo ./ksm_functional_tests
+    TAP version 13
+    1..3
+    # [RUN] test_unmerge
+    ok 1 Pages were unmerged
+    # [RUN] test_unmerge_discarded
+    ok 2 Pages were unmerged
+    # [RUN] test_unmerge_uffd_wp
+    not ok 3 Pages were unmerged
+    Bail out! 1 out of 3 tests failed
+    # Planned tests != run tests (2 != 3)
+    # Totals: pass:2 fail:1 xfail:0 xpass:0 skip:0 error:0
+
+The warning in dmesg also indicates this wrong handling:
+    [  230.096368] FAULT_FLAG_ALLOW_RETRY missing 881
+    [  230.100822] CPU: 1 PID: 1643 Comm: ksm-uffd-wp [...]
+    [  230.110124] Hardware name: [...]
+    [  230.117775] Call Trace:
+    [  230.120227]  <TASK>
+    [  230.122334]  dump_stack_lvl+0x44/0x5c
+    [  230.126010]  handle_userfault.cold+0x14/0x19
+    [  230.130281]  ? tlb_finish_mmu+0x65/0x170
+    [  230.134207]  ? uffd_wp_range+0x65/0xa0
+    [  230.137959]  ? _raw_spin_unlock+0x15/0x30
+    [  230.141972]  ? do_wp_page+0x50/0x590
+    [  230.145551]  __handle_mm_fault+0x9f5/0xf50
+    [  230.149652]  ? mmput+0x1f/0x40
+    [  230.152712]  handle_mm_fault+0xb9/0x2a0
+    [  230.156550]  break_ksm+0x141/0x180
+    [  230.159964]  unmerge_ksm_pages+0x60/0x90
+    [  230.163890]  ksm_madvise+0x3c/0xb0
+    [  230.167295]  do_madvise.part.0+0x10c/0xeb0
+    [  230.171396]  ? do_syscall_64+0x67/0x80
+    [  230.175157]  __x64_sys_madvise+0x5a/0x70
+    [  230.179082]  do_syscall_64+0x58/0x80
+    [  230.182661]  ? do_syscall_64+0x67/0x80
+    [  230.186413]  entry_SYSCALL_64_after_hwframe+0x63/0xcd
 
 This is primarily a fix for KSM+userfaultfd-wp, however, the fake write
 fault was always questionable.  As this fix is not easy to backport and
 it's not very critical, let's not cc stable.
 
-Link: https://lkml.kernel.org/r/20220930141931.174362-5-david@redhat.com
+Link: https://lkml.kernel.org/r/20221021101141.84170-6-david@redhat.com
 Fixes: 529b930b87d9 ("userfaultfd: wp: hook userfault handler to write protection fault")
 Signed-off-by: David Hildenbrand <david@redhat.com>
 Acked-by: Peter Xu <peterx@redhat.com>
@@ -170,7 +66,7 @@ Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: John Hubbard <jhubbard@nvidia.com>
-Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Shuah Khan <shuah@kernel.org>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
