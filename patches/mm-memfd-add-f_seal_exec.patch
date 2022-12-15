@@ -1,0 +1,109 @@
+From: Daniel Verkamp <dverkamp@chromium.org>
+Subject: mm/memfd: add F_SEAL_EXEC
+Date: Thu, 15 Dec 2022 00:12:01 +0000
+
+Patch series "mm/memfd: introduce MFD_NOEXEC_SEAL and MFD_EXEC", v8.
+
+Since Linux introduced the memfd feature, memfd have always had their
+execute bit set, and the memfd_create() syscall doesn't allow setting it
+differently.
+
+However, in a secure by default system, such as ChromeOS, (where all
+executables should come from the rootfs, which is protected by Verified
+boot), this executable nature of memfd opens a door for NoExec bypass and
+enables “confused deputy attack”.  E.g, in VRP bug [1]: cros_vm
+process created a memfd to share the content with an external process,
+however the memfd is overwritten and used for executing arbitrary code and
+root escalation.  [2] lists more VRP in this kind.
+
+On the other hand, executable memfd has its legit use, runc uses memfd’s
+seal and executable feature to copy the contents of the binary then
+execute them, for such system, we need a solution to differentiate runc's
+use of executable memfds and an attacker's [3].
+
+To address those above, this set of patches add following:
+1> Let memfd_create() set X bit at creation time.
+2> Let memfd to be sealed for modifying X bit.
+3> A new pid namespace sysctl: vm.memfd_noexec to control the behavior of
+   X bit.For example, if a container has vm.memfd_noexec=2, then
+   memfd_create() without MFD_NOEXEC_SEAL will be rejected.
+4> A new security hook in memfd_create(). This make it possible to a new
+   LSM, which rejects or allows executable memfd based on its security policy.
+
+
+This patch (of 5):
+
+The new F_SEAL_EXEC flag will prevent modification of the exec bits:
+written as traditional octal mask, 0111, or as named flags, S_IXUSR |
+S_IXGRP | S_IXOTH.  Any chmod(2) or similar call that attempts to modify
+any of these bits after the seal is applied will fail with errno EPERM.
+
+This will preserve the execute bits as they are at the time of sealing, so
+the memfd will become either permanently executable or permanently
+un-executable.
+
+Link: https://lkml.kernel.org/r/20221215001205.51969-1-jeffxu@google.com
+Link: https://lkml.kernel.org/r/20221215001205.51969-2-jeffxu@google.com
+Signed-off-by: Daniel Verkamp <dverkamp@chromium.org>
+Co-developed-by: Jeff Xu <jeffxu@google.com>
+Signed-off-by: Jeff Xu <jeffxu@google.com>
+Reviewed-by: Kees Cook <keescook@chromium.org>
+Cc: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jorge Lucangeli Obes <jorgelo@chromium.org>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: David Herrmann <dh.herrmann@gmail.com>
+Cc: kernel test robot <lkp@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/uapi/linux/fcntl.h |    1 +
+ mm/memfd.c                 |    2 ++
+ mm/shmem.c                 |    6 ++++++
+ 3 files changed, 9 insertions(+)
+
+--- a/include/uapi/linux/fcntl.h~mm-memfd-add-f_seal_exec
++++ a/include/uapi/linux/fcntl.h
+@@ -43,6 +43,7 @@
+ #define F_SEAL_GROW	0x0004	/* prevent file from growing */
+ #define F_SEAL_WRITE	0x0008	/* prevent writes */
+ #define F_SEAL_FUTURE_WRITE	0x0010  /* prevent future writes while mapped */
++#define F_SEAL_EXEC	0x0020  /* prevent chmod modifying exec bits */
+ /* (1U << 31) is reserved for signed error codes */
+ 
+ /*
+--- a/mm/memfd.c~mm-memfd-add-f_seal_exec
++++ a/mm/memfd.c
+@@ -147,6 +147,7 @@ static unsigned int *memfd_file_seals_pt
+ }
+ 
+ #define F_ALL_SEALS (F_SEAL_SEAL | \
++		     F_SEAL_EXEC | \
+ 		     F_SEAL_SHRINK | \
+ 		     F_SEAL_GROW | \
+ 		     F_SEAL_WRITE | \
+@@ -175,6 +176,7 @@ static int memfd_add_seals(struct file *
+ 	 *   SEAL_SHRINK: Prevent the file from shrinking
+ 	 *   SEAL_GROW: Prevent the file from growing
+ 	 *   SEAL_WRITE: Prevent write access to the file
++	 *   SEAL_EXEC: Prevent modification of the exec bits in the file mode
+ 	 *
+ 	 * As we don't require any trust relationship between two parties, we
+ 	 * must prevent seals from being removed. Therefore, sealing a file
+--- a/mm/shmem.c~mm-memfd-add-f_seal_exec
++++ a/mm/shmem.c
+@@ -1095,6 +1095,12 @@ static int shmem_setattr(struct user_nam
+ 	if (error)
+ 		return error;
+ 
++	if ((info->seals & F_SEAL_EXEC) && (attr->ia_valid & ATTR_MODE)) {
++		if ((inode->i_mode ^ attr->ia_mode) & 0111) {
++			return -EPERM;
++		}
++	}
++
+ 	if (S_ISREG(inode->i_mode) && (attr->ia_valid & ATTR_SIZE)) {
+ 		loff_t oldsize = inode->i_size;
+ 		loff_t newsize = attr->ia_size;
+_
