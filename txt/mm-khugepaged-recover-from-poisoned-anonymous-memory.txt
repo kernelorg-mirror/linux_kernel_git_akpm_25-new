@@ -1,0 +1,104 @@
+From: Jiaqi Yan <jiaqiyan@google.com>
+Subject: mm/khugepaged: recover from poisoned anonymous memory
+Date: Mon, 5 Dec 2022 15:40:58 -0800
+
+Patch series "Memory poison recovery in khugepaged collapsing", v9.
+
+Problem
+=======
+
+Memory DIMMs are subject to multi-bit flips, i.e.  memory errors.  As
+memory size and density increase, the chances of and number of memory
+errors increase.  The increasing size and density of server RAM in the
+data center and cloud have shown increased uncorrectable memory errors. 
+There are already mechanisms in the kernel to recover from uncorrectable
+memory errors.  This series of patches provides the recovery mechanism for
+the particular kernel agent khugepaged when it collapses memory pages.
+
+Impact
+======
+
+The main reason we chose to make khugepaged collapsing tolerant of memory
+failures was its high possibility of accessing poisoned memory while
+performing functionally optional compaction actions.  Standard
+applications typically don't have strict requirements on the size of their
+pages.  So they are given 4K pages by the kernel.  The kernel is able to
+improve application performance by either
+
+  1) giving applications 2M pages to begin with, or
+  2) collapsing 4K pages into 2M pages when possible.
+
+This collapsing operation is done by khugepaged, a kernel agent that is
+constantly scanning memory.  When collapsing 4K pages into a 2M page, it
+must copy the data from the 4K pages into a physically contiguous 2M page.
+Therefore, as long as there exists one poisoned cache line in collapsible
+4K pages, khugepaged will eventually access it.  The current impact to
+users is a machine check exception triggered kernel panic.  However,
+khugepaged’s compaction operations are not functionally required kernel
+actions.  Therefore making khugepaged tolerant to poisoned memory will
+greatly improve user experience.
+
+This patch series is for cases where khugepaged is the first guy that
+detects the memory errors on the poisoned pages.  IOW, the pages are not
+known to have memory errors when khugepaged collapsing gets to them.  In
+our observation, this happens frequently when the huge page ratio of the
+system is relatively low, which is fairly common in virtual machines
+running on cloud.
+
+Solution
+========
+
+As stated before, it is less desirable to crash the system only because
+khugepaged accesses poisoned pages while it is collapsing 4K pages.  The
+high level idea of this patch series is to skip the group of pages
+(usually 512 4K-size pages) once khugepaged finds one of them is poisoned,
+as these pages have become ineligible to be collapsed.
+
+We are also careful to unwind operations khuagepaged has performed before
+it detects memory failures.  For example, before copying and collapsing a
+group of anonymous pages into a huge page, the source pages will be
+isolated and their page table is unlinked from their PMD.  These
+operations need to be undone in order to ensure these pages are not
+changed/lost from the perspective of other threads (both user and kernel
+space).  As for file backed memory pages, there already exists a rollback
+case.  This patch just extends it so that khugepaged also correctly rolls
+back when it fails to copy poisoned 4K pages.
+
+
+This patch (of 2):
+
+Make __collapse_huge_page_copy return whether copying anonymous pages
+succeeded, and make collapse_huge_page handle the return status.
+
+Break existing PTE scan loop into two for-loops.  The first loop copies
+source pages into target huge page, and can fail gracefully when running
+into memory errors in source pages.  If copying all pages succeeds, the
+second loop releases and clears up these normal pages.  Otherwise, the
+second loop rolls back the page table and page states by: -
+re-establishing the original PTEs-to-PMD connection.  - releasing source
+pages back to their LRU list.
+
+Tested manually:
+0. Enable khugepaged on system under test.
+1. Start a two-thread application. Each thread allocates a chunk of
+   non-huge anonymous memory buffer.
+2. Pick 4 random buffer locations (2 in each thread) and inject
+   uncorrectable memory errors at corresponding physical addresses.
+3. Signal both threads to make their memory buffer collapsible, i.e.
+   calling madvise(MADV_HUGEPAGE).
+4. Wait and check kernel log: khugepaged is able to recover from poisoned
+   pages and skips collapsing them.
+5. Signal both threads to inspect their buffer contents and make sure no
+   data corruption.
+
+Link: https://lkml.kernel.org/r/20221205234059.42971-1-jiaqiyan@google.com
+Link: https://lkml.kernel.org/r/20221205234059.42971-2-jiaqiyan@google.com
+Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Tony Luck <tony.luck@intel.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: <tongtiangen@huawei.com>
