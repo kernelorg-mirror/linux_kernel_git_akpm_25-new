@@ -1,0 +1,213 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: convert head_subpages_mapcount() into folio_nr_pages_mapped()
+Date: Wed, 11 Jan 2023 14:28:48 +0000
+
+Calling this 'mapcount' is confusing since mapcount is usually the number
+of times something is mapped; instead this is the number of mapped pages. 
+It's also better to enforce that this is a folio rather than a head page.
+
+Move folio_nr_pages_mapped() into mm/internal.h since this is not
+something we want device drivers or filesystems poking at.  Get rid of
+folio_subpages_mapcount_ptr() and use folio->_nr_pages_mapped directly.
+
+Link: https://lkml.kernel.org/r/20230111142915.1001531-3-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h       |   22 ++--------------------
+ include/linux/mm_types.h |   12 +++---------
+ mm/debug.c               |    4 ++--
+ mm/hugetlb.c             |    4 ++--
+ mm/internal.h            |   18 ++++++++++++++++++
+ mm/rmap.c                |    9 +++++----
+ 6 files changed, 32 insertions(+), 37 deletions(-)
+
+--- a/include/linux/mm.h~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/include/linux/mm.h
+@@ -844,24 +844,6 @@ static inline int head_compound_mapcount
+ }
+ 
+ /*
+- * If a 16GB hugetlb page were mapped by PTEs of all of its 4kB sub-pages,
+- * its subpages_mapcount would be 0x400000: choose the COMPOUND_MAPPED bit
+- * above that range, instead of 2*(PMD_SIZE/PAGE_SIZE).  Hugetlb currently
+- * leaves subpages_mapcount at 0, but avoid surprise if it participates later.
+- */
+-#define COMPOUND_MAPPED	0x800000
+-#define SUBPAGES_MAPPED	(COMPOUND_MAPPED - 1)
+-
+-/*
+- * Number of sub-pages mapped by PTE, does not include compound mapcount.
+- * Must be called only on head of compound page.
+- */
+-static inline int head_subpages_mapcount(struct page *head)
+-{
+-	return atomic_read(subpages_mapcount_ptr(head)) & SUBPAGES_MAPPED;
+-}
+-
+-/*
+  * The atomic page->_mapcount, starts from -1: so that transitions
+  * both from it and to it can be tracked, using atomic_inc_and_test
+  * and atomic_add_negative(-1).
+@@ -920,9 +902,9 @@ static inline bool folio_large_is_mapped
+ {
+ 	/*
+ 	 * Reading folio_mapcount_ptr() below could be omitted if hugetlb
+-	 * participated in incrementing subpages_mapcount when compound mapped.
++	 * participated in incrementing nr_pages_mapped when compound mapped.
+ 	 */
+-	return atomic_read(folio_subpages_mapcount_ptr(folio)) > 0 ||
++	return atomic_read(&folio->_nr_pages_mapped) > 0 ||
+ 		atomic_read(folio_mapcount_ptr(folio)) >= 0;
+ }
+ 
+--- a/include/linux/mm_types.h~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/include/linux/mm_types.h
+@@ -307,7 +307,7 @@ static inline struct page *encoded_page_
+  * @_folio_dtor: Which destructor to use for this folio.
+  * @_folio_order: Do not use directly, call folio_order().
+  * @_compound_mapcount: Do not use directly, call folio_entire_mapcount().
+- * @_subpages_mapcount: Do not use directly, call folio_mapcount().
++ * @_nr_pages_mapped: Do not use directly, call folio_mapcount().
+  * @_pincount: Do not use directly, call folio_maybe_dma_pinned().
+  * @_folio_nr_pages: Do not use directly, call folio_nr_pages().
+  * @_flags_2: For alignment.  Do not use.
+@@ -361,7 +361,7 @@ struct folio {
+ 			unsigned char _folio_dtor;
+ 			unsigned char _folio_order;
+ 			atomic_t _compound_mapcount;
+-			atomic_t _subpages_mapcount;
++			atomic_t _nr_pages_mapped;
+ 			atomic_t _pincount;
+ #ifdef CONFIG_64BIT
+ 			unsigned int _folio_nr_pages;
+@@ -404,7 +404,7 @@ FOLIO_MATCH(compound_head, _head_1);
+ FOLIO_MATCH(compound_dtor, _folio_dtor);
+ FOLIO_MATCH(compound_order, _folio_order);
+ FOLIO_MATCH(compound_mapcount, _compound_mapcount);
+-FOLIO_MATCH(subpages_mapcount, _subpages_mapcount);
++FOLIO_MATCH(subpages_mapcount, _nr_pages_mapped);
+ FOLIO_MATCH(compound_pincount, _pincount);
+ #ifdef CONFIG_64BIT
+ FOLIO_MATCH(compound_nr, _folio_nr_pages);
+@@ -427,12 +427,6 @@ static inline atomic_t *folio_mapcount_p
+ 	return &tail->compound_mapcount;
+ }
+ 
+-static inline atomic_t *folio_subpages_mapcount_ptr(struct folio *folio)
+-{
+-	struct page *tail = &folio->page + 1;
+-	return &tail->subpages_mapcount;
+-}
+-
+ static inline atomic_t *compound_mapcount_ptr(struct page *page)
+ {
+ 	return &page[1].compound_mapcount;
+--- a/mm/debug.c~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/mm/debug.c
+@@ -94,10 +94,10 @@ static void __dump_page(struct page *pag
+ 			page, page_ref_count(head), mapcount, mapping,
+ 			page_to_pgoff(page), page_to_pfn(page));
+ 	if (compound) {
+-		pr_warn("head:%p order:%u compound_mapcount:%d subpages_mapcount:%d pincount:%d\n",
++		pr_warn("head:%p order:%u compound_mapcount:%d nr_pages_mapped:%d pincount:%d\n",
+ 				head, compound_order(head),
+ 				head_compound_mapcount(head),
+-				head_subpages_mapcount(head),
++				folio_nr_pages_mapped(folio),
+ 				atomic_read(&folio->_pincount));
+ 	}
+ 
+--- a/mm/hugetlb.c~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/mm/hugetlb.c
+@@ -1475,7 +1475,7 @@ static void __destroy_compound_gigantic_
+ 	struct page *p;
+ 
+ 	atomic_set(folio_mapcount_ptr(folio), 0);
+-	atomic_set(folio_subpages_mapcount_ptr(folio), 0);
++	atomic_set(&folio->_nr_pages_mapped, 0);
+ 	atomic_set(&folio->_pincount, 0);
+ 
+ 	for (i = 1; i < nr_pages; i++) {
+@@ -1997,7 +1997,7 @@ static bool __prep_compound_gigantic_fol
+ 			set_compound_head(p, &folio->page);
+ 	}
+ 	atomic_set(folio_mapcount_ptr(folio), -1);
+-	atomic_set(folio_subpages_mapcount_ptr(folio), 0);
++	atomic_set(&folio->_nr_pages_mapped, 0);
+ 	atomic_set(&folio->_pincount, 0);
+ 	return true;
+ 
+--- a/mm/internal.h~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/mm/internal.h
+@@ -52,6 +52,24 @@ struct folio_batch;
+ 
+ void page_writeback_init(void);
+ 
++/*
++ * If a 16GB hugetlb folio were mapped by PTEs of all of its 4kB pages,
++ * its nr_pages_mapped would be 0x400000: choose the COMPOUND_MAPPED bit
++ * above that range, instead of 2*(PMD_SIZE/PAGE_SIZE).  Hugetlb currently
++ * leaves nr_pages_mapped at 0, but avoid surprise if it participates later.
++ */
++#define COMPOUND_MAPPED		0x800000
++#define FOLIO_PAGES_MAPPED	(COMPOUND_MAPPED - 1)
++
++/*
++ * How many individual pages have an elevated _mapcount.  Excludes
++ * the folio's entire_mapcount.
++ */
++static inline int folio_nr_pages_mapped(struct folio *folio)
++{
++	return atomic_read(&folio->_nr_pages_mapped) & FOLIO_PAGES_MAPPED;
++}
++
+ static inline void *folio_raw_mapping(struct folio *folio)
+ {
+ 	unsigned long mapping = (unsigned long)folio->mapping;
+--- a/mm/rmap.c~mm-convert-head_subpages_mapcount-into-folio_nr_pages_mapped
++++ a/mm/rmap.c
+@@ -1080,12 +1080,13 @@ int pfn_mkclean_range(unsigned long pfn,
+ 
+ int total_compound_mapcount(struct page *head)
+ {
++	struct folio *folio = (struct folio *)head;
+ 	int mapcount = head_compound_mapcount(head);
+ 	int nr_subpages;
+ 	int i;
+ 
+ 	/* In the common case, avoid the loop when no subpages mapped by PTE */
+-	if (head_subpages_mapcount(head) == 0)
++	if (folio_nr_pages_mapped(folio) == 0)
+ 		return mapcount;
+ 	/*
+ 	 * Add all the PTE mappings of those subpages mapped by PTE.
+@@ -1233,7 +1234,7 @@ void page_add_anon_rmap(struct page *pag
+ 			nr = atomic_add_return_relaxed(COMPOUND_MAPPED, mapped);
+ 			if (likely(nr < COMPOUND_MAPPED + COMPOUND_MAPPED)) {
+ 				nr_pmdmapped = thp_nr_pages(page);
+-				nr = nr_pmdmapped - (nr & SUBPAGES_MAPPED);
++				nr = nr_pmdmapped - (nr & FOLIO_PAGES_MAPPED);
+ 				/* Raced ahead of a remove and another add? */
+ 				if (unlikely(nr < 0))
+ 					nr = 0;
+@@ -1337,7 +1338,7 @@ void page_add_file_rmap(struct page *pag
+ 			nr = atomic_add_return_relaxed(COMPOUND_MAPPED, mapped);
+ 			if (likely(nr < COMPOUND_MAPPED + COMPOUND_MAPPED)) {
+ 				nr_pmdmapped = thp_nr_pages(page);
+-				nr = nr_pmdmapped - (nr & SUBPAGES_MAPPED);
++				nr = nr_pmdmapped - (nr & FOLIO_PAGES_MAPPED);
+ 				/* Raced ahead of a remove and another add? */
+ 				if (unlikely(nr < 0))
+ 					nr = 0;
+@@ -1399,7 +1400,7 @@ void page_remove_rmap(struct page *page,
+ 			nr = atomic_sub_return_relaxed(COMPOUND_MAPPED, mapped);
+ 			if (likely(nr < COMPOUND_MAPPED)) {
+ 				nr_pmdmapped = thp_nr_pages(page);
+-				nr = nr_pmdmapped - (nr & SUBPAGES_MAPPED);
++				nr = nr_pmdmapped - (nr & FOLIO_PAGES_MAPPED);
+ 				/* Raced ahead of another remove and an add? */
+ 				if (unlikely(nr < 0))
+ 					nr = 0;
+_
