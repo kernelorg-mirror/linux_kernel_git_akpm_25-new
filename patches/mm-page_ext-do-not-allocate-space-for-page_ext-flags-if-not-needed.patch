@@ -1,0 +1,133 @@
+From: Pasha Tatashin <pasha.tatashin@soleen.com>
+Subject: mm/page_ext: do not allocate space for page_ext->flags if not needed
+Date: Fri, 13 Jan 2023 15:42:53 +0000
+
+There is 8 byte page_ext->flags field allocated per page whenever
+CONFIG_PAGE_EXTENSION is enabled.  However, not every user of page_ext
+uses flags.  Therefore, check whether flags is needed at least by one user
+and if so allocate space for it.
+
+For example when page_table_check is enabled, on a machine with 128G
+of memory before the fix:
+
+[    2.244288] allocated 536870912 bytes of page_ext
+after the fix:
+[    2.160154] allocated 268435456 bytes of page_ext
+
+Also, add a comment before page_ext_operations that describes the
+field, and remove check if need() is set, as that is now a required
+field.
+
+Link: https://lkml.kernel.org/r/20230113154253.92480-1-pasha.tatashin@soleen.com
+Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Charan Teja Kalla <quic_charante@quicinc.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Li Zhe <lizhe.67@bytedance.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/include/linux/page_ext.h~mm-page_ext-do-not-allocate-space-for-page_ext-flags-if-not-needed
++++ a/include/linux/page_ext.h
+@@ -7,15 +7,31 @@
+ #include <linux/stackdepot.h>
+ 
+ struct pglist_data;
++
++/*
++ * Each Page Extension client must define page_ext_operations in
++ * page_ext_ops array.
++ * offset  offset to the client's data within page_ext. Offset is returned to
++ *         the client by page_ext_init.
++ * size    the size of the client data within page_ext.
++ * need()  function that returns true if client requires page_ext
++ * init()  (optional) called to initialize client once page_exts are allocated.
++ * using_shared_ext_flags  true when client is using shared page_ext->flags
++ *         field.
++ */
+ struct page_ext_operations {
+ 	size_t offset;
+ 	size_t size;
+ 	bool (*need)(void);
+ 	void (*init)(void);
++	bool using_shared_ext_flags;
+ };
+ 
+ #ifdef CONFIG_PAGE_EXTENSION
+ 
++/*
++ * The page_ext_flags users must set using_shared_ext_flags to true.
++ */
+ enum page_ext_flags {
+ 	PAGE_EXT_OWNER,
+ 	PAGE_EXT_OWNER_ALLOCATED,
+@@ -31,6 +47,9 @@ enum page_ext_flags {
+  * page_ext helps us add more information about the page.
+  * All page_ext are allocated at boot or memory hotplug event,
+  * then the page_ext for pfn always exists.
++ * Note: that if none of the users of page_ext is setting
++ * using_shared_ext_flags to true, the field cannot be used,
++ * as it will be overlapped with another data.
+  */
+ struct page_ext {
+ 	unsigned long flags;
+--- a/mm/page_ext.c~mm-page_ext-do-not-allocate-space-for-page_ext-flags-if-not-needed
++++ a/mm/page_ext.c
+@@ -71,6 +71,7 @@ static bool need_page_idle(void)
+ }
+ static struct page_ext_operations page_idle_ops __initdata = {
+ 	.need = need_page_idle,
++	.using_shared_ext_flags = true,
+ };
+ #endif
+ 
+@@ -86,7 +87,7 @@ static struct page_ext_operations *page_
+ #endif
+ };
+ 
+-unsigned long page_ext_size = sizeof(struct page_ext);
++unsigned long page_ext_size;
+ 
+ static unsigned long total_usage;
+ static struct page_ext *lookup_page_ext(const struct page *page);
+@@ -106,7 +107,16 @@ static bool __init invoke_need_callbacks
+ 	bool need = false;
+ 
+ 	for (i = 0; i < entries; i++) {
+-		if (page_ext_ops[i]->need && page_ext_ops[i]->need()) {
++		if (page_ext_ops[i]->need()) {
++			if (page_ext_ops[i]->using_shared_ext_flags) {
++				page_ext_size = sizeof(struct page_ext);
++				break;
++			}
++		}
++	}
++
++	for (i = 0; i < entries; i++) {
++		if (page_ext_ops[i]->need()) {
+ 			page_ext_ops[i]->offset = page_ext_size;
+ 			page_ext_size += page_ext_ops[i]->size;
+ 			need = true;
+--- a/mm/page_owner.c~mm-page_ext-do-not-allocate-space-for-page_ext-flags-if-not-needed
++++ a/mm/page_owner.c
+@@ -99,6 +99,7 @@ struct page_ext_operations page_owner_op
+ 	.size = sizeof(struct page_owner),
+ 	.need = need_page_owner,
+ 	.init = init_page_owner,
++	.using_shared_ext_flags = true,
+ };
+ 
+ static inline struct page_owner *get_page_owner(struct page_ext *page_ext)
+--- a/mm/page_table_check.c~mm-page_ext-do-not-allocate-space-for-page_ext-flags-if-not-needed
++++ a/mm/page_table_check.c
+@@ -45,6 +45,7 @@ struct page_ext_operations page_table_ch
+ 	.size = sizeof(struct page_table_check),
+ 	.need = need_page_table_check,
+ 	.init = init_page_table_check,
++	.using_shared_ext_flags = false,
+ };
+ 
+ static struct page_table_check *get_page_table_check(struct page_ext *page_ext)
+_
