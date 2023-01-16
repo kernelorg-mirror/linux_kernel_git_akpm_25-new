@@ -1,10 +1,10 @@
 From: Huang Ying <ying.huang@intel.com>
 Subject: migrate_pages: organize stats with struct migrate_pages_stats
-Date: Tue, 27 Dec 2022 08:28:52 +0800
+Date: Tue, 10 Jan 2023 15:53:19 +0800
 
-Patch series "migrate_pages(): batch TLB flushing".
+Patch series "migrate_pages(): batch TLB flushing", v2.
 
-Now, migrate_pages() migrate folios one by one, like the fake code as
+Now, migrate_pages() migrates folios one by one, like the fake code as
 follows,
 
   for each folio
@@ -13,9 +13,9 @@ follows,
     copy
     restore map
 
-If multiple folios are passed to migrate_pages(), there are
-opportunities to batch the TLB flushing and copying.  That is, we can
-change the code to something as follows,
+If multiple folios are passed to migrate_pages(), there are opportunities
+to batch the TLB flushing and copying.  That is, we can change the code to
+something as follows,
 
   for each folio
     unmap
@@ -26,21 +26,21 @@ change the code to something as follows,
   for each folio
     restore map
 
-The total number of TLB flushing IPI can be reduced considerably.  And
-we may use some hardware accelerator such as DSA to accelerate the
-folio copying.
+The total number of TLB flushing IPI can be reduced considerably.  And we
+may use some hardware accelerator such as DSA to accelerate the folio
+copying.
 
 So in this patch, we refactor the migrate_pages() implementation and
-implement the TLB flushing batching.  Base on this, hardware
-accelerated folio copying can be implemented.
+implement the TLB flushing batching.  Base on this, hardware accelerated
+folio copying can be implemented.
 
 If too many folios are passed to migrate_pages(), in the naive batched
 implementation, we may unmap too many folios at the same time.  The
-possibility for a task to wait for the migrated folios to be mapped
-again increases.  So the latency may be hurt.  To deal with this
-issue, the max number of folios be unmapped in batch is restricted to
-no more than HPAGE_PMD_NR in the unit of page.  That is, the influence
-is at the same level of THP migration.
+possibility for a task to wait for the migrated folios to be mapped again
+increases.  So the latency may be hurt.  To deal with this issue, the max
+number of folios be unmapped in batch is restricted to no more than
+HPAGE_PMD_NR in the unit of page.  That is, the influence is at the same
+level of THP migration.
 
 We use the following test to measure the performance impact of the
 patchset,
@@ -52,53 +52,52 @@ On a 2-socket Intel server,
  - Run `migratepages` to migrate pages of pmbench between node 0 and
    node 1 back and forth.
 
-With the patch, the TLB flushing IPI reduces 99.1% during the test and
-the number of pages migrated successfully per second increases 291.7%.
+With the patch, the TLB flushing IPI reduces 99.1% during the test and the
+number of pages migrated successfully per second increases 291.7%.
 
 
-This patch (of 8):
+This patch (of 9):
 
 Define struct migrate_pages_stats to organize the various statistics in
 migrate_pages().  This makes it easier to collect and consume the
 statistics in multiple functions.  This will be needed in the following
 patches in the series.
 
-Link: https://lkml.kernel.org/r/20221227002859.27740-1-ying.huang@intel.com
-Link: https://lkml.kernel.org/r/20221227002859.27740-2-ying.huang@intel.com
+Link: https://lkml.kernel.org/r/20230110075327.590514-1-ying.huang@intel.com
+Link: https://lkml.kernel.org/r/20230110075327.590514-2-ying.huang@intel.com
 Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
 Reviewed-by: Alistair Popple <apopple@nvidia.com>
 Reviewed-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Yang Shi <shy828301@gmail.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Bharata B Rao <bharata@amd.com>
-Cc: Xin Hao <xhao@linux.alibaba.com>
-Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: haoxin <xhao@linux.alibaba.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/migrate.c |   58 +++++++++++++++++++++++++++----------------------
- 1 file changed, 32 insertions(+), 26 deletions(-)
 
 --- a/mm/migrate.c~migrate_pages-organize-stats-with-struct-migrate_pages_stats
 +++ a/mm/migrate.c
-@@ -1413,6 +1413,14 @@ static inline int try_split_folio(struct
+@@ -1413,6 +1413,16 @@ static inline int try_split_folio(struct
  	return rc;
  }
  
 +struct migrate_pages_stats {
-+	int nr_succeeded;
-+	int nr_failed_pages;
-+	int nr_thp_succeeded;
-+	int nr_thp_failed;
-+	int nr_thp_split;
++	int nr_succeeded;	/* Normal pages and THP migrated successfully, in units
++				   of base pages */
++	int nr_failed_pages;	/* Normal pages and THP failed to be migrated, in units
++				   of base pages.  Untried pages aren't counted */
++	int nr_thp_succeeded;	/* THP migrated successfully */
++	int nr_thp_failed;	/* THP failed to be migrated */
++	int nr_thp_split;	/* THP split before migrating */
 +};
 +
  /*
   * migrate_pages - migrate the folios specified in a list, to the free folios
   *		   supplied as the target for the page migration
-@@ -1447,13 +1455,8 @@ int migrate_pages(struct list_head *from
+@@ -1447,13 +1457,8 @@ int migrate_pages(struct list_head *from
  	int large_retry = 1;
  	int thp_retry = 1;
  	int nr_failed = 0;
@@ -112,7 +111,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int pass = 0;
  	bool is_large = false;
  	bool is_thp = false;
-@@ -1463,9 +1466,11 @@ int migrate_pages(struct list_head *from
+@@ -1463,9 +1468,11 @@ int migrate_pages(struct list_head *from
  	LIST_HEAD(split_folios);
  	bool nosplit = (reason == MR_NUMA_MISPLACED);
  	bool no_split_folio_counting = false;
@@ -124,7 +123,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  split_folio_migration:
  	for (pass = 0; pass < 10 && (retry || large_retry); pass++) {
  		retry = 0;
-@@ -1519,9 +1524,9 @@ split_folio_migration:
+@@ -1519,9 +1526,9 @@ split_folio_migration:
  				/* Large folio migration is unsupported */
  				if (is_large) {
  					nr_large_failed++;
@@ -136,7 +135,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  						break;
  					}
  				/* Hugetlb migration is unsupported */
-@@ -1529,7 +1534,7 @@ split_folio_migration:
+@@ -1529,7 +1536,7 @@ split_folio_migration:
  					nr_failed++;
  				}
  
@@ -145,7 +144,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				list_move_tail(&folio->lru, &ret_folios);
  				break;
  			case -ENOMEM:
-@@ -1539,13 +1544,13 @@ split_folio_migration:
+@@ -1539,13 +1546,13 @@ split_folio_migration:
  				 */
  				if (is_large) {
  					nr_large_failed++;
@@ -161,7 +160,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  							break;
  						} else if (reason == MR_LONGTERM_PIN &&
  							   ret == -EAGAIN) {
-@@ -1563,7 +1568,7 @@ split_folio_migration:
+@@ -1563,7 +1570,7 @@ split_folio_migration:
  					nr_failed++;
  				}
  
@@ -170,7 +169,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				/*
  				 * There might be some split folios of fail-to-migrate large
  				 * folios left in split_folios list. Move them back to migration
-@@ -1573,7 +1578,7 @@ split_folio_migration:
+@@ -1573,7 +1580,7 @@ split_folio_migration:
  				list_splice_init(&split_folios, from);
  				/* nr_failed isn't updated for not used */
  				nr_large_failed += large_retry;
@@ -179,7 +178,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			case -EAGAIN:
  				if (is_large) {
-@@ -1585,8 +1590,8 @@ split_folio_migration:
+@@ -1585,8 +1592,8 @@ split_folio_migration:
  				nr_retry_pages += nr_pages;
  				break;
  			case MIGRATEPAGE_SUCCESS:
@@ -190,7 +189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				break;
  			default:
  				/*
-@@ -1597,20 +1602,20 @@ split_folio_migration:
+@@ -1597,20 +1604,20 @@ split_folio_migration:
  				 */
  				if (is_large) {
  					nr_large_failed++;
@@ -215,7 +214,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Try to migrate split folios of fail-to-migrate large folios, no
  	 * nr_failed counting in this round, since all split folios of a
-@@ -1643,16 +1648,17 @@ out:
+@@ -1643,16 +1650,17 @@ out:
  	if (list_empty(from))
  		rc = 0;
  

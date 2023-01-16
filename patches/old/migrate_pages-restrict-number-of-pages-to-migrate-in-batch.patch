@@ -1,6 +1,6 @@
 From: Huang Ying <ying.huang@intel.com>
 Subject: migrate_pages: restrict number of pages to migrate in batch
-Date: Tue, 27 Dec 2022 08:28:54 +0800
+Date: Tue, 10 Jan 2023 15:53:21 +0800
 
 This is a preparation patch to batch the folio unmapping and moving for
 non-hugetlb folios.
@@ -15,27 +15,36 @@ issue, in this patch, we restrict the number of pages to be migrated to be
 no more than HPAGE_PMD_NR.  That is, the influence is at the same level of
 THP migration.
 
-Link: https://lkml.kernel.org/r/20221227002859.27740-4-ying.huang@intel.com
+Link: https://lkml.kernel.org/r/20230110075327.590514-4-ying.huang@intel.com
 Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Cc: Yang Shi <shy828301@gmail.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Bharata B Rao <bharata@amd.com>
 Cc: Alistair Popple <apopple@nvidia.com>
 Cc: haoxin <xhao@linux.alibaba.com>
-Cc: Mel Gorman <mgorman@techsingularity.net>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/migrate.c |  173 ++++++++++++++++++++++++++++++-------------------
- 1 file changed, 106 insertions(+), 67 deletions(-)
 
 --- a/mm/migrate.c~migrate_pages-restrict-number-of-pages-to-migrate-in-batch
 +++ a/mm/migrate.c
-@@ -1502,40 +1502,15 @@ out:
+@@ -1413,6 +1413,11 @@ static inline int try_split_folio(struct
  	return rc;
+ }
+ 
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++#define NR_MAX_BATCHED_MIGRATION	HPAGE_PMD_NR
++#else
++#define NR_MAX_BATCHED_MIGRATION	512
++#endif
+ #define NR_MAX_MIGRATE_PAGES_RETRY	10
+ 
+ struct migrate_pages_stats {
+@@ -1514,40 +1519,15 @@ static int migrate_hugetlbs(struct list_
+ 	return nr_failed;
  }
  
 -/*
@@ -54,10 +63,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * @ret_succeeded:	Set to the number of folios migrated successfully if
 - *			the caller passes a non-NULL pointer.
 - *
-- * The function returns after 10 attempts or if no folios are movable any more
-- * because the list has become empty or no retryable folios exist any more.
-- * It is caller's responsibility to call putback_movable_pages() to return folios
-- * to the LRU or free list only if ret != 0.
+- * The function returns after NR_MAX_MIGRATE_PAGES_RETRY attempts or if no folios
+- * are movable any more because the list has become empty or no retryable folios
+- * exist any more. It is caller's responsibility to call putback_movable_pages()
+- * to return folios to the LRU or free list only if ret != 0.
 - *
 - * Returns the number of {normal folio, large folio, hugetlb} that were not
 - * migrated, or an error code. The number of large folio splits will be
@@ -79,7 +88,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nr_retry_pages = 0;
  	int nr_large_failed = 0;
  	int pass = 0;
-@@ -1543,20 +1518,9 @@ int migrate_pages(struct list_head *from
+@@ -1555,20 +1535,9 @@ int migrate_pages(struct list_head *from
  	bool is_thp = false;
  	struct folio *folio, *folio2;
  	int rc, nr_pages;
@@ -99,11 +108,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	nr_failed = rc;
  
  split_folio_migration:
- 	for (pass = 0; pass < 10 && (retry || large_retry); pass++) {
-@@ -1566,11 +1530,6 @@ split_folio_migration:
+ 	for (pass = 0;
+@@ -1580,12 +1549,6 @@ split_folio_migration:
  		nr_retry_pages = 0;
  
  		list_for_each_entry_safe(folio, folio2, from, lru) {
+-			/* Retried hugetlb folios will be kept in list  */
 -			if (folio_test_hugetlb(folio)) {
 -				list_move_tail(&folio->lru, &ret_folios);
 -				continue;
@@ -112,7 +122,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			/*
  			 * Large folio statistics is based on the source large
  			 * folio. Capture required information that might get
-@@ -1584,15 +1543,14 @@ split_folio_migration:
+@@ -1599,15 +1562,14 @@ split_folio_migration:
  
  			rc = unmap_and_move(get_new_page, put_new_page,
  					    private, folio, pass > 2, mode,
@@ -130,7 +140,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			 */
  			switch(rc) {
  			/*
-@@ -1609,17 +1567,17 @@ split_folio_migration:
+@@ -1624,17 +1586,17 @@ split_folio_migration:
  				/* Large folio migration is unsupported */
  				if (is_large) {
  					nr_large_failed++;
@@ -152,7 +162,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				break;
  			case -ENOMEM:
  				/*
-@@ -1628,13 +1586,13 @@ split_folio_migration:
+@@ -1643,13 +1605,13 @@ split_folio_migration:
  				 */
  				if (is_large) {
  					nr_large_failed++;
@@ -168,7 +178,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  							break;
  						} else if (reason == MR_LONGTERM_PIN &&
  							   ret == -EAGAIN) {
-@@ -1652,17 +1610,17 @@ split_folio_migration:
+@@ -1667,17 +1629,17 @@ split_folio_migration:
  					nr_failed++;
  				}
  
@@ -190,7 +200,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			case -EAGAIN:
  				if (is_large) {
-@@ -1674,8 +1632,8 @@ split_folio_migration:
+@@ -1689,8 +1651,8 @@ split_folio_migration:
  				nr_retry_pages += nr_pages;
  				break;
  			case MIGRATEPAGE_SUCCESS:
@@ -201,7 +211,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				break;
  			default:
  				/*
-@@ -1686,20 +1644,20 @@ split_folio_migration:
+@@ -1701,20 +1663,20 @@ split_folio_migration:
  				 */
  				if (is_large) {
  					nr_large_failed++;
@@ -226,27 +236,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Try to migrate split folios of fail-to-migrate large folios, no
  	 * nr_failed counting in this round, since all split folios of a
-@@ -1710,7 +1668,7 @@ split_folio_migration:
- 		 * Move non-migrated folios (after 10 retries) to ret_folios
- 		 * to avoid migrating them again.
+@@ -1725,7 +1687,7 @@ split_folio_migration:
+ 		 * Move non-migrated folios (after NR_MAX_MIGRATE_PAGES_RETRY
+ 		 * retries) to ret_folios to avoid migrating them again.
  		 */
 -		list_splice_init(from, &ret_folios);
 +		list_splice_init(from, ret_folios);
  		list_splice_init(&split_folios, from);
  		no_split_folio_counting = true;
  		retry = 1;
-@@ -1719,6 +1677,87 @@ split_folio_migration:
+@@ -1734,6 +1696,82 @@ split_folio_migration:
  
  	rc = nr_failed + nr_large_failed;
  out:
 +	return rc;
 +}
-+
-+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-+#define NR_MAX_BATCHED_MIGRATION	HPAGE_PMD_NR
-+#else
-+#define NR_MAX_BATCHED_MIGRATION	512
-+#endif
 +
 +/*
 + * migrate_pages - migrate the folios specified in a list, to the free folios
@@ -264,10 +268,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @ret_succeeded:	Set to the number of folios migrated successfully if
 + *			the caller passes a non-NULL pointer.
 + *
-+ * The function returns after 10 attempts or if no folios are movable any more
-+ * because the list has become empty or no retryable folios exist any more.
-+ * It is caller's responsibility to call putback_movable_pages() to return folios
-+ * to the LRU or free list only if ret != 0.
++ * The function returns after NR_MAX_MIGRATE_PAGES_RETRY attempts or if no folios
++ * are movable any more because the list has become empty or no retryable folios
++ * exist any more. It is caller's responsibility to call putback_movable_pages()
++ * to return folios to the LRU or free list only if ret != 0.
 + *
 + * Returns the number of {normal folio, large folio, hugetlb} that were not
 + * migrated, or an error code. The number of large folio splits will be
@@ -278,7 +282,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		free_page_t put_new_page, unsigned long private,
 +		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
 +{
-+	int rc, rc_gether;
++	int rc, rc_gather;
 +	int nr_pages;
 +	struct folio *folio, *folio2;
 +	LIST_HEAD(folios);
@@ -289,13 +293,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	memset(&stats, 0, sizeof(stats));
 +
-+	rc_gether = migrate_hugetlbs(from, get_new_page, put_new_page, private,
++	rc_gather = migrate_hugetlbs(from, get_new_page, put_new_page, private,
 +				     mode, reason, &stats, &ret_folios);
-+	if (rc_gether < 0)
++	if (rc_gather < 0)
 +		goto out;
 +again:
 +	nr_pages = 0;
 +	list_for_each_entry_safe(folio, folio2, from, lru) {
++		/* Retried hugetlb folios will be kept in list  */
 +		if (folio_test_hugetlb(folio)) {
 +			list_move_tail(&folio->lru, &ret_folios);
 +			continue;
@@ -313,31 +318,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				 mode, reason, &ret_folios, &stats);
 +	list_splice_tail_init(&folios, &ret_folios);
 +	if (rc < 0) {
-+		rc_gether = rc;
++		rc_gather = rc;
 +		goto out;
 +	}
-+	rc_gether += rc;
++	rc_gather += rc;
 +	if (!list_empty(from))
 +		goto again;
 +out:
  	/*
  	 * Put the permanent failure folio back to migration list, they
  	 * will be put back to the right list by the caller.
-@@ -1730,7 +1769,7 @@ out:
+@@ -1745,7 +1783,7 @@ out:
  	 * are migrated successfully.
  	 */
  	if (list_empty(from))
 -		rc = 0;
-+		rc_gether = 0;
++		rc_gather = 0;
  
  	count_vm_events(PGMIGRATE_SUCCESS, stats.nr_succeeded);
  	count_vm_events(PGMIGRATE_FAIL, stats.nr_failed_pages);
-@@ -1744,7 +1783,7 @@ out:
+@@ -1759,7 +1797,7 @@ out:
  	if (ret_succeeded)
  		*ret_succeeded = stats.nr_succeeded;
  
 -	return rc;
-+	return rc_gether;
++	return rc_gather;
  }
  
  struct page *alloc_migration_target(struct page *page, unsigned long private)
