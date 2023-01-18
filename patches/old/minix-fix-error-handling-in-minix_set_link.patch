@@ -1,0 +1,111 @@
+From: Christoph Hellwig <hch@lst.de>
+Subject: minix: fix error handling in minix_set_link
+Date: Wed, 18 Jan 2023 18:30:23 +0100
+
+If minix_prepare_chunk fails, updating c/mtime and marking the dir inode
+dirty is wrong, as the inode hasn't been modified.  Also propagate the
+error to the caller.
+
+Note that this moves the dir_put_page call later, but that matches other
+uses of this helper in the directory code.
+
+Link: https://lkml.kernel.org/r/20230118173027.294869-4-hch@lst.de
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Cc: Evgeniy Dushistov <dushistov@mail.ru>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/minix/dir.c   |   22 ++++++++++++----------
+ fs/minix/minix.h |    3 ++-
+ fs/minix/namei.c |   10 ++++++----
+ 3 files changed, 20 insertions(+), 15 deletions(-)
+
+--- a/fs/minix/dir.c~minix-fix-error-handling-in-minix_set_link
++++ a/fs/minix/dir.c
+@@ -410,8 +410,8 @@ not_empty:
+ }
+ 
+ /* Releases the page */
+-void minix_set_link(struct minix_dir_entry *de, struct page *page,
+-	struct inode *inode)
++int minix_set_link(struct minix_dir_entry *de, struct page *page,
++		struct inode *inode)
+ {
+ 	struct inode *dir = page->mapping->host;
+ 	struct minix_sb_info *sbi = minix_sb(dir->i_sb);
+@@ -420,19 +420,21 @@ void minix_set_link(struct minix_dir_ent
+ 	int err;
+ 
+ 	lock_page(page);
+-
+ 	err = minix_prepare_chunk(page, pos, sbi->s_dirsize);
+-	if (err == 0) {
+-		if (sbi->s_version == MINIX_V3)
+-			((minix3_dirent *) de)->inode = inode->i_ino;
+-		else
+-			de->inode = inode->i_ino;
+-		err = dir_commit_chunk(page, pos, sbi->s_dirsize);
+-	} else {
++	if (err) {
+ 		unlock_page(page);
++		return err;
+ 	}
++	if (sbi->s_version == MINIX_V3)
++		((minix3_dirent *)de)->inode = inode->i_ino;
++	else
++		de->inode = inode->i_ino;
++	err = dir_commit_chunk(page, pos, sbi->s_dirsize);
++	if (err)
++		return err;
+ 	dir->i_mtime = dir->i_ctime = current_time(dir);
+ 	mark_inode_dirty(dir);
++	return 0;
+ }
+ 
+ struct minix_dir_entry * minix_dotdot (struct inode *dir, struct page **p)
+--- a/fs/minix/minix.h~minix-fix-error-handling-in-minix_set_link
++++ a/fs/minix/minix.h
+@@ -69,7 +69,8 @@ extern int minix_add_link(struct dentry*
+ extern int minix_delete_entry(struct minix_dir_entry*, struct page*);
+ extern int minix_make_empty(struct inode*, struct inode*);
+ extern int minix_empty_dir(struct inode*);
+-extern void minix_set_link(struct minix_dir_entry*, struct page*, struct inode*);
++int minix_set_link(struct minix_dir_entry *de, struct page *page,
++		struct inode *inode);
+ extern struct minix_dir_entry *minix_dotdot(struct inode*, struct page**);
+ extern ino_t minix_inode_by_name(struct dentry*);
+ 
+--- a/fs/minix/namei.c~minix-fix-error-handling-in-minix_set_link
++++ a/fs/minix/namei.c
+@@ -223,10 +223,11 @@ static int minix_rename(struct user_name
+ 		new_de = minix_find_entry(new_dentry, &new_page);
+ 		if (!new_de)
+ 			goto out_dir;
+-		err = 0;
+-		minix_set_link(new_de, new_page, old_inode);
++		err = minix_set_link(new_de, new_page, old_inode);
+ 		kunmap(new_page);
+ 		put_page(new_page);
++		if (err)
++			goto out_dir;
+ 		new_inode->i_ctime = current_time(new_inode);
+ 		if (dir_de)
+ 			drop_nlink(new_inode);
+@@ -243,8 +244,9 @@ static int minix_rename(struct user_name
+ 	mark_inode_dirty(old_inode);
+ 
+ 	if (dir_de) {
+-		minix_set_link(dir_de, dir_page, new_dir);
+-		inode_dec_link_count(old_dir);
++		err = minix_set_link(dir_de, dir_page, new_dir);
++		if (!err)
++			inode_dec_link_count(old_dir);
+ 	}
+ out_dir:
+ 	if (dir_de) {
+_
