@@ -1,0 +1,93 @@
+From: Christoph Hellwig <hch@lst.de>
+Subject: mm: remove __vfree_deferred
+Date: Sat, 21 Jan 2023 08:10:44 +0100
+
+Fold __vfree_deferred into vfree_atomic, and call vfree_atomic early on
+from vfree if called from interrupt context so that the extra low-level
+helper can be avoided.
+
+Link: https://lkml.kernel.org/r/20230121071051.1143058-4-hch@lst.de
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/mm/vmalloc.c~mm-remove-__vfree_deferred
++++ a/mm/vmalloc.c
+@@ -2769,20 +2769,6 @@ static void __vunmap(const void *addr, i
+ 	kfree(area);
+ }
+ 
+-static inline void __vfree_deferred(const void *addr)
+-{
+-	/*
+-	 * Use raw_cpu_ptr() because this can be called from preemptible
+-	 * context. Preemption is absolutely fine here, because the llist_add()
+-	 * implementation is lockless, so it works even if we are adding to
+-	 * another cpu's list. schedule_work() should be fine with this too.
+-	 */
+-	struct vfree_deferred *p = raw_cpu_ptr(&vfree_deferred);
+-
+-	if (llist_add((struct llist_node *)addr, &p->list))
+-		schedule_work(&p->wq);
+-}
+-
+ /**
+  * vfree_atomic - release memory allocated by vmalloc()
+  * @addr:	  memory base address
+@@ -2792,13 +2778,19 @@ static inline void __vfree_deferred(cons
+  */
+ void vfree_atomic(const void *addr)
+ {
+-	BUG_ON(in_nmi());
++	struct vfree_deferred *p = raw_cpu_ptr(&vfree_deferred);
+ 
++	BUG_ON(in_nmi());
+ 	kmemleak_free(addr);
+ 
+-	if (!addr)
+-		return;
+-	__vfree_deferred(addr);
++	/*
++	 * Use raw_cpu_ptr() because this can be called from preemptible
++	 * context. Preemption is absolutely fine here, because the llist_add()
++	 * implementation is lockless, so it works even if we are adding to
++	 * another cpu's list. schedule_work() should be fine with this too.
++	 */
++	if (addr && llist_add((struct llist_node *)addr, &p->list))
++		schedule_work(&p->wq);
+ }
+ 
+ /**
+@@ -2820,17 +2812,16 @@ void vfree_atomic(const void *addr)
+  */
+ void vfree(const void *addr)
+ {
+-	BUG_ON(in_nmi());
++	if (unlikely(in_interrupt())) {
++		vfree_atomic(addr);
++		return;
++	}
+ 
++	BUG_ON(in_nmi());
+ 	kmemleak_free(addr);
++	might_sleep();
+ 
+-	might_sleep_if(!in_interrupt());
+-
+-	if (!addr)
+-		return;
+-	if (unlikely(in_interrupt()))
+-		__vfree_deferred(addr);
+-	else
++	if (addr)
+ 		__vunmap(addr, 1);
+ }
+ EXPORT_SYMBOL(vfree);
+_
