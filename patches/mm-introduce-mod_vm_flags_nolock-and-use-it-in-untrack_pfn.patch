@@ -1,0 +1,241 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: introduce mod_vm_flags_nolock and use it in untrack_pfn
+Date: Wed, 25 Jan 2023 15:35:53 -0800
+
+In cases when VMA flags are modified after VMA was isolated and mmap_lock
+was downgraded, flags modifications would result in an assertion because
+mmap write lock is not held.
+
+Introduce mod_vm_flags_nolock to be used in such situation, when VMA is
+not part of VMA tree and locking it is not required.
+
+Pass a hint to untrack_pfn to conditionally use mod_vm_flags_nolock for
+flags modification and to avoid assertion.
+
+Link: https://lkml.kernel.org/r/20230125233554.153109-7-surenb@google.com
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/arch/x86/mm/pat/memtype.c~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/arch/x86/mm/pat/memtype.c
+@@ -1046,7 +1046,7 @@ void track_pfn_insert(struct vm_area_str
+  * can be for the entire vma (in which case pfn, size are zero).
+  */
+ void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
+-		 unsigned long size)
++		 unsigned long size, bool mm_wr_locked)
+ {
+ 	resource_size_t paddr;
+ 	unsigned long prot;
+@@ -1065,8 +1065,12 @@ void untrack_pfn(struct vm_area_struct *
+ 		size = vma->vm_end - vma->vm_start;
+ 	}
+ 	free_pfn_range(paddr, size);
+-	if (vma)
+-		clear_vm_flags(vma, VM_PAT);
++	if (vma) {
++		if (mm_wr_locked)
++			clear_vm_flags(vma, VM_PAT);
++		else
++			mod_vm_flags_nolock(vma, 0, VM_PAT);
++	}
+ }
+ 
+ /*
+--- a/include/linux/mm.h~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/include/linux/mm.h
+@@ -656,12 +656,22 @@ static inline void clear_vm_flags(struct
+ 	ACCESS_PRIVATE(vma, __vm_flags) &= ~flags;
+ }
+ 
++/*
++ * Use only if VMA has been previously isolated, is not part of the VMA tree
++ * and therefore needs no locking.
++ */
++static inline void mod_vm_flags_nolock(struct vm_area_struct *vma,
++				       vm_flags_t set, vm_flags_t clear)
++{
++	ACCESS_PRIVATE(vma, __vm_flags) |= set;
++	ACCESS_PRIVATE(vma, __vm_flags) &= ~clear;
++}
++
+ static inline void mod_vm_flags(struct vm_area_struct *vma,
+ 				vm_flags_t set, vm_flags_t clear)
+ {
+ 	mmap_assert_write_locked(vma->vm_mm);
+-	ACCESS_PRIVATE(vma, __vm_flags) |= set;
+-	ACCESS_PRIVATE(vma, __vm_flags) &= ~clear;
++	mod_vm_flags_nolock(vma, set, clear);
+ }
+ 
+ static inline void vma_set_anonymous(struct vm_area_struct *vma)
+@@ -2099,7 +2109,7 @@ static inline void zap_vma_pages(struct
+ }
+ void unmap_vmas(struct mmu_gather *tlb, struct maple_tree *mt,
+ 		struct vm_area_struct *start_vma, unsigned long start,
+-		unsigned long end);
++		unsigned long end, bool mm_wr_locked);
+ 
+ struct mmu_notifier_range;
+ 
+--- a/include/linux/pgtable.h~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/include/linux/pgtable.h
+@@ -1185,7 +1185,8 @@ static inline int track_pfn_copy(struct
+  * can be for the entire vma (in which case pfn, size are zero).
+  */
+ static inline void untrack_pfn(struct vm_area_struct *vma,
+-			       unsigned long pfn, unsigned long size)
++			       unsigned long pfn, unsigned long size,
++			       bool mm_wr_locked)
+ {
+ }
+ 
+@@ -1203,7 +1204,7 @@ extern void track_pfn_insert(struct vm_a
+ 			     pfn_t pfn);
+ extern int track_pfn_copy(struct vm_area_struct *vma);
+ extern void untrack_pfn(struct vm_area_struct *vma, unsigned long pfn,
+-			unsigned long size);
++			unsigned long size, bool mm_wr_locked);
+ extern void untrack_pfn_moved(struct vm_area_struct *vma);
+ #endif
+ 
+--- a/mm/memory.c~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/mm/memory.c
+@@ -1613,7 +1613,7 @@ void unmap_page_range(struct mmu_gather
+ static void unmap_single_vma(struct mmu_gather *tlb,
+ 		struct vm_area_struct *vma, unsigned long start_addr,
+ 		unsigned long end_addr,
+-		struct zap_details *details)
++		struct zap_details *details, bool mm_wr_locked)
+ {
+ 	unsigned long start = max(vma->vm_start, start_addr);
+ 	unsigned long end;
+@@ -1628,7 +1628,7 @@ static void unmap_single_vma(struct mmu_
+ 		uprobe_munmap(vma, start, end);
+ 
+ 	if (unlikely(vma->vm_flags & VM_PFNMAP))
+-		untrack_pfn(vma, 0, 0);
++		untrack_pfn(vma, 0, 0, mm_wr_locked);
+ 
+ 	if (start != end) {
+ 		if (unlikely(is_vm_hugetlb_page(vma))) {
+@@ -1675,7 +1675,7 @@ static void unmap_single_vma(struct mmu_
+  */
+ void unmap_vmas(struct mmu_gather *tlb, struct maple_tree *mt,
+ 		struct vm_area_struct *vma, unsigned long start_addr,
+-		unsigned long end_addr)
++		unsigned long end_addr, bool mm_wr_locked)
+ {
+ 	struct mmu_notifier_range range;
+ 	struct zap_details details = {
+@@ -1689,7 +1689,8 @@ void unmap_vmas(struct mmu_gather *tlb,
+ 				start_addr, end_addr);
+ 	mmu_notifier_invalidate_range_start(&range);
+ 	do {
+-		unmap_single_vma(tlb, vma, start_addr, end_addr, &details);
++		unmap_single_vma(tlb, vma, start_addr, end_addr, &details,
++				 mm_wr_locked);
+ 	} while ((vma = mas_find(&mas, end_addr - 1)) != NULL);
+ 	mmu_notifier_invalidate_range_end(&range);
+ }
+@@ -1723,7 +1724,7 @@ void zap_page_range_single(struct vm_are
+ 	 * unmap 'address-end' not 'range.start-range.end' as range
+ 	 * could have been expanded for hugetlb pmd sharing.
+ 	 */
+-	unmap_single_vma(&tlb, vma, address, end, details);
++	unmap_single_vma(&tlb, vma, address, end, details, false);
+ 	mmu_notifier_invalidate_range_end(&range);
+ 	tlb_finish_mmu(&tlb);
+ }
+@@ -2492,7 +2493,7 @@ int remap_pfn_range(struct vm_area_struc
+ 
+ 	err = remap_pfn_range_notrack(vma, addr, pfn, size, prot);
+ 	if (err)
+-		untrack_pfn(vma, pfn, PAGE_ALIGN(size));
++		untrack_pfn(vma, pfn, PAGE_ALIGN(size), true);
+ 	return err;
+ }
+ EXPORT_SYMBOL(remap_pfn_range);
+--- a/mm/memremap.c~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/mm/memremap.c
+@@ -129,7 +129,7 @@ static void pageunmap_range(struct dev_p
+ 	}
+ 	mem_hotplug_done();
+ 
+-	untrack_pfn(NULL, PHYS_PFN(range->start), range_len(range));
++	untrack_pfn(NULL, PHYS_PFN(range->start), range_len(range), true);
+ 	pgmap_array_delete(range);
+ }
+ 
+@@ -276,7 +276,7 @@ err_add_memory:
+ 	if (!is_private)
+ 		kasan_remove_zero_shadow(__va(range->start), range_len(range));
+ err_kasan:
+-	untrack_pfn(NULL, PHYS_PFN(range->start), range_len(range));
++	untrack_pfn(NULL, PHYS_PFN(range->start), range_len(range), true);
+ err_pfn_remap:
+ 	pgmap_array_delete(range);
+ 	return error;
+--- a/mm/mmap.c~mm-introduce-mod_vm_flags_nolock-and-use-it-in-untrack_pfn
++++ a/mm/mmap.c
+@@ -78,7 +78,7 @@ core_param(ignore_rlimit_data, ignore_rl
+ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+ 		struct vm_area_struct *vma, struct vm_area_struct *prev,
+ 		struct vm_area_struct *next, unsigned long start,
+-		unsigned long end);
++		unsigned long end, bool mm_wr_locked);
+ 
+ static pgprot_t vm_pgprot_modify(pgprot_t oldprot, unsigned long vm_flags)
+ {
+@@ -2136,14 +2136,14 @@ static inline void remove_mt(struct mm_s
+ static void unmap_region(struct mm_struct *mm, struct maple_tree *mt,
+ 		struct vm_area_struct *vma, struct vm_area_struct *prev,
+ 		struct vm_area_struct *next,
+-		unsigned long start, unsigned long end)
++		unsigned long start, unsigned long end, bool mm_wr_locked)
+ {
+ 	struct mmu_gather tlb;
+ 
+ 	lru_add_drain();
+ 	tlb_gather_mmu(&tlb, mm);
+ 	update_hiwater_rss(mm);
+-	unmap_vmas(&tlb, mt, vma, start, end);
++	unmap_vmas(&tlb, mt, vma, start, end, mm_wr_locked);
+ 	free_pgtables(&tlb, mt, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
+ 				 next ? next->vm_start : USER_PGTABLES_CEILING);
+ 	tlb_finish_mmu(&tlb);
+@@ -2391,7 +2391,11 @@ do_vmi_align_munmap(struct vma_iterator
+ 			mmap_write_downgrade(mm);
+ 	}
+ 
+-	unmap_region(mm, &mt_detach, vma, prev, next, start, end);
++	/*
++	 * We can free page tables without write-locking mmap_lock because VMAs
++	 * were isolated before we downgraded mmap_lock.
++	 */
++	unmap_region(mm, &mt_detach, vma, prev, next, start, end, !downgrade);
+ 	/* Statistics and freeing VMAs */
+ 	mas_set(&mas_detach, start);
+ 	remove_mt(mm, &mas_detach);
+@@ -2704,7 +2708,7 @@ unmap_and_free_vma:
+ 
+ 		/* Undo any partial mapping done by a device driver. */
+ 		unmap_region(mm, &mm->mm_mt, vma, prev, next, vma->vm_start,
+-			     vma->vm_end);
++			     vma->vm_end, true);
+ 	}
+ 	if (file && (vm_flags & VM_SHARED))
+ 		mapping_unmap_writable(file->f_mapping);
+@@ -3031,7 +3035,7 @@ void exit_mmap(struct mm_struct *mm)
+ 	tlb_gather_mmu_fullmm(&tlb, mm);
+ 	/* update_hiwater_rss(mm) here? but nobody should be looking */
+ 	/* Use ULONG_MAX here to ensure all VMAs in the mm are unmapped */
+-	unmap_vmas(&tlb, &mm->mm_mt, vma, 0, ULONG_MAX);
++	unmap_vmas(&tlb, &mm->mm_mt, vma, 0, ULONG_MAX, false);
+ 	mmap_read_unlock(mm);
+ 
+ 	/*
+_
