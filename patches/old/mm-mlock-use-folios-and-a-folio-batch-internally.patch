@@ -1,17 +1,18 @@
 From: Lorenzo Stoakes <lstoakes@gmail.com>
 Subject: mm: mlock: use folios and a folio batch internally
-Date: Mon, 26 Dec 2022 08:44:20 +0000
+Date: Thu, 12 Jan 2023 12:39:29 +0000
 
 This brings mlock in line with the folio batches declared in mm/swap.c and
 makes the code more consistent across the two.
 
 The existing mechanism for identifying which operation each folio in the
-batch is undergoing is maintained, i.e. using the lower 2 bits of the
-struct folio address (previously struct page address). This should continue
-to function correctly as folios remain at least system word-aligned.
+batch is undergoing is maintained, i.e.  using the lower 2 bits of the
+struct folio address (previously struct page address).  This should
+continue to function correctly as folios remain at least system
+word-aligned.
 
-All invoctions of mlock() pass either a non-compound page or the head of a
-THP-compound page and no tail pages need updating so this functionality
+All invocations of mlock() pass either a non-compound page or the head of
+a THP-compound page and no tail pages need updating so this functionality
 works with struct folios being used internally rather than struct pages.
 
 In this patch the external interface is kept identical to before in order
@@ -22,8 +23,9 @@ However, this maintenance of the existing interface is intended to be
 temporary - the next patch in the series will update the interfaces to
 accept folios directly.
 
-Link: https://lkml.kernel.org/r/03ac78b416be5a361b79464acc3da7f93b9c37e8.1672043615.git.lstoakes@gmail.com
+Link: https://lkml.kernel.org/r/9f894d54d568773f4ed3cb0eef5f8932f62c95f4.1673526881.git.lstoakes@gmail.com
 Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Geert Uytterhoeven <geert@linux-m68k.org>
 Cc: Hugh Dickins <hughd@google.com>
@@ -31,14 +33,11 @@ Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Matthew Wilcox <willy@infradead.org>
-Cc: Mike Rapoport <rppt@kernel.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
 Cc: William Kucharski <william.kucharski@oracle.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mlock.c |  238 +++++++++++++++++++++++++--------------------------
- 1 file changed, 120 insertions(+), 118 deletions(-)
 
 --- a/mm/mlock.c~mm-mlock-use-folios-and-a-folio-batch-internally
 +++ a/mm/mlock.c
@@ -203,7 +202,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		__mod_zone_page_state(page_zone(page), NR_MLOCK, -nr_pages);
 -		if (isolated || !PageUnevictable(page))
 +	if (folio_test_clear_mlocked(folio)) {
-+		zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);
++		__zone_stat_mod_folio(folio, NR_MLOCK, -nr_pages);
 +		if (isolated || !folio_test_unevictable(folio))
  			__count_vm_events(UNEVICTABLE_PGMUNLOCKED, nr_pages);
  		else
@@ -233,20 +232,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * Flags held in the low bits of a struct page pointer on the mlock_pvec.
 + * Flags held in the low bits of a struct folio pointer on the mlock_fbatch.
   */
- #define LRU_PAGE 0x1
- #define NEW_PAGE 0x2
+-#define LRU_PAGE 0x1
+-#define NEW_PAGE 0x2
 -static inline struct page *mlock_lru(struct page *page)
++#define LRU_FOLIO 0x1
++#define NEW_FOLIO 0x2
 +static inline struct folio *mlock_lru(struct folio *folio)
  {
 -	return (struct page *)((unsigned long)page + LRU_PAGE);
-+	return (struct folio *)((unsigned long)folio + LRU_PAGE);
++	return (struct folio *)((unsigned long)folio + LRU_FOLIO);
  }
  
 -static inline struct page *mlock_new(struct page *page)
 +static inline struct folio *mlock_new(struct folio *folio)
  {
 -	return (struct page *)((unsigned long)page + NEW_PAGE);
-+	return (struct folio *)((unsigned long)folio + NEW_PAGE);
++	return (struct folio *)((unsigned long)folio + NEW_FOLIO);
  }
  
  /*
@@ -256,7 +257,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * pagevecs instead, but one feels better (munlocking a full pagevec
 - * does not need to drain mlocking pagevecs first).
 + * mlock_folio_batch() is derived from folio_batch_move_lru(): perhaps that can
-+ * make use of such page pointer flags in future, but for now just keep it for
++ * make use of such folio pointer flags in future, but for now just keep it for
 + * mlock.  We could use three separate folio batches instead, but one feels
 + * better (munlocking a full folio batch does not need to drain mlocking folio
 + * batches first).
@@ -275,17 +276,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		mlock = (unsigned long)page & (LRU_PAGE | NEW_PAGE);
 -		page = (struct page *)((unsigned long)page - mlock);
 -		pvec->pages[i] = page;
+-
+-		if (mlock & LRU_PAGE)
+-			lruvec = __mlock_page(page, lruvec);
+-		else if (mlock & NEW_PAGE)
+-			lruvec = __mlock_new_page(page, lruvec);
 +	for (i = 0; i < folio_batch_count(fbatch); i++) {
 +		folio = fbatch->folios[i];
-+		mlock = (unsigned long)folio & (LRU_PAGE | NEW_PAGE);
++		mlock = (unsigned long)folio & (LRU_FOLIO | NEW_FOLIO);
 +		folio = (struct folio *)((unsigned long)folio - mlock);
 +		fbatch->folios[i] = folio;
- 
- 		if (mlock & LRU_PAGE)
--			lruvec = __mlock_page(page, lruvec);
++
++		if (mlock & LRU_FOLIO)
 +			lruvec = __mlock_folio(folio, lruvec);
- 		else if (mlock & NEW_PAGE)
--			lruvec = __mlock_new_page(page, lruvec);
++		else if (mlock & NEW_FOLIO)
 +			lruvec = __mlock_new_folio(folio, lruvec);
  		else
 -			lruvec = __munlock_page(page, lruvec);
