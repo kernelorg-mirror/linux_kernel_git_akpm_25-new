@@ -14,6 +14,10 @@ KSM page will be skipped, but still call memory_failure_queue() to be
 consistent with general memory failure process, and we could support KSM
 page recovery in the feature.
 
+[wangkefeng.wang@huawei.com: enhance unuse_pte(), fix issue found by lkp]
+  Link: https://lkml.kernel.org/r/20221213120523.141588-1-wangkefeng.wang@huawei.com
+[wangkefeng.wang@huawei.com: update changelog, alter ksm_might_need_to_copy(), restore unlikely() in unuse_pte()]
+  Link: https://lkml.kernel.org/r/20230201074433.96641-1-wangkefeng.wang@huawei.com
 Link: https://lkml.kernel.org/r/20221209072801.193221-1-wangkefeng.wang@huawei.com
 Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
 Reviewed-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
@@ -22,10 +26,14 @@ Cc: Tony Luck <tony.luck@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ mm/ksm.c      |    7 +++++--
+ mm/memory.c   |    3 +++
+ mm/swapfile.c |   20 ++++++++++++++------
+ 3 files changed, 22 insertions(+), 8 deletions(-)
 
 --- a/mm/ksm.c~mm-hwposion-support-recovery-from-ksm_might_need_to_copy
 +++ a/mm/ksm.c
-@@ -2629,8 +2629,12 @@ struct page *ksm_might_need_to_copy(stru
+@@ -2629,8 +2629,11 @@ struct page *ksm_might_need_to_copy(stru
  		new_page = NULL;
  	}
  	if (new_page) {
@@ -33,9 +41,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -
 +		if (copy_mc_user_highpage(new_page, page, address, vma)) {
 +			put_page(new_page);
-+			new_page = ERR_PTR(-EHWPOISON);
 +			memory_failure_queue(page_to_pfn(page), 0);
-+			return new_page;
++			return ERR_PTR(-EHWPOISON);
 +		}
  		SetPageDirty(new_page);
  		__SetPageUptodate(new_page);
@@ -54,13 +61,54 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/swapfile.c~mm-hwposion-support-recovery-from-ksm_might_need_to_copy
 +++ a/mm/swapfile.c
-@@ -1768,7 +1768,7 @@ static int unuse_pte(struct vm_area_stru
+@@ -1764,12 +1764,15 @@ static int unuse_pte(struct vm_area_stru
+ 	struct page *swapcache;
+ 	spinlock_t *ptl;
+ 	pte_t *pte, new_pte;
++	bool hwposioned = false;
+ 	int ret = 1;
  
  	swapcache = page;
  	page = ksm_might_need_to_copy(page, vma, addr);
--	if (unlikely(!page))
-+	if (IS_ERR_OR_NULL(page))
+ 	if (unlikely(!page))
  		return -ENOMEM;
++	else if (unlikely(PTR_ERR(page) == -EHWPOISON))
++		hwposioned = true;
  
  	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+ 	if (unlikely(!pte_same_as_swp(*pte, swp_entry_to_pte(entry)))) {
+@@ -1777,15 +1780,19 @@ static int unuse_pte(struct vm_area_stru
+ 		goto out;
+ 	}
+ 
+-	if (unlikely(!PageUptodate(page))) {
+-		pte_t pteval;
++	if (unlikely(hwposioned || !PageUptodate(page))) {
++		swp_entry_t swp_entry;
+ 
+ 		dec_mm_counter(vma->vm_mm, MM_SWAPENTS);
+-		pteval = swp_entry_to_pte(make_swapin_error_entry());
+-		set_pte_at(vma->vm_mm, addr, pte, pteval);
+-		swap_free(entry);
++		if (hwposioned) {
++			swp_entry = make_hwpoison_entry(swapcache);
++			page = swapcache;
++		} else {
++			swp_entry = make_swapin_error_entry();
++		}
++		new_pte = swp_entry_to_pte(swp_entry);
+ 		ret = 0;
+-		goto out;
++		goto setpte;
+ 	}
+ 
+ 	/* See do_swap_page() */
+@@ -1817,6 +1824,7 @@ static int unuse_pte(struct vm_area_stru
+ 		new_pte = pte_mksoft_dirty(new_pte);
+ 	if (pte_swp_uffd_wp(*pte))
+ 		new_pte = pte_mkuffd_wp(new_pte);
++setpte:
+ 	set_pte_at(vma->vm_mm, addr, pte, new_pte);
+ 	swap_free(entry);
+ out:
 _
