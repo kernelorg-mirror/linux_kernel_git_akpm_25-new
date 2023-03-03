@@ -1,0 +1,113 @@
+From: Raghavendra K T <raghavendra.kt@amd.com>
+Subject: sched/numa: implement access PID reset logic
+Date: Wed, 1 Mar 2023 17:49:02 +0530
+
+This helps to ensure that only recently accessed PIDs scan the VMAs.
+
+Current implementation: (idea supported by PeterZ)
+
+ 1. Accessing PID information is maintained in two windows. 
+    access_pids[1] being newest.
+
+ 2. Reset old access PID info i.e.  access_pid[0] every (4 *
+    sysctl_numa_balancing_scan_delay) interval after initial scan delay
+    period expires.
+
+The above interval seemed to be experimentally optimum since it avoids
+frequent reset of access info as well as helps clearing the old access
+info regularly.  The reset logic is implemented in scan path.
+
+Link: https://lkml.kernel.org/r/f7a675f66d1442d048b4216b2baf94515012c405.1677672277.git.raghavendra.kt@amd.com
+Signed-off-by: Raghavendra K T <raghavendra.kt@amd.com>
+Suggested-by: Mel Gorman <mgorman@techsingularity.net>
+Cc: Bharata B Rao <bharata@amd.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Disha Talreja <dishaa.talreja@amd.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/include/linux/mm.h~sched-numa-implement-access-pid-reset-logic
++++ a/include/linux/mm.h
+@@ -1672,8 +1672,8 @@ static inline void vma_set_access_pid_bi
+ 	unsigned int pid_bit;
+ 
+ 	pid_bit = current->pid % BITS_PER_LONG;
+-	if (vma->numab_state && !test_bit(pid_bit, &vma->numab_state->access_pids)) {
+-		__set_bit(pid_bit, &vma->numab_state->access_pids);
++	if (vma->numab_state && !test_bit(pid_bit, &vma->numab_state->access_pids[1])) {
++		__set_bit(pid_bit, &vma->numab_state->access_pids[1]);
+ 	}
+ }
+ #else /* !CONFIG_NUMA_BALANCING */
+--- a/include/linux/mm_types.h~sched-numa-implement-access-pid-reset-logic
++++ a/include/linux/mm_types.h
+@@ -477,7 +477,8 @@ struct vma_lock {
+ 
+ struct vma_numab_state {
+ 	unsigned long next_scan;
+-	unsigned long access_pids;
++	unsigned long next_pid_reset;
++	unsigned long access_pids[2];
+ };
+ 
+ /*
+--- a/kernel/sched/fair.c~sched-numa-implement-access-pid-reset-logic
++++ a/kernel/sched/fair.c
+@@ -2930,6 +2930,7 @@ static void reset_ptenuma_scan(struct ta
+ 
+ static bool vma_is_accessed(struct vm_area_struct *vma)
+ {
++	unsigned long pids;
+ 	/*
+ 	 * Allow unconditional access first two times, so that all the (pages)
+ 	 * of VMAs get prot_none fault introduced irrespective of accesses.
+@@ -2939,10 +2940,12 @@ static bool vma_is_accessed(struct vm_ar
+ 	if (READ_ONCE(current->mm->numa_scan_seq) < 2)
+ 		return true;
+ 
+-	return test_bit(current->pid % BITS_PER_LONG,
+-				&vma->numab_state->access_pids);
++	pids = vma->numab_state->access_pids[0] | vma->numab_state->access_pids[1];
++	return test_bit(current->pid % BITS_PER_LONG, &pids);
+ }
+ 
++#define VMA_PID_RESET_PERIOD (4 * sysctl_numa_balancing_scan_delay)
++
+ /*
+  * The expensive part of numa migration is done from task_work context.
+  * Triggered from task_tick_numa().
+@@ -3051,6 +3054,10 @@ static void task_numa_work(struct callba
+ 
+ 			vma->numab_state->next_scan = now +
+ 				msecs_to_jiffies(sysctl_numa_balancing_scan_delay);
++
++			/* Reset happens after 4 times scan delay of scan start */
++			vma->numab_state->next_pid_reset =  vma->numab_state->next_scan +
++				msecs_to_jiffies(VMA_PID_RESET_PERIOD);
+ 		}
+ 
+ 		/*
+@@ -3065,6 +3072,18 @@ static void task_numa_work(struct callba
+ 		if (!vma_is_accessed(vma))
+ 			continue;
+ 
++		/*
++		 * RESET access PIDs regularly for old VMAs. Resetting after checking
++		 * vma for recent access to avoid clearing PID info before access..
++		 */
++		if (mm->numa_scan_seq &&
++				time_after(jiffies, vma->numab_state->next_pid_reset)) {
++			vma->numab_state->next_pid_reset = vma->numab_state->next_pid_reset +
++				msecs_to_jiffies(VMA_PID_RESET_PERIOD);
++			vma->numab_state->access_pids[0] = READ_ONCE(vma->numab_state->access_pids[1]);
++			vma->numab_state->access_pids[1] = 0;
++		}
++
+ 		do {
+ 			start = max(start, vma->vm_start);
+ 			end = ALIGN(start + (pages << PAGE_SHIFT), HPAGE_SIZE);
+_
