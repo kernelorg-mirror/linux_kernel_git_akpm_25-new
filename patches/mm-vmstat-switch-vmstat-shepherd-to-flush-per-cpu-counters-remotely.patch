@@ -1,0 +1,86 @@
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Subject: mm/vmstat: switch vmstat shepherd to flush per-CPU counters remotely
+Date: Fri, 03 Mar 2023 16:58:51 -0300
+
+Now that the counters are modified via cmpxchg both CPU locally (via the
+account functions), and remotely (via cpu_vm_stats_fold), its possible to
+switch vmstat_shepherd to perform the per-CPU vmstats folding remotely.
+
+This fixes the following two problems:
+
+ 1. A customer provided some evidence which indicates that
+    the idle tick was stopped; albeit, CPU-specific vmstat
+    counters still remained populated.
+
+    Thus one can only assume quiet_vmstat() was not
+    invoked on return to the idle loop. If I understand
+    correctly, I suspect this divergence might erroneously
+    prevent a reclaim attempt by kswapd. If the number of
+    zone specific free pages are below their per-cpu drift
+    value then zone_page_state_snapshot() is used to
+    compute a more accurate view of the aforementioned
+    statistic.  Thus any task blocked on the NUMA node
+    specific pfmemalloc_wait queue will be unable to make
+    significant progress via direct reclaim unless it is
+    killed after being woken up by kswapd
+    (see throttle_direct_reclaim())
+
+ 2. With a SCHED_FIFO task that busy loops on a given CPU,
+    and kworker for that CPU at SCHED_OTHER priority,
+    queuing work to sync per-vmstats will either cause that
+    work to never execute, or stalld (i.e. stall daemon)
+    boosts kworker priority which causes a latency
+    violation
+
+Link: https://lkml.kernel.org/r/20230303195909.003776725@redhat.com
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Aaron Tomlin <atomlin@atomlin.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Ingo Molnar <mingo@elte.hu>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: "Russell King (Oracle)" <linux@armlinux.org.uk>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/mm/vmstat.c~mm-vmstat-switch-vmstat-shepherd-to-flush-per-cpu-counters-remotely
++++ a/mm/vmstat.c
+@@ -2010,6 +2010,23 @@ static void vmstat_shepherd(struct work_
+ 
+ static DECLARE_DEFERRABLE_WORK(shepherd, vmstat_shepherd);
+ 
++#ifdef CONFIG_HAVE_CMPXCHG_LOCAL
++/* Flush counters remotely if CPU uses cmpxchg to update its per-CPU counters */
++static void vmstat_shepherd(struct work_struct *w)
++{
++	int cpu;
++
++	cpus_read_lock();
++	for_each_online_cpu(cpu) {
++		cpu_vm_stats_fold(cpu);
++		cond_resched();
++	}
++	cpus_read_unlock();
++
++	schedule_delayed_work(&shepherd,
++		round_jiffies_relative(sysctl_stat_interval));
++}
++#else
+ static void vmstat_shepherd(struct work_struct *w)
+ {
+ 	int cpu;
+@@ -2029,6 +2046,7 @@ static void vmstat_shepherd(struct work_
+ 	schedule_delayed_work(&shepherd,
+ 		round_jiffies_relative(sysctl_stat_interval));
+ }
++#endif
+ 
+ static void __init start_shepherd_timer(void)
+ {
+_
