@@ -1,0 +1,54 @@
+From: Paolo Abeni <pabeni@redhat.com>
+Subject: epoll: use refcount to reduce ep_mutex contention
+Date: Tue, 7 Mar 2023 19:46:37 +0100
+
+We are observing huge contention on the epmutex during an http
+connection/rate test:
+
+ 83.17% 0.25%  nginx            [kernel.kallsyms]         [k] entry_SYSCALL_64_after_hwframe
+[...]
+           |--66.96%--__fput
+                      |--60.04%--eventpoll_release_file
+                                 |--58.41%--__mutex_lock.isra.6
+                                           |--56.56%--osq_lock
+
+The application is multi-threaded, creates a new epoll entry for each
+incoming connection, and does not delete it before the connection shutdown
+- that is, before the connection's fd close().
+
+Many different threads compete frequently for the epmutex lock, affecting
+the overall performance.
+
+To reduce the contention this patch introduces explicit reference counting
+for the eventpoll struct.  Each registered event acquires a reference, and
+references are released at ep_remove() time.
+
+Additionally, this introduces a new 'dying' flag to prevent races between
+the EP file close() and the monitored file close(). 
+ep_eventpoll_release() marks, under f_lock spinlock, each epitem as before
+removing it, while EP file close() does not touch dying epitems.
+
+The eventpoll struct is released by whoever - among EP file close() and
+and the monitored file close() drops its last reference.
+
+With all the above in place, we can drop the epmutex usage at disposal time.
+
+Overall this produces a significant performance improvement in the
+mentioned connection/rate scenario: the mutex operations disappear from
+the topmost offenders in the perf report, and the measured
+connections/rate grows by ~60%.
+
+To make the change more readable this additionally renames ep_free() to
+ep_clear_and_put(), and moves the actual memory cleanup in a separate
+ep_free() helper.
+
+Link: https://lkml.kernel.org/r/e8228f0048977456466bc33b42600e929fedd319.1678213651.git.pabeni@redhat.com
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Tested-by: Xiumei Mu <xmu@redhiat.com>
+Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Carlos Maiolino <cmaiolino@redhat.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Eric Biggers <ebiggers@kernel.org>
+Cc: Jens Axboe <axboe@kernel.dk>
