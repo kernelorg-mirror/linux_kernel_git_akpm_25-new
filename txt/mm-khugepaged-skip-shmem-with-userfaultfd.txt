@@ -1,0 +1,55 @@
+From: David Stevens <stevensd@chromium.org>
+Subject: mm/khugepaged: skip shmem with userfaultfd
+Date: Tue, 7 Mar 2023 14:20:35 +0900
+
+Make sure that collapse_file respects any userfaultfds registered with
+MODE_MISSING.  If userspace has any such userfaultfds registered, then for
+any page which it knows to be missing, it may expect a
+UFFD_EVENT_PAGEFAULT.  This means collapse_file needs to be careful when
+collapsing a shmem range would result in replacing an empty page with a
+THP, to avoid breaking userfaultfd.
+
+Synchronization when checking for userfaultfds in collapse_file is tricky
+because the mmap locks can't be used to prevent races with the
+registration of new userfaultfds.  Instead, we provide synchronization by
+ensuring that userspace cannot observe the fact that pages are missing
+before we check for userfaultfds.  Although this allows registration of a
+userfaultfd to race with collapse_file, it ensures that userspace cannot
+observe any pages transition from missing to present after such a race
+occurs.  This makes such a race indistinguishable to the collapse
+occurring immediately before the userfaultfd registration.
+
+The first step to provide this synchronization is to stop filling gaps
+during the loop iterating over the target range, since the page cache lock
+can be dropped during that loop.  The second step is to fill the gaps with
+XA_RETRY_ENTRY after the page cache lock is acquired the final time, to
+avoid races with accesses to the page cache that only take the RCU read
+lock.
+
+The fact that we don't fill holes during the initial iteration means that
+collapse_file now has to handle faults occurring during the collapse. 
+This is done by re-validating the number of missing pages after acquiring
+the page cache lock for the final time.
+
+This fix is targeted at khugepaged, but the change also applies to
+MADV_COLLAPSE.  MADV_COLLAPSE on a range with a userfaultfd will now
+return EBUSY if there are any missing pages (instead of succeeding on
+shmem and returning EINVAL on anonymous memory).  There is also now a
+window during MADV_COLLAPSE where a fault on a missing page will cause the
+syscall to fail with EAGAIN.
+
+The fact that intermediate page cache state can no longer be observed
+before the rollback of a failed collapse is also technically a
+userspace-visible change (via at least SEEK_DATA and SEEK_END), but it is
+exceedingly unlikely that anything relies on being able to observe that
+transient state.
+
+Link: https://lkml.kernel.org/r/20230307052036.1520708-3-stevensd@google.com
+Signed-off-by: David Stevens <stevensd@chromium.org>
+Acked-by: Peter Xu <peterx@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Yang Shi <shy828301@gmail.com>
