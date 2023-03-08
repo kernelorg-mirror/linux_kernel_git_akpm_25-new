@@ -1,6 +1,6 @@
 From: Huang Ying <ying.huang@intel.com>
 Subject: migrate_pages: try migrate in batch asynchronously firstly
-Date: Fri, 24 Feb 2023 22:11:45 +0800
+Date: Fri, 3 Mar 2023 11:01:55 +0800
 
 When we have locked more than one folios, we cannot wait the lock or bit
 (e.g., page lock, buffer head lock, writeback bit) synchronously. 
@@ -14,10 +14,11 @@ migrated asynchronously will be migrated synchronously one by one.
 Test shows that this can restore the TLB flushing batching performance for
 synchronous migration effectively.
 
-Link: https://lkml.kernel.org/r/20230224141145.96814-4-ying.huang@intel.com
-Fixes: 6f7d760e86fa ("migrate_pages: move THP/hugetlb migration support check to simplify code")
+Link: https://lkml.kernel.org/r/20230303030155.160983-4-ying.huang@intel.com
+Fixes: 5dfab109d519 ("migrate_pages: batch _unmap and _move")
 Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
 Tested-by: Hugh Dickins <hughd@google.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: "Xu, Pengfei" <pengfei.xu@intel.com>
 Cc: Christoph Hellwig <hch@lst.de>
 Cc: Stefan Roesch <shr@devkernel.io>
@@ -25,7 +26,6 @@ Cc: Tejun Heo <tj@kernel.org>
 Cc: Xin Hao <xhao@linux.alibaba.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Cc: Yang Shi <shy828301@gmail.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -34,7 +34,57 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/mm/migrate.c~migrate_pages-try-migrate-in-batch-asynchronously-firstly
 +++ a/mm/migrate.c
-@@ -1843,6 +1843,51 @@ out:
+@@ -1112,9 +1112,8 @@ static void migrate_folio_done(struct fo
+ /* Obtain the lock on page, remove all ptes. */
+ static int migrate_folio_unmap(new_page_t get_new_page, free_page_t put_new_page,
+ 			       unsigned long private, struct folio *src,
+-			       struct folio **dstp, int force,
+-			       enum migrate_mode mode, enum migrate_reason reason,
+-			       struct list_head *ret)
++			       struct folio **dstp, enum migrate_mode mode,
++			       enum migrate_reason reason, struct list_head *ret)
+ {
+ 	struct folio *dst;
+ 	int rc = -EAGAIN;
+@@ -1144,7 +1143,7 @@ static int migrate_folio_unmap(new_page_
+ 	dst->private = NULL;
+ 
+ 	if (!folio_trylock(src)) {
+-		if (!force || mode == MIGRATE_ASYNC)
++		if (mode == MIGRATE_ASYNC)
+ 			goto out;
+ 
+ 		/*
+@@ -1182,8 +1181,6 @@ static int migrate_folio_unmap(new_page_
+ 			rc = -EBUSY;
+ 			goto out;
+ 		}
+-		if (!force)
+-			goto out;
+ 		folio_wait_writeback(src);
+ 	}
+ 
+@@ -1497,6 +1494,9 @@ static inline int try_split_folio(struct
+ #define NR_MAX_BATCHED_MIGRATION	512
+ #endif
+ #define NR_MAX_MIGRATE_PAGES_RETRY	10
++#define NR_MAX_MIGRATE_ASYNC_RETRY	3
++#define NR_MAX_MIGRATE_SYNC_RETRY					\
++	(NR_MAX_MIGRATE_PAGES_RETRY - NR_MAX_MIGRATE_ASYNC_RETRY)
+ 
+ struct migrate_pages_stats {
+ 	int nr_succeeded;	/* Normal and large folios migrated successfully, in
+@@ -1678,8 +1678,7 @@ static int migrate_pages_batch(struct li
+ 			}
+ 
+ 			rc = migrate_folio_unmap(get_new_page, put_new_page, private,
+-						 folio, &dst, pass > 2, mode,
+-						 reason, ret_folios);
++						 folio, &dst, mode, reason, ret_folios);
+ 			/*
+ 			 * The rules are:
+ 			 *	Success: folio will be freed
+@@ -1857,6 +1856,51 @@ out:
  	return rc;
  }
  
@@ -51,7 +101,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/* Try to migrate in batch with MIGRATE_ASYNC mode firstly */
 +	rc = migrate_pages_batch(from, get_new_page, put_new_page, private, MIGRATE_ASYNC,
 +				 reason, &folios, split_folios, &astats,
-+				 NR_MAX_MIGRATE_PAGES_RETRY);
++				 NR_MAX_MIGRATE_ASYNC_RETRY);
 +	stats->nr_succeeded += astats.nr_succeeded;
 +	stats->nr_thp_succeeded += astats.nr_thp_succeeded;
 +	stats->nr_thp_split += astats.nr_thp_split;
@@ -73,7 +123,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		list_move(from->next, &folios);
 +		rc = migrate_pages_batch(&folios, get_new_page, put_new_page,
 +					 private, mode, reason, ret_folios,
-+					 split_folios, stats, NR_MAX_MIGRATE_PAGES_RETRY);
++					 split_folios, stats, NR_MAX_MIGRATE_SYNC_RETRY);
 +		list_splice_tail_init(&folios, ret_folios);
 +		if (rc < 0)
 +			return rc;
@@ -86,7 +136,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * migrate_pages - migrate the folios specified in a list, to the free folios
   *		   supplied as the target for the page migration
-@@ -1874,7 +1919,7 @@ int migrate_pages(struct list_head *from
+@@ -1888,7 +1932,7 @@ int migrate_pages(struct list_head *from
  		enum migrate_mode mode, int reason, unsigned int *ret_succeeded)
  {
  	int rc, rc_gather;
@@ -95,7 +145,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct folio *folio, *folio2;
  	LIST_HEAD(folios);
  	LIST_HEAD(ret_folios);
-@@ -1890,10 +1935,6 @@ int migrate_pages(struct list_head *from
+@@ -1904,10 +1948,6 @@ int migrate_pages(struct list_head *from
  	if (rc_gather < 0)
  		goto out;
  
@@ -106,7 +156,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  again:
  	nr_pages = 0;
  	list_for_each_entry_safe(folio, folio2, from, lru) {
-@@ -1904,16 +1945,20 @@ again:
+@@ -1918,16 +1958,20 @@ again:
  		}
  
  		nr_pages += folio_nr_pages(folio);
