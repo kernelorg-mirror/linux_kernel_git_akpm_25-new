@@ -1,0 +1,108 @@
+From: Vlastimil Babka <vbabka@suse.cz>
+Subject: mm/mmap: start distinguishing if vma can be removed in mergeability test
+Date: Thu, 9 Mar 2023 12:12:57 +0100
+
+Since pre-git times, is_mergeable_vma() returns false for a vma with
+vm_ops->close, so that no owner assumptions are violated in case the vma
+is removed as part of the merge.
+
+This check is currently very conservative and can prevent merging even
+situations where vma can't be removed, such as simple expansion of
+previous vma, as evidenced by commit d014cd7c1c35 ("mm, mremap: fix
+mremap() expanding for vma's with vm_ops->close()")
+
+In order to allow more merging when appropriate and simplify the code that
+was made more complex by commit d014cd7c1c35, start distinguishing cases
+where the vma can be really removed, and allow merging with vm_ops->close
+otherwise.
+
+As a first step, add a may_remove_vma parameter to is_mergeable_vma(). 
+can_vma_merge_before() sets it to true, because when called from
+vma_merge(), a removal of the vma is possible.
+
+In can_vma_merge_after(), pass the parameter as false, because no
+removal can occur in each of its callers:
+- vma_merge() calls it on the 'prev' vma, which is never removed
+- mmap_region() and do_brk_flags() call it to determine if it can expand
+  a vma, which is not removed
+
+As a result, vma's with vm_ops->close may now merge with compatible ranges
+in more situations than previously.  We can also revert commit
+d014cd7c1c35 as the next step to simplify mremap code again.
+
+Link: https://lkml.kernel.org/r/20230309111258.24079-10-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mmap.c |   15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+--- a/mm/mmap.c~mm-mmap-start-distinguishing-if-vma-can-be-removed-in-mergeability-test
++++ a/mm/mmap.c
+@@ -755,12 +755,13 @@ int vma_shrink(struct vma_iterator *vmi,
+ 
+ /*
+  * If the vma has a ->close operation then the driver probably needs to release
+- * per-vma resources, so we don't attempt to merge those.
++ * per-vma resources, so we don't attempt to merge those in case the caller
++ * indicates the current vma may be removed as part of the merge.
+  */
+ static inline bool is_mergeable_vma(struct vm_area_struct *vma,
+ 		struct file *file, unsigned long vm_flags,
+ 		struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+-		struct anon_vma_name *anon_name)
++		struct anon_vma_name *anon_name, bool may_remove_vma)
+ {
+ 	/*
+ 	 * VM_SOFTDIRTY should not prevent from VMA merging, if we
+@@ -774,7 +775,7 @@ static inline bool is_mergeable_vma(stru
+ 		return false;
+ 	if (vma->vm_file != file)
+ 		return false;
+-	if (vma->vm_ops && vma->vm_ops->close)
++	if (may_remove_vma && vma->vm_ops && vma->vm_ops->close)
+ 		return false;
+ 	if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
+ 		return false;
+@@ -806,6 +807,8 @@ static inline bool is_mergeable_anon_vma
+  * We don't check here for the merged mmap wrapping around the end of pagecache
+  * indices (16TB on ia32) because do_mmap() does not permit mmap's which
+  * wrap, nor mmaps which cover the final page at index -1UL.
++ *
++ * We assume the vma may be removed as part of the merge.
+  */
+ static bool
+ can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
+@@ -813,7 +816,7 @@ can_vma_merge_before(struct vm_area_stru
+ 		pgoff_t vm_pgoff, struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+ 		struct anon_vma_name *anon_name)
+ {
+-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
++	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name, true) &&
+ 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
+ 		if (vma->vm_pgoff == vm_pgoff)
+ 			return true;
+@@ -827,6 +830,8 @@ can_vma_merge_before(struct vm_area_stru
+  *
+  * We cannot merge two vmas if they have differently assigned (non-NULL)
+  * anon_vmas, nor if same anon_vma is assigned but offsets incompatible.
++ *
++ * We assume that vma is not removed as part of the merge.
+  */
+ static bool
+ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
+@@ -834,7 +839,7 @@ can_vma_merge_after(struct vm_area_struc
+ 		pgoff_t vm_pgoff, struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
+ 		struct anon_vma_name *anon_name)
+ {
+-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
++	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name, false) &&
+ 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
+ 		pgoff_t vm_pglen;
+ 		vm_pglen = vma_pages(vma);
+_
