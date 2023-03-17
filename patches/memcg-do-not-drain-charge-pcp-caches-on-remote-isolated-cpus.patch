@@ -1,0 +1,80 @@
+From: Michal Hocko <mhocko@suse.com>
+Subject: memcg: do not drain charge pcp caches on remote isolated cpus
+Date: Fri, 17 Mar 2023 14:44:48 +0100
+
+Leonardo Bras has noticed that pcp charge cache draining might be
+disruptive on workloads relying on 'isolated cpus', a feature commonly
+used on workloads that are sensitive to interruption and context switching
+such as vRAN and Industrial Control Systems.
+
+There are essentially two ways how to approach the issue.  We can either
+allow the pcp cache to be drained on a different rather than a local cpu
+or avoid remote flushing on isolated cpus.
+
+The current pcp charge cache is really optimized for high performance and
+it always relies to stick with its cpu.  That means it only requires
+local_lock (preempt_disable on !RT) and draining is handed over to pcp WQ
+to drain locally again.
+
+The former solution (remote draining) would require to add an additional
+locking to prevent local charges from racing with the draining.  This adds
+an atomic operation to otherwise simple arithmetic fast path in the
+try_charge path.  Another concern is that the remote draining can cause a
+lock contention for the isolated workloads and therefore interfere with it
+indirectly via user space interfaces.
+
+Another option is to avoid draining scheduling on isolated cpus
+altogether.  That means that those remote cpus would keep their charges
+even after drain_all_stock returns.  This is certainly not optimal either
+but it shouldn't really cause any major problems.  In the worst case (many
+isolated cpus with charges - each of them with MEMCG_CHARGE_BATCH i.e 64
+page) the memory consumption of a memcg would be artificially higher than
+can be immediately used from other cpus.
+
+Theoretically a memcg OOM killer could be triggered pre-maturely. 
+Currently it is not really clear whether this is a practical problem
+though.  Tight memcg limit would be really counter productive to cpu
+isolated workloads pretty much by definition because any memory reclaimed
+induced by memcg limit could break user space timing expectations as those
+usually expect execution in the userspace most of the time.
+
+Also charges could be left behind on memcg removal.  Any future charge on
+those isolated cpus will drain that pcp cache so this won't be a permanent
+leak.
+
+Considering cons and pros of both approaches this patch is implementing
+the second option and simply do not schedule remote draining if the target
+cpu is isolated.  This solution is much more simpler.  It doesn't add any
+new locking and it is more more predictable from the user space POV. 
+Should the pre-mature memcg OOM become a real life problem, we can revisit
+this decision.
+
+Link: https://lkml.kernel.org/r/20230317134448.11082-3-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Suggested-by: Roman Gushchin <roman.gushchin@linux.dev>
+Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+Reported-by: Leonardo Bras <leobras@redhat.com>
+Cc: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ingo Molnar <mingo@elte.hu>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/mm/memcontrol.c~memcg-do-not-drain-charge-pcp-caches-on-remote-isolated-cpus
++++ a/mm/memcontrol.c
+@@ -2366,7 +2366,7 @@ static void drain_all_stock(struct mem_c
+ 		    !test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags)) {
+ 			if (cpu == curcpu)
+ 				drain_local_stock(&stock->work);
+-			else
++			else if (!cpu_is_isolated(cpu))
+ 				schedule_work_on(cpu, &stock->work);
+ 		}
+ 	}
+_
