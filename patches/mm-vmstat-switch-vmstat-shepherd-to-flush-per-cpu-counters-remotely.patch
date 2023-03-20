@@ -1,0 +1,79 @@
+From: Marcelo Tosatti <mtosatti@redhat.com>
+Subject: mm/vmstat: switch vmstat shepherd to flush per-CPU counters remotely
+Date: Mon, 20 Mar 2023 15:03:43 -0300
+
+With a task that busy loops on a given CPU, the kworker interruption to
+execute vmstat_update is undesired and may exceed latency thresholds for
+certain applications.
+
+Performance details for the kworker interruption:
+
+oslat   1094.456862: sys_mlock(start: 7f7ed0000b60, len: 1000)
+oslat   1094.456971: workqueue_queue_work: ... function=vmstat_update ...
+oslat   1094.456974: sched_switch: prev_comm=oslat ... ==> next_comm=kworker/5:1 ...
+kworker 1094.456978: sched_switch: prev_comm=kworker/5:1 ==> next_comm=oslat ...
+
+The example above shows an additional 7us for the
+
+        oslat -> kworker -> oslat
+
+switches.  In the case of a virtualized CPU, and the vmstat_update
+interruption in the host (of a qemu-kvm vcpu), the latency penalty
+observed in the guest is higher than 50us, violating the acceptable
+latency threshold for certain applications.
+
+To fix this, now that the counters are modified via cmpxchg both CPU
+locally (via the account functions), and remotely (via cpu_vm_stats_fold),
+its possible to switch vmstat_shepherd to perform the per-CPU vmstats
+folding remotely.
+
+Link: https://lkml.kernel.org/r/20230320180745.807656081@redhat.com
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Aaron Tomlin <atomlin@atomlin.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: "Russell King (Oracle)" <linux@armlinux.org.uk>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+
+--- a/mm/vmstat.c~mm-vmstat-switch-vmstat-shepherd-to-flush-per-cpu-counters-remotely
++++ a/mm/vmstat.c
+@@ -2049,6 +2049,23 @@ static void vmstat_shepherd(struct work_
+ 
+ static DECLARE_DEFERRABLE_WORK(shepherd, vmstat_shepherd);
+ 
++#ifdef CONFIG_HAVE_CMPXCHG_LOCAL
++/* Flush counters remotely if CPU uses cmpxchg to update its per-CPU counters */
++static void vmstat_shepherd(struct work_struct *w)
++{
++	int cpu;
++
++	cpus_read_lock();
++	for_each_online_cpu(cpu) {
++		cpu_vm_stats_fold(cpu);
++		cond_resched();
++	}
++	cpus_read_unlock();
++
++	schedule_delayed_work(&shepherd,
++		round_jiffies_relative(sysctl_stat_interval));
++}
++#else
+ static void vmstat_shepherd(struct work_struct *w)
+ {
+ 	int cpu;
+@@ -2068,6 +2085,7 @@ static void vmstat_shepherd(struct work_
+ 	schedule_delayed_work(&shepherd,
+ 		round_jiffies_relative(sysctl_stat_interval));
+ }
++#endif
+ 
+ static void __init start_shepherd_timer(void)
+ {
+_
