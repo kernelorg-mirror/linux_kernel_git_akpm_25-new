@@ -1,0 +1,125 @@
+From: Tomas Mudrunka <tomas.mudrunka@gmail.com>
+Subject: mm/memtest: add results of early memtest to /proc/meminfo
+Date: Tue, 21 Mar 2023 11:34:30 +0100
+
+Currently the memtest results were only presented in dmesg.
+
+When running a large fleet of devices without ECC RAM it's currently not
+easy to do bulk monitoring for memory corruption.  You have to parse
+dmesg, but that's a ring buffer so the error might disappear after some
+time.  In general I do not consider dmesg to be a great API to query RAM
+status.
+
+In several companies I've seen such errors remain undetected and cause
+issues for way too long.  So I think it makes sense to provide a
+monitoring API, so that we can safely detect and act upon them.
+
+This adds /proc/meminfo entry which can be easily used by scripts.
+
+Link: https://lkml.kernel.org/r/20230321103430.7130-1-tomas.mudrunka@gmail.com
+Signed-off-by: Tomas Mudrunka <tomas.mudrunka@gmail.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/filesystems/proc.rst |    8 ++++++++
+ fs/proc/meminfo.c                  |   13 +++++++++++++
+ include/linux/memblock.h           |    2 ++
+ mm/memtest.c                       |    6 ++++++
+ 4 files changed, 29 insertions(+)
+
+--- a/Documentation/filesystems/proc.rst~add-results-of-early-memtest-to-proc-meminfo
++++ a/Documentation/filesystems/proc.rst
+@@ -996,6 +996,7 @@ Example output. You may not have all of
+     VmallocUsed:       40444 kB
+     VmallocChunk:          0 kB
+     Percpu:            29312 kB
++    EarlyMemtestBad:       0 kB
+     HardwareCorrupted:     0 kB
+     AnonHugePages:   4149248 kB
+     ShmemHugePages:        0 kB
+@@ -1146,6 +1147,13 @@ VmallocChunk
+ Percpu
+               Memory allocated to the percpu allocator used to back percpu
+               allocations. This stat excludes the cost of metadata.
++EarlyMemtestBad
++              The amount of RAM/memory in kB, that was identified as corrupted
++              by early memtest. If memtest was not run, this field will not
++              be displayed at all. Size is never rounded down to 0 kB.
++              That means if 0 kB is reported, you can safely assume
++              there was at least one pass of memtest and none of the passes
++              found a single faulty byte of RAM.
+ HardwareCorrupted
+               The amount of RAM/memory in KB, the kernel identifies as
+               corrupted.
+--- a/fs/proc/meminfo.c~add-results-of-early-memtest-to-proc-meminfo
++++ a/fs/proc/meminfo.c
+@@ -6,6 +6,7 @@
+ #include <linux/hugetlb.h>
+ #include <linux/mman.h>
+ #include <linux/mmzone.h>
++#include <linux/memblock.h>
+ #include <linux/proc_fs.h>
+ #include <linux/percpu.h>
+ #include <linux/seq_file.h>
+@@ -131,6 +132,18 @@ static int meminfo_proc_show(struct seq_
+ 	show_val_kb(m, "VmallocChunk:   ", 0ul);
+ 	show_val_kb(m, "Percpu:         ", pcpu_nr_pages());
+ 
++#ifdef CONFIG_MEMTEST
++	if (early_memtest_done) {
++		unsigned long early_memtest_bad_size_kb;
++
++		early_memtest_bad_size_kb = early_memtest_bad_size>>10;
++		if (early_memtest_bad_size && !early_memtest_bad_size_kb)
++			early_memtest_bad_size_kb = 1;
++		/* When 0 is reported, it means there actually was a successful test */
++		seq_printf(m, "EarlyMemtestBad:   %5lu kB\n", early_memtest_bad_size_kb);
++	}
++#endif
++
+ #ifdef CONFIG_MEMORY_FAILURE
+ 	seq_printf(m, "HardwareCorrupted: %5lu kB\n",
+ 		   atomic_long_read(&num_poisoned_pages) << (PAGE_SHIFT - 10));
+--- a/include/linux/memblock.h~add-results-of-early-memtest-to-proc-meminfo
++++ a/include/linux/memblock.h
+@@ -597,6 +597,8 @@ extern int hashdist;		/* Distribute hash
+ #endif
+ 
+ #ifdef CONFIG_MEMTEST
++extern phys_addr_t early_memtest_bad_size;	/* Size of faulty ram found by memtest */
++extern bool early_memtest_done;			/* Was early memtest done? */
+ extern void early_memtest(phys_addr_t start, phys_addr_t end);
+ #else
+ static inline void early_memtest(phys_addr_t start, phys_addr_t end)
+--- a/mm/memtest.c~add-results-of-early-memtest-to-proc-meminfo
++++ a/mm/memtest.c
+@@ -4,6 +4,9 @@
+ #include <linux/init.h>
+ #include <linux/memblock.h>
+ 
++bool early_memtest_done;
++phys_addr_t early_memtest_bad_size;
++
+ static u64 patterns[] __initdata = {
+ 	/* The first entry has to be 0 to leave memtest with zeroed memory */
+ 	0,
+@@ -30,6 +33,7 @@ static void __init reserve_bad_mem(u64 p
+ 	pr_info("  %016llx bad mem addr %pa - %pa reserved\n",
+ 		cpu_to_be64(pattern), &start_bad, &end_bad);
+ 	memblock_reserve(start_bad, end_bad - start_bad);
++	early_memtest_bad_size += (end_bad - start_bad);
+ }
+ 
+ static void __init memtest(u64 pattern, phys_addr_t start_phys, phys_addr_t size)
+@@ -61,6 +65,8 @@ static void __init memtest(u64 pattern,
+ 	}
+ 	if (start_bad)
+ 		reserve_bad_mem(pattern, start_bad, last_bad + incr);
++
++	early_memtest_done = true;
+ }
+ 
+ static void __init do_one_pass(u64 pattern, phys_addr_t start, phys_addr_t end)
+_
