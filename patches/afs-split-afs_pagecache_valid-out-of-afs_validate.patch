@@ -1,0 +1,101 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: afs: split afs_pagecache_valid() out of afs_validate()
+Date: Mon, 27 Mar 2023 18:45:14 +0100
+
+For the map_pages() method, we need a test that does not sleep.  The page
+fault handler will continue to call the fault() method where we can sleep
+and do the full revalidation there.
+
+Link: https://lkml.kernel.org/r/20230327174515.1811532-3-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: David Howells <dhowells@redhat.com>
+Tested-by: David Howells <dhowells@redhat.com>
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/afs/file.c     |   14 ++------------
+ fs/afs/inode.c    |   27 +++++++++++++++++++--------
+ fs/afs/internal.h |    1 +
+ 3 files changed, 22 insertions(+), 20 deletions(-)
+
+--- a/fs/afs/file.c~afs-split-afs_pagecache_valid-out-of-afs_validate
++++ a/fs/afs/file.c
+@@ -569,20 +569,10 @@ static void afs_vm_close(struct vm_area_
+ static vm_fault_t afs_vm_map_pages(struct vm_fault *vmf, pgoff_t start_pgoff, pgoff_t end_pgoff)
+ {
+ 	struct afs_vnode *vnode = AFS_FS_I(file_inode(vmf->vma->vm_file));
+-	struct afs_file *af = vmf->vma->vm_file->private_data;
+ 
+-	switch (afs_validate(vnode, af->key)) {
+-	case 0:
++	if (afs_pagecache_valid(vnode))
+ 		return filemap_map_pages(vmf, start_pgoff, end_pgoff);
+-	case -ENOMEM:
+-		return VM_FAULT_OOM;
+-	case -EINTR:
+-	case -ERESTARTSYS:
+-		return VM_FAULT_RETRY;
+-	case -ESTALE:
+-	default:
+-		return VM_FAULT_SIGBUS;
+-	}
++	return 0;
+ }
+ 
+ static ssize_t afs_file_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+--- a/fs/afs/inode.c~afs-split-afs_pagecache_valid-out-of-afs_validate
++++ a/fs/afs/inode.c
+@@ -668,6 +668,24 @@ bool afs_check_validity(struct afs_vnode
+ }
+ 
+ /*
++ * Returns true if the pagecache is still valid.  Does not sleep.
++ */
++bool afs_pagecache_valid(struct afs_vnode *vnode)
++{
++	if (unlikely(test_bit(AFS_VNODE_DELETED, &vnode->flags))) {
++		if (vnode->netfs.inode.i_nlink)
++			clear_nlink(&vnode->netfs.inode);
++		return true;
++	}
++
++	if (test_bit(AFS_VNODE_CB_PROMISED, &vnode->flags) &&
++	    afs_check_validity(vnode))
++		return true;
++
++	return false;
++}
++
++/*
+  * validate a vnode/inode
+  * - there are several things we need to check
+  *   - parent dir data changes (rm, rmdir, rename, mkdir, create, link,
+@@ -684,14 +702,7 @@ int afs_validate(struct afs_vnode *vnode
+ 	       vnode->fid.vid, vnode->fid.vnode, vnode->flags,
+ 	       key_serial(key));
+ 
+-	if (unlikely(test_bit(AFS_VNODE_DELETED, &vnode->flags))) {
+-		if (vnode->netfs.inode.i_nlink)
+-			clear_nlink(&vnode->netfs.inode);
+-		goto valid;
+-	}
+-
+-	if (test_bit(AFS_VNODE_CB_PROMISED, &vnode->flags) &&
+-	    afs_check_validity(vnode))
++	if (afs_pagecache_valid(vnode))
+ 		goto valid;
+ 
+ 	down_write(&vnode->validate_lock);
+--- a/fs/afs/internal.h~afs-split-afs_pagecache_valid-out-of-afs_validate
++++ a/fs/afs/internal.h
+@@ -1171,6 +1171,7 @@ extern struct inode *afs_iget(struct afs
+ extern struct inode *afs_root_iget(struct super_block *, struct key *);
+ extern bool afs_check_validity(struct afs_vnode *);
+ extern int afs_validate(struct afs_vnode *, struct key *);
++bool afs_pagecache_valid(struct afs_vnode *);
+ extern int afs_getattr(struct mnt_idmap *idmap, const struct path *,
+ 		       struct kstat *, u32, unsigned int);
+ extern int afs_setattr(struct mnt_idmap *idmap, struct dentry *, struct iattr *);
+_
