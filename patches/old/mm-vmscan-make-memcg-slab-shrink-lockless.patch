@@ -1,12 +1,12 @@
 From: Qi Zheng <zhengqi.arch@bytedance.com>
 Subject: mm: vmscan: make memcg slab shrink lockless
-Date: Tue, 7 Mar 2023 14:56:00 +0800
+Date: Mon, 13 Mar 2023 19:28:14 +0800
 
 Like global slab shrink, this commit also uses SRCU to make memcg slab
 shrink lockless.
 
-We can reproduce the down_read_trylock() hotspot through the following
-script:
+We can reproduce the down_read_trylock() hotspot through the
+following script:
 
 ```
 
@@ -108,21 +108,22 @@ perf stat -e cycles,instructions -G test -a --repeat 5 -- sleep 10
 
           10.01064 +- 0.00831 seconds time elapsed  ( +-  0.08% )
 
-We can see that IPC drops very seriously when calling down_read_trylock()
-at high frequency.  After using SRCU, the IPC is at a normal level.
+We can see that IPC drops very seriously when calling
+down_read_trylock() at high frequency. After using SRCU,
+the IPC is at a normal level.
 
-Link: https://lkml.kernel.org/r/20230307065605.58209-4-zhengqi.arch@bytedance.com
+Link: https://lkml.kernel.org/r/20230313112819.38938-4-zhengqi.arch@bytedance.com
 Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
 Acked-by: Kirill Tkhai <tkhai@ya.ru>
 Acked-by: Vlastimil Babka <Vbabka@suse.cz>
+Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Christian König <christian.koenig@amd.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Paul E. McKenney <paulmck@kernel.org>
-Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Shakeel Butt <shakeelb@google.com>
 Cc: Sultan Alsawaf <sultan@kerneltoast.com>
 Cc: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
@@ -130,18 +131,12 @@ Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ mm/vmscan.c |   45 ++++++++++++++++++++++++++-------------------
+ 1 file changed, 26 insertions(+), 19 deletions(-)
 
 --- a/mm/vmscan.c~mm-vmscan-make-memcg-slab-shrink-lockless
 +++ a/mm/vmscan.c
-@@ -57,6 +57,7 @@
- #include <linux/khugepaged.h>
- #include <linux/rculist_nulls.h>
- #include <linux/random.h>
-+#include <linux/srcu.h>
- 
- #include <asm/tlbflush.h>
- #include <asm/div64.h>
-@@ -221,8 +222,21 @@ static inline int shrinker_defer_size(in
+@@ -222,8 +222,21 @@ static inline int shrinker_defer_size(in
  static struct shrinker_info *shrinker_info_protected(struct mem_cgroup *memcg,
  						     int nid)
  {
@@ -164,8 +159,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	kvfree(container_of(head, struct shrinker_info, rcu));
  }
  
- static inline bool need_expand(int new_nr_max, int old_nr_max)
-@@ -269,7 +283,7 @@ static int expand_one_shrinker_info(stru
+ static int expand_one_shrinker_info(struct mem_cgroup *memcg,
+@@ -264,7 +277,7 @@ static int expand_one_shrinker_info(stru
  		       defer_size - old_defer_size);
  
  		rcu_assign_pointer(pn->shrinker_info, new);
@@ -174,7 +169,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	return 0;
-@@ -355,15 +369,16 @@ void set_shrinker_bit(struct mem_cgroup
+@@ -350,15 +363,16 @@ void set_shrinker_bit(struct mem_cgroup
  {
  	if (shrinker_id >= 0 && memcg && !mem_cgroup_is_root(memcg)) {
  		struct shrinker_info *info;
@@ -194,7 +189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  }
  
-@@ -377,7 +392,6 @@ static int prealloc_memcg_shrinker(struc
+@@ -372,7 +386,6 @@ static int prealloc_memcg_shrinker(struc
  		return -ENOSYS;
  
  	down_write(&shrinker_rwsem);
@@ -202,7 +197,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	id = idr_alloc(&shrinker_idr, shrinker, 0, 0, GFP_KERNEL);
  	if (id < 0)
  		goto unlock;
-@@ -411,7 +425,7 @@ static long xchg_nr_deferred_memcg(int n
+@@ -406,7 +419,7 @@ static long xchg_nr_deferred_memcg(int n
  {
  	struct shrinker_info *info;
  
@@ -211,7 +206,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return atomic_long_xchg(&info->nr_deferred[shrinker->id], 0);
  }
  
-@@ -420,7 +434,7 @@ static long add_nr_deferred_memcg(long n
+@@ -415,7 +428,7 @@ static long add_nr_deferred_memcg(long n
  {
  	struct shrinker_info *info;
  
@@ -220,7 +215,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return atomic_long_add_return(nr, &info->nr_deferred[shrinker->id]);
  }
  
-@@ -898,15 +912,14 @@ static unsigned long shrink_slab_memcg(g
+@@ -893,15 +906,14 @@ static unsigned long shrink_slab_memcg(g
  {
  	struct shrinker_info *info;
  	unsigned long ret, freed = 0;
@@ -239,7 +234,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (unlikely(!info))
  		goto unlock;
  
-@@ -956,14 +969,9 @@ static unsigned long shrink_slab_memcg(g
+@@ -951,14 +963,9 @@ static unsigned long shrink_slab_memcg(g
  				set_shrinker_bit(memcg, nid, i);
  		}
  		freed += ret;
