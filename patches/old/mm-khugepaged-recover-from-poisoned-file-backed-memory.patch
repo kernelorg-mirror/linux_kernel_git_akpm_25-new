@@ -1,6 +1,6 @@
 From: Jiaqi Yan <jiaqiyan@google.com>
 Subject: mm/khugepaged: recover from poisoned file-backed memory
-Date: Sat, 4 Mar 2023 22:51:12 -0800
+Date: Mon, 27 Mar 2023 14:15:48 -0700
 
 Make collapse_file roll back when copying pages failed. More concretely:
 - extract copying operations into a separate loop
@@ -26,26 +26,26 @@ Tested manually:
 5. Signal both threads to inspect their buffer contents and make sure no
    data corruption.
 
-Link: https://lkml.kernel.org/r/20230305065112.1932255-4-jiaqiyan@google.com
+Link: https://lkml.kernel.org/r/20230327211548.462509-4-jiaqiyan@google.com
 Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
-Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Tong Tiangen <tongtiangen@huawei.com>
 Cc: Tony Luck <tony.luck@intel.com>
-Cc: Yang Shi <shy828301@gmail.com>
-Cc: David Stevens <stevensd@chromium.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |   78 ++++++++++++++++++++++++++++------------------
- 1 file changed, 48 insertions(+), 30 deletions(-)
+ mm/khugepaged.c |   86 ++++++++++++++++++++++++++++------------------
+ 1 file changed, 54 insertions(+), 32 deletions(-)
 
 --- a/mm/khugepaged.c~mm-khugepaged-recover-from-poisoned-file-backed-memory
 +++ a/mm/khugepaged.c
-@@ -1890,6 +1890,9 @@ static int collapse_file(struct mm_struc
+@@ -1874,6 +1874,9 @@ static int collapse_file(struct mm_struc
  {
  	struct address_space *mapping = file->f_mapping;
  	struct page *hpage;
@@ -55,7 +55,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgoff_t index = 0, end = start + HPAGE_PMD_NR;
  	LIST_HEAD(pagelist);
  	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
-@@ -1934,8 +1937,7 @@ static int collapse_file(struct mm_struc
+@@ -1918,8 +1921,7 @@ static int collapse_file(struct mm_struc
  
  	xas_set(&xas, start);
  	for (index = start; index < end; index++) {
@@ -65,9 +65,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		VM_BUG_ON(index != xas.xa_index);
  		if (is_shmem) {
-@@ -2117,10 +2119,7 @@ out_unlock:
+@@ -2099,12 +2101,8 @@ out_unlock:
+ 		put_page(page);
+ 		goto xa_unlocked;
  	}
- 	nr = thp_nr_pages(hpage);
+-	nr = thp_nr_pages(hpage);
  
 -	if (is_shmem)
 -		__mod_lruvec_page_state(hpage, NR_SHMEM_THPS, nr);
@@ -77,13 +79,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		filemap_nr_thps_inc(mapping);
  		/*
  		 * Paired with smp_mb() in do_dentry_open() to ensure
-@@ -2131,21 +2130,10 @@ out_unlock:
+@@ -2115,21 +2113,9 @@ out_unlock:
  		smp_mb();
  		if (inode_is_open_for_write(mapping->host)) {
  			result = SCAN_FAIL;
 -			__mod_lruvec_page_state(hpage, NR_FILE_THPS, -nr);
  			filemap_nr_thps_dec(mapping);
- 			goto xa_locked;
+-			goto xa_locked;
  		}
  	}
 -
@@ -99,7 +101,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  xa_locked:
  	xas_unlock_irq(&xas);
  xa_unlocked:
-@@ -2158,21 +2146,35 @@ xa_unlocked:
+@@ -2142,21 +2128,36 @@ xa_unlocked:
  	try_to_unmap_flush();
  
  	if (result == SCAN_SUCCEED) {
@@ -133,6 +135,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		}
 +	}
 +
++	nr = thp_nr_pages(hpage);
 +	if (result == SCAN_SUCCEED) {
 +		/*
 +		 * Copying old pages to huge one has succeeded, now we
@@ -142,7 +145,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			list_del(&page->lru);
  			page->mapping = NULL;
  			page_ref_unfreeze(page, 1);
-@@ -2180,12 +2182,23 @@ xa_unlocked:
+@@ -2164,12 +2165,23 @@ xa_unlocked:
  			ClearPageUnevictable(page);
  			unlock_page(page);
  			put_page(page);
@@ -170,7 +173,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		folio = page_folio(hpage);
  		folio_mark_uptodate(folio);
-@@ -2203,8 +2216,6 @@ xa_unlocked:
+@@ -2187,8 +2199,6 @@ xa_unlocked:
  		unlock_page(hpage);
  		hpage = NULL;
  	} else {
@@ -179,14 +182,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/* Something went wrong: roll back page cache changes */
  		xas_lock_irq(&xas);
  		if (nr_none) {
-@@ -2238,6 +2249,13 @@ xa_unlocked:
+@@ -2222,6 +2232,18 @@ xa_unlocked:
  			xas_lock_irq(&xas);
  		}
  		VM_BUG_ON(nr_none);
 +		/*
-+		 * Undo the updates of filemap_nr_thps_inc for non-SHMEM file only.
-+		 * This undo is not needed unless failure is due to SCAN_COPY_MC.
++		 * Undo the updates of filemap_nr_thps_inc for non-SHMEM
++		 * file only. This undo is not needed unless failure is
++		 * due to SCAN_COPY_MC.
++		 *
++		 * Paired with smp_mb() in do_dentry_open() to ensure the
++		 * update to nr_thps is visible.
 +		 */
++		smp_mb();
 +		if (!is_shmem && result == SCAN_COPY_MC)
 +			filemap_nr_thps_dec(mapping);
 +
