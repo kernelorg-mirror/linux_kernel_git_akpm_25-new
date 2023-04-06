@@ -14,18 +14,96 @@ unlinks and frees page tables, it must ensure that all of those either are
 locked or don't exist.  This patch adds a fourth lock under which page
 tables can be traversed, and so khugepaged must also lock out that one.
 
+[surenb@google.com: vm_lock/i_mmap_rwsem inversion in retract_page_tables]
+  Link: https://lkml.kernel.org/r/20230303213250.3555716-1-surenb@google.com
+[surenb@google.com: build fix]
+  Link: https://lkml.kernel.org/r/CAJuCfpFjWhtzRE1X=J+_JjgJzNKhq-=JT8yTBSTHthwp0pqWZw@mail.gmail.com
 Link: https://lkml.kernel.org/r/20230227173632.3292573-16-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |    5 +++++
- mm/rmap.c       |   31 ++++++++++++++++---------------
- 2 files changed, 21 insertions(+), 15 deletions(-)
+ include/linux/mm.h |   41 ++++++++++++++++++++++++++++++-----------
+ mm/khugepaged.c    |    8 ++++++++
+ mm/rmap.c          |   31 ++++++++++++++++---------------
+ 3 files changed, 54 insertions(+), 26 deletions(-)
 
+--- a/include/linux/mm.h~mm-khugepaged-write-lock-vma-while-collapsing-a-huge-page
++++ a/include/linux/mm.h
+@@ -665,18 +665,23 @@ static inline void vma_end_read(struct v
+ 	rcu_read_unlock();
+ }
+ 
+-static inline void vma_start_write(struct vm_area_struct *vma)
++static bool __is_vma_write_locked(struct vm_area_struct *vma, int *mm_lock_seq)
+ {
+-	int mm_lock_seq;
+-
+ 	mmap_assert_write_locked(vma->vm_mm);
+ 
+ 	/*
+ 	 * current task is holding mmap_write_lock, both vma->vm_lock_seq and
+ 	 * mm->mm_lock_seq can't be concurrently modified.
+ 	 */
+-	mm_lock_seq = READ_ONCE(vma->vm_mm->mm_lock_seq);
+-	if (vma->vm_lock_seq == mm_lock_seq)
++	*mm_lock_seq = READ_ONCE(vma->vm_mm->mm_lock_seq);
++	return (vma->vm_lock_seq == *mm_lock_seq);
++}
++
++static inline void vma_start_write(struct vm_area_struct *vma)
++{
++	int mm_lock_seq;
++
++	if (__is_vma_write_locked(vma, &mm_lock_seq))
+ 		return;
+ 
+ 	down_write(&vma->lock);
+@@ -684,14 +689,26 @@ static inline void vma_start_write(struc
+ 	up_write(&vma->lock);
+ }
+ 
++static inline bool vma_try_start_write(struct vm_area_struct *vma)
++{
++	int mm_lock_seq;
++
++	if (__is_vma_write_locked(vma, &mm_lock_seq))
++		return true;
++
++	if (!down_write_trylock(&vma->vm_lock->lock))
++		return false;
++
++	vma->vm_lock_seq = mm_lock_seq;
++	up_write(&vma->vm_lock->lock);
++	return true;
++}
++
+ static inline void vma_assert_write_locked(struct vm_area_struct *vma)
+ {
+-	mmap_assert_write_locked(vma->vm_mm);
+-	/*
+-	 * current task is holding mmap_write_lock, both vma->vm_lock_seq and
+-	 * mm->mm_lock_seq can't be concurrently modified.
+-	 */
+-	VM_BUG_ON_VMA(vma->vm_lock_seq != READ_ONCE(vma->vm_mm->mm_lock_seq), vma);
++	int mm_lock_seq;
++
++	VM_BUG_ON_VMA(!__is_vma_write_locked(vma, &mm_lock_seq), vma);
+ }
+ 
+ #else /* CONFIG_PER_VMA_LOCK */
+@@ -701,6 +718,8 @@ static inline bool vma_start_read(struct
+ 		{ return false; }
+ static inline void vma_end_read(struct vm_area_struct *vma) {}
+ static inline void vma_start_write(struct vm_area_struct *vma) {}
++static inline bool vma_try_start_write(struct vm_area_struct *vma)
++		{ return true; }
+ static inline void vma_assert_write_locked(struct vm_area_struct *vma) {}
+ 
+ #endif /* CONFIG_PER_VMA_LOCK */
 --- a/mm/khugepaged.c~mm-khugepaged-write-lock-vma-while-collapsing-a-huge-page
 +++ a/mm/khugepaged.c
-@@ -1061,6 +1061,7 @@ static int collapse_huge_page(struct mm_
+@@ -1056,6 +1056,7 @@ static int collapse_huge_page(struct mm_
  	if (result != SCAN_SUCCEED)
  		goto out_up_write;
  
@@ -33,7 +111,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	anon_vma_lock_write(vma->anon_vma);
  
  	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, mm, address,
-@@ -1522,6 +1523,9 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1517,6 +1518,9 @@ int collapse_pte_mapped_thp(struct mm_st
  		goto drop_hpage;
  	}
  
@@ -43,14 +121,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * We need to lock the mapping so that from here on, only GUP-fast and
  	 * hardware page walks can access the parts of the page tables that
-@@ -1727,6 +1731,7 @@ static int retract_page_tables(struct ad
- 				result = SCAN_PTE_UFFD_WP;
- 				goto unlock_next;
- 			}
-+			vma_start_write(vma);
- 			collapse_and_free_pmd(mm, vma, addr, pmd);
- 			if (!cc->is_khugepaged && is_target)
- 				result = set_huge_pmd(vma, addr, pmd, hpage);
+@@ -1694,6 +1698,10 @@ static int retract_page_tables(struct ad
+ 		result = SCAN_PTE_MAPPED_HUGEPAGE;
+ 		if ((cc->is_khugepaged || is_target) &&
+ 		    mmap_write_trylock(mm)) {
++			/* trylock for the same lock inversion as above */
++			if (!vma_try_start_write(vma))
++				goto unlock_next;
++
+ 			/*
+ 			 * Re-check whether we have an ->anon_vma, because
+ 			 * collapse_and_free_pmd() requires that either no
 --- a/mm/rmap.c~mm-khugepaged-write-lock-vma-while-collapsing-a-huge-page
 +++ a/mm/rmap.c
 @@ -25,21 +25,22 @@
