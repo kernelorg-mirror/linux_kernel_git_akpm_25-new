@@ -1,6 +1,6 @@
 From: "Mike Rapoport (IBM)" <rppt@kernel.org>
 Subject: mm: move most of core MM initialization to mm/mm_init.c
-Date: Sun, 19 Mar 2023 23:59:57 +0200
+Date: Tue, 21 Mar 2023 19:05:02 +0200
 
 The bulk of memory management initialization code is spread all over
 mm/page_alloc.c and makes navigating through page allocator functionality
@@ -12,18 +12,47 @@ mm/page_alloc.c reaches 10k lines.
 
 No functional changes.
 
-Link: https://lkml.kernel.org/r/20230319220008.2138576-5-rppt@kernel.org
+Link: https://lkml.kernel.org/r/20230321170513.2401534-4-rppt@kernel.org
 Signed-off-by: Mike Rapoport (IBM) <rppt@kernel.org>
 Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Doug Berger <opendmb@gmail.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Mel Gorman <mgorman@suse.de>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ include/linux/gfp.h |    5 
+ mm/cma.c            |    1 
+ mm/internal.h       |   38 
+ mm/mm_init.c        | 2304 +++++++++++++++++++++++++++++++++++++++++
+ mm/page_alloc.c     | 2344 ------------------------------------------
+ 5 files changed, 2353 insertions(+), 2339 deletions(-)
 
+--- a/include/linux/gfp.h~mm-move-most-of-core-mm-initialization-to-mm-mm_initc
++++ a/include/linux/gfp.h
+@@ -361,9 +361,4 @@ extern struct page *alloc_contig_pages(u
+ #endif
+ void free_contig_range(unsigned long pfn, unsigned long nr_pages);
+ 
+-#ifdef CONFIG_CMA
+-/* CMA stuff */
+-extern void init_cma_reserved_pageblock(struct page *page);
+-#endif
+-
+ #endif /* __LINUX_GFP_H */
+--- a/mm/cma.c~mm-move-most-of-core-mm-initialization-to-mm-mm_initc
++++ a/mm/cma.c
+@@ -33,6 +33,7 @@
+ #include <linux/kmemleak.h>
+ #include <trace/events/cma.h>
+ 
++#include "internal.h"
+ #include "cma.h"
+ 
+ struct cma cma_areas[MAX_CMA_AREAS];
 --- a/mm/internal.h~mm-move-most-of-core-mm-initialization-to-mm-mm_initc
 +++ a/mm/internal.h
 @@ -202,6 +202,8 @@ pmd_t *mm_find_pmd(struct mm_struct *mm,
@@ -73,8 +102,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  extern void *memmap_alloc(phys_addr_t size, phys_addr_t align,
  			  phys_addr_t min_addr,
-@@ -679,6 +704,12 @@ static inline loff_t fadvise_calc_endbyt
- }
+@@ -474,7 +499,12 @@ isolate_migratepages_range(struct compac
+ 
+ int __alloc_contig_migrate_range(struct compact_control *cc,
+ 					unsigned long start, unsigned long end);
+-#endif
++
++/* Free whole pageblock and set its migration type to MIGRATE_CMA. */
++void init_cma_reserved_pageblock(struct page *page);
++
++#endif /* CONFIG_COMPACTION || CONFIG_CMA */
++
+ int find_suitable_fallback(struct free_area *area, unsigned int order,
+ 			int migratetype, bool only_stealable, bool *can_steal);
+ 
+@@ -658,6 +688,12 @@ static inline void vunmap_range_noflush(
+ #endif /* !CONFIG_MMU */
  
  /* Memory initialisation debug and verification */
 +#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
@@ -103,7 +146,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #ifdef CONFIG_DEBUG_MEMORY_INIT
  int __meminitdata mminit_loglevel;
-@@ -198,3 +205,2280 @@ static int __init mm_sysfs_init(void)
+@@ -198,3 +205,2300 @@ static int __init mm_sysfs_init(void)
  	return 0;
  }
  postcore_initcall(mm_sysfs_init);
@@ -2176,6 +2219,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +#endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
 +
++#ifdef CONFIG_CMA
++void __init init_cma_reserved_pageblock(struct page *page)
++{
++	unsigned i = pageblock_nr_pages;
++	struct page *p = page;
++
++	do {
++		__ClearPageReserved(p);
++		set_page_count(p, 0);
++	} while (++p, --i);
++
++	set_pageblock_migratetype(page, MIGRATE_CMA);
++	set_page_refcounted(page);
++	__free_pages(page, pageblock_order);
++
++	adjust_managed_page_count(page, pageblock_nr_pages);
++	page_zone(page)->cma_pages += pageblock_nr_pages;
++}
++#endif
++
 +void __init page_alloc_init_late(void)
 +{
 +	struct zone *zone;
@@ -2698,7 +2761,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Check that the whole (or subset of) a pageblock given by the interval of
   * [start_pfn, end_pfn) is valid and within the same zone, before scanning it
-@@ -1874,424 +1653,6 @@ void clear_zone_contiguous(struct zone *
+@@ -1874,445 +1653,6 @@ void clear_zone_contiguous(struct zone *
  	zone->contiguous = false;
  }
  
@@ -3120,10 +3183,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		set_zone_contiguous(zone);
 -}
 -
+-#ifdef CONFIG_CMA
+-/* Free whole pageblock and set its migration type to MIGRATE_CMA. */
+-void __init init_cma_reserved_pageblock(struct page *page)
+-{
+-	unsigned i = pageblock_nr_pages;
+-	struct page *p = page;
+-
+-	do {
+-		__ClearPageReserved(p);
+-		set_page_count(p, 0);
+-	} while (++p, --i);
+-
+-	set_pageblock_migratetype(page, MIGRATE_CMA);
+-	set_page_refcounted(page);
+-	__free_pages(page, pageblock_order);
+-
+-	adjust_managed_page_count(page, pageblock_nr_pages);
+-	page_zone(page)->cma_pages += pageblock_nr_pages;
+-}
+-#endif
+-
  /*
   * The order of subdivision here is critical for the IO subsystem.
   * Please do not alter this order without good reasons and regression
-@@ -6526,7 +5887,6 @@ static void per_cpu_pages_init(struct pe
+@@ -6547,7 +5887,6 @@ static void per_cpu_pages_init(struct pe
  #define BOOT_PAGESET_BATCH	1
  static DEFINE_PER_CPU(struct per_cpu_pages, boot_pageset);
  static DEFINE_PER_CPU(struct per_cpu_zonestat, boot_zonestats);
@@ -3131,7 +3215,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static void __build_all_zonelists(void *data)
  {
-@@ -6640,366 +6000,6 @@ void __ref build_all_zonelists(pg_data_t
+@@ -6661,366 +6000,6 @@ void __ref build_all_zonelists(pg_data_t
  #endif
  }
  
@@ -3498,7 +3582,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int zone_batchsize(struct zone *zone)
  {
  #ifdef CONFIG_MMU
-@@ -7238,7 +6238,7 @@ void __init setup_per_cpu_pageset(void)
+@@ -7259,7 +6238,7 @@ void __init setup_per_cpu_pageset(void)
  			alloc_percpu(struct per_cpu_nodestat);
  }
  
@@ -3507,7 +3591,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	/*
  	 * per cpu subsystem is not up at this point. The following code
-@@ -7255,1148 +6255,6 @@ static __meminit void zone_pcp_init(stru
+@@ -7276,1148 +6255,6 @@ static __meminit void zone_pcp_init(stru
  			 zone->present_pages, zone_batchsize(zone));
  }
  
@@ -4656,7 +4740,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  void adjust_managed_page_count(struct page *page, long count)
  {
  	atomic_long_add(count, &page_zone(page)->managed_pages);
-@@ -8495,22 +6353,6 @@ void __init mem_init_print_info(void)
+@@ -8516,22 +6353,6 @@ void __init mem_init_print_info(void)
  		);
  }
  
@@ -4679,7 +4763,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int page_alloc_cpu_dead(unsigned int cpu)
  {
  	struct zone *zone;
-@@ -8952,149 +6794,6 @@ out:
+@@ -8976,149 +6797,6 @@ out:
  	return ret;
  }
  
