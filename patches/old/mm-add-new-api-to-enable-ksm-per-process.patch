@@ -1,8 +1,8 @@
 From: Stefan Roesch <shr@devkernel.io>
 Subject: mm: add new api to enable ksm per process
-Date: Thu, 23 Feb 2023 20:39:58 -0800
+Date: Fri, 10 Mar 2023 10:28:49 -0800
 
-Patch series "mm: process/cgroup ksm support", v3.
+Patch series "mm: process/cgroup ksm support", v4.
 
 So far KSM can only be enabled by calling madvise for memory regions.  To
 be able to use KSM for more workloads, KSM needs to have the ability to be
@@ -29,7 +29,7 @@ Use case 3:
 
   With the madvise call sharing opportunities are only enabled for the
   current process: it is a workload-local decision.  A considerable number
-  of sharing opportuniites may exist across multiple workloads or jobs. 
+  of sharing opportuniites may exist across multiple workloads or jobs.
   Only a higler level entity like a job scheduler or container can know
   for certain if its running one or more instances of a job.  That job
   scheduler however doesn't have the necessary internal worklaod knowledge
@@ -50,10 +50,9 @@ Performance:
   Experiments with using UKSM have shown a capacity increase of around
   20%.
 
-
 1. New options for prctl system command
 
-   This patch series adds two new options to the prctl system call. 
+   This patch series adds two new options to the prctl system call.
    The first one allows to enable KSM at the process level and the second
    one to query the setting.
 
@@ -86,12 +85,13 @@ Performance:
 
 5. Add more tests to ksm_tests
 
-   This adds an option to specify the merge type to the ksm_tests. 
+   This adds an option to specify the merge type to the ksm_tests.
    This allows to test madvise and prctl KSM.  It also adds a new option
    to query if prctl KSM has been enabled.  It adds a fork test to verify
    that the KSM process setting is inherited by client processes.
 
 An update to the prctl(2) manpage has been proposed at [1].
+
 
 This patch (of 3):
 
@@ -131,9 +131,11 @@ basis instead of only at the VMA basis (with madvise).
    - enable ksm for all vmas of a process (if the vmas support it).
    - query if ksm has been enabled for a process.
 
+Link: https://lkml.kernel.org/r/20230310182851.2579138-1-shr@devkernel.io
 Link: https://lkml.kernel.org/r/20230227220206.436662-1-shr@devkernel.io [1]
 Link: https://lkml.kernel.org/r/20230224044000.3084046-1-shr@devkernel.io
 Link: https://lkml.kernel.org/r/20230224044000.3084046-2-shr@devkernel.io
+Link: https://lkml.kernel.org/r/20230310182851.2579138-2-shr@devkernel.io
 Signed-off-by: Stefan Roesch <shr@devkernel.io>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
@@ -143,6 +145,12 @@ Cc: Bagas Sanjaya <bagasdotme@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ include/linux/ksm.h            |   14 +++-
+ include/linux/sched/coredump.h |    1 
+ include/uapi/linux/prctl.h     |    2 
+ kernel/sys.c                   |   27 +++++++++
+ mm/ksm.c                       |   90 +++++++++++++++++++++----------
+ 5 files changed, 101 insertions(+), 33 deletions(-)
 
 --- a/include/linux/ksm.h~mm-add-new-api-to-enable-ksm-per-process
 +++ a/include/linux/ksm.h
@@ -203,7 +211,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/perf_event.h>
  #include <linux/resource.h>
  #include <linux/kernel.h>
-@@ -2661,6 +2662,34 @@ SYSCALL_DEFINE5(prctl, int, option, unsi
+@@ -2672,6 +2673,32 @@ SYSCALL_DEFINE5(prctl, int, option, unsi
  	case PR_SET_VMA:
  		error = prctl_set_vma(arg2, arg3, arg4, arg5);
  		break;
@@ -216,9 +224,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (mmap_write_lock_killable(me->mm))
 +				return -EINTR;
 +
-+			if (test_bit(MMF_VM_MERGEABLE, &me->mm->flags))
-+				error = -EINVAL;
-+			else if (!test_bit(MMF_VM_MERGE_ANY, &me->mm->flags))
++			if (!test_bit(MMF_VM_MERGE_ANY, &me->mm->flags))
 +				error = __ksm_enter(me->mm, MMF_VM_MERGE_ANY);
 +			mmap_write_unlock(me->mm);
 +		} else {
@@ -240,7 +246,77 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		break;
 --- a/mm/ksm.c~mm-add-new-api-to-enable-ksm-per-process
 +++ a/mm/ksm.c
-@@ -1070,6 +1070,7 @@ mm_exiting:
+@@ -515,16 +515,58 @@ static int break_ksm(struct vm_area_stru
+ 	return (ret & VM_FAULT_OOM) ? -ENOMEM : 0;
+ }
+ 
++static bool vma_ksm_compatible(struct vm_area_struct *vma)
++{
++	/*
++	 * Be somewhat over-protective for now!
++	 */
++	if (vma->vm_flags & (VM_MERGEABLE | VM_SHARED  | VM_MAYSHARE   |
++			     VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
++			     VM_HUGETLB | VM_MIXEDMAP))
++		return false;		/* just ignore the advice */
++
++	if (vma_is_dax(vma))
++		return false;
++
++#ifdef VM_SAO
++	if (*vm_flags & VM_SAO)
++		return false;
++#endif
++#ifdef VM_SPARC_ADI
++	if (*vm_flags & VM_SPARC_ADI)
++		return false;
++#endif
++
++	return true;
++}
++
++static bool vma_ksm_mergeable(struct vm_area_struct *vma)
++{
++	if (vma->vm_flags & VM_MERGEABLE)
++		return true;
++
++	if (test_bit(MMF_VM_MERGE_ANY, &vma->vm_mm->flags) &&
++		vma_ksm_compatible(vma))
++		return true;
++
++	return false;
++}
++
+ static struct vm_area_struct *find_mergeable_vma(struct mm_struct *mm,
+ 		unsigned long addr)
+ {
+ 	struct vm_area_struct *vma;
++
+ 	if (ksm_test_exit(mm))
+ 		return NULL;
++
+ 	vma = vma_lookup(mm, addr);
+-	if (!vma || !(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
++	if (!vma || !vma->anon_vma)
+ 		return NULL;
+-	return vma;
++	if (vma_ksm_mergeable(vma))
++		return vma;
++
++	return NULL;
+ }
+ 
+ static void break_cow(struct ksm_rmap_item *rmap_item)
+@@ -1003,7 +1045,7 @@ static int unmerge_and_remove_all_rmap_i
+ 			goto mm_exiting;
+ 
+ 		for_each_vma(vmi, vma) {
+-			if (!(vma->vm_flags & VM_MERGEABLE) || !vma->anon_vma)
++			if (!vma_ksm_mergeable(vma) || !vma->anon_vma)
+ 				continue;
+ 			err = unmerge_ksm_pages(vma,
+ 						vma->vm_start, vma->vm_end);
+@@ -1026,6 +1068,7 @@ mm_exiting:
  
  			mm_slot_free(mm_slot_cache, mm_slot);
  			clear_bit(MMF_VM_MERGEABLE, &mm->flags);
@@ -248,47 +324,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			mmdrop(mm);
  		} else
  			spin_unlock(&ksm_mmlist_lock);
-@@ -2338,6 +2339,17 @@ static struct ksm_rmap_item *get_next_rm
- 	return rmap_item;
- }
- 
-+static bool vma_ksm_mergeable(struct vm_area_struct *vma)
-+{
-+	if (vma->vm_flags & VM_MERGEABLE)
-+		return true;
-+
-+	if (test_bit(MMF_VM_MERGE_ANY, &vma->vm_mm->flags))
-+		return true;
-+
-+	return false;
-+}
-+
- static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
- {
- 	struct mm_struct *mm;
-@@ -2414,8 +2426,20 @@ next_mm:
+@@ -2338,8 +2381,9 @@ next_mm:
  		goto no_vmas;
  
  	for_each_vma(vmi, vma) {
 -		if (!(vma->vm_flags & VM_MERGEABLE))
 +		if (!vma_ksm_mergeable(vma))
  			continue;
-+		if (!(vma->vm_flags & VM_MERGEABLE)) {
-+			unsigned long flags = vma->vm_flags;
 +
-+			/* madvise failed, use next vma */
-+			if (ksm_madvise(vma, vma->vm_start, vma->vm_end, MADV_MERGEABLE, &flags))
-+				continue;
-+			/* vma, not supported as being mergeable */
-+			if (!(flags & VM_MERGEABLE))
-+				continue;
-+
-+			vm_flags_set(vma, VM_MERGEABLE);
-+		}
  		if (ksm_scan.address < vma->vm_start)
  			ksm_scan.address = vma->vm_start;
  		if (!vma->anon_vma)
-@@ -2500,6 +2524,7 @@ no_vmas:
+@@ -2408,6 +2452,7 @@ no_vmas:
  
  		mm_slot_free(mm_slot_cache, mm_slot);
  		clear_bit(MMF_VM_MERGEABLE, &mm->flags);
@@ -296,10 +343,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		mmap_read_unlock(mm);
  		mmdrop(mm);
  	} else {
-@@ -2604,8 +2629,9 @@ int ksm_madvise(struct vm_area_struct *v
- 			return 0;
- #endif
+@@ -2493,28 +2538,12 @@ int ksm_madvise(struct vm_area_struct *v
  
+ 	switch (advice) {
+ 	case MADV_MERGEABLE:
+-		/*
+-		 * Be somewhat over-protective for now!
+-		 */
+-		if (*vm_flags & (VM_MERGEABLE | VM_SHARED  | VM_MAYSHARE   |
+-				 VM_PFNMAP    | VM_IO      | VM_DONTEXPAND |
+-				 VM_HUGETLB | VM_MIXEDMAP))
+-			return 0;		/* just ignore the advice */
+-
+-		if (vma_is_dax(vma))
++		if (!vma_ksm_compatible(vma))
+ 			return 0;
+ 
+-#ifdef VM_SAO
+-		if (*vm_flags & VM_SAO)
+-			return 0;
+-#endif
+-#ifdef VM_SPARC_ADI
+-		if (*vm_flags & VM_SPARC_ADI)
+-			return 0;
+-#endif
+-
 -		if (!test_bit(MMF_VM_MERGEABLE, &mm->flags)) {
 -			err = __ksm_enter(mm);
 +		if (!test_bit(MMF_VM_MERGEABLE, &mm->flags) &&
@@ -308,7 +376,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (err)
  				return err;
  		}
-@@ -2631,7 +2657,7 @@ int ksm_madvise(struct vm_area_struct *v
+@@ -2540,7 +2569,7 @@ int ksm_madvise(struct vm_area_struct *v
  }
  EXPORT_SYMBOL_GPL(ksm_madvise);
  
@@ -317,7 +385,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct ksm_mm_slot *mm_slot;
  	struct mm_slot *slot;
-@@ -2664,7 +2690,7 @@ int __ksm_enter(struct mm_struct *mm)
+@@ -2573,7 +2602,7 @@ int __ksm_enter(struct mm_struct *mm)
  		list_add_tail(&slot->mm_node, &ksm_scan.mm_slot->slot.mm_node);
  	spin_unlock(&ksm_mmlist_lock);
  
@@ -326,48 +394,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mmgrab(mm);
  
  	if (needs_wakeup)
-@@ -2673,12 +2699,39 @@ int __ksm_enter(struct mm_struct *mm)
+@@ -2583,12 +2612,17 @@ int __ksm_enter(struct mm_struct *mm)
  	return 0;
  }
  
 -void __ksm_exit(struct mm_struct *mm)
-+static void unmerge_vmas(struct mm_struct *mm)
-+{
-+	struct vm_area_struct *vma;
-+	struct vma_iterator vmi;
-+
-+	vma_iter_init(&vmi, mm, 0);
-+
-+	mmap_read_lock(mm);
-+	for_each_vma(vmi, vma) {
-+		if (vma->vm_flags & VM_MERGEABLE) {
-+			unsigned long flags = vma->vm_flags;
-+
-+			if (ksm_madvise(vma, vma->vm_start, vma->vm_end, MADV_UNMERGEABLE, &flags))
-+				continue;
-+
-+			vm_flags_clear(vma, VM_MERGEABLE);
-+		}
-+	}
-+	mmap_read_unlock(mm);
-+}
-+
 +void __ksm_exit(struct mm_struct *mm, int flag)
  {
  	struct ksm_mm_slot *mm_slot;
  	struct mm_slot *slot;
  	int easy_to_free = 0;
  
-+	if (!(current->flags & PF_EXITING) && flag == MMF_VM_MERGE_ANY &&
-+		test_bit(MMF_VM_MERGE_ANY, &mm->flags)) {
++	if (!(current->flags & PF_EXITING) &&
++	      flag == MMF_VM_MERGE_ANY &&
++	      test_bit(MMF_VM_MERGE_ANY, &mm->flags))
 +		clear_bit(MMF_VM_MERGE_ANY, &mm->flags);
-+		unmerge_vmas(mm);
-+	}
 +
  	/*
  	 * This process is exiting: if it's straightforward (as is the
  	 * case when ksmd was never running), free mm_slot immediately.
-@@ -2705,7 +2758,7 @@ void __ksm_exit(struct mm_struct *mm)
+@@ -2615,7 +2649,7 @@ void __ksm_exit(struct mm_struct *mm)
  
  	if (easy_to_free) {
  		mm_slot_free(mm_slot_cache, mm_slot);
