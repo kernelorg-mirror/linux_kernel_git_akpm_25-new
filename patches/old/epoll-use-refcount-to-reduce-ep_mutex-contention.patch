@@ -1,6 +1,6 @@
 From: Paolo Abeni <pabeni@redhat.com>
 Subject: epoll: use refcount to reduce ep_mutex contention
-Date: Tue, 7 Mar 2023 19:46:37 +0100
+Date: Wed, 22 Mar 2023 17:57:02 +0100
 
 We are observing huge contention on the epmutex during an http
 connection/rate test:
@@ -12,61 +12,65 @@ connection/rate test:
                                  |--58.41%--__mutex_lock.isra.6
                                            |--56.56%--osq_lock
 
-The application is multi-threaded, creates a new epoll entry for each
-incoming connection, and does not delete it before the connection shutdown
-- that is, before the connection's fd close().
+The application is multi-threaded, creates a new epoll entry for
+each incoming connection, and does not delete it before the
+connection shutdown - that is, before the connection's fd close().
 
-Many different threads compete frequently for the epmutex lock, affecting
-the overall performance.
+Many different threads compete frequently for the epmutex lock,
+affecting the overall performance.
 
 To reduce the contention this patch introduces explicit reference counting
-for the eventpoll struct.  Each registered event acquires a reference, and
-references are released at ep_remove() time.
+for the eventpoll struct. Each registered event acquires a reference,
+and references are released at ep_remove() time.
 
 The eventpoll struct is released by whoever - among EP file close() and
 and the monitored file close() drops its last reference.
 
 Additionally, this introduces a new 'dying' flag to prevent races between
-the EP file close() and the monitored file close(). 
+the EP file close() and the monitored file close().
 ep_eventpoll_release() marks, under f_lock spinlock, each epitem as dying
 before removing it, while EP file close() does not touch dying epitems.
 
 The above is needed as both close operations could run concurrently and
-drop the EP reference acquired via the epitem entry.  Without the above
+drop the EP reference acquired via the epitem entry. Without the above
 flag, the monitored file close() could reach the EP struct via the epitem
 list while the epitem is still listed and then try to put it after its
 disposal.
 
-An alternative could be avoiding touching the references acquired via the
-epitems at EP file close() time, but that could leave the EP struct alive
-for potentially unlimited time after EP file close(), with nasty side
-effects.
+An alternative could be avoiding touching the references acquired via
+the epitems at EP file close() time, but that could leave the EP struct
+alive for potentially unlimited time after EP file close(), with nasty
+side effects.
 
-With all the above in place, we can drop the epmutex usage at disposal
-time.
+With all the above in place, we can drop the epmutex usage at disposal time.
 
 Overall this produces a significant performance improvement in the
 mentioned connection/rate scenario: the mutex operations disappear from
-the topmost offenders in the perf report, and the measured
-connections/rate grows by ~60%.
+the topmost offenders in the perf report, and the measured connections/rate
+grows by ~60%.
 
 To make the change more readable this additionally renames ep_free() to
 ep_clear_and_put(), and moves the actual memory cleanup in a separate
 ep_free() helper.
 
-Link: https://lkml.kernel.org/r/e8228f0048977456466bc33b42600e929fedd319.1678213651.git.pabeni@redhat.com
+Link: https://lkml.kernel.org/r/4a57788dcaf28f5eb4f8dfddcc3a8b172a7357bb.1679504153.git.pabeni@redhat.com
 Signed-off-by: Paolo Abeni <pabeni@redhat.com>
-Tested-by: Xiumei Mu <xmu@redhat.com>
-Reviewed-by: Jacob Keller <jacob.e.keller@intel.com>
+Co-developed-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Tested-by: Xiumei Mu <xmu@redhiat.com>
 Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
-Cc: Al Viro <viro@zeniv.linux.org.uk>
+Reviewed-by: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
 Cc: Carlos Maiolino <cmaiolino@redhat.com>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Eric Biggers <ebiggers@kernel.org>
+Cc: Jacob Keller <jacob.e.keller@intel.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ fs/eventpoll.c |  195 +++++++++++++++++++++++++++++------------------
+ 1 file changed, 123 insertions(+), 72 deletions(-)
 
 --- a/fs/eventpoll.c~epoll-use-refcount-to-reduce-ep_mutex-contention
 +++ a/fs/eventpoll.c
@@ -133,7 +137,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  static void ep_unregister_pollwait(struct eventpoll *ep, struct epitem *epi)
  {
-@@ -681,11 +685,38 @@ static void epi_rcu_free(struct rcu_head
+@@ -681,11 +685,40 @@ static void epi_rcu_free(struct rcu_head
  	kmem_cache_free(epi_cache, epi);
  }
  
@@ -166,6 +170,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * Removes a "struct epitem" from the eventpoll RB tree and deallocates
   * all the associated resources. Must be called with "mtx" held.
 + * If the dying flag is set, do the removal only if force is true.
++ * This prevents ep_clear_and_put() from dropping all the ep references
++ * while running concurrently with eventpoll_release_file().
 + * Returns true if the eventpoll can be disposed.
   */
 -static int ep_remove(struct eventpoll *ep, struct epitem *epi)
@@ -173,7 +179,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct file *file = epi->ffd.file;
  	struct epitems_head *to_free;
-@@ -700,6 +731,11 @@ static int ep_remove(struct eventpoll *e
+@@ -700,6 +733,11 @@ static int ep_remove(struct eventpoll *e
  
  	/* Remove the current item from the list of epoll hooks */
  	spin_lock(&file->f_lock);
@@ -185,7 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	to_free = NULL;
  	head = file->f_ep;
  	if (head->first == &epi->fllink && !epi->fllink.next) {
-@@ -733,28 +769,28 @@ static int ep_remove(struct eventpoll *e
+@@ -733,28 +771,28 @@ static int ep_remove(struct eventpoll *e
  	call_rcu(&epi->rcu, epi_rcu_free);
  
  	percpu_counter_dec(&ep->user->epoll_watches);
@@ -204,7 +210,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -static void ep_free(struct eventpoll *ep)
 +static void ep_clear_and_put(struct eventpoll *ep)
  {
- 	struct rb_node *rbp;
+-	struct rb_node *rbp;
++	struct rb_node *rbp, *next;
  	struct epitem *epi;
 +	bool dispose;
  
@@ -225,21 +232,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Walks through the whole tree by unregistering poll callbacks.
-@@ -768,25 +804,21 @@ static void ep_free(struct eventpoll *ep
+@@ -767,26 +805,25 @@ static void ep_free(struct eventpoll *ep
+ 	}
  
  	/*
- 	 * Walks through the whole tree by freeing each "struct epitem". At this
+-	 * Walks through the whole tree by freeing each "struct epitem". At this
 -	 * point we are sure no poll callbacks will be lingering around, and also by
 -	 * holding "epmutex" we can be sure that no file cleanup code will hit
 -	 * us during this operation. So we can avoid the lock on "ep->lock".
 -	 * We do not need to lock ep->mtx, either, we only do it to prevent
 -	 * a lockdep warning.
-+	 * point we are sure no poll callbacks will be lingering around.
++	 * Walks through the whole tree and try to free each "struct epitem".
++	 * Note that ep_remove_safe() will not remove the epitem in case of a
++	 * racing eventpoll_release_file(); the latter will do the removal.
++	 * At this point we are sure no poll callbacks will be lingering around.
 +	 * Since we still own a reference to the eventpoll struct, the loop can't
 +	 * dispose it.
  	 */
 -	mutex_lock(&ep->mtx);
- 	while ((rbp = rb_first_cached(&ep->rbr)) != NULL) {
+-	while ((rbp = rb_first_cached(&ep->rbr)) != NULL) {
++	for (rbp = rb_first_cached(&ep->rbr); rbp; rbp = next) {
++		next = rb_next(rbp);
  		epi = rb_entry(rbp, struct epitem, rbn);
 -		ep_remove(ep, epi);
 +		ep_remove_safe(ep, epi);
@@ -259,7 +272,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int ep_eventpoll_release(struct inode *inode, struct file *file)
-@@ -794,7 +826,7 @@ static int ep_eventpoll_release(struct i
+@@ -794,7 +831,7 @@ static int ep_eventpoll_release(struct i
  	struct eventpoll *ep = file->private_data;
  
  	if (ep)
@@ -268,7 +281,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return 0;
  }
-@@ -906,33 +938,35 @@ void eventpoll_release_file(struct file
+@@ -906,33 +943,34 @@ void eventpoll_release_file(struct file
  {
  	struct eventpoll *ep;
  	struct epitem *epi;
@@ -287,7 +300,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 * from anywhere but ep_free().
 -	 *
 -	 * Besides, ep_remove() acquires the lock, so we can't hold it here.
-+	 * Use the 'dying' flag to prevent a concurrent ep_cleat_and_put() from
++	 * Use the 'dying' flag to prevent a concurrent ep_clear_and_put() from
 +	 * touching the epitems list before eventpoll_release_file() can access
 +	 * the ep->mtx.
  	 */
@@ -300,7 +313,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +again:
 +	spin_lock(&file->f_lock);
 +	if (file->f_ep && file->f_ep->first) {
-+		/* detach from ep tree */
 +		epi = hlist_entry(file->f_ep->first, struct epitem, fllink);
 +		epi->dying = true;
 +		spin_unlock(&file->f_lock);
@@ -325,7 +337,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int ep_alloc(struct eventpoll **pep)
-@@ -955,6 +989,7 @@ static int ep_alloc(struct eventpoll **p
+@@ -955,6 +993,7 @@ static int ep_alloc(struct eventpoll **p
  	ep->rbr = RB_ROOT_CACHED;
  	ep->ovflist = EP_UNACTIVE_PTR;
  	ep->user = user;
@@ -333,7 +345,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	*pep = ep;
  
-@@ -1223,10 +1258,10 @@ out_unlock:
+@@ -1223,10 +1262,10 @@ out_unlock:
  		 */
  		list_del_init(&wait->entry);
  		/*
@@ -348,7 +360,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 */
  		smp_store_release(&ep_pwq_from_wait(wait)->whead, NULL);
  	}
-@@ -1496,16 +1531,22 @@ static int ep_insert(struct eventpoll *e
+@@ -1496,16 +1535,22 @@ static int ep_insert(struct eventpoll *e
  	if (tep)
  		mutex_unlock(&tep->mtx);
  
@@ -373,7 +385,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			return error;
  		}
  	}
-@@ -1529,7 +1570,7 @@ static int ep_insert(struct eventpoll *e
+@@ -1529,7 +1574,7 @@ static int ep_insert(struct eventpoll *e
  	 * high memory pressure.
  	 */
  	if (unlikely(!epq.epi)) {
@@ -382,7 +394,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return -ENOMEM;
  	}
  
-@@ -2025,7 +2066,7 @@ static int do_epoll_create(int flags)
+@@ -2025,7 +2070,7 @@ static int do_epoll_create(int flags)
  out_free_fd:
  	put_unused_fd(fd);
  out_free_ep:
@@ -391,7 +403,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return error;
  }
  
-@@ -2167,10 +2208,16 @@ int do_epoll_ctl(int epfd, int op, int f
+@@ -2167,10 +2212,16 @@ int do_epoll_ctl(int epfd, int op, int f
  			error = -EEXIST;
  		break;
  	case EPOLL_CTL_DEL:
