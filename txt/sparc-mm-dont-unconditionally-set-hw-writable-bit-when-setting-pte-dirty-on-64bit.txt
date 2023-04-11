@@ -1,0 +1,93 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: sparc/mm: don't unconditionally set HW writable bit when setting PTE dirty on 64bit
+Date: Tue, 11 Apr 2023 16:25:09 +0200
+
+On sparc64, there is no HW modified bit, therefore, SW tracks via a SW bit
+if the PTE is dirty via pte_mkdirty().  However, pte_mkdirty() currently
+also unconditionally sets the HW writable bit, which is wrong.
+
+pte_mkdirty() is not supposed to make a PTE actually writable, unless the
+SW writable bit -- pte_write() -- indicates that the PTE is not
+write-protected.  Fortunately, sparc64 also defines a SW writable bit.
+
+For example, this already turned into a problem in the context of THP
+splitting as documented in commit 624a2c94f5b7 ("Partly revert "mm/thp:
+carry over dirty bit when thp splits on pmd""), and for page migration, as
+documented in commit 96a9c287e25d ("mm/migrate: fix wrongly apply write
+bit after mkdirty on sparc64").
+
+Also, we might want to use the dirty PTE bit in the context of KSM with
+shared zeropage [1], whereby setting the page writable would be
+problematic.
+
+But more general, any code that might end up setting a PTE/PMD dirty
+inside a VM without write permissions is possibly broken,
+
+Before this commit (sun4u in QEMU):
+	root@debian:~/linux/tools/testing/selftests/mm# ./mkdirty
+	# [INFO] detected THP size: 8192 KiB
+	TAP version 13
+	1..6
+	# [INFO] PTRACE write access
+	not ok 1 SIGSEGV generated, page not modified
+	# [INFO] PTRACE write access to THP
+	not ok 2 SIGSEGV generated, page not modified
+	# [INFO] Page migration
+	ok 3 SIGSEGV generated, page not modified
+	# [INFO] Page migration of THP
+	ok 4 SIGSEGV generated, page not modified
+	# [INFO] PTE-mapping a THP
+	ok 5 SIGSEGV generated, page not modified
+	# [INFO] UFFDIO_COPY
+	not ok 6 SIGSEGV generated, page not modified
+	Bail out! 3 out of 6 tests failed
+	# Totals: pass:3 fail:3 xfail:0 xpass:0 skip:0 error:0
+
+Test #3,#4,#5 pass ever since we added some MM workarounds, the
+underlying issue remains.
+
+Let's fix the remaining issues and prepare for reverting the workarounds
+by setting the HW writable bit only if both, the SW dirty bit and the SW
+writable bit are set.
+
+We have to move pte_dirty() and pte_dirty() up. The code patching
+mechanism and handling constants > 22bit is a bit special on sparc64.
+
+The ASM logic in pte_mkdirty() and pte_mkwrite() match the logic in
+pte_mkold() to create the mask depending on the machine type. The ASM
+logic in __pte_mkhwwrite() matches the logic in pte_present(), just
+using an "or" instead of an "and" instruction.
+
+With this commit (sun4u in QEMU):
+	root@debian:~/linux/tools/testing/selftests/mm# ./mkdirty
+	# [INFO] detected THP size: 8192 KiB
+	TAP version 13
+	1..6
+	# [INFO] PTRACE write access
+	ok 1 SIGSEGV generated, page not modified
+	# [INFO] PTRACE write access to THP
+	ok 2 SIGSEGV generated, page not modified
+	# [INFO] Page migration
+	ok 3 SIGSEGV generated, page not modified
+	# [INFO] Page migration of THP
+	ok 4 SIGSEGV generated, page not modified
+	# [INFO] PTE-mapping a THP
+	ok 5 SIGSEGV generated, page not modified
+	# [INFO] UFFDIO_COPY
+	ok 6 SIGSEGV generated, page not modified
+	# Totals: pass:6 fail:0 xfail:0 xpass:0 skip:0 error:0
+
+This handling seems to have been in place forever.
+
+[1] https://lkml.kernel.org/r/533a7c3d-3a48-b16b-b421-6e8386e0b142@redhat.com
+
+Link: https://lkml.kernel.org/r/20230411142512.438404-4-david@redhat.com
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Sam Ravnborg <sam@ravnborg.org>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Yu Zhao <yuzhao@google.com>
