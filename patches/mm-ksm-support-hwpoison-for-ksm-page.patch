@@ -1,0 +1,198 @@
+From: Longlong Xia <xialonglong1@huawei.com>
+Subject: mm: ksm: support hwpoison for ksm page
+Date: Fri, 14 Apr 2023 10:17:41 +0800
+
+hwpoison_user_mappings() is updated to support ksm pages, and add
+collect_procs_ksm() to collect processes when the error hit an ksm page. 
+The difference from collect_procs_anon() is that it also needs to traverse
+the rmap-item list on the stable node of the ksm page.  At the same time,
+add_to_kill_ksm() is added to handle ksm pages.  And
+task_in_to_kill_list() is added to avoid duplicate addition of tsk to the
+to_kill list.  This is because when scanning the list, if the pages that
+make up the ksm page all come from the same process, they may be added
+repeatedly.
+
+Link: https://lkml.kernel.org/r/20230414021741.2597273-3-xialonglong1@huawei.com
+Signed-off-by: Longlong Xia <xialonglong1@huawei.com>
+Tested-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Nanyong Sun <sunnanyong@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/ksm.h |   11 ++++++++++
+ include/linux/mm.h  |    7 ++++++
+ mm/ksm.c            |   45 ++++++++++++++++++++++++++++++++++++++++++
+ mm/memory-failure.c |   34 +++++++++++++++++++++++--------
+ 4 files changed, 88 insertions(+), 9 deletions(-)
+
+--- a/include/linux/ksm.h~mm-ksm-support-hwpoison-for-ksm-page
++++ a/include/linux/ksm.h
+@@ -51,6 +51,10 @@ struct page *ksm_might_need_to_copy(stru
+ void rmap_walk_ksm(struct folio *folio, struct rmap_walk_control *rwc);
+ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio);
+ 
++#ifdef CONFIG_MEMORY_FAILURE
++void collect_procs_ksm(struct page *page, struct list_head *to_kill,
++		       int force_early);
++#endif
+ #else  /* !CONFIG_KSM */
+ 
+ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
+@@ -62,6 +66,13 @@ static inline void ksm_exit(struct mm_st
+ {
+ }
+ 
++#ifdef CONFIG_MEMORY_FAILURE
++static inline void collect_procs_ksm(struct page *page,
++				     struct list_head *to_kill, int force_early)
++{
++}
++#endif
++
+ #ifdef CONFIG_MMU
+ static inline int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+ 		unsigned long end, int advice, unsigned long *vm_flags)
+--- a/include/linux/mm.h~mm-ksm-support-hwpoison-for-ksm-page
++++ a/include/linux/mm.h
+@@ -3604,6 +3604,7 @@ extern int __get_huge_page_for_hwpoison(
+ 					bool *migratable_cleared);
+ void num_poisoned_pages_inc(unsigned long pfn);
+ void num_poisoned_pages_sub(unsigned long pfn, long i);
++struct task_struct *task_early_kill(struct task_struct *tsk, int force_early);
+ #else
+ static inline void memory_failure_queue(unsigned long pfn, int flags)
+ {
+@@ -3624,6 +3625,12 @@ static inline void num_poisoned_pages_su
+ }
+ #endif
+ 
++#if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_KSM)
++void add_to_kill_ksm(struct task_struct *tsk, struct page *p,
++		     struct vm_area_struct *vma, struct list_head *to_kill,
++		     unsigned long ksm_addr);
++#endif
++
+ #if defined(CONFIG_MEMORY_FAILURE) && defined(CONFIG_MEMORY_HOTPLUG)
+ extern void memblk_nr_poison_inc(unsigned long pfn);
+ extern void memblk_nr_poison_sub(unsigned long pfn, long i);
+--- a/mm/ksm.c~mm-ksm-support-hwpoison-for-ksm-page
++++ a/mm/ksm.c
+@@ -2738,6 +2738,51 @@ again:
+ 		goto again;
+ }
+ 
++#ifdef CONFIG_MEMORY_FAILURE
++/*
++ * Collect processes when the error hit an ksm page.
++ */
++void collect_procs_ksm(struct page *page, struct list_head *to_kill,
++		       int force_early)
++{
++	struct ksm_stable_node *stable_node;
++	struct ksm_rmap_item *rmap_item;
++	struct folio *folio = page_folio(page);
++	struct vm_area_struct *vma;
++	struct task_struct *tsk;
++
++	stable_node = folio_stable_node(folio);
++	if (!stable_node)
++		return;
++	hlist_for_each_entry(rmap_item, &stable_node->hlist, hlist) {
++		struct anon_vma *av = rmap_item->anon_vma;
++
++		anon_vma_lock_read(av);
++		read_lock(&tasklist_lock);
++		for_each_process(tsk) {
++			struct anon_vma_chain *vmac;
++			unsigned long addr;
++			struct task_struct *t =
++				task_early_kill(tsk, force_early);
++			if (!t)
++				continue;
++			anon_vma_interval_tree_foreach(vmac, &av->rb_root, 0,
++						       ULONG_MAX)
++			{
++				vma = vmac->vma;
++				if (vma->vm_mm == t->mm) {
++					addr = rmap_item->address & PAGE_MASK;
++					add_to_kill_ksm(t, page, vma, to_kill,
++							addr);
++				}
++			}
++		}
++		read_unlock(&tasklist_lock);
++		anon_vma_unlock_read(av);
++	}
++}
++#endif
++
+ #ifdef CONFIG_MIGRATION
+ void folio_migrate_ksm(struct folio *newfolio, struct folio *folio)
+ {
+--- a/mm/memory-failure.c~mm-ksm-support-hwpoison-for-ksm-page
++++ a/mm/memory-failure.c
+@@ -455,6 +455,27 @@ static void add_to_kill_anon_file(struct
+ 	__add_to_kill(tsk, p, vma, to_kill, 0, FSDAX_INVALID_PGOFF);
+ }
+ 
++#ifdef CONFIG_KSM
++static bool task_in_to_kill_list(struct list_head *to_kill,
++				 struct task_struct *tsk)
++{
++	struct to_kill *tk, *next;
++
++	list_for_each_entry_safe(tk, next, to_kill, nd) {
++		if (tk->tsk == tsk)
++			return true;
++	}
++
++	return false;
++}
++void add_to_kill_ksm(struct task_struct *tsk, struct page *p,
++		     struct vm_area_struct *vma, struct list_head *to_kill,
++		     unsigned long ksm_addr)
++{
++	if (!task_in_to_kill_list(to_kill, tsk))
++		__add_to_kill(tsk, p, vma, to_kill, ksm_addr, FSDAX_INVALID_PGOFF);
++}
++#endif
+ /*
+  * Kill the processes that have been collected earlier.
+  *
+@@ -534,8 +555,7 @@ static struct task_struct *find_early_ki
+  * processes sharing the same error page,if the process is "early kill", the
+  * task_struct of the dedicated thread will also be returned.
+  */
+-static struct task_struct *task_early_kill(struct task_struct *tsk,
+-					   int force_early)
++struct task_struct *task_early_kill(struct task_struct *tsk, int force_early)
+ {
+ 	if (!tsk->mm)
+ 		return NULL;
+@@ -666,8 +686,9 @@ static void collect_procs(struct page *p
+ {
+ 	if (!page->mapping)
+ 		return;
+-
+-	if (PageAnon(page))
++	if (unlikely(PageKsm(page)))
++		collect_procs_ksm(page, tokill, force_early);
++	else if (PageAnon(page))
+ 		collect_procs_anon(page, tokill, force_early);
+ 	else
+ 		collect_procs_file(page, tokill, force_early);
+@@ -1522,11 +1543,6 @@ static bool hwpoison_user_mappings(struc
+ 	if (!page_mapped(hpage))
+ 		return true;
+ 
+-	if (PageKsm(p)) {
+-		pr_err("%#lx: can't handle KSM pages.\n", pfn);
+-		return false;
+-	}
+-
+ 	if (PageSwapCache(p)) {
+ 		pr_err("%#lx: keeping poisoned page in swap cache\n", pfn);
+ 		ttu &= ~TTU_HWPOISON;
+_
