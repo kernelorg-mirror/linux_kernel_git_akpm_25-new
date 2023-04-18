@@ -1,6 +1,6 @@
 From: Jiaqi Yan <jiaqiyan@google.com>
 Subject: mm/khugepaged: recover from poisoned file-backed memory
-Date: Mon, 27 Mar 2023 14:15:48 -0700
+Date: Wed, 29 Mar 2023 08:11:21 -0700
 
 Make collapse_file roll back when copying pages failed. More concretely:
 - extract copying operations into a separate loop
@@ -26,9 +26,11 @@ Tested manually:
 5. Signal both threads to inspect their buffer contents and make sure no
    data corruption.
 
-Link: https://lkml.kernel.org/r/20230327211548.462509-4-jiaqiyan@google.com
+Link: https://lkml.kernel.org/r/20230329151121.949896-4-jiaqiyan@google.com
 Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
 Reviewed-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Hugh Dickins <hughd@google.com>
+Cc: David Stevens <stevensd@chromium.org>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
 Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
@@ -40,12 +42,12 @@ Cc: Tony Luck <tony.luck@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |   86 ++++++++++++++++++++++++++++------------------
- 1 file changed, 54 insertions(+), 32 deletions(-)
+ mm/khugepaged.c |   87 +++++++++++++++++++++++++++++-----------------
+ 1 file changed, 56 insertions(+), 31 deletions(-)
 
 --- a/mm/khugepaged.c~mm-khugepaged-recover-from-poisoned-file-backed-memory
 +++ a/mm/khugepaged.c
-@@ -1874,6 +1874,9 @@ static int collapse_file(struct mm_struc
+@@ -1877,6 +1877,9 @@ static int collapse_file(struct mm_struc
  {
  	struct address_space *mapping = file->f_mapping;
  	struct page *hpage;
@@ -55,7 +57,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgoff_t index = 0, end = start + HPAGE_PMD_NR;
  	LIST_HEAD(pagelist);
  	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
-@@ -1918,8 +1921,7 @@ static int collapse_file(struct mm_struc
+@@ -1921,8 +1924,7 @@ static int collapse_file(struct mm_struc
  
  	xas_set(&xas, start);
  	for (index = start; index < end; index++) {
@@ -65,7 +67,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		VM_BUG_ON(index != xas.xa_index);
  		if (is_shmem) {
-@@ -2099,12 +2101,8 @@ out_unlock:
+@@ -2116,12 +2118,8 @@ out_unlock:
  		put_page(page);
  		goto xa_unlocked;
  	}
@@ -79,7 +81,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		filemap_nr_thps_inc(mapping);
  		/*
  		 * Paired with smp_mb() in do_dentry_open() to ensure
-@@ -2115,21 +2113,9 @@ out_unlock:
+@@ -2132,21 +2130,10 @@ out_unlock:
  		smp_mb();
  		if (inode_is_open_for_write(mapping->host)) {
  			result = SCAN_FAIL;
@@ -88,7 +90,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			goto xa_locked;
  		}
  	}
--
+ 
 -	if (nr_none) {
 -		__mod_lruvec_page_state(hpage, NR_FILE_PAGES, nr_none);
 -		/* nr_none is always 0 for non-shmem. */
@@ -98,10 +100,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	/* Join all the small entries into a single multi-index entry */
 -	xas_set_order(&xas, start, HPAGE_PMD_ORDER);
 -	xas_store(&xas, hpage);
- xa_locked:
- 	xas_unlock_irq(&xas);
- xa_unlocked:
-@@ -2142,21 +2128,36 @@ xa_unlocked:
+ 	/* Here we can't get an ENOMEM (because entries were
+ 	 * previously allocated) But let's check for errors
+ 	 * (XArray implementation can be changed in the future)
+@@ -2164,21 +2151,36 @@ xa_unlocked:
  	try_to_unmap_flush();
  
  	if (result == SCAN_SUCCEED) {
@@ -145,7 +147,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			list_del(&page->lru);
  			page->mapping = NULL;
  			page_ref_unfreeze(page, 1);
-@@ -2164,12 +2165,23 @@ xa_unlocked:
+@@ -2186,12 +2188,23 @@ xa_unlocked:
  			ClearPageUnevictable(page);
  			unlock_page(page);
  			put_page(page);
@@ -173,7 +175,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		folio = page_folio(hpage);
  		folio_mark_uptodate(folio);
-@@ -2187,8 +2199,6 @@ xa_unlocked:
+@@ -2209,8 +2222,6 @@ xa_unlocked:
  		unlock_page(hpage);
  		hpage = NULL;
  	} else {
@@ -182,7 +184,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/* Something went wrong: roll back page cache changes */
  		xas_lock_irq(&xas);
  		if (nr_none) {
-@@ -2222,6 +2232,18 @@ xa_unlocked:
+@@ -2244,6 +2255,20 @@ xa_unlocked:
  			xas_lock_irq(&xas);
  		}
  		VM_BUG_ON(nr_none);
@@ -190,13 +192,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * Undo the updates of filemap_nr_thps_inc for non-SHMEM
 +		 * file only. This undo is not needed unless failure is
 +		 * due to SCAN_COPY_MC.
-+		 *
-+		 * Paired with smp_mb() in do_dentry_open() to ensure the
-+		 * update to nr_thps is visible.
 +		 */
-+		smp_mb();
-+		if (!is_shmem && result == SCAN_COPY_MC)
++		if (!is_shmem && result == SCAN_COPY_MC) {
 +			filemap_nr_thps_dec(mapping);
++			/*
++			 * Paired with smp_mb() in do_dentry_open() to
++			 * ensure the update to nr_thps is visible.
++			 */
++			smp_mb();
++		}
 +
  		xas_unlock_irq(&xas);
  

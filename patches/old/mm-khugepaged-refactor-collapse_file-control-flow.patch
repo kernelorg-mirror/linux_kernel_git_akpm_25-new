@@ -1,37 +1,30 @@
 From: David Stevens <stevensd@chromium.org>
 Subject: mm/khugepaged: refactor collapse_file control flow
-Date: Tue, 7 Mar 2023 14:20:34 +0900
-
-Patch series "mm/khugepaged: fix khugepaged+shmem races", v5.
-
-Fix two races in khugepaged+shmem that cause issues with userfaultfd and
-lseek, respectively.
-
-
-This patch (of 3):
+Date: Tue, 4 Apr 2023 21:01:15 +0900
 
 Add a rollback label to deal with failure, instead of continuously
 checking for RESULT_SUCCESS, to make it easier to add more failure cases. 
 The refactoring also allows the collapse_file tracepoint to include hpage
 on success (instead of NULL).
 
-Link: https://lkml.kernel.org/r/20230307052036.1520708-1-stevensd@google.com
-Link: https://lkml.kernel.org/r/20230307052036.1520708-2-stevensd@google.com
+Link: https://lkml.kernel.org/r/20230404120117.2562166-3-stevensd@google.com
 Signed-off-by: David Stevens <stevensd@chromium.org>
 Acked-by: Peter Xu <peterx@redhat.com>
 Reviewed-by: Yang Shi <shy828301@gmail.com>
+Acked-by: Hugh Dickins <hughd@google.com>
 Cc: David Hildenbrand <david@redhat.com>
-Cc: Hugh Dickins <hughd@google.com>
 Cc: Jiaqi Yan <jiaqiyan@google.com>
-Cc: "Kirill A . Shutemov" <kirill@shutemov.name>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ mm/khugepaged.c |  236 ++++++++++++++++++++++------------------------
+ 1 file changed, 116 insertions(+), 120 deletions(-)
 
 --- a/mm/khugepaged.c~mm-khugepaged-refactor-collapse_file-control-flow
 +++ a/mm/khugepaged.c
-@@ -1907,6 +1907,12 @@ static int collapse_file(struct mm_struc
+@@ -1894,6 +1894,12 @@ static int collapse_file(struct mm_struc
  	if (result != SCAN_SUCCEED)
  		goto out;
  
@@ -44,7 +37,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Ensure we have slots for all the pages in the range.  This is
  	 * almost certainly a no-op because most of the pages must be present
-@@ -1919,16 +1925,10 @@ static int collapse_file(struct mm_struc
+@@ -1906,16 +1912,10 @@ static int collapse_file(struct mm_struc
  		xas_unlock_irq(&xas);
  		if (!xas_nomem(&xas, GFP_KERNEL)) {
  			result = SCAN_FAIL;
@@ -62,7 +55,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * At this point the hpage is locked and not up-to-date.
  	 * It's safe to insert it into the page cache, because nobody would
-@@ -2145,129 +2145,126 @@ xa_unlocked:
+@@ -2152,137 +2152,133 @@ xa_unlocked:
  	 */
  	try_to_unmap_flush();
  
@@ -100,6 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
 -	}
 -
+-	nr = thp_nr_pages(hpage);
 -	if (result == SCAN_SUCCEED) {
 -		/*
 -		 * Copying old pages to huge one has succeeded, now we
@@ -160,6 +154,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (is_shmem)
 -			folio_mark_dirty(folio);
 -		folio_add_lru(folio);
++	nr = thp_nr_pages(hpage);
 +	xas_lock_irq(&xas);
 +	if (is_shmem)
 +		__mod_lruvec_page_state(hpage, NR_SHMEM_THPS, nr);
@@ -249,13 +244,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			continue;
  		}
 -		VM_BUG_ON(nr_none);
--		/*
--		 * Undo the updates of filemap_nr_thps_inc for non-SHMEM file only.
--		 * This undo is not needed unless failure is due to SCAN_COPY_MC.
--		 */
--		if (!is_shmem && result == SCAN_COPY_MC)
--			filemap_nr_thps_dec(mapping);
- 
++
 +		VM_BUG_ON_PAGE(page->index != xas.xa_index, page);
 +
 +		/* Unfreeze the page. */
@@ -263,30 +252,48 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		page_ref_unfreeze(page, 2);
 +		xas_store(&xas, page);
 +		xas_pause(&xas);
- 		xas_unlock_irq(&xas);
--
--		hpage->mapping = NULL;
++		xas_unlock_irq(&xas);
 +		unlock_page(page);
 +		putback_lru_page(page);
 +		xas_lock_irq(&xas);
- 	}
++	}
 +	VM_BUG_ON(nr_none);
 +	/*
-+	 * Undo the updates of filemap_nr_thps_inc for non-SHMEM file only.
-+	 * This undo is not needed unless failure is due to SCAN_COPY_MC.
++	 * Undo the updates of filemap_nr_thps_inc for non-SHMEM
++	 * file only. This undo is not needed unless failure is
++	 * due to SCAN_COPY_MC.
 +	 */
-+	if (!is_shmem && result == SCAN_COPY_MC)
++	if (!is_shmem && result == SCAN_COPY_MC) {
 +		filemap_nr_thps_dec(mapping);
-+
+ 		/*
+-		 * Undo the updates of filemap_nr_thps_inc for non-SHMEM
+-		 * file only. This undo is not needed unless failure is
+-		 * due to SCAN_COPY_MC.
++		 * Paired with smp_mb() in do_dentry_open() to
++		 * ensure the update to nr_thps is visible.
+ 		 */
+-		if (!is_shmem && result == SCAN_COPY_MC) {
+-			filemap_nr_thps_dec(mapping);
+-			/*
+-			 * Paired with smp_mb() in do_dentry_open() to
+-			 * ensure the update to nr_thps is visible.
+-			 */
+-			smp_mb();
+-		}
++		smp_mb();
++	}
+ 
+-		xas_unlock_irq(&xas);
 +	xas_unlock_irq(&xas);
-+
+ 
+-		hpage->mapping = NULL;
+-	}
 +	hpage->mapping = NULL;
-+
-+	unlock_page(hpage);
-+	put_page(hpage);
  
 -	if (hpage)
 -		unlock_page(hpage);
++	unlock_page(hpage);
++	put_page(hpage);
  out:
  	VM_BUG_ON(!list_empty(&pagelist));
 -	if (hpage)
