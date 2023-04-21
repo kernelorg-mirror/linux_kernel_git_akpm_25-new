@@ -1,6 +1,6 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: mm: do not increment pgfault stats when page fault handler retries
-Date: Fri, 14 Apr 2023 10:54:44 -0700
+Date: Wed, 19 Apr 2023 10:58:36 -0700
 
 If the page fault handler requests a retry, we will count the fault
 multiple times.  This is a relatively harmless problem as the retry paths
@@ -9,16 +9,18 @@ fault counter will be slightly higher than it should be.  Nevertheless,
 userspace only took one fault, and should not see the fact that the kernel
 had to retry the fault multiple times.
 
-Link: https://lkml.kernel.org/r/20230414175444.1837474-1-surenb@google.com
+Move page fault accounting into mm_account_fault() and skip incomplete
+faults which will be accounted upon completion.
+
+Link: https://lkml.kernel.org/r/20230419175836.3857458-1-surenb@google.com
 Fixes: d065bd810b6d ("mm: retry page fault when blocking on disk transfer")
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Peter Xu <peterx@redhat.com>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Josef Bacik <josef@toxicpanda.com>
-Cc: kernel-team@android.com
-Cc: Laurent Dufour <laurent.dufour@fr.ibm.com>
 Cc: Laurent Dufour <ldufour@linux.ibm.com>
 Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Lorenzo Stoakes <lstoakes@gmail.com>
@@ -30,12 +32,61 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memory.c |   16 ++++++++++------
- 1 file changed, 10 insertions(+), 6 deletions(-)
+ mm/memory.c |   46 +++++++++++++++++++++++++++-------------------
+ 1 file changed, 27 insertions(+), 19 deletions(-)
 
 --- a/mm/memory.c~mm-do-not-increment-pgfault-stats-when-page-fault-handler-retries
 +++ a/mm/memory.c
-@@ -5197,17 +5197,16 @@ vm_fault_t handle_mm_fault(struct vm_are
+@@ -5104,24 +5104,31 @@ retry_pud:
+  * updates.  However, note that the handling of PERF_COUNT_SW_PAGE_FAULTS should
+  * still be in per-arch page fault handlers at the entry of page fault.
+  */
+-static inline void mm_account_fault(struct pt_regs *regs,
++static inline void mm_account_fault(struct mm_struct *mm, struct pt_regs *regs,
+ 				    unsigned long address, unsigned int flags,
+ 				    vm_fault_t ret)
+ {
+ 	bool major;
+ 
++	/* Incomplete faults will be accounted upon completion. */
++	if (ret & VM_FAULT_RETRY)
++		return;
++
++	/*
++	 * To preserve the behavior of older kernels, PGFAULT counters record
++	 * both successful and failed faults, as opposed to perf counters,
++	 * which ignore failed cases.
++	 */
++	count_vm_event(PGFAULT);
++	count_memcg_event_mm(mm, PGFAULT);
++
+ 	/*
+-	 * We don't do accounting for some specific faults:
+-	 *
+-	 * - Unsuccessful faults (e.g. when the address wasn't valid).  That
+-	 *   includes arch_vma_access_permitted() failing before reaching here.
+-	 *   So this is not a "this many hardware page faults" counter.  We
+-	 *   should use the hw profiling for that.
+-	 *
+-	 * - Incomplete faults (VM_FAULT_RETRY).  They will only be counted
+-	 *   once they're completed.
++	 * Do not account for unsuccessful faults (e.g. when the address wasn't
++	 * valid).  That includes arch_vma_access_permitted() failing before
++	 * reaching here. So this is not a "this many hardware page faults"
++	 * counter.  We should use the hw profiling for that.
+ 	 */
+-	if (ret & (VM_FAULT_ERROR | VM_FAULT_RETRY))
++	if (ret & VM_FAULT_ERROR)
+ 		return;
+ 
+ 	/*
+@@ -5204,21 +5211,22 @@ static vm_fault_t sanitize_fault_flags(s
+ vm_fault_t handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 			   unsigned int flags, struct pt_regs *regs)
+ {
++	/* If the fault handler drops the mmap_lock, vma may be freed */
++	struct mm_struct *mm = vma->vm_mm;
+ 	vm_fault_t ret;
  
  	__set_current_state(TASK_RUNNING);
  
@@ -58,15 +109,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Enable the memcg OOM handling for faults triggered in user
-@@ -5238,6 +5237,11 @@ vm_fault_t handle_mm_fault(struct vm_are
+@@ -5247,8 +5255,8 @@ vm_fault_t handle_mm_fault(struct vm_are
+ 		if (task_in_memcg_oom(current) && !(ret & VM_FAULT_OOM))
+ 			mem_cgroup_oom_synchronize(false);
  	}
- 
- 	mm_account_fault(regs, address, flags, ret);
+-
+-	mm_account_fault(regs, address, flags, ret);
 +out:
-+	if (!(ret & VM_FAULT_RETRY)) {
-+		count_vm_event(PGFAULT);
-+		count_memcg_event_mm(vma->vm_mm, PGFAULT);
-+	}
++	mm_account_fault(mm, regs, address, flags, ret);
  
  	return ret;
  }
