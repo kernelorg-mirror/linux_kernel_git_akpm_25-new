@@ -1,0 +1,132 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: memcg: use seq_buf_do_printk() with mem_cgroup_print_oom_meminfo()
+Date: Fri, 28 Apr 2023 13:24:05 +0000
+
+Currently, we format all the memcg stats into a buffer in
+mem_cgroup_print_oom_meminfo() and use pr_info() to dump it to the logs. 
+However, this buffer is large in size.  Although it is currently working
+as intended, ther is a dependency between the memcg stats buffer and the
+printk record size limit.
+
+If we add more stats in the future and the buffer becomes larger than the
+printk record size limit, or if the prink record size limit is reduced,
+the logs may be truncated.
+
+It is safer to use seq_buf_do_printk(), which will automatically break up
+the buffer at line breaks and issue small printk() calls.
+
+Refactor the code to move the seq_buf from memory_stat_format() to its
+callers, and use seq_buf_do_printk() to print the seq_buf in
+mem_cgroup_print_oom_meminfo().
+
+Link: https://lkml.kernel.org/r/20230428132406.2540811-2-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol.c |   27 ++++++++++++++-------------
+ 1 file changed, 14 insertions(+), 13 deletions(-)
+
+--- a/mm/memcontrol.c~memcg-use-seq_buf_do_printk-with-mem_cgroup_print_oom_meminfo
++++ a/mm/memcontrol.c
+@@ -1580,13 +1580,10 @@ static inline unsigned long memcg_page_s
+ 	return memcg_page_state(memcg, item) * memcg_page_state_unit(item);
+ }
+ 
+-static void memory_stat_format(struct mem_cgroup *memcg, char *buf, int bufsize)
++static void memory_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
+ {
+-	struct seq_buf s;
+ 	int i;
+ 
+-	seq_buf_init(&s, buf, bufsize);
+-
+ 	/*
+ 	 * Provide statistics on the state of the memory subsystem as
+ 	 * well as cumulative event counters that show past behavior.
+@@ -1603,21 +1600,21 @@ static void memory_stat_format(struct me
+ 		u64 size;
+ 
+ 		size = memcg_page_state_output(memcg, memory_stats[i].idx);
+-		seq_buf_printf(&s, "%s %llu\n", memory_stats[i].name, size);
++		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
+ 
+ 		if (unlikely(memory_stats[i].idx == NR_SLAB_UNRECLAIMABLE_B)) {
+ 			size += memcg_page_state_output(memcg,
+ 							NR_SLAB_RECLAIMABLE_B);
+-			seq_buf_printf(&s, "slab %llu\n", size);
++			seq_buf_printf(s, "slab %llu\n", size);
+ 		}
+ 	}
+ 
+ 	/* Accumulated memory events */
+-	seq_buf_printf(&s, "pgscan %lu\n",
++	seq_buf_printf(s, "pgscan %lu\n",
+ 		       memcg_events(memcg, PGSCAN_KSWAPD) +
+ 		       memcg_events(memcg, PGSCAN_DIRECT) +
+ 		       memcg_events(memcg, PGSCAN_KHUGEPAGED));
+-	seq_buf_printf(&s, "pgsteal %lu\n",
++	seq_buf_printf(s, "pgsteal %lu\n",
+ 		       memcg_events(memcg, PGSTEAL_KSWAPD) +
+ 		       memcg_events(memcg, PGSTEAL_DIRECT) +
+ 		       memcg_events(memcg, PGSTEAL_KHUGEPAGED));
+@@ -1627,13 +1624,13 @@ static void memory_stat_format(struct me
+ 		    memcg_vm_event_stat[i] == PGPGOUT)
+ 			continue;
+ 
+-		seq_buf_printf(&s, "%s %lu\n",
++		seq_buf_printf(s, "%s %lu\n",
+ 			       vm_event_name(memcg_vm_event_stat[i]),
+ 			       memcg_events(memcg, memcg_vm_event_stat[i]));
+ 	}
+ 
+ 	/* The above should easily fit into one page */
+-	WARN_ON_ONCE(seq_buf_has_overflowed(&s));
++	WARN_ON_ONCE(seq_buf_has_overflowed(s));
+ }
+ 
+ #define K(x) ((x) << (PAGE_SHIFT-10))
+@@ -1671,6 +1668,7 @@ void mem_cgroup_print_oom_meminfo(struct
+ {
+ 	/* Use static buffer, for the caller is holding oom_lock. */
+ 	static char buf[PAGE_SIZE];
++	struct seq_buf s;
+ 
+ 	lockdep_assert_held(&oom_lock);
+ 
+@@ -1693,8 +1691,9 @@ void mem_cgroup_print_oom_meminfo(struct
+ 	pr_info("Memory cgroup stats for ");
+ 	pr_cont_cgroup_path(memcg->css.cgroup);
+ 	pr_cont(":");
+-	memory_stat_format(memcg, buf, sizeof(buf));
+-	pr_info("%s", buf);
++	seq_buf_init(&s, buf, sizeof(buf));
++	memory_stat_format(memcg, &s);
++	seq_buf_do_printk(&s, KERN_INFO);
+ }
+ 
+ /*
+@@ -6635,10 +6634,12 @@ static int memory_stat_show(struct seq_f
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
+ 	char *buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
++	struct seq_buf s;
+ 
+ 	if (!buf)
+ 		return -ENOMEM;
+-	memory_stat_format(memcg, buf, PAGE_SIZE);
++	seq_buf_init(&s, buf, PAGE_SIZE);
++	memory_stat_format(memcg, &s);
+ 	seq_puts(m, buf);
+ 	kfree(buf);
+ 	return 0;
+_
