@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lstoakes@gmail.com>
 Subject: mm/gup: disallow FOLL_LONGTERM GUP-fast writing to file-backed mappings
-Date: Tue, 2 May 2023 00:11:49 +0100
+Date: Tue, 2 May 2023 23:51:35 +0100
 
 Writing to file-backed dirty-tracked mappings via GUP is inherently broken
 as we cannot rule out folios being cleaned and then a GUP user writing to
@@ -12,34 +12,24 @@ have already done in the slow path.
 
 We have access to less information in the fast path as we cannot examine
 the VMA containing the mapping, however we can determine whether the folio
-is anonymous and then whitelist known-good mappings - specifically hugetlb
-and shmem mappings.
+is anonymous or belonging to a whitelisted filesystem - specifically
+hugetlb and shmem mappings.
 
-While we obtain a stable folio for this check, the mapping might not be,
-as a truncate could nullify it at any time.  Since doing so requires
-mappings to be zapped, we can synchronise against a TLB shootdown
-operation.
-
-For some architectures TLB shootdown is synchronised by IPI, against which
-we are protected as the GUP-fast operation is performed with interrupts
-disabled.  However, other architectures which specify
-CONFIG_MMU_GATHER_RCU_TABLE_FREE use an RCU lock for this operation.
-
-In these instances, we acquire an RCU lock while performing our checks. 
-If we cannot get a stable mapping, we fall back to the slow path, as
-otherwise we'd have to walk the page tables again and it's simpler and
-more effective to just fall back.
+We take special care to ensure that both the folio and mapping are safe to
+access when performing these checks and document folio_fast_pin_allowed()
+accordingly.
 
 It's important to note that there are no APIs allowing users to specify
 FOLL_FAST_ONLY for a PUP-fast let alone with FOLL_LONGTERM, so we can
 always rely on the fact that if we fail to pin on the fast path, the code
 will fall back to the slow path which can perform the more thorough check.
 
-Link: https://lkml.kernel.org/r/dee4f4ad6532b0f94d073da263526de334d5d7e0.1682981880.git.lstoakes@gmail.com
+Link: https://lkml.kernel.org/r/a690186fc37e1ea92556a7dbd0887fe201fcc709.1683067198.git.lstoakes@gmail.com
 Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
 Suggested-by: Kirill A . Shutemov <kirill@shutemov.name>
-Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
 Cc: Adrian Hunter <adrian.hunter@intel.com>
 Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
 Cc: Alexei Starovoitov <ast@kernel.org>
@@ -47,6 +37,7 @@ Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
 Cc: Bernard Metzler <bmt@zurich.ibm.com>
 Cc: Björn Töpel <bjorn@kernel.org>
 Cc: Christian Benvenuti <benve@cisco.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Daniel Borkmann <daniel@iogearbox.net>
 Cc: Dave Chinner <david@fromorbit.com>
@@ -56,33 +47,34 @@ Cc: Eric Dumazet <edumazet@google.com>
 Cc: Ian Rogers <irogers@google.com>
 Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Jakub Kicinski <kuba@kernel.org>
-Cc: Jan Kara <jack@suse.cz>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jens Axboe <axboe@kernel.dk>
 Cc: Jesper Dangaard Brouer <hawk@kernel.org>
 Cc: Jiri Olsa <jolsa@kernel.org>
 Cc: John Fastabend <john.fastabend@gmail.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Jonathan Lemon <jonathan.lemon@gmail.com>
 Cc: Leon Romanovsky <leon@kernel.org>
 Cc: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
 Cc: Magnus Karlsson <magnus.karlsson@intel.com>
 Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Matthew Rosato <mjrosato@linux.ibm.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Mika Penttilä <mpenttil@redhat.com>
 Cc: Namhyung Kim <namhyung@kernel.org>
 Cc: Nelson Escobar <neescoba@cisco.com>
 Cc: Oleg Nesterov <oleg@redhat.com>
 Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
 Cc: Pavel Begunkov <asml.silence@gmail.com>
 Cc: Peter Xu <peterx@redhat.com>
-Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Richard Cochran <richardcochran@gmail.com>
 Cc: Theodore Ts'o <tytso@mit.edu>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/gup.c |   87 +++++++++++++++++++++++++++++++++++++++++++++++++++--
- 1 file changed, 85 insertions(+), 2 deletions(-)
+ mm/gup.c |  102 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 102 insertions(+)
 
 --- a/mm/gup.c~mm-gup-disallow-foll_longterm-gup-fast-writing-to-file-backed-mappings
 +++ a/mm/gup.c
@@ -94,118 +86,147 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include <asm/mmu_context.h>
  #include <asm/tlbflush.h>
-@@ -95,6 +96,77 @@ retry:
+@@ -95,6 +96,83 @@ retry:
  	return folio;
  }
  
-+#ifdef CONFIG_MMU_GATHER_RCU_TABLE_FREE
-+static bool stabilise_mapping_rcu(struct folio *folio)
-+{
-+	struct address_space *mapping = READ_ONCE(folio->mapping);
-+
-+	rcu_read_lock();
-+
-+	return mapping == READ_ONCE(folio->mapping);
-+}
-+
-+static void unlock_rcu(void)
-+{
-+	rcu_read_unlock();
-+}
-+#else
-+static bool stabilise_mapping_rcu(struct folio *)
-+{
-+	return true;
-+}
-+
-+static void unlock_rcu(void)
-+{
-+}
-+#endif
-+
 +/*
-+ * Used in the GUP-fast path to determine whether a FOLL_PIN | FOLL_LONGTERM |
-+ * FOLL_WRITE pin is permitted for a specific folio.
++ * Used in the GUP-fast path to determine whether a pin is permitted for a
++ * specific folio.
 + *
-+ * This assumes the folio is stable and pinned.
++ * This call assumes the caller has pinned the folio, that the lowest page table
++ * level still points to this folio, and that interrupts have been disabled.
 + *
 + * Writing to pinned file-backed dirty tracked folios is inherently problematic
-+ * (see comment describing the writeable_file_mapping_allowed() function). We
++ * (see comment describing the writable_file_mapping_allowed() function). We
 + * therefore try to avoid the most egregious case of a long-term mapping doing
 + * so.
 + *
 + * This function cannot be as thorough as that one as the VMA is not available
-+ * in the fast path, so instead we whitelist known good cases.
-+ *
-+ * The folio is stable, but the mapping might not be. When truncating for
-+ * instance, a zap is performed which triggers TLB shootdown. IRQs are disabled
-+ * so we are safe from an IPI, but some architectures use an RCU lock for this
-+ * operation, so we acquire an RCU lock to ensure the mapping is stable.
++ * in the fast path, so instead we whitelist known good cases and if in doubt,
++ * fall back to the slow path.
 + */
-+static bool folio_longterm_write_pin_allowed(struct folio *folio)
++static bool folio_fast_pin_allowed(struct folio *folio, unsigned int flags)
 +{
-+	bool ret;
++	struct address_space *mapping;
++	unsigned long mapping_flags;
 +
-+	/* hugetlb mappings do not require dirty tracking. */
++	/*
++	 * If we aren't pinning then no problematic write can occur. A long term
++	 * pin is the most egregious case so this is the one we disallow.
++	 */
++	if ((flags & (FOLL_PIN | FOLL_LONGTERM | FOLL_WRITE)) !=
++	    (FOLL_PIN | FOLL_LONGTERM | FOLL_WRITE))
++		return true;
++
++	/* The folio is pinned, so we can safely access folio fields. */
++
++	/* Neither of these should be possible, but check to be sure. */
++	if (unlikely(folio_test_slab(folio) || folio_test_swapcache(folio)))
++		return false;
++
++	/* hugetlb mappings do not require dirty-tracking. */
 +	if (folio_test_hugetlb(folio))
 +		return true;
 +
-+	if (stabilise_mapping_rcu(folio)) {
-+		struct address_space *mapping = folio_mapping(folio);
++	/*
++	 * GUP-fast disables IRQs. When IRQS are disabled, RCU grace periods
++	 * cannot proceed, which means no actions performed under RCU can
++	 * proceed either.
++	 *
++	 * inodes and thus their mappings are freed under RCU, which means the
++	 * mapping cannot be freed beneath us and thus we can safely dereference
++	 * it.
++	 */
++	lockdep_assert_irqs_disabled();
 +
-+		/*
-+		 * Neither anonymous nor shmem-backed folios require
-+		 * dirty tracking.
-+		 */
-+		ret = folio_test_anon(folio) ||
-+			(mapping && shmem_mapping(mapping));
-+	} else {
-+		/* If the mapping is unstable, fallback to the slow path. */
-+		ret = false;
-+	}
++	/*
++	 * However, there may be operations which _alter_ the mapping, so ensure
++	 * we read it once and only once.
++	 */
++	mapping = READ_ONCE(folio->mapping);
 +
-+	unlock_rcu();
++	/*
++	 * The mapping may have been truncated, in any case we cannot determine
++	 * if this mapping is safe - fall back to slow path to determine how to
++	 * proceed.
++	 */
++	if (!mapping)
++		return false;
 +
-+	return ret;
++	/* Anonymous folios are fine, other non-file backed cases are not. */
++	mapping_flags = (unsigned long)mapping & PAGE_MAPPING_FLAGS;
++	if (mapping_flags)
++		return mapping_flags == PAGE_MAPPING_ANON;
++
++	/*
++	 * At this point, we know the mapping is non-null and points to an
++	 * address_space object. The only remaining whitelisted file system is
++	 * shmem.
++	 */
++	return shmem_mapping(mapping);
 +}
 +
  /**
   * try_grab_folio() - Attempt to get or pin a folio.
   * @page:  pointer to page to be grabbed
-@@ -123,6 +195,8 @@ retry:
-  */
- struct folio *try_grab_folio(struct page *page, int refs, unsigned int flags)
- {
-+	bool is_longterm = flags & FOLL_LONGTERM;
-+
- 	if (unlikely(!(flags & FOLL_PCI_P2PDMA) && is_pci_p2pdma_page(page)))
- 		return NULL;
+@@ -2464,6 +2542,11 @@ static int gup_pte_range(pmd_t pmd, pmd_
+ 			goto pte_unmap;
+ 		}
  
-@@ -136,8 +210,7 @@ struct folio *try_grab_folio(struct page
- 		 * right zone, so fail and let the caller fall back to the slow
- 		 * path.
- 		 */
--		if (unlikely((flags & FOLL_LONGTERM) &&
--			     !is_longterm_pinnable_page(page)))
-+		if (unlikely(is_longterm && !is_longterm_pinnable_page(page)))
- 			return NULL;
- 
- 		/*
-@@ -149,6 +222,16 @@ struct folio *try_grab_folio(struct page
- 			return NULL;
- 
- 		/*
-+		 * Can this folio be safely pinned? We need to perform this
-+		 * check after the folio is stabilised.
-+		 */
-+		if ((flags & FOLL_WRITE) && is_longterm &&
-+		    !folio_longterm_write_pin_allowed(folio)) {
-+			folio_put_refs(folio, refs);
-+			return NULL;
++		if (!folio_fast_pin_allowed(folio, flags)) {
++			gup_put_folio(folio, 1, flags);
++			goto pte_unmap;
 +		}
 +
-+		/*
- 		 * When pinning a large folio, use an exact count to track it.
- 		 *
- 		 * However, be sure to *also* increment the normal folio
+ 		if (!pte_write(pte) && gup_must_unshare(NULL, flags, page)) {
+ 			gup_put_folio(folio, 1, flags);
+ 			goto pte_unmap;
+@@ -2656,6 +2739,11 @@ static int gup_hugepte(pte_t *ptep, unsi
+ 		return 0;
+ 	}
+ 
++	if (!folio_fast_pin_allowed(folio, flags)) {
++		gup_put_folio(folio, refs, flags);
++		return 0;
++	}
++
+ 	if (!pte_write(pte) && gup_must_unshare(NULL, flags, &folio->page)) {
+ 		gup_put_folio(folio, refs, flags);
+ 		return 0;
+@@ -2722,6 +2810,10 @@ static int gup_huge_pmd(pmd_t orig, pmd_
+ 		return 0;
+ 	}
+ 
++	if (!folio_fast_pin_allowed(folio, flags)) {
++		gup_put_folio(folio, refs, flags);
++		return 0;
++	}
+ 	if (!pmd_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
+ 		gup_put_folio(folio, refs, flags);
+ 		return 0;
+@@ -2762,6 +2854,11 @@ static int gup_huge_pud(pud_t orig, pud_
+ 		return 0;
+ 	}
+ 
++	if (!folio_fast_pin_allowed(folio, flags)) {
++		gup_put_folio(folio, refs, flags);
++		return 0;
++	}
++
+ 	if (!pud_write(orig) && gup_must_unshare(NULL, flags, &folio->page)) {
+ 		gup_put_folio(folio, refs, flags);
+ 		return 0;
+@@ -2796,6 +2893,11 @@ static int gup_huge_pgd(pgd_t orig, pgd_
+ 		gup_put_folio(folio, refs, flags);
+ 		return 0;
+ 	}
++
++	if (!folio_fast_pin_allowed(folio, flags)) {
++		gup_put_folio(folio, refs, flags);
++		return 0;
++	}
+ 
+ 	*nr += refs;
+ 	folio_set_referenced(folio);
 _
