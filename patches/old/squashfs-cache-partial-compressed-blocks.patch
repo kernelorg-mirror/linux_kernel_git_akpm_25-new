@@ -1,6 +1,6 @@
 From: Vincent Whitchurch <vincent.whitchurch@axis.com>
 Subject: squashfs: cache partial compressed blocks
-Date: Fri, 12 May 2023 15:18:05 +0200
+Date: Tue, 16 May 2023 10:22:49 +0200
 
 Before commit 93e72b3c612adcaca1 ("squashfs: migrate from ll_rw_block
 usage to BIO"), compressed blocks read by squashfs were cached in the page
@@ -27,41 +27,39 @@ The compressed block caching is only applied when the disk block size is
 equal to the page size, to avoid having to deal with caching sub-page
 reads.
 
-Link: https://lkml.kernel.org/r/20230510-squashfs-cache-v2-1-42a501a17569@axis.com
+Link: https://lkml.kernel.org/r/20230510-squashfs-cache-v3-1-9f56ffd43f03@axis.com
 Signed-off-by: Vincent Whitchurch <vincent.whitchurch@axis.com>
 Reviewed-by: Phillip Lougher <phillip@squashfs.org.uk>
 Cc: Christoph Hellwig <hch@lst.de>
-Cc: Philippe Liard <pliard@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/squashfs/block.c          |  116 ++++++++++++++++++++++++++++++++-
+ fs/squashfs/block.c          |  115 ++++++++++++++++++++++++++++++++-
  fs/squashfs/squashfs_fs_sb.h |    1 
  fs/squashfs/super.c          |   12 +++
- 3 files changed, 126 insertions(+), 3 deletions(-)
+ 3 files changed, 125 insertions(+), 3 deletions(-)
 
 --- a/fs/squashfs/block.c~squashfs-cache-partial-compressed-blocks
 +++ a/fs/squashfs/block.c
-@@ -76,10 +76,101 @@ static int copy_bio_to_actor(struct bio
+@@ -76,10 +76,100 @@ static int copy_bio_to_actor(struct bio
  	return copied_bytes;
  }
  
-+static int squashfs_bio_read_cached(struct bio *fullbio, struct address_space *cache_mapping,
-+				    u64 index, int length, u64 read_start, u64 read_end,
-+				    int page_count)
++static int squashfs_bio_read_cached(struct bio *fullbio,
++		struct address_space *cache_mapping, u64 index, int length,
++		u64 read_start, u64 read_end, int page_count)
 +{
 +	struct page *head_to_cache = NULL, *tail_to_cache = NULL;
 +	struct block_device *bdev = fullbio->bi_bdev;
++	int start_idx = 0, end_idx = 0;
 +	struct bvec_iter_all iter_all;
 +	struct bio *bio = NULL;
-+	int prev_io_idx = -1;
 +	struct bio_vec *bv;
 +	int idx = 0;
 +	int err = 0;
 +
 +	bio_for_each_segment_all(bv, fullbio, iter_all) {
 +		struct page *page = bv->bv_page;
-+		int retlen;
 +
 +		if (page->mapping == cache_mapping && PageUptodate(page)) {
 +			idx++;
@@ -82,28 +80,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		else if (idx == page_count - 1 && index + length != read_end)
 +			tail_to_cache = page;
 +
-+		if (!bio || idx != prev_io_idx + 1) {
-+			unsigned int remaining_pages;
-+			unsigned int this_nr_pages;
++		if (!bio || idx != end_idx) {
++			struct bio *new = bio_alloc_clone(bdev, fullbio,
++							  GFP_NOIO, &fs_bio_set);
 +
-+submit_and_retry:
-+			remaining_pages = page_count - idx;
-+			this_nr_pages = min(remaining_pages, BIO_MAX_VECS);
-+			bio = blk_next_bio(bio, bdev, this_nr_pages, REQ_OP_READ,
-+					   GFP_NOIO);
-+			bio->bi_iter.bi_sector = fullbio->bi_iter.bi_sector +
-+						 idx * (PAGE_SIZE / SECTOR_SIZE);
++			if (bio) {
++				bio_trim(bio, start_idx * PAGE_SECTORS,
++					 (end_idx - start_idx) * PAGE_SECTORS);
++				bio_chain(bio, new);
++				submit_bio(bio);
++			}
++
++			bio = new;
++			start_idx = idx;
 +		}
 +
-+		retlen = bio_add_page(bio, bv->bv_page, bv->bv_len, bv->bv_offset);
-+		if (retlen != bv->bv_len)
-+			goto submit_and_retry;
-+
-+		prev_io_idx = idx;
 +		idx++;
++		end_idx = idx;
 +	}
 +
 +	if (bio) {
++		bio_trim(bio, start_idx * PAGE_SECTORS,
++			 (end_idx - start_idx) * PAGE_SECTORS);
 +		err = submit_bio_wait(bio);
 +		bio_put(bio);
 +	}
@@ -144,7 +142,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	const u64 read_start = round_down(index, msblk->devblksize);
  	const sector_t block = read_start >> msblk->devblksize_log2;
  	const u64 read_end = round_up(index + length, msblk->devblksize);
-@@ -99,13 +190,27 @@ static int squashfs_bio_read(struct supe
+@@ -99,13 +189,27 @@ static int squashfs_bio_read(struct supe
  	for (i = 0; i < page_count; ++i) {
  		unsigned int len =
  			min_t(unsigned int, PAGE_SIZE - offset, total_len);
@@ -174,7 +172,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			error = -EIO;
  			goto out_free_bio;
  		}
-@@ -113,7 +218,12 @@ static int squashfs_bio_read(struct supe
+@@ -113,7 +217,12 @@ static int squashfs_bio_read(struct supe
  		total_len -= len;
  	}
  

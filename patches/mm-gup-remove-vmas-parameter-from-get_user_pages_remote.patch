@@ -1,0 +1,351 @@
+From: Lorenzo Stoakes <lstoakes@gmail.com>
+Subject: mm/gup: remove vmas parameter from get_user_pages_remote()
+Date: Wed, 17 May 2023 20:25:39 +0100
+
+The only instances of get_user_pages_remote() invocations which used the
+vmas parameter were for a single page which can instead simply look up the
+VMA directly. In particular:-
+
+- __update_ref_ctr() looked up the VMA but did nothing with it so we simply
+  remove it.
+
+- __access_remote_vm() was already using vma_lookup() when the original
+  lookup failed so by doing the lookup directly this also de-duplicates the
+  code.
+
+We are able to perform these VMA operations as we already hold the
+mmap_lock in order to be able to call get_user_pages_remote().
+
+As part of this work we add get_user_page_vma_remote() which abstracts the
+VMA lookup, error handling and decrementing the page reference count should
+the VMA lookup fail.
+
+This forms part of a broader set of patches intended to eliminate the vmas
+parameter altogether.
+
+Link: https://lkml.kernel.org/r/d20128c849ecdbf4dd01cc828fcec32127ed939a.1684350871.git.lstoakes@gmail.com
+Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
+Reviewed-by: Catalin Marinas <catalin.marinas@arm.com> (for arm64)
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Janosch Frank <frankja@linux.ibm.com> (for s390)
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/kernel/mte.c   |   17 +++++++++--------
+ arch/s390/kvm/interrupt.c |    2 +-
+ fs/exec.c                 |    2 +-
+ include/linux/mm.h        |   34 +++++++++++++++++++++++++++++++---
+ kernel/events/uprobes.c   |   13 +++++--------
+ mm/gup.c                  |   12 ++++--------
+ mm/memory.c               |   20 ++++++++++----------
+ mm/rmap.c                 |    2 +-
+ security/tomoyo/domain.c  |    2 +-
+ virt/kvm/async_pf.c       |    3 +--
+ 10 files changed, 64 insertions(+), 43 deletions(-)
+
+--- a/arch/arm64/kernel/mte.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/arch/arm64/kernel/mte.c
+@@ -419,10 +419,9 @@ long get_mte_ctrl(struct task_struct *ta
+ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
+ 				struct iovec *kiov, unsigned int gup_flags)
+ {
+-	struct vm_area_struct *vma;
+ 	void __user *buf = kiov->iov_base;
+ 	size_t len = kiov->iov_len;
+-	int ret;
++	int err = 0;
+ 	int write = gup_flags & FOLL_WRITE;
+ 
+ 	if (!access_ok(buf, len))
+@@ -432,14 +431,16 @@ static int __access_remote_tags(struct m
+ 		return -EIO;
+ 
+ 	while (len) {
++		struct vm_area_struct *vma;
+ 		unsigned long tags, offset;
+ 		void *maddr;
+-		struct page *page = NULL;
++		struct page *page = get_user_page_vma_remote(mm, addr,
++							     gup_flags, &vma);
+ 
+-		ret = get_user_pages_remote(mm, addr, 1, gup_flags, &page,
+-					    &vma, NULL);
+-		if (ret <= 0)
++		if (IS_ERR_OR_NULL(page)) {
++			err = page == NULL ? -EIO : PTR_ERR(page);
+ 			break;
++		}
+ 
+ 		/*
+ 		 * Only copy tags if the page has been mapped as PROT_MTE
+@@ -449,7 +450,7 @@ static int __access_remote_tags(struct m
+ 		 * was never mapped with PROT_MTE.
+ 		 */
+ 		if (!(vma->vm_flags & VM_MTE)) {
+-			ret = -EOPNOTSUPP;
++			err = -EOPNOTSUPP;
+ 			put_page(page);
+ 			break;
+ 		}
+@@ -482,7 +483,7 @@ static int __access_remote_tags(struct m
+ 	kiov->iov_len = buf - kiov->iov_base;
+ 	if (!kiov->iov_len) {
+ 		/* check for error accessing the tracee's address space */
+-		if (ret <= 0)
++		if (err)
+ 			return -EIO;
+ 		else
+ 			return -EFAULT;
+--- a/arch/s390/kvm/interrupt.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/arch/s390/kvm/interrupt.c
+@@ -2777,7 +2777,7 @@ static struct page *get_map_page(struct
+ 
+ 	mmap_read_lock(kvm->mm);
+ 	get_user_pages_remote(kvm->mm, uaddr, 1, FOLL_WRITE,
+-			      &page, NULL, NULL);
++			      &page, NULL);
+ 	mmap_read_unlock(kvm->mm);
+ 	return page;
+ }
+--- a/fs/exec.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/fs/exec.c
+@@ -220,7 +220,7 @@ static struct page *get_arg_page(struct
+ 	 */
+ 	mmap_read_lock(bprm->mm);
+ 	ret = get_user_pages_remote(bprm->mm, pos, 1, gup_flags,
+-			&page, NULL, NULL);
++			&page, NULL);
+ 	mmap_read_unlock(bprm->mm);
+ 	if (ret <= 0)
+ 		return NULL;
+--- a/include/linux/mm.h~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/include/linux/mm.h
+@@ -2366,6 +2366,9 @@ static inline void unmap_shared_mapping_
+ 	unmap_mapping_range(mapping, holebegin, holelen, 0);
+ }
+ 
++static inline struct vm_area_struct *vma_lookup(struct mm_struct *mm,
++						unsigned long addr);
++
+ extern int access_process_vm(struct task_struct *tsk, unsigned long addr,
+ 		void *buf, int len, unsigned int gup_flags);
+ extern int access_remote_vm(struct mm_struct *mm, unsigned long addr,
+@@ -2374,13 +2377,38 @@ extern int __access_remote_vm(struct mm_
+ 			      void *buf, int len, unsigned int gup_flags);
+ 
+ long get_user_pages_remote(struct mm_struct *mm,
+-			    unsigned long start, unsigned long nr_pages,
+-			    unsigned int gup_flags, struct page **pages,
+-			    struct vm_area_struct **vmas, int *locked);
++			   unsigned long start, unsigned long nr_pages,
++			   unsigned int gup_flags, struct page **pages,
++			   int *locked);
+ long pin_user_pages_remote(struct mm_struct *mm,
+ 			   unsigned long start, unsigned long nr_pages,
+ 			   unsigned int gup_flags, struct page **pages,
+ 			   int *locked);
++
++static inline struct page *get_user_page_vma_remote(struct mm_struct *mm,
++						    unsigned long addr,
++						    int gup_flags,
++						    struct vm_area_struct **vmap)
++{
++	struct page *page;
++	struct vm_area_struct *vma;
++	int got = get_user_pages_remote(mm, addr, 1, gup_flags, &page, NULL);
++
++	if (got < 0)
++		return ERR_PTR(got);
++	if (got == 0)
++		return NULL;
++
++	vma = vma_lookup(mm, addr);
++	if (WARN_ON_ONCE(!vma)) {
++		put_page(page);
++		return ERR_PTR(-EINVAL);
++	}
++
++	*vmap = vma;
++	return page;
++}
++
+ long get_user_pages(unsigned long start, unsigned long nr_pages,
+ 		    unsigned int gup_flags, struct page **pages);
+ long pin_user_pages(unsigned long start, unsigned long nr_pages,
+--- a/kernel/events/uprobes.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/kernel/events/uprobes.c
+@@ -365,7 +365,6 @@ __update_ref_ctr(struct mm_struct *mm, u
+ {
+ 	void *kaddr;
+ 	struct page *page;
+-	struct vm_area_struct *vma;
+ 	int ret;
+ 	short *ptr;
+ 
+@@ -373,7 +372,7 @@ __update_ref_ctr(struct mm_struct *mm, u
+ 		return -EINVAL;
+ 
+ 	ret = get_user_pages_remote(mm, vaddr, 1,
+-			FOLL_WRITE, &page, &vma, NULL);
++				    FOLL_WRITE, &page, NULL);
+ 	if (unlikely(ret <= 0)) {
+ 		/*
+ 		 * We are asking for 1 page. If get_user_pages_remote() fails,
+@@ -474,10 +473,9 @@ retry:
+ 	if (is_register)
+ 		gup_flags |= FOLL_SPLIT_PMD;
+ 	/* Read the page with vaddr into memory */
+-	ret = get_user_pages_remote(mm, vaddr, 1, gup_flags,
+-				    &old_page, &vma, NULL);
+-	if (ret <= 0)
+-		return ret;
++	old_page = get_user_page_vma_remote(mm, vaddr, gup_flags, &vma);
++	if (IS_ERR_OR_NULL(old_page))
++		return PTR_ERR(old_page);
+ 
+ 	ret = verify_opcode(old_page, vaddr, &opcode);
+ 	if (ret <= 0)
+@@ -2027,8 +2025,7 @@ static int is_trap_at_addr(struct mm_str
+ 	 * but we treat this as a 'remote' access since it is
+ 	 * essentially a kernel access to the memory.
+ 	 */
+-	result = get_user_pages_remote(mm, vaddr, 1, FOLL_FORCE, &page,
+-			NULL, NULL);
++	result = get_user_pages_remote(mm, vaddr, 1, FOLL_FORCE, &page, NULL);
+ 	if (result < 0)
+ 		return result;
+ 
+--- a/mm/gup.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/mm/gup.c
+@@ -2208,8 +2208,6 @@ static bool is_valid_gup_args(struct pag
+  * @pages:	array that receives pointers to the pages pinned.
+  *		Should be at least nr_pages long. Or NULL, if caller
+  *		only intends to ensure the pages are faulted in.
+- * @vmas:	array of pointers to vmas corresponding to each page.
+- *		Or NULL if the caller does not require them.
+  * @locked:	pointer to lock flag indicating whether lock is held and
+  *		subsequently whether VM_FAULT_RETRY functionality can be
+  *		utilised. Lock must initially be held.
+@@ -2224,8 +2222,6 @@ static bool is_valid_gup_args(struct pag
+  *
+  * The caller is responsible for releasing returned @pages, via put_page().
+  *
+- * @vmas are valid only as long as mmap_lock is held.
+- *
+  * Must be called with mmap_lock held for read or write.
+  *
+  * get_user_pages_remote walks a process's page tables and takes a reference
+@@ -2262,15 +2258,15 @@ static bool is_valid_gup_args(struct pag
+ long get_user_pages_remote(struct mm_struct *mm,
+ 		unsigned long start, unsigned long nr_pages,
+ 		unsigned int gup_flags, struct page **pages,
+-		struct vm_area_struct **vmas, int *locked)
++		int *locked)
+ {
+ 	int local_locked = 1;
+ 
+-	if (!is_valid_gup_args(pages, vmas, locked, &gup_flags,
++	if (!is_valid_gup_args(pages, NULL, locked, &gup_flags,
+ 			       FOLL_TOUCH | FOLL_REMOTE))
+ 		return -EINVAL;
+ 
+-	return __get_user_pages_locked(mm, start, nr_pages, pages, vmas,
++	return __get_user_pages_locked(mm, start, nr_pages, pages, NULL,
+ 				       locked ? locked : &local_locked,
+ 				       gup_flags);
+ }
+@@ -2280,7 +2276,7 @@ EXPORT_SYMBOL(get_user_pages_remote);
+ long get_user_pages_remote(struct mm_struct *mm,
+ 			   unsigned long start, unsigned long nr_pages,
+ 			   unsigned int gup_flags, struct page **pages,
+-			   struct vm_area_struct **vmas, int *locked)
++			   int *locked)
+ {
+ 	return 0;
+ }
+--- a/mm/memory.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/mm/memory.c
+@@ -5590,7 +5590,6 @@ EXPORT_SYMBOL_GPL(generic_access_phys);
+ int __access_remote_vm(struct mm_struct *mm, unsigned long addr, void *buf,
+ 		       int len, unsigned int gup_flags)
+ {
+-	struct vm_area_struct *vma;
+ 	void *old_buf = buf;
+ 	int write = gup_flags & FOLL_WRITE;
+ 
+@@ -5599,29 +5598,30 @@ int __access_remote_vm(struct mm_struct
+ 
+ 	/* ignore errors, just check how much was successfully transferred */
+ 	while (len) {
+-		int bytes, ret, offset;
++		int bytes, offset;
+ 		void *maddr;
+-		struct page *page = NULL;
++		struct vm_area_struct *vma = NULL;
++		struct page *page = get_user_page_vma_remote(mm, addr,
++							     gup_flags, &vma);
+ 
+-		ret = get_user_pages_remote(mm, addr, 1,
+-				gup_flags, &page, &vma, NULL);
+-		if (ret <= 0) {
++		if (IS_ERR_OR_NULL(page)) {
+ #ifndef CONFIG_HAVE_IOREMAP_PROT
+ 			break;
+ #else
++			int res = 0;
++
+ 			/*
+ 			 * Check if this is a VM_IO | VM_PFNMAP VMA, which
+ 			 * we can access using slightly different code.
+ 			 */
+-			vma = vma_lookup(mm, addr);
+ 			if (!vma)
+ 				break;
+ 			if (vma->vm_ops && vma->vm_ops->access)
+-				ret = vma->vm_ops->access(vma, addr, buf,
++				res = vma->vm_ops->access(vma, addr, buf,
+ 							  len, write);
+-			if (ret <= 0)
++			if (res <= 0)
+ 				break;
+-			bytes = ret;
++			bytes = res;
+ #endif
+ 		} else {
+ 			bytes = len;
+--- a/mm/rmap.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/mm/rmap.c
+@@ -2328,7 +2328,7 @@ int make_device_exclusive_range(struct m
+ 
+ 	npages = get_user_pages_remote(mm, start, npages,
+ 				       FOLL_GET | FOLL_WRITE | FOLL_SPLIT_PMD,
+-				       pages, NULL, NULL);
++				       pages, NULL);
+ 	if (npages < 0)
+ 		return npages;
+ 
+--- a/security/tomoyo/domain.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/security/tomoyo/domain.c
+@@ -916,7 +916,7 @@ bool tomoyo_dump_page(struct linux_binpr
+ 	 */
+ 	mmap_read_lock(bprm->mm);
+ 	ret = get_user_pages_remote(bprm->mm, pos, 1,
+-				    FOLL_FORCE, &page, NULL, NULL);
++				    FOLL_FORCE, &page, NULL);
+ 	mmap_read_unlock(bprm->mm);
+ 	if (ret <= 0)
+ 		return false;
+--- a/virt/kvm/async_pf.c~mm-gup-remove-vmas-parameter-from-get_user_pages_remote
++++ a/virt/kvm/async_pf.c
+@@ -61,8 +61,7 @@ static void async_pf_execute(struct work
+ 	 * access remotely.
+ 	 */
+ 	mmap_read_lock(mm);
+-	get_user_pages_remote(mm, addr, 1, FOLL_WRITE, NULL, NULL,
+-			&locked);
++	get_user_pages_remote(mm, addr, 1, FOLL_WRITE, NULL, &locked);
+ 	if (locked)
+ 		mmap_read_unlock(mm);
+ 
+_
