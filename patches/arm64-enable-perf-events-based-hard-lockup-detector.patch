@@ -1,0 +1,153 @@
+From: Douglas Anderson <dianders@chromium.org>
+Subject: arm64: enable perf events based hard lockup detector
+Date: Fri, 19 May 2023 10:18:42 -0700
+
+With the recent feature added to enable perf events to use pseudo NMIs as
+interrupts on platforms which support GICv3 or later, its now been
+possible to enable hard lockup detector (or NMI watchdog) on arm64
+platforms.  So enable corresponding support.
+
+One thing to note here is that normally lockup detector is initialized
+just after the early initcalls but PMU on arm64 comes up much later as
+device_initcall().  To cope with that, override
+arch_perf_nmi_is_available() to let the watchdog framework know PMU not
+ready, and inform the framework to re-initialize lockup detection once PMU
+has been initialized.
+
+Link: https://lkml.kernel.org/r/20230519101840.v5.18.Ia44852044cdcb074f387e80df6b45e892965d4a1@changeid
+Co-developed-by: Sumit Garg <sumit.garg@linaro.org>
+Signed-off-by: Sumit Garg <sumit.garg@linaro.org>
+Co-developed-by: Pingfan Liu <kernelfans@gmail.com>
+Signed-off-by: Pingfan Liu <kernelfans@gmail.com>
+Signed-off-by: Lecopzer Chen <lecopzer.chen@mediatek.com>
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Chen-Yu Tsai <wens@csie.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Colin Cross <ccross@android.com>
+Cc: Daniel Thompson <daniel.thompson@linaro.org>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Guenter Roeck <groeck@chromium.org>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masayoshi Mizuma <msys.mizuma@gmail.com>
+Cc: Matthias Kaehlcke <mka@chromium.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Cc: Ricardo Neri <ricardo.neri@intel.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Stephen Boyd <swboyd@chromium.org>
+Cc: Tzung-Bi Shih <tzungbi@chromium.org>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/Kconfig               |    2 ++
+ arch/arm64/kernel/watchdog_hld.c |   12 ++++++++++++
+ drivers/perf/arm_pmu.c           |    5 +++++
+ drivers/perf/arm_pmuv3.c         |   12 ++++++++++--
+ include/linux/perf/arm_pmu.h     |    2 ++
+ 5 files changed, 31 insertions(+), 2 deletions(-)
+
+--- a/arch/arm64/Kconfig~arm64-enable-perf-events-based-hard-lockup-detector
++++ a/arch/arm64/Kconfig
+@@ -203,12 +203,14 @@ config ARM64
+ 	select HAVE_FUNCTION_ERROR_INJECTION
+ 	select HAVE_FUNCTION_GRAPH_TRACER
+ 	select HAVE_GCC_PLUGINS
++	select HAVE_HARDLOCKUP_DETECTOR_PERF if PERF_EVENTS && HAVE_PERF_EVENTS_NMI
+ 	select HAVE_HW_BREAKPOINT if PERF_EVENTS
+ 	select HAVE_IOREMAP_PROT
+ 	select HAVE_IRQ_TIME_ACCOUNTING
+ 	select HAVE_KVM
+ 	select HAVE_NMI
+ 	select HAVE_PERF_EVENTS
++	select HAVE_PERF_EVENTS_NMI if ARM64_PSEUDO_NMI
+ 	select HAVE_PERF_REGS
+ 	select HAVE_PERF_USER_STACK_DUMP
+ 	select HAVE_PREEMPT_DYNAMIC_KEY
+--- a/arch/arm64/kernel/watchdog_hld.c~arm64-enable-perf-events-based-hard-lockup-detector
++++ a/arch/arm64/kernel/watchdog_hld.c
+@@ -1,5 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
++#include <linux/nmi.h>
+ #include <linux/cpufreq.h>
++#include <linux/perf/arm_pmu.h>
+ 
+ /*
+  * Safe maximum CPU frequency in case a particular platform doesn't implement
+@@ -22,3 +24,13 @@ u64 hw_nmi_get_sample_period(int watchdo
+ 
+ 	return (u64)max_cpu_freq * watchdog_thresh;
+ }
++
++bool __init arch_perf_nmi_is_available(void)
++{
++	/*
++	 * hardlockup_detector_perf_init() will success even if Pseudo-NMI turns off,
++	 * however, the pmu interrupts will act like a normal interrupt instead of
++	 * NMI and the hardlockup detector would be broken.
++	 */
++	return arm_pmu_irq_is_nmi();
++}
+--- a/drivers/perf/arm_pmu.c~arm64-enable-perf-events-based-hard-lockup-detector
++++ a/drivers/perf/arm_pmu.c
+@@ -687,6 +687,11 @@ static int armpmu_get_cpu_irq(struct arm
+ 	return per_cpu(hw_events->irq, cpu);
+ }
+ 
++bool arm_pmu_irq_is_nmi(void)
++{
++	return has_nmi;
++}
++
+ /*
+  * PMU hardware loses all context when a CPU goes offline.
+  * When a CPU is hotplugged back in, since some hardware registers are
+--- a/drivers/perf/arm_pmuv3.c~arm64-enable-perf-events-based-hard-lockup-detector
++++ a/drivers/perf/arm_pmuv3.c
+@@ -22,6 +22,7 @@
+ #include <linux/platform_device.h>
+ #include <linux/sched_clock.h>
+ #include <linux/smp.h>
++#include <linux/nmi.h>
+ 
+ #include <asm/arm_pmuv3.h>
+ 
+@@ -1348,10 +1349,17 @@ static struct platform_driver armv8_pmu_
+ 
+ static int __init armv8_pmu_driver_init(void)
+ {
++	int ret;
++
+ 	if (acpi_disabled)
+-		return platform_driver_register(&armv8_pmu_driver);
++		ret = platform_driver_register(&armv8_pmu_driver);
+ 	else
+-		return arm_pmu_acpi_probe(armv8_pmuv3_pmu_init);
++		ret = arm_pmu_acpi_probe(armv8_pmuv3_pmu_init);
++
++	if (!ret)
++		lockup_detector_retry_init();
++
++	return ret;
+ }
+ device_initcall(armv8_pmu_driver_init)
+ 
+--- a/include/linux/perf/arm_pmu.h~arm64-enable-perf-events-based-hard-lockup-detector
++++ a/include/linux/perf/arm_pmu.h
+@@ -171,6 +171,8 @@ void kvm_host_pmu_init(struct arm_pmu *p
+ #define kvm_host_pmu_init(x)	do { } while(0)
+ #endif
+ 
++bool arm_pmu_irq_is_nmi(void);
++
+ /* Internal functions only for core arm_pmu code */
+ struct arm_pmu *armpmu_alloc(void);
+ void armpmu_free(struct arm_pmu *pmu);
+_

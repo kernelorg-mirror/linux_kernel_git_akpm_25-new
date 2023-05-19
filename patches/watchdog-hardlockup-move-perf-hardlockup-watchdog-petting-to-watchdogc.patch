@@ -1,0 +1,159 @@
+From: Douglas Anderson <dianders@chromium.org>
+Subject: watchdog/hardlockup: move perf hardlockup watchdog petting to watchdog.c
+Date: Fri, 19 May 2023 10:18:35 -0700
+
+In preparation for the buddy hardlockup detector, which wants the same
+petting logic as the current perf hardlockup detector, move the code to
+watchdog.c.  While doing this, rename the global variable to match others
+nearby.  As part of this change we have to change the code to account for
+the fact that the CPU we're running on might be different than the one
+we're checking.
+
+Currently the code in watchdog.c is guarded by
+CONFIG_HARDLOCKUP_DETECTOR_PERF, which makes this change seem silly. 
+However, a future patch will change this.
+
+Link: https://lkml.kernel.org/r/20230519101840.v5.11.I00dfd6386ee00da25bf26d140559a41339b53e57@changeid
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Chen-Yu Tsai <wens@csie.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Colin Cross <ccross@android.com>
+Cc: Daniel Thompson <daniel.thompson@linaro.org>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Guenter Roeck <groeck@chromium.org>
+Cc: Ian Rogers <irogers@google.com>
+Cc: Lecopzer Chen <lecopzer.chen@mediatek.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masayoshi Mizuma <msys.mizuma@gmail.com>
+Cc: Matthias Kaehlcke <mka@chromium.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Pingfan Liu <kernelfans@gmail.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+Cc: Ricardo Neri <ricardo.neri@intel.com>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Stephen Boyd <swboyd@chromium.org>
+Cc: Sumit Garg <sumit.garg@linaro.org>
+Cc: Tzung-Bi Shih <tzungbi@chromium.org>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/nmi.h    |    5 +++--
+ kernel/watchdog.c      |   19 +++++++++++++++++++
+ kernel/watchdog_perf.c |   19 -------------------
+ 3 files changed, 22 insertions(+), 21 deletions(-)
+
+--- a/include/linux/nmi.h~watchdog-hardlockup-move-perf-hardlockup-watchdog-petting-to-watchdogc
++++ a/include/linux/nmi.h
+@@ -88,7 +88,10 @@ static inline void hardlockup_detector_d
+ #endif
+ 
+ #if defined(CONFIG_HARDLOCKUP_DETECTOR_PERF)
++void arch_touch_nmi_watchdog(void);
+ void watchdog_hardlockup_check(unsigned int cpu, struct pt_regs *regs);
++#elif !defined(CONFIG_HAVE_NMI_WATCHDOG)
++static inline void arch_touch_nmi_watchdog(void) { }
+ #endif
+ 
+ #if defined(CONFIG_HAVE_NMI_WATCHDOG) || defined(CONFIG_HARDLOCKUP_DETECTOR)
+@@ -98,7 +101,6 @@ void watchdog_hardlockup_check(unsigned
+ #endif
+ 
+ #if defined(CONFIG_HARDLOCKUP_DETECTOR_PERF)
+-extern void arch_touch_nmi_watchdog(void);
+ extern void hardlockup_detector_perf_stop(void);
+ extern void hardlockup_detector_perf_restart(void);
+ extern void hardlockup_detector_perf_disable(void);
+@@ -113,7 +115,6 @@ static inline void hardlockup_detector_p
+ static inline void hardlockup_detector_perf_cleanup(void) { }
+ # if !defined(CONFIG_HAVE_NMI_WATCHDOG)
+ static inline int hardlockup_detector_perf_init(void) { return -ENODEV; }
+-static inline void arch_touch_nmi_watchdog(void) {}
+ # else
+ static inline int hardlockup_detector_perf_init(void) { return 0; }
+ # endif
+--- a/kernel/watchdog.c~watchdog-hardlockup-move-perf-hardlockup-watchdog-petting-to-watchdogc
++++ a/kernel/watchdog.c
+@@ -90,8 +90,22 @@ __setup("nmi_watchdog=", hardlockup_pani
+ static DEFINE_PER_CPU(atomic_t, hrtimer_interrupts);
+ static DEFINE_PER_CPU(int, hrtimer_interrupts_saved);
+ static DEFINE_PER_CPU(bool, watchdog_hardlockup_warned);
++static DEFINE_PER_CPU(bool, watchdog_hardlockup_touched);
+ static unsigned long watchdog_hardlockup_all_cpu_dumped;
+ 
++notrace void arch_touch_nmi_watchdog(void)
++{
++	/*
++	 * Using __raw here because some code paths have
++	 * preemption enabled.  If preemption is enabled
++	 * then interrupts should be enabled too, in which
++	 * case we shouldn't have to worry about the watchdog
++	 * going off.
++	 */
++	raw_cpu_write(watchdog_hardlockup_touched, true);
++}
++EXPORT_SYMBOL(arch_touch_nmi_watchdog);
++
+ static bool is_hardlockup(unsigned int cpu)
+ {
+ 	int hrint = atomic_read(&per_cpu(hrtimer_interrupts, cpu));
+@@ -116,6 +130,11 @@ static void watchdog_hardlockup_kick(voi
+ 
+ void watchdog_hardlockup_check(unsigned int cpu, struct pt_regs *regs)
+ {
++	if (per_cpu(watchdog_hardlockup_touched, cpu)) {
++		per_cpu(watchdog_hardlockup_touched, cpu) = false;
++		return;
++	}
++
+ 	/*
+ 	 * Check for a hardlockup by making sure the CPU's timer
+ 	 * interrupt is incrementing. The timer interrupt should have
+--- a/kernel/watchdog_perf.c~watchdog-hardlockup-move-perf-hardlockup-watchdog-petting-to-watchdogc
++++ a/kernel/watchdog_perf.c
+@@ -20,26 +20,12 @@
+ #include <asm/irq_regs.h>
+ #include <linux/perf_event.h>
+ 
+-static DEFINE_PER_CPU(bool, watchdog_nmi_touch);
+ static DEFINE_PER_CPU(struct perf_event *, watchdog_ev);
+ static DEFINE_PER_CPU(struct perf_event *, dead_event);
+ static struct cpumask dead_events_mask;
+ 
+ static atomic_t watchdog_cpus = ATOMIC_INIT(0);
+ 
+-notrace void arch_touch_nmi_watchdog(void)
+-{
+-	/*
+-	 * Using __raw here because some code paths have
+-	 * preemption enabled.  If preemption is enabled
+-	 * then interrupts should be enabled too, in which
+-	 * case we shouldn't have to worry about the watchdog
+-	 * going off.
+-	 */
+-	raw_cpu_write(watchdog_nmi_touch, true);
+-}
+-EXPORT_SYMBOL(arch_touch_nmi_watchdog);
+-
+ #ifdef CONFIG_HARDLOCKUP_CHECK_TIMESTAMP
+ static DEFINE_PER_CPU(ktime_t, last_timestamp);
+ static DEFINE_PER_CPU(unsigned int, nmi_rearmed);
+@@ -115,11 +101,6 @@ static void watchdog_overflow_callback(s
+ 	if (!watchdog_check_timestamp())
+ 		return;
+ 
+-	if (__this_cpu_read(watchdog_nmi_touch) == true) {
+-		__this_cpu_write(watchdog_nmi_touch, false);
+-		return;
+-	}
+-
+ 	watchdog_hardlockup_check(smp_processor_id(), regs);
+ }
+ 
+_

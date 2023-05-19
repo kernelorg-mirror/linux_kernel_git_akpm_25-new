@@ -1,0 +1,112 @@
+From: Christoph Hellwig <hch@lst.de>
+Subject: filemap: add a kiocb_invalidate_pages helper
+Date: Fri, 19 May 2023 11:35:13 +0200
+
+Factor out a helper that calls filemap_write_and_wait_range and
+invalidate_inode_pages2_rangefor a the range covered by a write kiocb or
+returns -EAGAIN if the kiocb is marked as nowait and there would be pages
+to write or invalidate.
+
+Link: https://lkml.kernel.org/r/20230519093521.133226-6-hch@lst.de
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Andreas Gruenbacher <agruenba@redhat.com>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Chao Yu <chao@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Damien Le Moal <dlemoal@kernel.org>
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Ilya Dryomov <idryomov@gmail.com>
+Cc: Jaegeuk Kim <jaegeuk@kernel.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Theodore Ts'o <tytso@mit.edu>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Cc: Xiubo Li <xiubli@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/pagemap.h |    1 
+ mm/filemap.c            |   48 ++++++++++++++++++++++----------------
+ 2 files changed, 29 insertions(+), 20 deletions(-)
+
+--- a/include/linux/pagemap.h~filemap-add-a-kiocb_invalidate_pages-helper
++++ a/include/linux/pagemap.h
+@@ -30,6 +30,7 @@ static inline void invalidate_remote_ino
+ int invalidate_inode_pages2(struct address_space *mapping);
+ int invalidate_inode_pages2_range(struct address_space *mapping,
+ 		pgoff_t start, pgoff_t end);
++int kiocb_invalidate_pages(struct kiocb *iocb, size_t count);
+ 
+ int write_inode_now(struct inode *, int sync);
+ int filemap_fdatawrite(struct address_space *);
+--- a/mm/filemap.c~filemap-add-a-kiocb_invalidate_pages-helper
++++ a/mm/filemap.c
+@@ -2750,6 +2750,33 @@ int kiocb_write_and_wait(struct kiocb *i
+ 	return filemap_write_and_wait_range(mapping, pos, end);
+ }
+ 
++int kiocb_invalidate_pages(struct kiocb *iocb, size_t count)
++{
++	struct address_space *mapping = iocb->ki_filp->f_mapping;
++	loff_t pos = iocb->ki_pos;
++	loff_t end = pos + count - 1;
++	int ret;
++
++	if (iocb->ki_flags & IOCB_NOWAIT) {
++		/* we could block if there are any pages in the range */
++		if (filemap_range_has_page(mapping, pos, end))
++			return -EAGAIN;
++	} else {
++		ret = filemap_write_and_wait_range(mapping, pos, end);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * After a write we want buffered reads to be sure to go to disk to get
++	 * the new data.  We invalidate clean cached page from the region we're
++	 * about to write.  We do this *before* the write so that we can return
++	 * without clobbering -EIOCBQUEUED from ->direct_IO().
++	 */
++	return invalidate_inode_pages2_range(mapping, pos >> PAGE_SHIFT,
++					     end >> PAGE_SHIFT);
++}
++
+ /**
+  * generic_file_read_iter - generic filesystem read routine
+  * @iocb:	kernel I/O control block
+@@ -3793,30 +3820,11 @@ generic_file_direct_write(struct kiocb *
+ 	write_len = iov_iter_count(from);
+ 	end = (pos + write_len - 1) >> PAGE_SHIFT;
+ 
+-	if (iocb->ki_flags & IOCB_NOWAIT) {
+-		/* If there are pages to writeback, return */
+-		if (filemap_range_has_page(file->f_mapping, pos,
+-					   pos + write_len - 1))
+-			return -EAGAIN;
+-	} else {
+-		written = filemap_write_and_wait_range(mapping, pos,
+-							pos + write_len - 1);
+-		if (written)
+-			goto out;
+-	}
+-
+-	/*
+-	 * After a write we want buffered reads to be sure to go to disk to get
+-	 * the new data.  We invalidate clean cached page from the region we're
+-	 * about to write.  We do this *before* the write so that we can return
+-	 * without clobbering -EIOCBQUEUED from ->direct_IO().
+-	 */
+-	written = invalidate_inode_pages2_range(mapping,
+-					pos >> PAGE_SHIFT, end);
+ 	/*
+ 	 * If a page can not be invalidated, return 0 to fall back
+ 	 * to buffered write.
+ 	 */
++	written = kiocb_invalidate_pages(iocb, write_len);
+ 	if (written) {
+ 		if (written == -EBUSY)
+ 			return 0;
+_

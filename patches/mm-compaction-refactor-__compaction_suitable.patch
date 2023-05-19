@@ -1,0 +1,241 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: compaction: refactor __compaction_suitable()
+Date: Fri, 19 May 2023 14:39:57 +0200
+
+__compaction_suitable() is supposed to check for available migration
+targets.  However, it also checks whether the operation was requested via
+/proc/sys/vm/compact_memory, and whether the original allocation request
+can already succeed.  These don't apply to all callsites.
+
+Move the checks out to the callers, so that later patches can deal with
+them one by one.  No functional change intended.
+
+Link: https://lkml.kernel.org/r/20230519123959.77335-4-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/compaction.h |    4 -
+ mm/compaction.c            |   78 ++++++++++++++++++++++-------------
+ mm/vmscan.c                |   35 +++++++++------
+ 3 files changed, 73 insertions(+), 44 deletions(-)
+
+--- a/include/linux/compaction.h~mm-compaction-refactor-__compaction_suitable
++++ a/include/linux/compaction.h
+@@ -90,7 +90,7 @@ extern enum compact_result try_to_compac
+ 		struct page **page);
+ extern void reset_isolation_suitable(pg_data_t *pgdat);
+ extern enum compact_result compaction_suitable(struct zone *zone, int order,
+-		unsigned int alloc_flags, int highest_zoneidx);
++					       int highest_zoneidx);
+ 
+ extern void compaction_defer_reset(struct zone *zone, int order,
+ 				bool alloc_success);
+@@ -108,7 +108,7 @@ static inline void reset_isolation_suita
+ }
+ 
+ static inline enum compact_result compaction_suitable(struct zone *zone, int order,
+-					int alloc_flags, int highest_zoneidx)
++						      int highest_zoneidx)
+ {
+ 	return COMPACT_SKIPPED;
+ }
+--- a/mm/compaction.c~mm-compaction-refactor-__compaction_suitable
++++ a/mm/compaction.c
+@@ -2216,24 +2216,10 @@ static enum compact_result compact_finis
+ }
+ 
+ static enum compact_result __compaction_suitable(struct zone *zone, int order,
+-					unsigned int alloc_flags,
+ 					int highest_zoneidx,
+ 					unsigned long wmark_target)
+ {
+ 	unsigned long watermark;
+-
+-	if (is_via_compact_memory(order))
+-		return COMPACT_CONTINUE;
+-
+-	watermark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
+-	/*
+-	 * If watermarks for high-order allocation are already met, there
+-	 * should be no need for compaction at all.
+-	 */
+-	if (zone_watermark_ok(zone, order, watermark, highest_zoneidx,
+-								alloc_flags))
+-		return COMPACT_SUCCESS;
+-
+ 	/*
+ 	 * Watermarks for order-0 must be met for compaction to be able to
+ 	 * isolate free pages for migration targets. This means that the
+@@ -2266,13 +2252,12 @@ static enum compact_result __compaction_
+  *   COMPACT_CONTINUE - If compaction should run now
+  */
+ enum compact_result compaction_suitable(struct zone *zone, int order,
+-					unsigned int alloc_flags,
+ 					int highest_zoneidx)
+ {
+ 	enum compact_result ret;
+ 	int fragindex;
+ 
+-	ret = __compaction_suitable(zone, order, alloc_flags, highest_zoneidx,
++	ret = __compaction_suitable(zone, order, highest_zoneidx,
+ 				    zone_page_state(zone, NR_FREE_PAGES));
+ 	/*
+ 	 * fragmentation index determines if allocation failures are due to
+@@ -2316,7 +2301,16 @@ bool compaction_zonelist_suitable(struct
+ 	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
+ 				ac->highest_zoneidx, ac->nodemask) {
+ 		unsigned long available;
+-		enum compact_result compact_result;
++		unsigned long watermark;
++
++		if (is_via_compact_memory(order))
++			return true;
++
++		/* Allocation can already succeed, nothing to do */
++		watermark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
++		if (zone_watermark_ok(zone, order, watermark,
++				      ac->highest_zoneidx, alloc_flags))
++			continue;
+ 
+ 		/*
+ 		 * Do not consider all the reclaimable memory because we do not
+@@ -2326,9 +2320,8 @@ bool compaction_zonelist_suitable(struct
+ 		 */
+ 		available = zone_reclaimable_pages(zone) / order;
+ 		available += zone_page_state_snapshot(zone, NR_FREE_PAGES);
+-		compact_result = __compaction_suitable(zone, order, alloc_flags,
+-				ac->highest_zoneidx, available);
+-		if (compact_result == COMPACT_CONTINUE)
++		if (__compaction_suitable(zone, order, ac->highest_zoneidx,
++					  available) == COMPACT_CONTINUE)
+ 			return true;
+ 	}
+ 
+@@ -2358,11 +2351,23 @@ compact_zone(struct compact_control *cc,
+ 	INIT_LIST_HEAD(&cc->migratepages);
+ 
+ 	cc->migratetype = gfp_migratetype(cc->gfp_mask);
+-	ret = compaction_suitable(cc->zone, cc->order, cc->alloc_flags,
+-							cc->highest_zoneidx);
+-	/* Compaction is likely to fail */
+-	if (ret == COMPACT_SUCCESS || ret == COMPACT_SKIPPED)
+-		return ret;
++
++	if (!is_via_compact_memory(cc->order)) {
++		unsigned long watermark;
++
++		/* Allocation can already succeed, nothing to do */
++		watermark = wmark_pages(cc->zone,
++					cc->alloc_flags & ALLOC_WMARK_MASK);
++		if (zone_watermark_ok(cc->zone, cc->order, watermark,
++				      cc->highest_zoneidx, cc->alloc_flags))
++			return COMPACT_SUCCESS;
++
++		ret = compaction_suitable(cc->zone, cc->order,
++					  cc->highest_zoneidx);
++		/* Compaction is likely to fail */
++		if (ret == COMPACT_SKIPPED)
++			return ret;
++	}
+ 
+ 	/*
+ 	 * Clear pageblock skip if there were failures recently and compaction
+@@ -2866,7 +2871,16 @@ static bool kcompactd_node_suitable(pg_d
+ 		if (!populated_zone(zone))
+ 			continue;
+ 
+-		if (compaction_suitable(zone, pgdat->kcompactd_max_order, 0,
++		if (is_via_compact_memory(pgdat->kcompactd_max_order))
++			return true;
++
++		/* Allocation can already succeed, check other zones */
++		if (zone_watermark_ok(zone, pgdat->kcompactd_max_order,
++				      min_wmark_pages(zone),
++				      highest_zoneidx, 0))
++			continue;
++
++		if (compaction_suitable(zone, pgdat->kcompactd_max_order,
+ 					highest_zoneidx) == COMPACT_CONTINUE)
+ 			return true;
+ 	}
+@@ -2904,10 +2918,18 @@ static void kcompactd_do_work(pg_data_t
+ 		if (compaction_deferred(zone, cc.order))
+ 			continue;
+ 
+-		if (compaction_suitable(zone, cc.order, 0, zoneid) !=
+-							COMPACT_CONTINUE)
++		if (is_via_compact_memory(cc.order))
++			goto compact;
++
++		/* Allocation can already succeed, nothing to do */
++		if (zone_watermark_ok(zone, cc.order,
++				      min_wmark_pages(zone), zoneid, 0))
+ 			continue;
+ 
++		if (compaction_suitable(zone, cc.order,
++					zoneid) != COMPACT_CONTINUE)
++			continue;
++compact:
+ 		if (kthread_should_stop())
+ 			return;
+ 
+--- a/mm/vmscan.c~mm-compaction-refactor-__compaction_suitable
++++ a/mm/vmscan.c
+@@ -6399,14 +6399,17 @@ static inline bool should_continue_recla
+ 		if (!managed_zone(zone))
+ 			continue;
+ 
+-		switch (compaction_suitable(zone, sc->order, 0, sc->reclaim_idx)) {
+-		case COMPACT_SUCCESS:
+-		case COMPACT_CONTINUE:
++		if (sc->order == -1) /* is_via_compact_memory() */
++			return false;
++
++		/* Allocation can already succeed, nothing to do */
++		if (zone_watermark_ok(zone, sc->order, min_wmark_pages(zone),
++				      sc->reclaim_idx, 0))
++			return false;
++
++		if (compaction_suitable(zone, sc->order,
++					sc->reclaim_idx) == COMPACT_CONTINUE)
+ 			return false;
+-		default:
+-			/* check next zone */
+-			;
+-		}
+ 	}
+ 
+ 	/*
+@@ -6594,16 +6597,20 @@ again:
+ static inline bool compaction_ready(struct zone *zone, struct scan_control *sc)
+ {
+ 	unsigned long watermark;
+-	enum compact_result suitable;
+ 
+-	suitable = compaction_suitable(zone, sc->order, 0, sc->reclaim_idx);
+-	if (suitable == COMPACT_SUCCESS)
+-		/* Allocation should succeed already. Don't reclaim. */
++	if (sc->order == -1) /* is_via_compact_memory() */
++		goto suitable;
++
++	/* Allocation can already succeed, nothing to do */
++	if (zone_watermark_ok(zone, sc->order, min_wmark_pages(zone),
++			      sc->reclaim_idx, 0))
+ 		return true;
+-	if (suitable == COMPACT_SKIPPED)
+-		/* Compaction cannot yet proceed. Do reclaim. */
+-		return false;
+ 
++	/* Compaction cannot yet proceed. Do reclaim. */
++	if (compaction_suitable(zone, sc->order,
++				sc->reclaim_idx) == COMPACT_SKIPPED)
++		return false;
++suitable:
+ 	/*
+ 	 * Compaction is already possible, but it takes time to run and there
+ 	 * are potentially other callers using the pages just freed. So proceed
+_
