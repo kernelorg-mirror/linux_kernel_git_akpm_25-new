@@ -1,0 +1,121 @@
+From: Nicholas Piggin <npiggin@gmail.com>
+Subject: lazy tlb: consolidate lazy tlb mm switching
+Date: Wed, 24 May 2023 16:04:55 +1000
+
+Switching a kernel thread using a "lazy tlb mm" to init_mm is a relatively
+common sequence that is not quite trivial.  Consolidate this into a
+function.
+
+This fixes a bug in do_shoot_lazy_tlb() for any arch that implements
+finish_arch_post_lock_switch().  None select MMU_LAZY_TLB_SHOOTDOWN at the
+moment.
+
+Link: https://lkml.kernel.org/r/20230524060455.147699-2-npiggin@gmail.com
+Fixes: 2655421ae69fa ("lazy tlb: shoot lazies, non-refcounting lazy tlb mm reference handling scheme")
+Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/powerpc/mm/book3s64/radix_tlb.c |    6 ----
+ include/linux/sched/task.h           |    2 +
+ kernel/fork.c                        |    7 +----
+ kernel/sched/core.c                  |   34 +++++++++++++++++--------
+ 4 files changed, 29 insertions(+), 20 deletions(-)
+
+--- a/arch/powerpc/mm/book3s64/radix_tlb.c~lazy-tlb-consolidate-lazy-tlb-mm-switching
++++ a/arch/powerpc/mm/book3s64/radix_tlb.c
+@@ -795,12 +795,8 @@ void exit_lazy_flush_tlb(struct mm_struc
+ 		goto out;
+ 
+ 	if (current->active_mm == mm) {
+-		WARN_ON_ONCE(current->mm != NULL);
+ 		/* Is a kernel thread and is using mm as the lazy tlb */
+-		mmgrab_lazy_tlb(&init_mm);
+-		current->active_mm = &init_mm;
+-		switch_mm_irqs_off(mm, &init_mm, current);
+-		mmdrop_lazy_tlb(mm);
++		kthread_end_lazy_tlb_mm();
+ 	}
+ 
+ 	/*
+--- a/include/linux/sched/task.h~lazy-tlb-consolidate-lazy-tlb-mm-switching
++++ a/include/linux/sched/task.h
+@@ -61,6 +61,8 @@ extern int lockdep_tasklist_lock_is_held
+ extern asmlinkage void schedule_tail(struct task_struct *prev);
+ extern void init_idle(struct task_struct *idle, int cpu);
+ 
++extern void kthread_end_lazy_tlb_mm(void);
++
+ extern int sched_fork(unsigned long clone_flags, struct task_struct *p);
+ extern void sched_cgroup_fork(struct task_struct *p, struct kernel_clone_args *kargs);
+ extern void sched_post_fork(struct task_struct *p);
+--- a/kernel/fork.c~lazy-tlb-consolidate-lazy-tlb-mm-switching
++++ a/kernel/fork.c
+@@ -854,11 +854,8 @@ static void do_shoot_lazy_tlb(void *arg)
+ {
+ 	struct mm_struct *mm = arg;
+ 
+-	if (current->active_mm == mm) {
+-		WARN_ON_ONCE(current->mm);
+-		current->active_mm = &init_mm;
+-		switch_mm(mm, &init_mm, current);
+-	}
++	if (current->active_mm == mm)
++		kthread_end_lazy_tlb_mm();
+ }
+ 
+ static void cleanup_lazy_tlbs(struct mm_struct *mm)
+--- a/kernel/sched/core.c~lazy-tlb-consolidate-lazy-tlb-mm-switching
++++ a/kernel/sched/core.c
+@@ -5347,6 +5347,29 @@ context_switch(struct rq *rq, struct tas
+ }
+ 
+ /*
++ * If this kthread has a user process's mm for its active_mm (aka lazy tlb mm)
++ * then switch away from it, to init_mm. Must not be called while using an
++ * mm with kthread_use_mm().
++ */
++void kthread_end_lazy_tlb_mm(void)
++{
++	struct mm_struct *mm = current->active_mm;
++
++	WARN_ON_ONCE(!irqs_disabled());
++
++	if (WARN_ON_ONCE(current->mm))
++		return; /* Not a kthread or doing kthread_use_mm */
++
++	if (mm != &init_mm) {
++		mmgrab_lazy_tlb(&init_mm);
++		current->active_mm = &init_mm;
++		switch_mm_irqs_off(mm, &init_mm, current);
++		finish_arch_post_lock_switch();
++		mmdrop_lazy_tlb(mm);
++	}
++}
++
++/*
+  * nr_running and nr_context_switches:
+  *
+  * externally visible scheduler statistics: current number of runnable
+@@ -9375,17 +9398,8 @@ void sched_setnuma(struct task_struct *p
+  */
+ void idle_task_prepare_exit(void)
+ {
+-	struct mm_struct *mm = current->active_mm;
+-
+ 	WARN_ON(!irqs_disabled());
+-
+-	if (mm != &init_mm) {
+-		mmgrab_lazy_tlb(&init_mm);
+-		current->active_mm = &init_mm;
+-		switch_mm_irqs_off(mm, &init_mm, current);
+-		finish_arch_post_lock_switch();
+-		mmdrop_lazy_tlb(mm);
+-	}
++	kthread_end_lazy_tlb_mm();
+ 	/* finish_cpu() will mmdrop the init_mm ref after this CPU stops */
+ }
+ 
+_
