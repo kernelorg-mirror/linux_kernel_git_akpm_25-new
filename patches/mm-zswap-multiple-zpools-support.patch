@@ -1,0 +1,370 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: mm: zswap: multiple zpools support
+Date: Wed, 31 May 2023 22:13:01 +0000
+
+Support using multiple zpools of the same type in zswap, for concurrency
+purposes.  Add CONFIG_ZSWAP_NR_ZPOOLS_ORDER to control the number of
+zpools.  The order is specific by the config rather than the absolute
+number to guarantee a power of 2.  This is useful so that we can use
+deterministically link each entry to a zpool by hashing the zswap_entry
+pointer.
+
+On a setup with zswap and zsmalloc, comparing a single zpool (current
+default) to 32 zpools (by setting CONFIG_ZSWAP_NR_ZPOOLS_ORDER=32) shows
+improvements in the zsmalloc lock contention, especially on the swap out
+path.
+
+The following shows the perf analysis of the swapout path when 10
+workloads are simultaneously reclaiming and refaulting tmpfs pages.  There
+are some improvements on the swap in path as well, but much less
+significant.
+
+1 zpool:
+
+ |--28.99%--zswap_frontswap_store
+       |
+       <snip>
+       |
+       |--8.98%--zpool_map_handle
+       |     |
+       |      --8.98%--zs_zpool_map
+       |           |
+       |            --8.95%--zs_map_object
+       |                 |
+       |                  --8.38%--_raw_spin_lock
+       |                       |
+       |                        --7.39%--queued_spin_lock_slowpath
+       |
+       |--8.82%--zpool_malloc
+       |     |
+       |      --8.82%--zs_zpool_malloc
+       |           |
+       |            --8.80%--zs_malloc
+       |                 |
+       |                 |--7.21%--_raw_spin_lock
+       |                 |     |
+       |                 |      --6.81%--queued_spin_lock_slowpath
+       <snip>
+
+32 zpools:
+
+ |--16.73%--zswap_frontswap_store
+       |
+       <snip>
+       |
+       |--1.81%--zpool_malloc
+       |     |
+       |      --1.81%--zs_zpool_malloc
+       |           |
+       |            --1.79%--zs_malloc
+       |                 |
+       |                  --0.73%--obj_malloc
+       |
+       |--1.06%--zswap_update_total_size
+       |
+       |--0.59%--zpool_map_handle
+       |     |
+       |      --0.59%--zs_zpool_map
+       |           |
+       |            --0.57%--zs_map_object
+       |                 |
+       |                  --0.51%--_raw_spin_lock
+       <snip>
+
+Link: https://lkml.kernel.org/r/20230531221302.1664613-1-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Suggested-by: Yu Zhao <yuzhao@google.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/Kconfig |   12 ++++++
+ mm/zswap.c |   93 ++++++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 74 insertions(+), 31 deletions(-)
+
+--- a/mm/Kconfig~mm-zswap-multiple-zpools-support
++++ a/mm/Kconfig
+@@ -59,6 +59,18 @@ config ZSWAP_EXCLUSIVE_LOADS
+ 	  The cost is that if the page was never dirtied and needs to be
+ 	  swapped out again, it will be re-compressed.
+ 
++config ZSWAP_NR_ZPOOLS_ORDER
++	int "Number of zpools in zswap, as power of 2"
++	default 0
++	depends on ZSWAP
++	help
++	  This options determines the number of zpools to use for zswap, it
++	  will be 1 << CONFIG_ZSWAP_NR_ZPOOLS_ORDER.
++
++	  Having multiple zpools helps with concurrency and lock contention
++	  on the swap in and swap out paths, but uses a little bit of extra
++	  space.
++
+ choice
+ 	prompt "Default compressor"
+ 	depends on ZSWAP
+--- a/mm/zswap.c~mm-zswap-multiple-zpools-support
++++ a/mm/zswap.c
+@@ -137,6 +137,9 @@ static bool zswap_non_same_filled_pages_
+ module_param_named(non_same_filled_pages_enabled, zswap_non_same_filled_pages_enabled,
+ 		   bool, 0644);
+ 
++/* Number of zpools in zswap_pool */
++#define ZSWAP_NR_ZPOOLS (1 << CONFIG_ZSWAP_NR_ZPOOLS_ORDER)
++
+ /*********************************
+ * data structures
+ **********************************/
+@@ -150,7 +153,6 @@ struct crypto_acomp_ctx {
+ };
+ 
+ struct zswap_pool {
+-	struct zpool *zpool;
+ 	struct crypto_acomp_ctx __percpu *acomp_ctx;
+ 	struct kref kref;
+ 	struct list_head list;
+@@ -158,6 +160,7 @@ struct zswap_pool {
+ 	struct work_struct shrink_work;
+ 	struct hlist_node node;
+ 	char tfm_name[CRYPTO_MAX_ALG_NAME];
++	struct zpool *zpools[ZSWAP_NR_ZPOOLS];
+ };
+ 
+ /*
+@@ -236,7 +239,7 @@ static bool zswap_has_pool;
+ 
+ #define zswap_pool_debug(msg, p)				\
+ 	pr_debug("%s pool %s/%s\n", msg, (p)->tfm_name,		\
+-		 zpool_get_type((p)->zpool))
++		 zpool_get_type((p)->zpools[0]))
+ 
+ static int zswap_writeback_entry(struct zpool *pool, unsigned long handle);
+ static int zswap_pool_get(struct zswap_pool *pool);
+@@ -263,11 +266,13 @@ static void zswap_update_total_size(void
+ {
+ 	struct zswap_pool *pool;
+ 	u64 total = 0;
++	int i;
+ 
+ 	rcu_read_lock();
+ 
+ 	list_for_each_entry_rcu(pool, &zswap_pools, list)
+-		total += zpool_get_total_size(pool->zpool);
++		for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
++			total += zpool_get_total_size(pool->zpools[i]);
+ 
+ 	rcu_read_unlock();
+ 
+@@ -350,6 +355,16 @@ static void zswap_rb_erase(struct rb_roo
+ 	}
+ }
+ 
++static struct zpool *zswap_find_zpool(struct zswap_entry *entry)
++{
++	int i = 0;
++
++	if (ZSWAP_NR_ZPOOLS > 1)
++		i = hash_ptr(entry, ilog2(ZSWAP_NR_ZPOOLS));
++
++	return entry->pool->zpools[i];
++}
++
+ /*
+  * Carries out the common pattern of freeing and entry's zpool allocation,
+  * freeing the entry itself, and decrementing the number of stored pages.
+@@ -363,7 +378,7 @@ static void zswap_free_entry(struct zswa
+ 	if (!entry->length)
+ 		atomic_dec(&zswap_same_filled_pages);
+ 	else {
+-		zpool_free(entry->pool->zpool, entry->handle);
++		zpool_free(zswap_find_zpool(entry), entry->handle);
+ 		zswap_pool_put(entry->pool);
+ 	}
+ 	zswap_entry_cache_free(entry);
+@@ -572,7 +587,8 @@ static struct zswap_pool *zswap_pool_fin
+ 	list_for_each_entry_rcu(pool, &zswap_pools, list) {
+ 		if (strcmp(pool->tfm_name, compressor))
+ 			continue;
+-		if (strcmp(zpool_get_type(pool->zpool), type))
++		/* all zpools share the same type */
++		if (strcmp(zpool_get_type(pool->zpools[0]), type))
+ 			continue;
+ 		/* if we can't get it, it's about to be destroyed */
+ 		if (!zswap_pool_get(pool))
+@@ -587,14 +603,17 @@ static void shrink_worker(struct work_st
+ {
+ 	struct zswap_pool *pool = container_of(w, typeof(*pool),
+ 						shrink_work);
++	int i;
+ 
+-	if (zpool_shrink(pool->zpool, 1, NULL))
+-		zswap_reject_reclaim_fail++;
++	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
++		if (zpool_shrink(pool->zpools[i], 1, NULL))
++			zswap_reject_reclaim_fail++;
+ 	zswap_pool_put(pool);
+ }
+ 
+ static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
+ {
++	int i;
+ 	struct zswap_pool *pool;
+ 	char name[38]; /* 'zswap' + 32 char (max) num + \0 */
+ 	gfp_t gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
+@@ -615,15 +634,19 @@ static struct zswap_pool *zswap_pool_cre
+ 	if (!pool)
+ 		return NULL;
+ 
+-	/* unique name for each pool specifically required by zsmalloc */
+-	snprintf(name, 38, "zswap%x", atomic_inc_return(&zswap_pools_count));
+-
+-	pool->zpool = zpool_create_pool(type, name, gfp, &zswap_zpool_ops);
+-	if (!pool->zpool) {
+-		pr_err("%s zpool not available\n", type);
+-		goto error;
++	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++) {
++		/* unique name for each pool specifically required by zsmalloc */
++		snprintf(name, 38, "zswap%x",
++			 atomic_inc_return(&zswap_pools_count));
++
++		pool->zpools[i] = zpool_create_pool(type, name, gfp,
++						    &zswap_zpool_ops);
++		if (!pool->zpools[i]) {
++			pr_err("%s zpool not available\n", type);
++			goto error;
++		}
+ 	}
+-	pr_debug("using %s zpool\n", zpool_get_type(pool->zpool));
++	pr_debug("using %s zpool\n", zpool_get_type(pool->zpools[0]));
+ 
+ 	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
+ 
+@@ -653,8 +676,8 @@ static struct zswap_pool *zswap_pool_cre
+ error:
+ 	if (pool->acomp_ctx)
+ 		free_percpu(pool->acomp_ctx);
+-	if (pool->zpool)
+-		zpool_destroy_pool(pool->zpool);
++	while (i--)
++		zpool_destroy_pool(pool->zpools[i]);
+ 	kfree(pool);
+ 	return NULL;
+ }
+@@ -703,11 +726,14 @@ static struct zswap_pool *__zswap_pool_c
+ 
+ static void zswap_pool_destroy(struct zswap_pool *pool)
+ {
++	int i;
++
+ 	zswap_pool_debug("destroying", pool);
+ 
+ 	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
+ 	free_percpu(pool->acomp_ctx);
+-	zpool_destroy_pool(pool->zpool);
++	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
++		zpool_destroy_pool(pool->zpools[i]);
+ 	kfree(pool);
+ }
+ 
+@@ -1160,6 +1186,7 @@ static int zswap_frontswap_store(unsigne
+ 	unsigned long handle, value;
+ 	char *buf;
+ 	u8 *src, *dst;
++	struct zpool *zpool;
+ 	struct zswap_header zhdr = { .swpentry = swp_entry(type, offset) };
+ 	gfp_t gfp;
+ 
+@@ -1264,11 +1291,13 @@ static int zswap_frontswap_store(unsigne
+ 	}
+ 
+ 	/* store */
+-	hlen = zpool_evictable(entry->pool->zpool) ? sizeof(zhdr) : 0;
++	zpool = zswap_find_zpool(entry);
++	hlen = zpool_evictable(zpool) ? sizeof(zhdr) : 0;
+ 	gfp = __GFP_NORETRY | __GFP_NOWARN | __GFP_KSWAPD_RECLAIM;
+-	if (zpool_malloc_support_movable(entry->pool->zpool))
++	if (zpool_malloc_support_movable(zpool))
+ 		gfp |= __GFP_HIGHMEM | __GFP_MOVABLE;
+-	ret = zpool_malloc(entry->pool->zpool, hlen + dlen, gfp, &handle);
++	ret = zpool_malloc(zpool, hlen + dlen, gfp, &handle);
++
+ 	if (ret == -ENOSPC) {
+ 		zswap_reject_compress_poor++;
+ 		goto put_dstmem;
+@@ -1277,10 +1306,10 @@ static int zswap_frontswap_store(unsigne
+ 		zswap_reject_alloc_fail++;
+ 		goto put_dstmem;
+ 	}
+-	buf = zpool_map_handle(entry->pool->zpool, handle, ZPOOL_MM_WO);
++	buf = zpool_map_handle(zpool, handle, ZPOOL_MM_WO);
+ 	memcpy(buf, &zhdr, hlen);
+ 	memcpy(buf + hlen, dst, dlen);
+-	zpool_unmap_handle(entry->pool->zpool, handle);
++	zpool_unmap_handle(zpool, handle);
+ 	mutex_unlock(acomp_ctx->mutex);
+ 
+ 	/* populate entry */
+@@ -1358,6 +1387,7 @@ static int zswap_frontswap_load(unsigned
+ 	u8 *src, *dst, *tmp;
+ 	unsigned int dlen;
+ 	int ret;
++	struct zpool *zpool;
+ 
+ 	/* find */
+ 	spin_lock(&tree->lock);
+@@ -1377,7 +1407,8 @@ static int zswap_frontswap_load(unsigned
+ 		goto stats;
+ 	}
+ 
+-	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
++	zpool = zswap_find_zpool(entry);
++	if (!zpool_can_sleep_mapped(zpool)) {
+ 		tmp = kmalloc(entry->length, GFP_KERNEL);
+ 		if (!tmp) {
+ 			ret = -ENOMEM;
+@@ -1387,14 +1418,14 @@ static int zswap_frontswap_load(unsigned
+ 
+ 	/* decompress */
+ 	dlen = PAGE_SIZE;
+-	src = zpool_map_handle(entry->pool->zpool, entry->handle, ZPOOL_MM_RO);
+-	if (zpool_evictable(entry->pool->zpool))
++	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
++	if (zpool_evictable(zpool))
+ 		src += sizeof(struct zswap_header);
+ 
+-	if (!zpool_can_sleep_mapped(entry->pool->zpool)) {
++	if (!zpool_can_sleep_mapped(zpool)) {
+ 		memcpy(tmp, src, entry->length);
+ 		src = tmp;
+-		zpool_unmap_handle(entry->pool->zpool, entry->handle);
++		zpool_unmap_handle(zpool, entry->handle);
+ 	}
+ 
+ 	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+@@ -1406,8 +1437,8 @@ static int zswap_frontswap_load(unsigned
+ 	ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
+ 	mutex_unlock(acomp_ctx->mutex);
+ 
+-	if (zpool_can_sleep_mapped(entry->pool->zpool))
+-		zpool_unmap_handle(entry->pool->zpool, entry->handle);
++	if (zpool_can_sleep_mapped(zpool))
++		zpool_unmap_handle(zpool, entry->handle);
+ 	else
+ 		kfree(tmp);
+ 
+@@ -1563,7 +1594,7 @@ static int zswap_setup(void)
+ 	pool = __zswap_pool_create_fallback();
+ 	if (pool) {
+ 		pr_info("loaded using pool %s/%s\n", pool->tfm_name,
+-			zpool_get_type(pool->zpool));
++			zpool_get_type(pool->zpools[0]));
+ 		list_add(&pool->list, &zswap_pools);
+ 		zswap_has_pool = true;
+ 	} else {
+_
