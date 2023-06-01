@@ -1,0 +1,146 @@
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Subject: mm: add support for unaccepted memory
+Date: Thu, 1 Jun 2023 21:25:35 +0300
+
+Patch series "mm, x86/cc, efi: Implement support for unaccepted memory",
+v13.
+
+UEFI Specification version 2.9 introduces the concept of memory
+acceptance: some Virtual Machine platforms, such as Intel TDX or AMD
+SEV-SNP, requiring memory to be accepted before it can be used by the
+guest.  Accepting happens via a protocol specific for the Virtual Machine
+platform.
+
+Accepting memory is costly and it makes VMM allocate memory for the
+accepted guest physical address range.  It's better to postpone memory
+acceptance until memory is needed.  It lowers boot time and reduces memory
+overhead.
+
+The kernel needs to know what memory has been accepted.  Firmware
+communicates this information via memory map: a new memory type --
+EFI_UNACCEPTED_MEMORY -- indicates such memory.
+
+Range-based tracking works fine for firmware, but it gets bulky for the
+kernel: e820 has to be modified on every page acceptance.  It leads to
+table fragmentation, but there's a limited number of entries in the e820
+table
+
+Another option is to mark such memory as usable in e820 and track if the
+range has been accepted in a bitmap.  One bit in the bitmap represents
+2MiB in the address space: one 4k page is enough to track 64GiB or
+physical address space.
+
+In the worst-case scenario -- a huge hole in the middle of the address
+space -- It needs 256MiB to handle 4PiB of the address space.
+
+Any unaccepted memory that is not aligned to 2M gets accepted upfront.
+
+The approach lowers boot time substantially.  Boot to shell is ~2.5x
+faster for 4G TDX VM and ~4x faster for 64G.
+
+TDX-specific code isolated from the core of unaccepted memory support.  It
+supposed to help to plug-in different implementation of unaccepted memory
+such as SEV-SNP.
+
+-- Fragmentation study --
+
+Vlastimil and Mel were concern about effect of unaccepted memory on
+fragmentation prevention measures in page allocator.  I tried to evaluate
+it, but it is tricky.  As suggested I tried to run multiple parallel
+kernel builds and follow how often kmem:mm_page_alloc_extfrag gets hit.
+
+See results in the v9 of the patchset[1][2]
+
+[1] https://lore.kernel.org/all/20230330114956.20342-1-kirill.shutemov@linux.intel.com
+[2] https://lore.kernel.org/all/20230416191940.ex7ao43pmrjhru2p@box.shutemov.name
+
+
+This patch (of 9):
+
+UEFI Specification version 2.9 introduces the concept of memory
+acceptance.  Some Virtual Machine platforms, such as Intel TDX or AMD
+SEV-SNP, require memory to be accepted before it can be used by the guest.
+Accepting happens via a protocol specific to the Virtual Machine
+platform.
+
+There are several ways kernel can deal with unaccepted memory:
+
+ 1. Accept all the memory during the boot. It is easy to implement and
+    it doesn't have runtime cost once the system is booted. The downside
+    is very long boot time.
+
+    Accept can be parallelized to multiple CPUs to keep it manageable
+    (i.e. via DEFERRED_STRUCT_PAGE_INIT), but it tends to saturate
+    memory bandwidth and does not scale beyond the point.
+
+ 2. Accept a block of memory on the first use. It requires more
+    infrastructure and changes in page allocator to make it work, but
+    it provides good boot time.
+
+    On-demand memory accept means latency spikes every time kernel steps
+    onto a new memory block. The spikes will go away once workload data
+    set size gets stabilized or all memory gets accepted.
+
+ 3. Accept all memory in background. Introduce a thread (or multiple)
+    that gets memory accepted proactively. It will minimize time the
+    system experience latency spikes on memory allocation while keeping
+    low boot time.
+
+    This approach cannot function on its own. It is an extension of #2:
+    background memory acceptance requires functional scheduler, but the
+    page allocator may need to tap into unaccepted memory before that.
+
+    The downside of the approach is that these threads also steal CPU
+    cycles and memory bandwidth from the user's workload and may hurt
+    user experience.
+
+Implement #1 and #2 for now. #2 is the default. Some workloads may want
+to use #1 with accept_memory=eager in kernel command line. #3 can be
+implemented later based on user's demands.
+
+Support of unaccepted memory requires a few changes in core-mm code:
+
+  - memblock accepts memory on allocation. It serves early boot memory
+    allocations and doesn't limit them to pre-accepted pool of memory.
+
+  - page allocator accepts memory on the first allocation of the page.
+    When kernel runs out of accepted memory, it accepts memory until the
+    high watermark is reached. It helps to minimize fragmentation.
+
+EFI code will provide two helpers if the platform supports unaccepted
+memory:
+
+ - accept_memory() makes a range of physical addresses accepted.
+
+ - range_contains_unaccepted_memory() checks anything within the range
+   of physical addresses requires acceptance.
+
+Link: https://lkml.kernel.org/r/20230601182543.19036-1-kirill.shutemov@linux.intel.com
+Link: https://lkml.kernel.org/r/20230601182543.19036-2-kirill.shutemov@linux.intel.com
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Acked-by: Mike Rapoport <rppt@linux.ibm.com>	# memblock
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Borislav Petkov (AMD) <bp@alien8.de>
+Cc: Dario Faggioli <dfaggioli@suse.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Joerg Roedel <jroedel@suse.de>
+Cc: Kuppuswamy Sathyanarayanan <sathyanarayanan.kuppuswamy@linux.intel.com>
+Cc: Marcelo Henrique Cerri <marcelo.cerri@canonical.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sean Christopherson <seanjc@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tim Gardner <tim.gardner@canonical.com>
+Cc: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: Borislav Petkov <bp@suse.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Liam Merwick <liam.merwick@oracle.com>
