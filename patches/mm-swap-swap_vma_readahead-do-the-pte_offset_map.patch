@@ -1,0 +1,204 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm/swap: swap_vma_readahead() do the pte_offset_map()
+Date: Thu, 8 Jun 2023 18:52:17 -0700 (PDT)
+
+swap_vma_readahead() has been proceeding in an unconventional way, its
+preliminary swap_ra_info() doing the pte_offset_map() and pte_unmap(),
+then relying on that pte pointer even after the pte_unmap() - in its
+CONFIG_64BIT case (I think !CONFIG_HIGHPTE was intended; whereas 32-bit
+copied ptes to stack while they were mapped, but had to limit how many).
+
+Though it would be difficult to construct a failing testcase, accessing
+page table after pte_unmap() will become bad practice, even on 64-bit: an
+rcu_read_unlock() in pte_unmap() will allow page table to be freed.
+
+Move relevant definitions from include/linux/swap.h to mm/swap_state.c,
+nothing else used them.  Delete the CONFIG_64BIT distinction and buffer,
+delete all reference to ptes from swap_ra_info(), use pte_offset_map()
+repeatedly in swap_vma_readahead(), breaking from the loop if it fails.
+
+(Will the repeated "map" and "unmap" show up as a slowdown anywhere?  If
+so, maybe modify __read_swap_cache_async() to do the pte_unmap() only when
+it does not find the page already in the swapcache.)
+
+Use ptep_get_lockless(), mainly for its READ_ONCE().  Correctly advance
+the address passed down to each call of __read__swap_cache_async().
+
+Link: https://lkml.kernel.org/r/b7c64ab3-9e44-aac0-d2b-c57de578af1c@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zack Rusin <zackr@vmware.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/swap.h |   19 -----------------
+ mm/swap_state.c      |   45 +++++++++++++++++++++--------------------
+ 2 files changed, 24 insertions(+), 40 deletions(-)
+
+--- a/include/linux/swap.h~mm-swap-swap_vma_readahead-do-the-pte_offset_map
++++ a/include/linux/swap.h
+@@ -337,25 +337,6 @@ struct swap_info_struct {
+ 					   */
+ };
+ 
+-#ifdef CONFIG_64BIT
+-#define SWAP_RA_ORDER_CEILING	5
+-#else
+-/* Avoid stack overflow, because we need to save part of page table */
+-#define SWAP_RA_ORDER_CEILING	3
+-#define SWAP_RA_PTE_CACHE_SIZE	(1 << SWAP_RA_ORDER_CEILING)
+-#endif
+-
+-struct vma_swap_readahead {
+-	unsigned short win;
+-	unsigned short offset;
+-	unsigned short nr_pte;
+-#ifdef CONFIG_64BIT
+-	pte_t *ptes;
+-#else
+-	pte_t ptes[SWAP_RA_PTE_CACHE_SIZE];
+-#endif
+-};
+-
+ static inline swp_entry_t folio_swap_entry(struct folio *folio)
+ {
+ 	swp_entry_t entry = { .val = page_private(&folio->page) };
+--- a/mm/swap_state.c~mm-swap-swap_vma_readahead-do-the-pte_offset_map
++++ a/mm/swap_state.c
+@@ -709,6 +709,14 @@ void exit_swap_address_space(unsigned in
+ 	swapper_spaces[type] = NULL;
+ }
+ 
++#define SWAP_RA_ORDER_CEILING	5
++
++struct vma_swap_readahead {
++	unsigned short win;
++	unsigned short offset;
++	unsigned short nr_pte;
++};
++
+ static void swap_ra_info(struct vm_fault *vmf,
+ 			 struct vma_swap_readahead *ra_info)
+ {
+@@ -716,11 +724,7 @@ static void swap_ra_info(struct vm_fault
+ 	unsigned long ra_val;
+ 	unsigned long faddr, pfn, fpfn, lpfn, rpfn;
+ 	unsigned long start, end;
+-	pte_t *pte, *orig_pte;
+ 	unsigned int max_win, hits, prev_win, win;
+-#ifndef CONFIG_64BIT
+-	pte_t *tpte;
+-#endif
+ 
+ 	max_win = 1 << min_t(unsigned int, READ_ONCE(page_cluster),
+ 			     SWAP_RA_ORDER_CEILING);
+@@ -739,12 +743,9 @@ static void swap_ra_info(struct vm_fault
+ 					       max_win, prev_win);
+ 	atomic_long_set(&vma->swap_readahead_info,
+ 			SWAP_RA_VAL(faddr, win, 0));
+-
+ 	if (win == 1)
+ 		return;
+ 
+-	/* Copy the PTEs because the page table may be unmapped */
+-	orig_pte = pte = pte_offset_map(vmf->pmd, faddr);
+ 	if (fpfn == pfn + 1) {
+ 		lpfn = fpfn;
+ 		rpfn = fpfn + win;
+@@ -764,15 +765,6 @@ static void swap_ra_info(struct vm_fault
+ 
+ 	ra_info->nr_pte = end - start;
+ 	ra_info->offset = fpfn - start;
+-	pte -= ra_info->offset;
+-#ifdef CONFIG_64BIT
+-	ra_info->ptes = pte;
+-#else
+-	tpte = ra_info->ptes;
+-	for (pfn = start; pfn != end; pfn++)
+-		*tpte++ = *pte++;
+-#endif
+-	pte_unmap(orig_pte);
+ }
+ 
+ /**
+@@ -796,7 +788,8 @@ static struct page *swap_vma_readahead(s
+ 	struct swap_iocb *splug = NULL;
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	struct page *page;
+-	pte_t *pte, pentry;
++	pte_t *pte = NULL, pentry;
++	unsigned long addr;
+ 	swp_entry_t entry;
+ 	unsigned int i;
+ 	bool page_allocated;
+@@ -808,17 +801,25 @@ static struct page *swap_vma_readahead(s
+ 	if (ra_info.win == 1)
+ 		goto skip;
+ 
++	addr = vmf->address - (ra_info.offset * PAGE_SIZE);
++
+ 	blk_start_plug(&plug);
+-	for (i = 0, pte = ra_info.ptes; i < ra_info.nr_pte;
+-	     i++, pte++) {
+-		pentry = *pte;
++	for (i = 0; i < ra_info.nr_pte; i++, addr += PAGE_SIZE) {
++		if (!pte++) {
++			pte = pte_offset_map(vmf->pmd, addr);
++			if (!pte)
++				break;
++		}
++		pentry = ptep_get_lockless(pte);
+ 		if (!is_swap_pte(pentry))
+ 			continue;
+ 		entry = pte_to_swp_entry(pentry);
+ 		if (unlikely(non_swap_entry(entry)))
+ 			continue;
++		pte_unmap(pte);
++		pte = NULL;
+ 		page = __read_swap_cache_async(entry, gfp_mask, vma,
+-					       vmf->address, &page_allocated);
++					       addr, &page_allocated);
+ 		if (!page)
+ 			continue;
+ 		if (page_allocated) {
+@@ -830,6 +831,8 @@ static struct page *swap_vma_readahead(s
+ 		}
+ 		put_page(page);
+ 	}
++	if (pte)
++		pte_unmap(pte);
+ 	blk_finish_plug(&plug);
+ 	swap_read_unplug(splug);
+ 	lru_add_drain();
+_

@@ -1,9 +1,9 @@
 From: Lorenzo Stoakes <lstoakes@gmail.com>
 Subject: mm/mmap: separate writenotify and dirty tracking logic
-Date: Tue, 2 May 2023 23:51:33 +0100
+Date: Thu, 4 May 2023 22:27:51 +0100
 
 Patch series "mm/gup: disallow GUP writing to file-backed mappings by
-default", v8.
+default", v9.
 
 Writing to file-backed mappings which require folio dirty tracking using
 GUP is a fundamentally broken operation, as kernel write access to GUP
@@ -42,79 +42,40 @@ This patch (of 3):
 
 vma_wants_writenotify() is specifically intended for setting PTE page
 table flags, accounting for existing page table flag state and whether the
-filesystem performs dirty tracking.
+underlying filesystem performs dirty tracking for a file-backed mapping.
 
-Separate out the notions of dirty tracking and PTE write notify checking
-in order that we can invoke the dirty tracking check from elsewhere.
+Everything is predicated firstly on whether the mapping is shared
+writable, as this is the only instance where dirty tracking is pertinent -
+MAP_PRIVATE mappings will always be CoW'd and unshared, and read-only
+file-backed shared mappings cannot be written to, even with FOLL_FORCE.
 
-Note that this change introduces a very small duplicate check of the
-separated out vm_ops_needs_writenotify() and vma_is_shared_writable()
-functions.  This is necessary to avoid making vma_needs_dirty_tracking()
-needlessly complicated (e.g.  passing flags or having it assume checks
-were already performed).  This is small enough that it doesn't seem too
-egregious.
+All other checks are in line with existing logic, though now separated
+into checks eplicitily for dirty tracking and those for determining how to
+set page table flags.
 
-We check to ensure the mapping is shared writable, as any GUP caller will
-be safe - MAP_PRIVATE mappings will be CoW'd and read-only file-backed
-shared mappings are not permitted access, even with FOLL_FORCE.
+We make this change so we can perform checks in the GUP logic to determine
+which mappings might be problematic when written to.
 
-Link: https://lkml.kernel.org/r/cover.1683067198.git.lstoakes@gmail.com
-Link: https://lkml.kernel.org/r/7ac8bb557517bcdc9225b4e4893a2ca7f603fcc4.1683067198.git.lstoakes@gmail.com
+Link: https://lkml.kernel.org/r/cover.1683235180.git.lstoakes@gmail.com
+Link: https://lkml.kernel.org/r/0f218370bd49b4e6bbfbb499f7c7b92c26ba1ceb.1683235180.git.lstoakes@gmail.com
 Signed-off-by: Lorenzo Stoakes <lstoakes@gmail.com>
 Reviewed-by: John Hubbard <jhubbard@nvidia.com>
 Reviewed-by: Mika Penttilä <mpenttil@redhat.com>
 Reviewed-by: Jan Kara <jack@suse.cz>
 Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
 Acked-by: David Hildenbrand <david@redhat.com>
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
-Cc: Alexei Starovoitov <ast@kernel.org>
-Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
-Cc: Bernard Metzler <bmt@zurich.ibm.com>
-Cc: Björn Töpel <bjorn@kernel.org>
-Cc: Christian Benvenuti <benve@cisco.com>
-Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
-Cc: Christian Brauner <brauner@kernel.org>
-Cc: Daniel Borkmann <daniel@iogearbox.net>
-Cc: Dave Chinner <david@fromorbit.com>
-Cc: David S. Miller <davem@davemloft.net>
-Cc: Dennis Dalessandro <dennis.dalessandro@cornelisnetworks.com>
-Cc: Eric Dumazet <edumazet@google.com>
-Cc: Ian Rogers <irogers@google.com>
-Cc: Ingo Molnar <mingo@redhat.com>
-Cc: Jakub Kicinski <kuba@kernel.org>
-Cc: Jens Axboe <axboe@kernel.dk>
-Cc: Jesper Dangaard Brouer <hawk@kernel.org>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: John Fastabend <john.fastabend@gmail.com>
-Cc: Jonathan Lemon <jonathan.lemon@gmail.com>
-Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
-Cc: Leon Romanovsky <leon@kernel.org>
-Cc: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
-Cc: Magnus Karlsson <magnus.karlsson@intel.com>
-Cc: Mark Rutland <mark.rutland@arm.com>
-Cc: Matthew Rosato <mjrosato@linux.ibm.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Nelson Escobar <neescoba@cisco.com>
-Cc: Oleg Nesterov <oleg@redhat.com>
-Cc: Paolo Abeni <pabeni@redhat.com>
-Cc: Paul E. McKenney <paulmck@kernel.org>
-Cc: Pavel Begunkov <asml.silence@gmail.com>
-Cc: Peter Xu <peterx@redhat.com>
+Cc: Kirill A . Shutemov <kirill@shutemov.name>
 Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Richard Cochran <richardcochran@gmail.com>
-Cc: Theodore Ts'o <tytso@mit.edu>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/mm.h |    1 
- mm/mmap.c          |   53 ++++++++++++++++++++++++++++++++-----------
- 2 files changed, 41 insertions(+), 13 deletions(-)
+ mm/mmap.c          |   58 ++++++++++++++++++++++++++++++++++---------
+ 2 files changed, 47 insertions(+), 12 deletions(-)
 
 --- a/include/linux/mm.h~mm-mmap-separate-writenotify-and-dirty-tracking-logic
 +++ a/include/linux/mm.h
-@@ -2422,6 +2422,7 @@ extern unsigned long move_page_tables(st
+@@ -2461,6 +2461,7 @@ extern unsigned long move_page_tables(st
  #define  MM_CP_UFFD_WP_ALL                 (MM_CP_UFFD_WP | \
  					    MM_CP_UFFD_WP_RESOLVE)
  
@@ -124,21 +85,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 --- a/mm/mmap.c~mm-mmap-separate-writenotify-and-dirty-tracking-logic
 +++ a/mm/mmap.c
-@@ -1475,6 +1475,42 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_ar
+@@ -1454,6 +1454,48 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_ar
  }
  #endif /* __ARCH_WANT_SYS_OLD_MMAP */
  
-+/* Do VMA operations imply write notify is required? */
 +static bool vm_ops_needs_writenotify(const struct vm_operations_struct *vm_ops)
 +{
 +	return vm_ops && (vm_ops->page_mkwrite || vm_ops->pfn_mkwrite);
 +}
 +
-+/* Is this VMA shared and writable? */
 +static bool vma_is_shared_writable(struct vm_area_struct *vma)
 +{
 +	return (vma->vm_flags & (VM_WRITE | VM_SHARED)) ==
 +		(VM_WRITE | VM_SHARED);
++}
++
++static bool vma_fs_can_writeback(struct vm_area_struct *vma)
++{
++	/* No managed pages to writeback. */
++	if (vma->vm_flags & VM_PFNMAP)
++		return false;
++
++	return vma->vm_file && vma->vm_file->f_mapping &&
++		mapping_can_writeback(vma->vm_file->f_mapping);
 +}
 +
 +/*
@@ -155,19 +124,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (vm_ops_needs_writenotify(vma->vm_ops))
 +		return true;
 +
-+	/* Specialty mapping? */
-+	if (vma->vm_flags & VM_PFNMAP)
-+		return false;
-+
-+	/* Can the mapping track the dirty pages? */
-+	return vma->vm_file && vma->vm_file->f_mapping &&
-+		mapping_can_writeback(vma->vm_file->f_mapping);
++	/*
++	 * Even if the filesystem doesn't indicate a need for writenotify, if it
++	 * can writeback, dirty tracking is still required.
++	 */
++	return vma_fs_can_writeback(vma);
 +}
 +
  /*
   * Some shared mappings will want the pages marked read-only
   * to track write events. If so, we'll downgrade vm_page_prot
-@@ -1483,21 +1519,18 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_ar
+@@ -1462,21 +1504,18 @@ SYSCALL_DEFINE1(old_mmap, struct mmap_ar
   */
  int vma_wants_writenotify(struct vm_area_struct *vma, pgprot_t vm_page_prot)
  {
@@ -192,7 +159,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return 0;
  
  	/*
-@@ -1511,13 +1544,7 @@ int vma_wants_writenotify(struct vm_area
+@@ -1490,13 +1529,8 @@ int vma_wants_writenotify(struct vm_area
  	if (userfaultfd_wp(vma))
  		return 1;
  
@@ -200,10 +167,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (vm_flags & VM_PFNMAP)
 -		return 0;
 -
--	/* Can the mapping track the dirty pages? */
+ 	/* Can the mapping track the dirty pages? */
 -	return vma->vm_file && vma->vm_file->f_mapping &&
 -		mapping_can_writeback(vma->vm_file->f_mapping);
-+	return vma_needs_dirty_tracking(vma);
++	return vma_fs_can_writeback(vma);
  }
  
  /*

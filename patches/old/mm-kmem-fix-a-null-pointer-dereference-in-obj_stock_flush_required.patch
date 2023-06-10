@@ -1,6 +1,6 @@
 From: Roman Gushchin <roman.gushchin@linux.dev>
 Subject: mm: kmem: fix a NULL pointer dereference in obj_stock_flush_required()
-Date: Fri, 21 Apr 2023 10:40:54 -0700
+Date: Tue, 2 May 2023 09:08:38 -0700
 
 KCSAN found an issue in obj_stock_flush_required():
 stock->cached_objcg can be reset between the check and dereference:
@@ -57,27 +57,68 @@ Reported by Kernel Concurrency Sanitizer on:
 CPU: 1 PID: 19632 Comm: syz-executor.0 Not tainted 6.3.0-rc2-syzkaller-00387-g534293368afa #0
 Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 03/02/2023
 
-Fix it by reading the cached_objcg with READ_ONCE().
+Fix it by using READ_ONCE()/WRITE_ONCE() for all accesses to
+stock->cached_objcg.
 
-Link: https://lkml.kernel.org/r/20230421174054.3434533-1-roman.gushchin@linux.dev
+Link: https://lkml.kernel.org/r/20230502160839.361544-1-roman.gushchin@linux.dev
 Fixes: bf4f059954dc ("mm: memcg/slab: obj_cgroup API")
 Signed-off-by: Roman Gushchin <roman.gushchin@linux.dev>
 Reported-by: syzbot+774c29891415ab0fd29d@syzkaller.appspotmail.com
 Reported-by: Dmitry Vyukov <dvyukov@google.com>
   Link: https://lore.kernel.org/linux-mm/CACT4Y+ZfucZhM60YPphWiCLJr6+SGFhT+jjm8k1P-a_8Kkxsjg@mail.gmail.com/T/#t
-Acked-by: Muchun Song <songmuchun@bytedance.com>
 Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Shakeel Butt <shakeelb@google.com>
+Acked-by: Shakeel Butt <shakeelb@google.com>
+Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memcontrol.c |    5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
+ mm/memcontrol.c |   19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
 
 --- a/mm/memcontrol.c~mm-kmem-fix-a-null-pointer-dereference-in-obj_stock_flush_required
 +++ a/mm/memcontrol.c
+@@ -3208,12 +3208,12 @@ void mod_objcg_state(struct obj_cgroup *
+ 	 * accumulating over a page of vmstat data or when pgdat or idx
+ 	 * changes.
+ 	 */
+-	if (stock->cached_objcg != objcg) {
++	if (READ_ONCE(stock->cached_objcg) != objcg) {
+ 		old = drain_obj_stock(stock);
+ 		obj_cgroup_get(objcg);
+ 		stock->nr_bytes = atomic_read(&objcg->nr_charged_bytes)
+ 				? atomic_xchg(&objcg->nr_charged_bytes, 0) : 0;
+-		stock->cached_objcg = objcg;
++		WRITE_ONCE(stock->cached_objcg, objcg);
+ 		stock->cached_pgdat = pgdat;
+ 	} else if (stock->cached_pgdat != pgdat) {
+ 		/* Flush the existing cached vmstat data */
+@@ -3267,7 +3267,7 @@ static bool consume_obj_stock(struct obj
+ 	local_lock_irqsave(&memcg_stock.stock_lock, flags);
+ 
+ 	stock = this_cpu_ptr(&memcg_stock);
+-	if (objcg == stock->cached_objcg && stock->nr_bytes >= nr_bytes) {
++	if (objcg == READ_ONCE(stock->cached_objcg) && stock->nr_bytes >= nr_bytes) {
+ 		stock->nr_bytes -= nr_bytes;
+ 		ret = true;
+ 	}
+@@ -3279,7 +3279,7 @@ static bool consume_obj_stock(struct obj
+ 
+ static struct obj_cgroup *drain_obj_stock(struct memcg_stock_pcp *stock)
+ {
+-	struct obj_cgroup *old = stock->cached_objcg;
++	struct obj_cgroup *old = READ_ONCE(stock->cached_objcg);
+ 
+ 	if (!old)
+ 		return NULL;
+@@ -3332,7 +3332,7 @@ static struct obj_cgroup *drain_obj_stoc
+ 		stock->cached_pgdat = NULL;
+ 	}
+ 
+-	stock->cached_objcg = NULL;
++	WRITE_ONCE(stock->cached_objcg, NULL);
+ 	/*
+ 	 * The `old' objects needs to be released by the caller via
+ 	 * obj_cgroup_put() outside of memcg_stock_pcp::stock_lock.
 @@ -3343,10 +3343,11 @@ static struct obj_cgroup *drain_obj_stoc
  static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
  				     struct mem_cgroup *root_memcg)
@@ -92,4 +133,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (memcg && mem_cgroup_is_descendant(memcg, root_memcg))
  			return true;
  	}
+@@ -3365,10 +3366,10 @@ static void refill_obj_stock(struct obj_
+ 	local_lock_irqsave(&memcg_stock.stock_lock, flags);
+ 
+ 	stock = this_cpu_ptr(&memcg_stock);
+-	if (stock->cached_objcg != objcg) { /* reset if necessary */
++	if (READ_ONCE(stock->cached_objcg) != objcg) { /* reset if necessary */
+ 		old = drain_obj_stock(stock);
+ 		obj_cgroup_get(objcg);
+-		stock->cached_objcg = objcg;
++		WRITE_ONCE(stock->cached_objcg, objcg);
+ 		stock->nr_bytes = atomic_read(&objcg->nr_charged_bytes)
+ 				? atomic_xchg(&objcg->nr_charged_bytes, 0) : 0;
+ 		allow_uncharge = true;	/* Allow uncharge when objcg changes */
 _

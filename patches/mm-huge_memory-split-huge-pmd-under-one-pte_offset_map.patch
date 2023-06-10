@@ -1,0 +1,130 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm/huge_memory: split huge pmd under one pte_offset_map()
+Date: Thu, 8 Jun 2023 18:41:31 -0700 (PDT)
+
+__split_huge_zero_page_pmd() use a single pte_offset_map() to sweep the
+extent: it's already under pmd_lock(), so this is no worse for latency;
+and since it's supposed to have full control of the just-withdrawn page
+table, here choose to VM_BUG_ON if it were to fail.  And please don't
+increment haddr by PAGE_SIZE, that should remain huge aligned: declare a
+separate addr (not a bugfix, but it was deceptive).
+
+__split_huge_pmd_locked() likewise (but it had declared a separate addr);
+and change its BUG_ON(!pte_none) to VM_BUG_ON, for consistency with zero
+(those deposited page tables are sometimes victims of random corruption).
+
+Link: https://lkml.kernel.org/r/90cbed7f-90d9-b779-4a46-d2485baf9595@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zack Rusin <zackr@vmware.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+--- a/mm/huge_memory.c~mm-huge_memory-split-huge-pmd-under-one-pte_offset_map
++++ a/mm/huge_memory.c
+@@ -2037,6 +2037,8 @@ static void __split_huge_zero_page_pmd(s
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgtable_t pgtable;
+ 	pmd_t _pmd, old_pmd;
++	unsigned long addr;
++	pte_t *pte;
+ 	int i;
+ 
+ 	/*
+@@ -2052,17 +2054,20 @@ static void __split_huge_zero_page_pmd(s
+ 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+ 	pmd_populate(mm, &_pmd, pgtable);
+ 
+-	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
+-		pte_t *pte, entry;
+-		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
++	pte = pte_offset_map(&_pmd, haddr);
++	VM_BUG_ON(!pte);
++	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
++		pte_t entry;
++
++		entry = pfn_pte(my_zero_pfn(addr), vma->vm_page_prot);
+ 		entry = pte_mkspecial(entry);
+ 		if (pmd_uffd_wp(old_pmd))
+ 			entry = pte_mkuffd_wp(entry);
+-		pte = pte_offset_map(&_pmd, haddr);
+ 		VM_BUG_ON(!pte_none(*pte));
+-		set_pte_at(mm, haddr, pte, entry);
+-		pte_unmap(pte);
++		set_pte_at(mm, addr, pte, entry);
++		pte++;
+ 	}
++	pte_unmap(pte - 1);
+ 	smp_wmb(); /* make pte visible before pmd */
+ 	pmd_populate(mm, pmd, pgtable);
+ }
+@@ -2077,6 +2082,7 @@ static void __split_huge_pmd_locked(stru
+ 	bool young, write, soft_dirty, pmd_migration = false, uffd_wp = false;
+ 	bool anon_exclusive = false, dirty = false;
+ 	unsigned long addr;
++	pte_t *pte;
+ 	int i;
+ 
+ 	VM_BUG_ON(haddr & ~HPAGE_PMD_MASK);
+@@ -2205,8 +2211,10 @@ static void __split_huge_pmd_locked(stru
+ 	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+ 	pmd_populate(mm, &_pmd, pgtable);
+ 
++	pte = pte_offset_map(&_pmd, haddr);
++	VM_BUG_ON(!pte);
+ 	for (i = 0, addr = haddr; i < HPAGE_PMD_NR; i++, addr += PAGE_SIZE) {
+-		pte_t entry, *pte;
++		pte_t entry;
+ 		/*
+ 		 * Note that NUMA hinting access restrictions are not
+ 		 * transferred to avoid any possibility of altering
+@@ -2249,11 +2257,11 @@ static void __split_huge_pmd_locked(stru
+ 				entry = pte_mkuffd_wp(entry);
+ 			page_add_anon_rmap(page + i, vma, addr, false);
+ 		}
+-		pte = pte_offset_map(&_pmd, addr);
+-		BUG_ON(!pte_none(*pte));
++		VM_BUG_ON(!pte_none(*pte));
+ 		set_pte_at(mm, addr, pte, entry);
+-		pte_unmap(pte);
++		pte++;
+ 	}
++	pte_unmap(pte - 1);
+ 
+ 	if (!pmd_migration)
+ 		page_remove_rmap(page, vma, true);
+_

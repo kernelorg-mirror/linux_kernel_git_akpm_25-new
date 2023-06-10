@@ -1,0 +1,176 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm/memory: handle_pte_fault() use pte_offset_map_nolock()
+Date: Thu, 8 Jun 2023 18:45:05 -0700 (PDT)
+
+handle_pte_fault() use pte_offset_map_nolock() to get the vmf.ptl which
+corresponds to vmf.pte, instead of pte_lockptr() being used later, when
+there's a chance that the pmd entry might have changed, perhaps to none,
+or to a huge pmd, with no split ptlock in its struct page.
+
+Remove its pmd_devmap_trans_unstable() call: pte_offset_map_nolock() will
+handle that case by failing.  Update the "morph" comment above, looking
+forward to when shmem or file collapse to THP may not take mmap_lock for
+write (or not at all).
+
+do_numa_page() use the vmf->ptl from handle_pte_fault() at first, but
+refresh it when refreshing vmf->pte.
+
+do_swap_page()'s pte_unmap_same() (the thing that takes ptl to verify a
+two-part PAE orig_pte) use the vmf->ptl from handle_pte_fault() too; but
+do_swap_page() is also used by anon THP's __collapse_huge_page_swapin(),
+so adjust that to set vmf->ptl by pte_offset_map_nolock().
+
+Link: https://lkml.kernel.org/r/c1107654-3929-60ac-223e-6877cbb86065@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zack Rusin <zackr@vmware.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |    6 ++++--
+ mm/memory.c     |   38 +++++++++++++-------------------------
+ 2 files changed, 17 insertions(+), 27 deletions(-)
+
+--- a/mm/khugepaged.c~mm-memory-handle_pte_fault-use-pte_offset_map_nolock
++++ a/mm/khugepaged.c
+@@ -1003,6 +1003,7 @@ static int __collapse_huge_page_swapin(s
+ 	unsigned long address, end = haddr + (HPAGE_PMD_NR * PAGE_SIZE);
+ 	int result;
+ 	pte_t *pte = NULL;
++	spinlock_t *ptl;
+ 
+ 	for (address = haddr; address < end; address += PAGE_SIZE) {
+ 		struct vm_fault vmf = {
+@@ -1014,7 +1015,7 @@ static int __collapse_huge_page_swapin(s
+ 		};
+ 
+ 		if (!pte++) {
+-			pte = pte_offset_map(pmd, address);
++			pte = pte_offset_map_nolock(mm, pmd, address, &ptl);
+ 			if (!pte) {
+ 				mmap_read_unlock(mm);
+ 				result = SCAN_PMD_NULL;
+@@ -1022,11 +1023,12 @@ static int __collapse_huge_page_swapin(s
+ 			}
+ 		}
+ 
+-		vmf.orig_pte = *pte;
++		vmf.orig_pte = ptep_get_lockless(pte);
+ 		if (!is_swap_pte(vmf.orig_pte))
+ 			continue;
+ 
+ 		vmf.pte = pte;
++		vmf.ptl = ptl;
+ 		ret = do_swap_page(&vmf);
+ 		/* Which unmaps pte (after perhaps re-checking the entry) */
+ 		pte = NULL;
+--- a/mm/memory.c~mm-memory-handle_pte_fault-use-pte_offset_map_nolock
++++ a/mm/memory.c
+@@ -2787,10 +2787,9 @@ static inline int pte_unmap_same(struct
+ 	int same = 1;
+ #if defined(CONFIG_SMP) || defined(CONFIG_PREEMPTION)
+ 	if (sizeof(pte_t) > sizeof(unsigned long)) {
+-		spinlock_t *ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+-		spin_lock(ptl);
++		spin_lock(vmf->ptl);
+ 		same = pte_same(*vmf->pte, vmf->orig_pte);
+-		spin_unlock(ptl);
++		spin_unlock(vmf->ptl);
+ 	}
+ #endif
+ 	pte_unmap(vmf->pte);
+@@ -4698,7 +4697,6 @@ static vm_fault_t do_numa_page(struct vm
+ 	 * validation through pte_unmap_same(). It's of NUMA type but
+ 	 * the pfn may be screwed if the read is non atomic.
+ 	 */
+-	vmf->ptl = pte_lockptr(vma->vm_mm, vmf->pmd);
+ 	spin_lock(vmf->ptl);
+ 	if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+@@ -4769,8 +4767,10 @@ static vm_fault_t do_numa_page(struct vm
+ 		flags |= TNF_MIGRATED;
+ 	} else {
+ 		flags |= TNF_MIGRATE_FAIL;
+-		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+-		spin_lock(vmf->ptl);
++		vmf->pte = pte_offset_map_lock(vma->vm_mm, vmf->pmd,
++					       vmf->address, &vmf->ptl);
++		if (unlikely(!vmf->pte))
++			goto out;
+ 		if (unlikely(!pte_same(*vmf->pte, vmf->orig_pte))) {
+ 			pte_unmap_unlock(vmf->pte, vmf->ptl);
+ 			goto out;
+@@ -4900,26 +4900,15 @@ static vm_fault_t handle_pte_fault(struc
+ 		vmf->flags &= ~FAULT_FLAG_ORIG_PTE_VALID;
+ 	} else {
+ 		/*
+-		 * If a huge pmd materialized under us just retry later.  Use
+-		 * pmd_trans_unstable() via pmd_devmap_trans_unstable() instead
+-		 * of pmd_trans_huge() to ensure the pmd didn't become
+-		 * pmd_trans_huge under us and then back to pmd_none, as a
+-		 * result of MADV_DONTNEED running immediately after a huge pmd
+-		 * fault in a different thread of this mm, in turn leading to a
+-		 * misleading pmd_trans_huge() retval. All we have to ensure is
+-		 * that it is a regular pmd that we can walk with
+-		 * pte_offset_map() and we can do that through an atomic read
+-		 * in C, which is what pmd_trans_unstable() provides.
+-		 */
+-		if (pmd_devmap_trans_unstable(vmf->pmd))
+-			return 0;
+-		/*
+ 		 * A regular pmd is established and it can't morph into a huge
+-		 * pmd from under us anymore at this point because we hold the
+-		 * mmap_lock read mode and khugepaged takes it in write mode.
+-		 * So now it's safe to run pte_offset_map().
++		 * pmd by anon khugepaged, since that takes mmap_lock in write
++		 * mode; but shmem or file collapse to THP could still morph
++		 * it into a huge pmd: just retry later if so.
+ 		 */
+-		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
++		vmf->pte = pte_offset_map_nolock(vmf->vma->vm_mm, vmf->pmd,
++						 vmf->address, &vmf->ptl);
++		if (unlikely(!vmf->pte))
++			return 0;
+ 		vmf->orig_pte = ptep_get_lockless(vmf->pte);
+ 		vmf->flags |= FAULT_FLAG_ORIG_PTE_VALID;
+ 
+@@ -4938,7 +4927,6 @@ static vm_fault_t handle_pte_fault(struc
+ 	if (pte_protnone(vmf->orig_pte) && vma_is_accessible(vmf->vma))
+ 		return do_numa_page(vmf);
+ 
+-	vmf->ptl = pte_lockptr(vmf->vma->vm_mm, vmf->pmd);
+ 	spin_lock(vmf->ptl);
+ 	entry = vmf->orig_pte;
+ 	if (unlikely(!pte_same(*vmf->pte, entry))) {
+_
