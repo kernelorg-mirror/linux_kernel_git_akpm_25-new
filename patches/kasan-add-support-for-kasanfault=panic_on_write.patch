@@ -1,0 +1,134 @@
+From: Marco Elver <elver@google.com>
+Subject: kasan: add support for kasan.fault=panic_on_write
+Date: Wed, 14 Jun 2023 11:51:16 +0200
+
+KASAN's boot time kernel parameter 'kasan.fault=' currently supports
+'report' and 'panic', which results in either only reporting bugs or also
+panicking on reports.
+
+However, some users may wish to have more control over when KASAN reports
+result in a kernel panic: in particular, KASAN reported invalid _writes_
+are of special interest, because they have greater potential to corrupt
+random kernel memory or be more easily exploited.
+
+To panic on invalid writes only, introduce 'kasan.fault=panic_on_write',
+which allows users to choose to continue running on invalid reads, but
+panic only on invalid writes.
+
+Link: https://lkml.kernel.org/r/20230614095158.1133673-1-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Reviewed-by: Alexander Potapenko <glider@google.com>
+Cc: Aleksandr Nogikh <nogikh@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Taras Madan <tarasmadan@google.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/dev-tools/kasan.rst |    7 +++---
+ mm/kasan/report.c                 |   31 +++++++++++++++++++++++-----
+ 2 files changed, 30 insertions(+), 8 deletions(-)
+
+--- a/Documentation/dev-tools/kasan.rst~kasan-add-support-for-kasanfault=panic_on_write
++++ a/Documentation/dev-tools/kasan.rst
+@@ -107,9 +107,10 @@ effectively disables ``panic_on_warn`` f
+ Alternatively, independent of ``panic_on_warn``, the ``kasan.fault=`` boot
+ parameter can be used to control panic and reporting behaviour:
+ 
+-- ``kasan.fault=report`` or ``=panic`` controls whether to only print a KASAN
+-  report or also panic the kernel (default: ``report``). The panic happens even
+-  if ``kasan_multi_shot`` is enabled.
++- ``kasan.fault=report``, ``=panic``, or ``=panic_on_write`` controls whether
++  to only print a KASAN report, panic the kernel, or panic the kernel on
++  invalid writes only (default: ``report``). The panic happens even if
++  ``kasan_multi_shot`` is enabled.
+ 
+ Software and Hardware Tag-Based KASAN modes (see the section about various
+ modes below) support altering stack trace collection behavior:
+--- a/mm/kasan/report.c~kasan-add-support-for-kasanfault=panic_on_write
++++ a/mm/kasan/report.c
+@@ -43,6 +43,7 @@ enum kasan_arg_fault {
+ 	KASAN_ARG_FAULT_DEFAULT,
+ 	KASAN_ARG_FAULT_REPORT,
+ 	KASAN_ARG_FAULT_PANIC,
++	KASAN_ARG_FAULT_PANIC_ON_WRITE,
+ };
+ 
+ static enum kasan_arg_fault kasan_arg_fault __ro_after_init = KASAN_ARG_FAULT_DEFAULT;
+@@ -57,6 +58,8 @@ static int __init early_kasan_fault(char
+ 		kasan_arg_fault = KASAN_ARG_FAULT_REPORT;
+ 	else if (!strcmp(arg, "panic"))
+ 		kasan_arg_fault = KASAN_ARG_FAULT_PANIC;
++	else if (!strcmp(arg, "panic_on_write"))
++		kasan_arg_fault = KASAN_ARG_FAULT_PANIC_ON_WRITE;
+ 	else
+ 		return -EINVAL;
+ 
+@@ -211,7 +214,7 @@ static void start_report(unsigned long *
+ 	pr_err("==================================================================\n");
+ }
+ 
+-static void end_report(unsigned long *flags, const void *addr)
++static void end_report(unsigned long *flags, const void *addr, bool is_write)
+ {
+ 	if (addr)
+ 		trace_error_report_end(ERROR_DETECTOR_KASAN,
+@@ -220,8 +223,18 @@ static void end_report(unsigned long *fl
+ 	spin_unlock_irqrestore(&report_lock, *flags);
+ 	if (!test_bit(KASAN_BIT_MULTI_SHOT, &kasan_flags))
+ 		check_panic_on_warn("KASAN");
+-	if (kasan_arg_fault == KASAN_ARG_FAULT_PANIC)
++	switch (kasan_arg_fault) {
++	case KASAN_ARG_FAULT_DEFAULT:
++	case KASAN_ARG_FAULT_REPORT:
++		break;
++	case KASAN_ARG_FAULT_PANIC:
+ 		panic("kasan.fault=panic set ...\n");
++		break;
++	case KASAN_ARG_FAULT_PANIC_ON_WRITE:
++		if (is_write)
++			panic("kasan.fault=panic_on_write set ...\n");
++		break;
++	}
+ 	add_taint(TAINT_BAD_PAGE, LOCKDEP_NOW_UNRELIABLE);
+ 	lockdep_on();
+ 	report_suppress_stop();
+@@ -536,7 +549,11 @@ void kasan_report_invalid_free(void *ptr
+ 
+ 	print_report(&info);
+ 
+-	end_report(&flags, ptr);
++	/*
++	 * Invalid free is considered a "write" since the allocator's metadata
++	 * updates involves writes.
++	 */
++	end_report(&flags, ptr, true);
+ }
+ 
+ /*
+@@ -570,7 +587,7 @@ bool kasan_report(const void *addr, size
+ 
+ 	print_report(&info);
+ 
+-	end_report(&irq_flags, (void *)addr);
++	end_report(&irq_flags, (void *)addr, is_write);
+ 
+ out:
+ 	user_access_restore(ua_flags);
+@@ -596,7 +613,11 @@ void kasan_report_async(void)
+ 	pr_err("Asynchronous fault: no details available\n");
+ 	pr_err("\n");
+ 	dump_stack_lvl(KERN_ERR);
+-	end_report(&flags, NULL);
++	/*
++	 * Conservatively set is_write=true, because no details are available.
++	 * In this mode, kasan.fault=panic_on_write is like kasan.fault=panic.
++	 */
++	end_report(&flags, NULL, true);
+ }
+ #endif /* CONFIG_KASAN_HW_TAGS */
+ 
+_
