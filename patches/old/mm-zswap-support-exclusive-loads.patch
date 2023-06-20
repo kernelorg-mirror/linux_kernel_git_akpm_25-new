@@ -1,16 +1,17 @@
 From: Yosry Ahmed <yosryahmed@google.com>
 Subject: mm: zswap: support exclusive loads
-Date: Tue, 30 May 2023 21:02:51 +0000
+Date: Wed, 7 Jun 2023 19:51:43 +0000
 
 Commit 71024cb4a0bf ("frontswap: remove frontswap_tmem_exclusive_gets")
-removed support for exclusive loads from frontswap as it was not used.
+removed support for exclusive loads from frontswap as it was not used. 
+Bring back exclusive loads support to frontswap by adding an "exclusive"
+output parameter to frontswap_ops->load.
 
-Bring back exclusive loads support to frontswap by adding an
-exclusive_loads argument to frontswap_ops.  Add support for exclusive
-loads to zswap behind CONFIG_ZSWAP_EXCLUSIVE_LOADS.
-
-Refactor zswap entry invalidation in zswap_frontswap_invalidate_page()
-into zswap_invalidate_entry() to reuse it in zswap_frontswap_load().
+On the zswap side, add a module parameter to enable/disable exclusive
+loads, and a config option to control the boot default value.  Refactor
+zswap entry invalidation in zswap_frontswap_invalidate_page() into
+zswap_invalidate_entry() to reuse it in zswap_frontswap_load() if
+exclusive loads are enabled.
 
 With exclusive loads, we avoid having two copies of the same page in
 memory (compressed & uncompressed) after faulting it in from zswap.  On
@@ -18,12 +19,12 @@ the other hand, if the page is to be reclaimed again without being
 dirtied, it will be re-compressed.  Compression is not usually slow, and a
 page that was just faulted in is less likely to be reclaimed again soon.
 
-Link: https://lkml.kernel.org/r/20230530210251.493194-1-yosryahmed@google.com
+Link: https://lkml.kernel.org/r/20230607195143.1473802-1-yosryahmed@google.com
 Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
 Suggested-by: Yu Zhao <yuzhao@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Dan Streetman <ddstreet@ieee.org>
 Cc: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Seth Jennings <sjenning@redhat.com>
@@ -31,32 +32,43 @@ Cc: Vitaly Wool <vitaly.wool@konsulko.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/frontswap.h |    1 +
- mm/Kconfig                |   13 +++++++++++++
- mm/frontswap.c            |    7 ++++++-
- mm/zswap.c                |   23 +++++++++++++++--------
- 4 files changed, 35 insertions(+), 9 deletions(-)
+ include/linux/frontswap.h |    2 +-
+ mm/Kconfig                |   16 ++++++++++++++++
+ mm/frontswap.c            |   10 ++++++++--
+ mm/zswap.c                |   28 ++++++++++++++++++++--------
+ 4 files changed, 45 insertions(+), 11 deletions(-)
 
 --- a/include/linux/frontswap.h~mm-zswap-support-exclusive-loads
 +++ a/include/linux/frontswap.h
-@@ -13,6 +13,7 @@ struct frontswap_ops {
- 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
+@@ -10,7 +10,7 @@
+ struct frontswap_ops {
+ 	void (*init)(unsigned); /* this swap type was just swapon'ed */
+ 	int (*store)(unsigned, pgoff_t, struct page *); /* store a page */
+-	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
++	int (*load)(unsigned, pgoff_t, struct page *, bool *); /* load a page */
  	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
  	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
-+	bool exclusive_loads; /* pages are invalidated after being loaded */
  };
- 
- int frontswap_register_ops(const struct frontswap_ops *ops);
 --- a/mm/frontswap.c~mm-zswap-support-exclusive-loads
 +++ a/mm/frontswap.c
-@@ -216,8 +216,13 @@ int __frontswap_load(struct page *page)
+@@ -206,6 +206,7 @@ int __frontswap_load(struct page *page)
+ 	int type = swp_type(entry);
+ 	struct swap_info_struct *sis = swap_info[type];
+ 	pgoff_t offset = swp_offset(entry);
++	bool exclusive = false;
+ 
+ 	VM_BUG_ON(!frontswap_ops);
+ 	VM_BUG_ON(!PageLocked(page));
+@@ -215,9 +216,14 @@ int __frontswap_load(struct page *page)
+ 		return -1;
  
  	/* Try loading from each implementation, until one succeeds. */
- 	ret = frontswap_ops->load(type, offset, page);
+-	ret = frontswap_ops->load(type, offset, page);
 -	if (ret == 0)
++	ret = frontswap_ops->load(type, offset, page, &exclusive);
 +	if (ret == 0) {
  		inc_frontswap_loads();
-+		if (frontswap_ops->exclusive_loads) {
++		if (exclusive) {
 +			SetPageDirty(page);
 +			__frontswap_clear(sis, offset);
 +		}
@@ -66,17 +78,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/Kconfig~mm-zswap-support-exclusive-loads
 +++ a/mm/Kconfig
-@@ -46,6 +46,19 @@ config ZSWAP_DEFAULT_ON
+@@ -46,6 +46,22 @@ config ZSWAP_DEFAULT_ON
  	  The selection made here can be overridden by using the kernel
  	  command line 'zswap.enabled=' option.
  
-+config ZSWAP_EXCLUSIVE_LOADS
++config ZSWAP_EXCLUSIVE_LOADS_DEFAULT_ON
 +	bool "Invalidate zswap entries when pages are loaded"
 +	depends on ZSWAP
 +	help
-+	  If selected, when a page is loaded from zswap, the zswap entry is
-+	  invalidated at once, as opposed to leaving it in zswap until the
-+	  swap entry is freed.
++	  If selected, exclusive loads for zswap will be enabled at boot,
++	  otherwise it will be disabled.
++
++	  If exclusive loads are enabled, when a page is loaded from zswap,
++	  the zswap entry is invalidated at once, as opposed to leaving it
++	  in zswap until the swap entry is freed.
 +
 +	  This avoids having two copies of the same page in memory
 +	  (compressed and uncompressed) after faulting in a page from zswap.
@@ -88,7 +103,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	depends on ZSWAP
 --- a/mm/zswap.c~mm-zswap-support-exclusive-loads
 +++ a/mm/zswap.c
-@@ -1336,6 +1336,16 @@ shrink:
+@@ -138,6 +138,10 @@ static bool zswap_non_same_filled_pages_
+ module_param_named(non_same_filled_pages_enabled, zswap_non_same_filled_pages_enabled,
+ 		   bool, 0644);
+ 
++static bool zswap_exclusive_loads_enabled = IS_ENABLED(
++		CONFIG_ZSWAP_EXCLUSIVE_LOADS_DEFAULT_ON);
++module_param_named(exclusive_loads, zswap_exclusive_loads_enabled, bool, 0644);
++
+ /*********************************
+ * data structures
+ **********************************/
+@@ -1340,12 +1344,22 @@ shrink:
  	goto reject;
  }
  
@@ -105,16 +131,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * returns 0 if the page was successfully decompressed
   * return -1 on entry not found or error
-@@ -1410,6 +1420,8 @@ stats:
- 		count_objcg_event(entry->objcg, ZSWPIN);
+ */
+ static int zswap_frontswap_load(unsigned type, pgoff_t offset,
+-				struct page *page)
++				struct page *page, bool *exclusive)
+ {
+ 	struct zswap_tree *tree = zswap_trees[type];
+ 	struct zswap_entry *entry;
+@@ -1415,6 +1429,10 @@ stats:
  freeentry:
  	spin_lock(&tree->lock);
-+	if (!ret && IS_ENABLED(CONFIG_ZSWAP_EXCLUSIVE_LOADS))
-+		zswap_invalidate_entry(tree, entry);
  	zswap_entry_put(tree, entry);
++	if (!ret && zswap_exclusive_loads_enabled) {
++		zswap_invalidate_entry(tree, entry);
++		*exclusive = true;
++	}
  	spin_unlock(&tree->lock);
  
-@@ -1430,13 +1442,7 @@ static void zswap_frontswap_invalidate_p
+ 	return ret;
+@@ -1434,13 +1452,7 @@ static void zswap_frontswap_invalidate_p
  		spin_unlock(&tree->lock);
  		return;
  	}
@@ -129,14 +164,4 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	spin_unlock(&tree->lock);
  }
  
-@@ -1479,7 +1485,8 @@ static const struct frontswap_ops zswap_
- 	.load = zswap_frontswap_load,
- 	.invalidate_page = zswap_frontswap_invalidate_page,
- 	.invalidate_area = zswap_frontswap_invalidate_area,
--	.init = zswap_frontswap_init
-+	.init = zswap_frontswap_init,
-+	.exclusive_loads = IS_ENABLED(CONFIG_ZSWAP_EXCLUSIVE_LOADS),
- };
- 
- /*********************************
 _
