@@ -1,0 +1,195 @@
+From: Chuck Lever <chuck.lever@oracle.com>
+Subject: shmem: stable directory offsets
+Date: Fri, 30 Jun 2023 13:49:03 -0400
+
+The current cursor-based directory offset mechanism doesn't work when a
+tmpfs filesystem is exported via NFS.  This is because NFS clients do not
+open directories.  Each server-side READDIR operation has to open the
+directory, read it, then close it.  The cursor state for that directory,
+being associated strictly with the opened struct file, is thus discarded
+after each NFS READDIR operation.
+
+Directory offsets are cached not only by NFS clients, but also by user
+space libraries on those clients.  Essentially there is no way to
+invalidate those caches when directory offsets have changed on an NFS
+server after the offset-to-dentry mapping changes.  Thus the whole
+application stack depends on unchanging directory offsets.
+
+The solution we've come up with is to make the directory offset for each
+file in a tmpfs filesystem stable for the life of the directory entry it
+represents.
+
+shmem_readdir() and shmem_dir_llseek() now use an xarray to map each
+directory offset (an loff_t integer) to the memory address of a struct
+dentry.
+
+Link: https://lkml.kernel.org/r/168814734331.530310.3911190551060453102.stgit@manet.1015granger.net
+Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/shmem_fs.h |    1 
+ mm/shmem.c               |   47 +++++++++++++++++++++++++++++++------
+ 2 files changed, 41 insertions(+), 7 deletions(-)
+
+--- a/include/linux/shmem_fs.h~shmem-stable-directory-offsets
++++ a/include/linux/shmem_fs.h
+@@ -27,6 +27,7 @@ struct shmem_inode_info {
+ 	atomic_t		stop_eviction;	/* hold when working on inode */
+ 	struct timespec64	i_crtime;	/* file creation time */
+ 	unsigned int		fsflags;	/* flags for FS_IOC_[SG]ETFLAGS */
++	struct offset_ctx	dir_offsets;	/* stable entry offsets */
+ 	struct inode		vfs_inode;
+ };
+ 
+--- a/mm/shmem.c~shmem-stable-directory-offsets
++++ a/mm/shmem.c
+@@ -2372,6 +2372,11 @@ static void shmem_set_inode_flags(struct
+ #define shmem_initxattrs NULL
+ #endif
+ 
++static struct offset_ctx *shmem_get_offset_ctx(struct inode *inode)
++{
++	return &SHMEM_I(inode)->dir_offsets;
++}
++
+ static struct inode *shmem_get_inode(struct mnt_idmap *idmap, struct super_block *sb,
+ 				     struct inode *dir, umode_t mode, dev_t dev,
+ 				     unsigned long flags)
+@@ -2427,7 +2432,8 @@ static struct inode *shmem_get_inode(str
+ 			/* Some things misbehave if size == 0 on a directory */
+ 			inode->i_size = 2 * BOGO_DIRENT_SIZE;
+ 			inode->i_op = &shmem_dir_inode_operations;
+-			inode->i_fop = &simple_dir_operations;
++			inode->i_fop = &simple_offset_dir_operations;
++			simple_offset_init(shmem_get_offset_ctx(inode));
+ 			break;
+ 		case S_IFLNK:
+ 			/*
+@@ -3099,7 +3105,10 @@ shmem_mknod(struct mnt_idmap *idmap, str
+ 		if (error && error != -EOPNOTSUPP)
+ 			goto out_iput;
+ 
+-		error = 0;
++		error = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
++		if (error)
++			goto out_iput;
++
+ 		dir->i_size += BOGO_DIRENT_SIZE;
+ 		dir->i_ctime = dir->i_mtime = current_time(dir);
+ 		inode_inc_iversion(dir);
+@@ -3176,6 +3185,13 @@ static int shmem_link(struct dentry *old
+ 			goto out;
+ 	}
+ 
++	ret = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
++	if (ret) {
++		if (inode->i_nlink)
++			shmem_free_inode(inode->i_sb);
++		goto out;
++	}
++
+ 	dir->i_size += BOGO_DIRENT_SIZE;
+ 	inode->i_ctime = dir->i_ctime = dir->i_mtime = current_time(inode);
+ 	inode_inc_iversion(dir);
+@@ -3194,6 +3210,8 @@ static int shmem_unlink(struct inode *di
+ 	if (inode->i_nlink > 1 && !S_ISDIR(inode->i_mode))
+ 		shmem_free_inode(inode->i_sb);
+ 
++	simple_offset_remove(shmem_get_offset_ctx(dir), dentry);
++
+ 	dir->i_size -= BOGO_DIRENT_SIZE;
+ 	inode->i_ctime = dir->i_ctime = dir->i_mtime = current_time(inode);
+ 	inode_inc_iversion(dir);
+@@ -3252,24 +3270,29 @@ static int shmem_rename2(struct mnt_idma
+ {
+ 	struct inode *inode = d_inode(old_dentry);
+ 	int they_are_dirs = S_ISDIR(inode->i_mode);
++	int error;
+ 
+ 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
+ 		return -EINVAL;
+ 
+ 	if (flags & RENAME_EXCHANGE)
+-		return simple_rename_exchange(old_dir, old_dentry, new_dir, new_dentry);
++		return simple_offset_rename_exchange(old_dir, old_dentry,
++						     new_dir, new_dentry);
+ 
+ 	if (!simple_empty(new_dentry))
+ 		return -ENOTEMPTY;
+ 
+ 	if (flags & RENAME_WHITEOUT) {
+-		int error;
+-
+ 		error = shmem_whiteout(idmap, old_dir, old_dentry);
+ 		if (error)
+ 			return error;
+ 	}
+ 
++	simple_offset_remove(shmem_get_offset_ctx(old_dir), old_dentry);
++	error = simple_offset_add(shmem_get_offset_ctx(new_dir), old_dentry);
++	if (error)
++		return error;
++
+ 	if (d_really_is_positive(new_dentry)) {
+ 		(void) shmem_unlink(new_dir, new_dentry);
+ 		if (they_are_dirs) {
+@@ -3313,19 +3336,23 @@ static int shmem_symlink(struct mnt_idma
+ 	if (error && error != -EOPNOTSUPP)
+ 		goto out_iput;
+ 
++	error = simple_offset_add(shmem_get_offset_ctx(dir), dentry);
++	if (error)
++		goto out_iput;
++
+ 	inode->i_size = len-1;
+ 	if (len <= SHORT_SYMLINK_LEN) {
+ 		inode->i_link = kmemdup(symname, len, GFP_KERNEL);
+ 		if (!inode->i_link) {
+ 			error = -ENOMEM;
+-			goto out_iput;
++			goto out_remove_offset;
+ 		}
+ 		inode->i_op = &shmem_short_symlink_operations;
+ 	} else {
+ 		inode_nohighmem(inode);
+ 		error = shmem_get_folio(inode, 0, &folio, SGP_WRITE);
+ 		if (error)
+-			goto out_iput;
++			goto out_remove_offset;
+ 		inode->i_mapping->a_ops = &shmem_aops;
+ 		inode->i_op = &shmem_symlink_inode_operations;
+ 		memcpy(folio_address(folio), symname, len);
+@@ -3340,6 +3367,9 @@ static int shmem_symlink(struct mnt_idma
+ 	d_instantiate(dentry, inode);
+ 	dget(dentry);
+ 	return 0;
++
++out_remove_offset:
++	simple_offset_remove(shmem_get_offset_ctx(dir), dentry);
+ out_iput:
+ 	iput(inode);
+ 	return error;
+@@ -4072,6 +4102,8 @@ static void shmem_destroy_inode(struct i
+ {
+ 	if (S_ISREG(inode->i_mode))
+ 		mpol_free_shared_policy(&SHMEM_I(inode)->policy);
++	if (S_ISDIR(inode->i_mode))
++		simple_offset_destroy(shmem_get_offset_ctx(inode));
+ }
+ 
+ static void shmem_init_inode(void *foo)
+@@ -4152,6 +4184,7 @@ static const struct inode_operations shm
+ 	.mknod		= shmem_mknod,
+ 	.rename		= shmem_rename2,
+ 	.tmpfile	= shmem_tmpfile,
++	.get_offset_ctx	= shmem_get_offset_ctx,
+ #endif
+ #ifdef CONFIG_TMPFS_XATTR
+ 	.listxattr	= shmem_listxattr,
+_
