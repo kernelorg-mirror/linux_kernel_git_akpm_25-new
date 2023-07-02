@@ -1,0 +1,108 @@
+From: Peter Xu <peterx@redhat.com>
+Subject: mm/gup: accelerate thp gup even for "pages != NULL"
+Date: Wed, 28 Jun 2023 17:53:07 -0400
+
+The acceleration of THP was done with ctx.page_mask, however it'll be
+ignored if **pages is non-NULL.
+
+The old optimization was introduced in 2013 in 240aadeedc4a ("mm:
+accelerate mm_populate() treatment of THP pages").  It didn't explain why
+we can't optimize the **pages non-NULL case.  It's possible that at that
+time the major goal was for mm_populate() which should be enough back
+then.
+
+Optimize thp for all cases, by properly looping over each subpage, doing
+cache flushes, and boost refcounts / pincounts where needed in one go.
+
+This can be verified using gup_test below:
+
+  # chrt -f 1 ./gup_test -m 512 -t -L -n 1024 -r 10
+
+Before:    13992.50 ( +-8.75%)
+After:       378.50 (+-69.62%)
+
+Link: https://lkml.kernel.org/r/20230628215310.73782-6-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Reviewed-by: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kirill A . Shutemov <kirill@shutemov.name>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/gup.c |   51 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 44 insertions(+), 7 deletions(-)
+
+--- a/mm/gup.c~mm-gup-accelerate-thp-gup-even-for-pages-=-null
++++ a/mm/gup.c
+@@ -1247,16 +1247,53 @@ retry:
+ 			goto out;
+ 		}
+ next_page:
+-		if (pages) {
+-			pages[i] = page;
+-			flush_anon_page(vma, page, start);
+-			flush_dcache_page(page);
+-			ctx.page_mask = 0;
+-		}
+-
+ 		page_increm = 1 + (~(start >> PAGE_SHIFT) & ctx.page_mask);
+ 		if (page_increm > nr_pages)
+ 			page_increm = nr_pages;
++
++		if (pages) {
++			struct page *subpage;
++			unsigned int j;
++
++			/*
++			 * This must be a large folio (and doesn't need to
++			 * be the whole folio; it can be part of it), do
++			 * the refcount work for all the subpages too.
++			 *
++			 * NOTE: here the page may not be the head page
++			 * e.g. when start addr is not thp-size aligned.
++			 * try_grab_folio() should have taken care of tail
++			 * pages.
++			 */
++			if (page_increm > 1) {
++				struct folio *folio;
++
++				/*
++				 * Since we already hold refcount on the
++				 * large folio, this should never fail.
++				 */
++				folio = try_grab_folio(page, page_increm - 1,
++						       foll_flags);
++				if (WARN_ON_ONCE(!folio)) {
++					/*
++					 * Release the 1st page ref if the
++					 * folio is problematic, fail hard.
++					 */
++					gup_put_folio(page_folio(page), 1,
++						      foll_flags);
++					ret = -EFAULT;
++					goto out;
++				}
++			}
++
++			for (j = 0; j < page_increm; j++) {
++				subpage = nth_page(page, j);
++				pages[i + j] = subpage;
++				flush_anon_page(vma, subpage, start + j * PAGE_SIZE);
++				flush_dcache_page(subpage);
++			}
++		}
++
+ 		i += page_increm;
+ 		start += page_increm * PAGE_SIZE;
+ 		nr_pages -= page_increm;
+_

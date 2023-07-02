@@ -1,0 +1,121 @@
+From: Peter Xu <peterx@redhat.com>
+Subject: mm/hugetlb: handle FOLL_DUMP well in follow_page_mask()
+Date: Wed, 28 Jun 2023 17:53:03 -0400
+
+Patch series "mm/gup: Unify hugetlb, speed up thp", v4.
+
+Hugetlb has a special path for slow gup that follow_page_mask() is
+actually skipped completely along with faultin_page().  It's not only
+confusing, but also duplicating a lot of logics that generic gup already
+has, making hugetlb slightly special.
+
+This patchset tries to dedup the logic, by first touching up the slow gup
+code to be able to handle hugetlb pages correctly with the current follow
+page and faultin routines (where we're mostly there..  due to 10 years ago
+we did try to optimize thp, but half way done; more below), then at the
+last patch drop the special path, then the hugetlb gup will always go the
+generic routine too via faultin_page().
+
+Note that hugetlb is still special for gup, mostly due to the pgtable
+walking (hugetlb_walk()) that we rely on which is currently per-arch.  But
+this is still one small step forward, and the diffstat might be a proof
+too that this might be worthwhile.
+
+Then for the "speed up thp" side: as a side effect, when I'm looking at
+the chunk of code, I found that thp support is actually partially done. 
+It doesn't mean that thp won't work for gup, but as long as **pages
+pointer passed over, the optimization will be skipped too.  Patch 6 should
+address that, so for thp we now get full speed gup.
+
+For a quick number, "chrt -f 1 ./gup_test -m 512 -t -L -n 1024 -r 10"
+gives me 13992.50us -> 378.50us.  Gup_test is an extreme case, but just to
+show how it affects thp gups.
+
+
+This patch (of 8):
+
+Firstly, the no_page_table() is meaningless for hugetlb which is a no-op
+there, because a hugetlb page always satisfies:
+
+  - vma_is_anonymous() == false
+  - vma->vm_ops->fault != NULL
+
+So we can already safely remove it in hugetlb_follow_page_mask(), alongside
+with the page* variable.
+
+Meanwhile, what we do in follow_hugetlb_page() actually makes sense for a
+dump: we try to fault in the page only if the page cache is already
+allocated.  Let's do the same here for follow_page_mask() on hugetlb.
+
+It should so far has zero effect on real dumps, because that still goes
+into follow_hugetlb_page().  But this may start to influence a bit on
+follow_page() users who mimics a "dump page" scenario, but hopefully in a
+good way.  This also paves way for unifying the hugetlb gup-slow.
+
+Link: https://lkml.kernel.org/r/20230628215310.73782-1-peterx@redhat.com
+Link: https://lkml.kernel.org/r/20230628215310.73782-2-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kirill A . Shutemov <kirill@shutemov.name>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/gup.c     |    9 ++-------
+ mm/hugetlb.c |    9 +++++++++
+ 2 files changed, 11 insertions(+), 7 deletions(-)
+
+--- a/mm/gup.c~mm-hugetlb-handle-foll_dump-well-in-follow_page_mask
++++ a/mm/gup.c
+@@ -811,7 +811,6 @@ static struct page *follow_page_mask(str
+ 			      struct follow_page_context *ctx)
+ {
+ 	pgd_t *pgd;
+-	struct page *page;
+ 	struct mm_struct *mm = vma->vm_mm;
+ 
+ 	ctx->page_mask = 0;
+@@ -824,12 +823,8 @@ static struct page *follow_page_mask(str
+ 	 * hugetlb_follow_page_mask is only for follow_page() handling here.
+ 	 * Ordinary GUP uses follow_hugetlb_page for hugetlb processing.
+ 	 */
+-	if (is_vm_hugetlb_page(vma)) {
+-		page = hugetlb_follow_page_mask(vma, address, flags);
+-		if (!page)
+-			page = no_page_table(vma, flags);
+-		return page;
+-	}
++	if (is_vm_hugetlb_page(vma))
++		return hugetlb_follow_page_mask(vma, address, flags);
+ 
+ 	pgd = pgd_offset(mm, address);
+ 
+--- a/mm/hugetlb.c~mm-hugetlb-handle-foll_dump-well-in-follow_page_mask
++++ a/mm/hugetlb.c
+@@ -6498,6 +6498,15 @@ out:
+ 	spin_unlock(ptl);
+ out_unlock:
+ 	hugetlb_vma_unlock_read(vma);
++
++	/*
++	 * Fixup retval for dump requests: if pagecache doesn't exist,
++	 * don't try to allocate a new page but just skip it.
++	 */
++	if (!page && (flags & FOLL_DUMP) &&
++	    !hugetlbfs_pagecache_present(h, vma, address))
++		page = ERR_PTR(-EFAULT);
++
+ 	return page;
+ }
+ 
+_
