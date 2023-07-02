@@ -1,0 +1,71 @@
+From: Haibo Li <haibo.li@mediatek.com>
+Subject: mm/filemap.c: fix update prev_pos after one read request done
+Date: Wed, 28 Jun 2023 19:02:20 +0800
+
+ra->prev_pos tracks the last visited byte in the previous read request. 
+It is used to check whether it is sequential read in ondemand_readahead
+and thus affects the readahead window.
+
+After commit 06c0444290ce ("mm/filemap.c: generic_file_buffered_read() now
+uses find_get_pages_contig"), update logic of prev_pos is changed.  It
+updates prev_pos after each return from filemap_get_pages().  But the read
+request from user may be not fully completed at this point.  The updated
+prev_pos impacts the subsequent readahead window.
+
+The real problem is performance drop of fsck_msdos between linux-5.4 and
+linux-5.15(also linux-6.4).  Comparing to linux-5.4,It spends about 110%
+time and read 140% pages.  The read pattern of fsck_msdos is not fully
+sequential.
+
+Simplified read pattern of fsck_msdos likes below:
+1.read at page offset 0xa,size 0x1000
+2.read at other page offset like 0x20,size 0x1000
+3.read at page offset 0xa,size 0x4000
+4.read at page offset 0xe,size 0x1000
+
+Here is the read status on linux-6.4:
+1.after read at page offset 0xa,size 0x1000
+    ->page ofs 0xa go into pagecache
+2.after read at page offset 0x20,size 0x1000
+    ->page ofs 0x20 go into pagecache
+3.read at page offset 0xa,size 0x4000
+    ->filemap_get_pages read ofs 0xa from pagecache and returns
+    ->prev_pos is updated to 0xb and goto next loop
+    ->filemap_get_pages tends to read ofs 0xb,size 0x3000
+    ->initial_readahead case in ondemand_readahead since prev_pos is
+      the same as request ofs.
+    ->read 8 pages while async size is 5 pages
+      (PageReadahead flag at page 0xe)
+4.read at page offset 0xe,size 0x1000
+    ->hit page 0xe with PageReadahead flag set,double the ra_size.
+      read 16 pages while async size is 16 pages
+Now it reads 24 pages while actually uses 5 pages
+
+on linux-5.4:
+1.the same as 6.4
+2.the same as 6.4
+3.read at page offset 0xa,size 0x4000
+    ->read ofs 0xa from pagecache
+    ->read ofs 0xb,size 0x3000 using page_cache_sync_readahead
+      read 3 pages
+    ->prev_pos is updated to 0xd before generic_file_buffered_read
+      returns
+4.read at page offset 0xe,size 0x1000
+    ->initial_readahead case in ondemand_readahead since
+      request ofs-prev_pos==1
+    ->read 4 pages while async size is 3 pages
+
+Now it reads 7 pages while actually uses 5 pages.
+
+In above demo, the initial_readahead case is triggered by offset of user
+request on linux-5.4.  While it may be triggered by update logic of
+prev_pos on linux-6.4.
+
+To fix the performance drop, update prev_pos after finishing one read
+request.
+
+Link: https://lkml.kernel.org/r/20230628110220.120134-1-haibo.li@mediatek.com
+Signed-off-by: Haibo Li <haibo.li@mediatek.com>
+Cc: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matthias Brugger <matthias.bgg@gmail.com>
