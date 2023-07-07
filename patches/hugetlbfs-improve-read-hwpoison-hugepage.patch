@@ -1,0 +1,116 @@
+From: Jiaqi Yan <jiaqiyan@google.com>
+Subject: hugetlbfs: improve read HWPOISON hugepage
+Date: Fri, 7 Jul 2023 20:19:03 +0000
+
+When a hugepage contains HWPOISON pages, read() fails to read any byte of
+the hugepage and returns -EIO, although many bytes in the HWPOISON
+hugepage are readable.
+
+Improve this by allowing hugetlbfs_read_iter returns as many bytes as
+possible.  For a requested range [offset, offset + len) that contains
+HWPOISON page, return [offset, first HWPOISON page addr); the next read
+attempt will fail and return -EIO.
+
+Link: https://lkml.kernel.org/r/20230707201904.953262-4-jiaqiyan@google.com
+Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c |   58 ++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 52 insertions(+), 6 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~hugetlbfs-improve-read-hwpoison-hugepage
++++ a/fs/hugetlbfs/inode.c
+@@ -283,6 +283,42 @@ hugetlb_get_unmapped_area(struct file *f
+ #endif
+ 
+ /*
++ * Someone wants to read @bytes from a HWPOISON hugetlb @page from @offset.
++ * Returns the maximum number of bytes one can read without touching the 1st raw
++ * HWPOISON subpage.
++ *
++ * The implementation borrows the iteration logic from copy_page_to_iter*.
++ */
++static size_t adjust_range_hwpoison(struct page *page, size_t offset, size_t bytes)
++{
++	size_t n = 0;
++	size_t res = 0;
++	struct folio *folio = page_folio(page);
++
++	/* First subpage to start the loop. */
++	page += offset / PAGE_SIZE;
++	offset %= PAGE_SIZE;
++	while (1) {
++		if (is_raw_hwp_subpage(folio, page))
++			break;
++
++		/* Safe to read n bytes without touching HWPOISON subpage. */
++		n = min(bytes, (size_t)PAGE_SIZE - offset);
++		res += n;
++		bytes -= n;
++		if (!bytes || !n)
++			break;
++		offset += n;
++		if (offset == PAGE_SIZE) {
++			page++;
++			offset = 0;
++		}
++	}
++
++	return res;
++}
++
++/*
+  * Support for read() - Find the page attached to f_mapping and copy out the
+  * data. This provides functionality similar to filemap_read().
+  */
+@@ -300,7 +336,7 @@ static ssize_t hugetlbfs_read_iter(struc
+ 
+ 	while (iov_iter_count(to)) {
+ 		struct page *page;
+-		size_t nr, copied;
++		size_t nr, copied, want;
+ 
+ 		/* nr is the maximum number of bytes to copy from this page */
+ 		nr = huge_page_size(h);
+@@ -328,16 +364,26 @@ static ssize_t hugetlbfs_read_iter(struc
+ 		} else {
+ 			unlock_page(page);
+ 
+-			if (PageHWPoison(page)) {
+-				put_page(page);
+-				retval = -EIO;
+-				break;
++			if (!PageHWPoison(page))
++				want = nr;
++			else {
++				/*
++				 * Adjust how many bytes safe to read without
++				 * touching the 1st raw HWPOISON subpage after
++				 * offset.
++				 */
++				want = adjust_range_hwpoison(page, offset, nr);
++				if (want == 0) {
++					put_page(page);
++					retval = -EIO;
++					break;
++				}
+ 			}
+ 
+ 			/*
+ 			 * We have the page, copy it to user space buffer.
+ 			 */
+-			copied = copy_page_to_iter(page, offset, nr, to);
++			copied = copy_page_to_iter(page, offset, want, to);
+ 			put_page(page);
+ 		}
+ 		offset += copied;
+_
