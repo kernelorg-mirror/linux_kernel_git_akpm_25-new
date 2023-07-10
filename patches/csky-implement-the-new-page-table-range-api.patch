@@ -1,0 +1,205 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: csky: implement the new page table range API
+Date: Mon, 10 Jul 2023 21:43:12 +0100
+
+Add PFN_PTE_SHIFT, update_mmu_cache_range() and flush_dcache_folio(). 
+Change the PG_dcache_clean flag from being per-page to per-folio.
+
+Link: https://lkml.kernel.org/r/20230710204339.3554919-12-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Guo Ren <guoren@kernel.org>
+Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/csky/abiv1/cacheflush.c         |   32 +++++++++++++----------
+ arch/csky/abiv1/inc/abi/cacheflush.h |    2 +
+ arch/csky/abiv2/cacheflush.c         |   34 ++++++++++++-------------
+ arch/csky/abiv2/inc/abi/cacheflush.h |   10 +++++--
+ arch/csky/include/asm/pgtable.h      |    8 +++--
+ 5 files changed, 51 insertions(+), 35 deletions(-)
+
+--- a/arch/csky/abiv1/cacheflush.c~csky-implement-the-new-page-table-range-api
++++ a/arch/csky/abiv1/cacheflush.c
+@@ -15,45 +15,51 @@
+ 
+ #define PG_dcache_clean		PG_arch_1
+ 
+-void flush_dcache_page(struct page *page)
++void flush_dcache_folio(struct folio *folio)
+ {
+ 	struct address_space *mapping;
+ 
+-	if (page == ZERO_PAGE(0))
++	if (is_zero_pfn(folio_pfn(folio)))
+ 		return;
+ 
+-	mapping = page_mapping_file(page);
++	mapping = folio_flush_mapping(folio);
+ 
+-	if (mapping && !page_mapcount(page))
+-		clear_bit(PG_dcache_clean, &page->flags);
++	if (mapping && !folio_mapped(folio))
++		clear_bit(PG_dcache_clean, &folio->flags);
+ 	else {
+ 		dcache_wbinv_all();
+ 		if (mapping)
+ 			icache_inv_all();
+-		set_bit(PG_dcache_clean, &page->flags);
++		set_bit(PG_dcache_clean, &folio->flags);
+ 	}
+ }
++EXPORT_SYMBOL(flush_dcache_folio);
++
++void flush_dcache_page(struct page *page)
++{
++	flush_dcache_folio(page_folio(page));
++}
+ EXPORT_SYMBOL(flush_dcache_page);
+ 
+-void update_mmu_cache(struct vm_area_struct *vma, unsigned long addr,
+-	pte_t *ptep)
++void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
++		unsigned long addr, pte_t *ptep, unsigned int nr)
+ {
+ 	unsigned long pfn = pte_pfn(*ptep);
+-	struct page *page;
++	struct folio *folio;
+ 
+ 	flush_tlb_page(vma, addr);
+ 
+ 	if (!pfn_valid(pfn))
+ 		return;
+ 
+-	page = pfn_to_page(pfn);
+-	if (page == ZERO_PAGE(0))
++	if (is_zero_pfn(pfn))
+ 		return;
+ 
+-	if (!test_and_set_bit(PG_dcache_clean, &page->flags))
++	folio = page_folio(pfn_to_page(pfn));
++	if (!test_and_set_bit(PG_dcache_clean, &folio->flags))
+ 		dcache_wbinv_all();
+ 
+-	if (page_mapping_file(page)) {
++	if (folio_flush_mapping(folio)) {
+ 		if (vma->vm_flags & VM_EXEC)
+ 			icache_inv_all();
+ 	}
+--- a/arch/csky/abiv1/inc/abi/cacheflush.h~csky-implement-the-new-page-table-range-api
++++ a/arch/csky/abiv1/inc/abi/cacheflush.h
+@@ -9,6 +9,8 @@
+ 
+ #define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE 1
+ extern void flush_dcache_page(struct page *);
++void flush_dcache_folio(struct folio *);
++#define flush_dcache_folio flush_dcache_folio
+ 
+ #define flush_cache_mm(mm)			dcache_wbinv_all()
+ #define flush_cache_page(vma, page, pfn)	cache_wbinv_all()
+--- a/arch/csky/abiv2/cacheflush.c~csky-implement-the-new-page-table-range-api
++++ a/arch/csky/abiv2/cacheflush.c
+@@ -7,32 +7,32 @@
+ #include <asm/cache.h>
+ #include <asm/tlbflush.h>
+ 
+-void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
+-		      pte_t *pte)
++void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
++		unsigned long address, pte_t *pte, unsigned int nr)
+ {
+-	unsigned long addr;
+-	struct page *page;
++	unsigned long pfn = pte_pfn(*pte);
++	struct folio *folio;
++	unsigned int i;
+ 
+ 	flush_tlb_page(vma, address);
+ 
+-	if (!pfn_valid(pte_pfn(*pte)))
++	if (!pfn_valid(pfn))
+ 		return;
+ 
+-	page = pfn_to_page(pte_pfn(*pte));
+-	if (page == ZERO_PAGE(0))
+-		return;
++	folio = page_folio(pfn_to_page(pfn));
+ 
+-	if (test_and_set_bit(PG_dcache_clean, &page->flags))
++	if (test_and_set_bit(PG_dcache_clean, &folio->flags))
+ 		return;
+ 
+-	addr = (unsigned long) kmap_atomic(page);
+-
+-	dcache_wb_range(addr, addr + PAGE_SIZE);
+-
+-	if (vma->vm_flags & VM_EXEC)
+-		icache_inv_range(addr, addr + PAGE_SIZE);
+-
+-	kunmap_atomic((void *) addr);
++	for (i = 0; i < folio_nr_pages(folio); i++) {
++		unsigned long addr = (unsigned long) kmap_local_folio(folio,
++								i * PAGE_SIZE);
++
++		dcache_wb_range(addr, addr + PAGE_SIZE);
++		if (vma->vm_flags & VM_EXEC)
++			icache_inv_range(addr, addr + PAGE_SIZE);
++		kunmap_local((void *) addr);
++	}
+ }
+ 
+ void flush_icache_deferred(struct mm_struct *mm)
+--- a/arch/csky/abiv2/inc/abi/cacheflush.h~csky-implement-the-new-page-table-range-api
++++ a/arch/csky/abiv2/inc/abi/cacheflush.h
+@@ -18,11 +18,17 @@
+ 
+ #define PG_dcache_clean		PG_arch_1
+ 
++static inline void flush_dcache_folio(struct folio *folio)
++{
++	if (test_bit(PG_dcache_clean, &folio->flags))
++		clear_bit(PG_dcache_clean, &folio->flags);
++}
++#define flush_dcache_folio flush_dcache_folio
++
+ #define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE 1
+ static inline void flush_dcache_page(struct page *page)
+ {
+-	if (test_bit(PG_dcache_clean, &page->flags))
+-		clear_bit(PG_dcache_clean, &page->flags);
++	flush_dcache_folio(page_folio(page));
+ }
+ 
+ #define flush_dcache_mmap_lock(mapping)		do { } while (0)
+--- a/arch/csky/include/asm/pgtable.h~csky-implement-the-new-page-table-range-api
++++ a/arch/csky/include/asm/pgtable.h
+@@ -28,6 +28,7 @@
+ #define pgd_ERROR(e) \
+ 	pr_err("%s:%d: bad pgd %08lx.\n", __FILE__, __LINE__, pgd_val(e))
+ 
++#define PFN_PTE_SHIFT	PAGE_SHIFT
+ #define pmd_pfn(pmd)	(pmd_phys(pmd) >> PAGE_SHIFT)
+ #define pmd_page(pmd)	(pfn_to_page(pmd_phys(pmd) >> PAGE_SHIFT))
+ #define pte_clear(mm, addr, ptep)	set_pte((ptep), \
+@@ -90,7 +91,6 @@ static inline void set_pte(pte_t *p, pte
+ 	/* prevent out of order excution */
+ 	smp_mb();
+ }
+-#define set_pte_at(mm, addr, ptep, pteval) set_pte(ptep, pteval)
+ 
+ static inline pte_t *pmd_page_vaddr(pmd_t pmd)
+ {
+@@ -263,8 +263,10 @@ static inline pte_t pte_modify(pte_t pte
+ extern pgd_t swapper_pg_dir[PTRS_PER_PGD];
+ extern void paging_init(void);
+ 
+-void update_mmu_cache(struct vm_area_struct *vma, unsigned long address,
+-		      pte_t *pte);
++void update_mmu_cache_range(struct vm_fault *vmf, struct vm_area_struct *vma,
++		unsigned long address, pte_t *pte, unsigned int nr);
++#define update_mmu_cache(vma, addr, ptep) \
++	update_mmu_cache_range(NULL, vma, addr, ptep, 1)
+ 
+ #define io_remap_pfn_range(vma, vaddr, pfn, size, prot) \
+ 	remap_pfn_range(vma, vaddr, pfn, size, prot)
+_
