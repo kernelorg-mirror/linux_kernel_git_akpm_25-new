@@ -1,0 +1,129 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: powerpc: add pte_free_defer() for pgtables sharing page
+Date: Tue, 11 Jul 2023 21:35:59 -0700 (PDT)
+
+Add powerpc-specific pte_free_defer(), to free table page via call_rcu(). 
+pte_free_defer() will be called inside khugepaged's retract_page_tables()
+loop, where allocating extra memory cannot be relied upon.  This precedes
+the generic version to avoid build breakage from incompatible pgtable_t.
+
+This is awkward because the struct page contains only one rcu_head, but
+that page may be shared between PTE_FRAG_NR pagetables, each wanting to
+use the rcu_head at the same time.  But powerpc never reuses a fragment
+once it has been freed: so mark the page Active in pte_free_defer(),
+before calling pte_fragment_free() directly; and there call_rcu() to
+pte_free_now() when last fragment is freed and the page is PageActive.
+
+Link: https://lkml.kernel.org/r/6e3ca5f1-334d-4b14-b92d-fc8e99914fcb@google.com
+Suggested-by: Jason Gunthorpe <jgg@ziepe.ca>
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huang, Ying <ying.huang@intel.com>
+Cc: Ira Weiny <ira.weiny@intel.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zack Rusin <zackr@vmware.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/powerpc/include/asm/pgalloc.h |    4 +++
+ arch/powerpc/mm/pgtable-frag.c     |   29 ++++++++++++++++++++++++---
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+--- a/arch/powerpc/include/asm/pgalloc.h~powerpc-add-pte_free_defer-for-pgtables-sharing-page
++++ a/arch/powerpc/include/asm/pgalloc.h
+@@ -45,6 +45,10 @@ static inline void pte_free(struct mm_st
+ 	pte_fragment_free((unsigned long *)ptepage, 0);
+ }
+ 
++/* arch use pte_free_defer() implementation in arch/powerpc/mm/pgtable-frag.c */
++#define pte_free_defer pte_free_defer
++void pte_free_defer(struct mm_struct *mm, pgtable_t pgtable);
++
+ /*
+  * Functions that deal with pagetables that could be at any level of
+  * the table need to be passed an "index_size" so they know how to
+--- a/arch/powerpc/mm/pgtable-frag.c~powerpc-add-pte_free_defer-for-pgtables-sharing-page
++++ a/arch/powerpc/mm/pgtable-frag.c
+@@ -106,6 +106,15 @@ pte_t *pte_fragment_alloc(struct mm_stru
+ 	return __alloc_for_ptecache(mm, kernel);
+ }
+ 
++static void pte_free_now(struct rcu_head *head)
++{
++	struct page *page;
++
++	page = container_of(head, struct page, rcu_head);
++	pgtable_pte_page_dtor(page);
++	__free_page(page);
++}
++
+ void pte_fragment_free(unsigned long *table, int kernel)
+ {
+ 	struct page *page = virt_to_page(table);
+@@ -115,8 +124,22 @@ void pte_fragment_free(unsigned long *ta
+ 
+ 	BUG_ON(atomic_read(&page->pt_frag_refcount) <= 0);
+ 	if (atomic_dec_and_test(&page->pt_frag_refcount)) {
+-		if (!kernel)
+-			pgtable_pte_page_dtor(page);
+-		__free_page(page);
++		if (kernel)
++			__free_page(page);
++		else if (TestClearPageActive(page))
++			call_rcu(&page->rcu_head, pte_free_now);
++		else
++			pte_free_now(&page->rcu_head);
+ 	}
+ }
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++void pte_free_defer(struct mm_struct *mm, pgtable_t pgtable)
++{
++	struct page *page;
++
++	page = virt_to_page(pgtable);
++	SetPageActive(page);
++	pte_fragment_free((unsigned long *)pgtable, 0);
++}
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+_
