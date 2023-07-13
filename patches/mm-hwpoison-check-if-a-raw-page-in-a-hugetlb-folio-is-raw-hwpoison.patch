@@ -1,0 +1,120 @@
+From: Jiaqi Yan <jiaqiyan@google.com>
+Subject: mm/hwpoison: check if a raw page in a hugetlb folio is raw HWPOISON
+Date: Thu, 13 Jul 2023 00:18:31 +0000
+
+Add the functionality, is_raw_hwpoison_page_in_hugepage, to tell if a raw
+page in a hugetlb folio is HWPOISON.  This functionality relies on
+RawHwpUnreliable to be not set; otherwise hugepage's raw HWPOISON list
+becomes meaningless.
+
+is_raw_hwpoison_page_in_hugepage holds mf_mutex in order to synchronize
+with folio_set_hugetlb_hwpoison and folio_free_raw_hwp who iterate,
+insert, or delete entry in raw_hwp_list.  llist itself doesn't ensure
+insertion and removal are synchornized with the llist_for_each_entry used
+by is_raw_hwpoison_page_in_hugepage (unless iterated entries are already
+deleted from the list).  Caller can minimize the overhead of lock cycles
+by first checking HWPOISON flag of the folio.
+
+Exports this functionality to be immediately used in the read operation
+for hugetlbfs.
+
+Link: https://lkml.kernel.org/r/20230713001833.3778937-3-jiaqiyan@google.com
+Signed-off-by: Jiaqi Yan <jiaqiyan@google.com>
+Reviewed-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Reviewed-by: Miaohe Lin <linmiaohe@huawei.com>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/hugetlb.h |    5 ++++
+ mm/memory-failure.c     |   40 ++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 43 insertions(+), 2 deletions(-)
+
+--- a/include/linux/hugetlb.h~mm-hwpoison-check-if-a-raw-page-in-a-hugetlb-folio-is-raw-hwpoison
++++ a/include/linux/hugetlb.h
+@@ -997,6 +997,11 @@ void hugetlb_register_node(struct node *
+ void hugetlb_unregister_node(struct node *node);
+ #endif
+ 
++/*
++ * Check if a given raw @page in a hugepage is HWPOISON.
++ */
++bool is_raw_hwpoison_page_in_hugepage(struct page *page);
++
+ #else	/* CONFIG_HUGETLB_PAGE */
+ struct hstate {};
+ 
+--- a/mm/memory-failure.c~mm-hwpoison-check-if-a-raw-page-in-a-hugetlb-folio-is-raw-hwpoison
++++ a/mm/memory-failure.c
+@@ -72,6 +72,8 @@ atomic_long_t num_poisoned_pages __read_
+ 
+ static bool hw_memory_failure __read_mostly = false;
+ 
++static DEFINE_MUTEX(mf_mutex);
++
+ void num_poisoned_pages_inc(unsigned long pfn)
+ {
+ 	atomic_long_inc(&num_poisoned_pages);
+@@ -1814,6 +1816,7 @@ EXPORT_SYMBOL_GPL(mf_dax_kill_procs);
+ #endif /* CONFIG_FS_DAX */
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
++
+ /*
+  * Struct raw_hwp_page represents information about "raw error page",
+  * constructing singly linked list from ->_hugetlb_hwpoison field of folio.
+@@ -1828,6 +1831,41 @@ static inline struct llist_head *raw_hwp
+ 	return (struct llist_head *)&folio->_hugetlb_hwpoison;
+ }
+ 
++bool is_raw_hwpoison_page_in_hugepage(struct page *page)
++{
++	struct llist_head *raw_hwp_head;
++	struct raw_hwp_page *p;
++	struct folio *folio = page_folio(page);
++	bool ret = false;
++
++	if (!folio_test_hwpoison(folio))
++		return false;
++
++	if (!folio_test_hugetlb(folio))
++		return PageHWPoison(page);
++
++	/*
++	 * When RawHwpUnreliable is set, kernel lost track of which subpages
++	 * are HWPOISON. So return as if ALL subpages are HWPOISONed.
++	 */
++	if (folio_test_hugetlb_raw_hwp_unreliable(folio))
++		return true;
++
++	mutex_lock(&mf_mutex);
++
++	raw_hwp_head = raw_hwp_list_head(folio);
++	llist_for_each_entry(p, raw_hwp_head->first, node) {
++		if (page == p->page) {
++			ret = true;
++			break;
++		}
++	}
++
++	mutex_unlock(&mf_mutex);
++
++	return ret;
++}
++
+ static unsigned long __folio_free_raw_hwp(struct folio *folio, bool move_flag)
+ {
+ 	struct llist_node *t, *tnode, *head;
+@@ -2108,8 +2146,6 @@ out:
+ 	return rc;
+ }
+ 
+-static DEFINE_MUTEX(mf_mutex);
+-
+ /**
+  * memory_failure - Handle memory failure of a page.
+  * @pfn: Page Number of the corrupted page
+_
