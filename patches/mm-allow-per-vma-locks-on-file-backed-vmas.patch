@@ -1,0 +1,138 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: allow per-VMA locks on file-backed VMAs
+Date: Mon, 24 Jul 2023 19:54:02 +0100
+
+Remove the TCP layering violation by allowing per-VMA locks on all VMAs. 
+The fault path will immediately fail in handle_mm_fault().  There may be a
+small performance reduction from this patch as a little unnecessary work
+will be done on each page fault.  See later patches for the improvement.
+
+Link: https://lkml.kernel.org/r/20230724185410.1124082-3-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Arjun Roy <arjunroy@google.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Punit Agrawal <punit.agrawal@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ MAINTAINERS            |    1 -
+ include/linux/net_mm.h |   17 -----------------
+ include/net/tcp.h      |    1 -
+ mm/memory.c            |   12 ++++++------
+ net/ipv4/tcp.c         |   11 ++++-------
+ 5 files changed, 10 insertions(+), 32 deletions(-)
+
+--- a/include/linux/net_mm.h
++++ /dev/null
+@@ -1,17 +0,0 @@
+-/* SPDX-License-Identifier: GPL-2.0-or-later */
+-#ifdef CONFIG_MMU
+-
+-#ifdef CONFIG_INET
+-extern const struct vm_operations_struct tcp_vm_ops;
+-static inline bool vma_is_tcp(const struct vm_area_struct *vma)
+-{
+-	return vma->vm_ops == &tcp_vm_ops;
+-}
+-#else
+-static inline bool vma_is_tcp(const struct vm_area_struct *vma)
+-{
+-	return false;
+-}
+-#endif /* CONFIG_INET*/
+-
+-#endif /* CONFIG_MMU */
+--- a/include/net/tcp.h~mm-allow-per-vma-locks-on-file-backed-vmas
++++ a/include/net/tcp.h
+@@ -45,7 +45,6 @@
+ #include <linux/memcontrol.h>
+ #include <linux/bpf-cgroup.h>
+ #include <linux/siphash.h>
+-#include <linux/net_mm.h>
+ 
+ extern struct inet_hashinfo tcp_hashinfo;
+ 
+--- a/MAINTAINERS~mm-allow-per-vma-locks-on-file-backed-vmas
++++ a/MAINTAINERS
+@@ -14809,7 +14809,6 @@ NETWORKING [TCP]
+ M:	Eric Dumazet <edumazet@google.com>
+ L:	netdev@vger.kernel.org
+ S:	Maintained
+-F:	include/linux/net_mm.h
+ F:	include/linux/tcp.h
+ F:	include/net/tcp.h
+ F:	include/trace/events/tcp.h
+--- a/mm/memory.c~mm-allow-per-vma-locks-on-file-backed-vmas
++++ a/mm/memory.c
+@@ -77,7 +77,6 @@
+ #include <linux/ptrace.h>
+ #include <linux/vmalloc.h>
+ #include <linux/sched/sysctl.h>
+-#include <linux/net_mm.h>
+ 
+ #include <trace/events/kmem.h>
+ 
+@@ -5360,6 +5359,11 @@ vm_fault_t handle_mm_fault(struct vm_are
+ 		goto out;
+ 	}
+ 
++	if ((flags & FAULT_FLAG_VMA_LOCK) && !vma_is_anonymous(vma)) {
++		vma_end_read(vma);
++		return VM_FAULT_RETRY;
++	}
++
+ 	/*
+ 	 * Enable the memcg OOM handling for faults triggered in user
+ 	 * space.  Kernel faults are handled more gracefully.
+@@ -5531,12 +5535,8 @@ retry:
+ 	if (!vma)
+ 		goto inval;
+ 
+-	/* Only anonymous and tcp vmas are supported for now */
+-	if (!vma_is_anonymous(vma) && !vma_is_tcp(vma))
+-		goto inval;
+-
+ 	/* find_mergeable_anon_vma uses adjacent vmas which are not locked */
+-	if (!vma->anon_vma && !vma_is_tcp(vma))
++	if (vma_is_anonymous(vma) && !vma->anon_vma)
+ 		goto inval;
+ 
+ 	if (!vma_start_read(vma))
+--- a/net/ipv4/tcp.c~mm-allow-per-vma-locks-on-file-backed-vmas
++++ a/net/ipv4/tcp.c
+@@ -1739,7 +1739,7 @@ void tcp_update_recv_tstamps(struct sk_b
+ }
+ 
+ #ifdef CONFIG_MMU
+-const struct vm_operations_struct tcp_vm_ops = {
++static const struct vm_operations_struct tcp_vm_ops = {
+ };
+ 
+ int tcp_mmap(struct file *file, struct socket *sock,
+@@ -2042,13 +2042,10 @@ static struct vm_area_struct *find_tcp_v
+ 					   unsigned long address,
+ 					   bool *mmap_locked)
+ {
+-	struct vm_area_struct *vma = NULL;
++	struct vm_area_struct *vma = lock_vma_under_rcu(mm, address);
+ 
+-#ifdef CONFIG_PER_VMA_LOCK
+-	vma = lock_vma_under_rcu(mm, address);
+-#endif
+ 	if (vma) {
+-		if (!vma_is_tcp(vma)) {
++		if (vma->vm_ops != &tcp_vm_ops) {
+ 			vma_end_read(vma);
+ 			return NULL;
+ 		}
+@@ -2058,7 +2055,7 @@ static struct vm_area_struct *find_tcp_v
+ 
+ 	mmap_read_lock(mm);
+ 	vma = vma_lookup(mm, address);
+-	if (!vma || !vma_is_tcp(vma)) {
++	if (!vma || vma->vm_ops != &tcp_vm_ops) {
+ 		mmap_read_unlock(mm);
+ 		return NULL;
+ 	}
+_
