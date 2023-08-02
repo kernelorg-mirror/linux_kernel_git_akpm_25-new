@@ -1,0 +1,155 @@
+From: Chengfeng Ye <dg573847474@gmail.com>
+Subject: ocfs2: cluster: fix potential deadlock on &qs->qs_lock
+Date: Wed, 2 Aug 2023 12:38:24 +0000
+
+&qs->qs_lock is acquired by timer o2net_idle_timer() along the following
+call chain.  Thus the acquisition of the lock under process context should
+disable bottom half, otherwise deadlock could happen if the timer happens
+to preempt the execution while the lock is held in process context on the
+same CPU.
+
+<timer interrupt>
+        -> o2net_idle_timer()
+        -> o2quo_conn_err()
+        -> spin_lock(&qs->qs_lock)
+
+Several lock acquisition of &qs->qs_lock under process contex do not
+disable irq or bottom half.  The patch fixes these potential deadlocks
+scenerio by using spin_lock_bh() on &qs->qs_lock.
+
+This flaw was found by an experimental static analysis tool I am
+developing for irq-related deadlock.  x86_64 allmodconfig using gcc shows
+no new warning.
+
+Link: https://lkml.kernel.org/r/20230802123824.15301-1-dg573847474@gmail.com
+Signed-off-by: Chengfeng Ye <dg573847474@gmail.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Joseph Qi <jiangqi903@gmail.com>
+Cc: Gang He <ghe@suse.com>
+Cc: Jun Piao <piaojun@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/ocfs2/cluster/quorum.c |   26 +++++++++++++-------------
+ 1 file changed, 13 insertions(+), 13 deletions(-)
+
+--- a/fs/ocfs2/cluster/quorum.c~ocfs2-cluster-fix-potential-deadlock-on-qs-qs_lock
++++ a/fs/ocfs2/cluster/quorum.c
+@@ -93,7 +93,7 @@ static void o2quo_make_decision(struct w
+ 	int lowest_hb, lowest_reachable = 0, fence = 0;
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	lowest_hb = find_first_bit(qs->qs_hb_bm, O2NM_MAX_NODES);
+ 	if (lowest_hb != O2NM_MAX_NODES)
+@@ -146,14 +146,14 @@ static void o2quo_make_decision(struct w
+ 
+ out:
+ 	if (fence) {
+-		spin_unlock(&qs->qs_lock);
++		spin_unlock_bh(&qs->qs_lock);
+ 		o2quo_fence_self();
+ 	} else {
+ 		mlog(ML_NOTICE, "not fencing this node, heartbeating: %d, "
+ 			"connected: %d, lowest: %d (%sreachable)\n",
+ 			qs->qs_heartbeating, qs->qs_connected, lowest_hb,
+ 			lowest_reachable ? "" : "un");
+-		spin_unlock(&qs->qs_lock);
++		spin_unlock_bh(&qs->qs_lock);
+ 
+ 	}
+ 
+@@ -196,7 +196,7 @@ void o2quo_hb_up(u8 node)
+ {
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	qs->qs_heartbeating++;
+ 	mlog_bug_on_msg(qs->qs_heartbeating == O2NM_MAX_NODES,
+@@ -211,7 +211,7 @@ void o2quo_hb_up(u8 node)
+ 	else
+ 		o2quo_clear_hold(qs, node);
+ 
+-	spin_unlock(&qs->qs_lock);
++	spin_unlock_bh(&qs->qs_lock);
+ }
+ 
+ /* hb going down releases any holds we might have had due to this node from
+@@ -220,7 +220,7 @@ void o2quo_hb_down(u8 node)
+ {
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	qs->qs_heartbeating--;
+ 	mlog_bug_on_msg(qs->qs_heartbeating < 0,
+@@ -233,7 +233,7 @@ void o2quo_hb_down(u8 node)
+ 
+ 	o2quo_clear_hold(qs, node);
+ 
+-	spin_unlock(&qs->qs_lock);
++	spin_unlock_bh(&qs->qs_lock);
+ }
+ 
+ /* this tells us that we've decided that the node is still heartbeating
+@@ -245,14 +245,14 @@ void o2quo_hb_still_up(u8 node)
+ {
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	mlog(0, "node %u\n", node);
+ 
+ 	qs->qs_pending = 1;
+ 	o2quo_clear_hold(qs, node);
+ 
+-	spin_unlock(&qs->qs_lock);
++	spin_unlock_bh(&qs->qs_lock);
+ }
+ 
+ /* This is analogous to hb_up.  as a node's connection comes up we delay the
+@@ -264,7 +264,7 @@ void o2quo_conn_up(u8 node)
+ {
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	qs->qs_connected++;
+ 	mlog_bug_on_msg(qs->qs_connected == O2NM_MAX_NODES,
+@@ -279,7 +279,7 @@ void o2quo_conn_up(u8 node)
+ 	else
+ 		o2quo_clear_hold(qs, node);
+ 
+-	spin_unlock(&qs->qs_lock);
++	spin_unlock_bh(&qs->qs_lock);
+ }
+ 
+ /* we've decided that we won't ever be connecting to the node again.  if it's
+@@ -290,7 +290,7 @@ void o2quo_conn_err(u8 node)
+ {
+ 	struct o2quo_state *qs = &o2quo_state;
+ 
+-	spin_lock(&qs->qs_lock);
++	spin_lock_bh(&qs->qs_lock);
+ 
+ 	if (test_bit(node, qs->qs_conn_bm)) {
+ 		qs->qs_connected--;
+@@ -307,7 +307,7 @@ void o2quo_conn_err(u8 node)
+ 	mlog(0, "node %u, %d total\n", node, qs->qs_connected);
+ 
+ 
+-	spin_unlock(&qs->qs_lock);
++	spin_unlock_bh(&qs->qs_lock);
+ }
+ 
+ void o2quo_init(void)
+_
