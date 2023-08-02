@@ -1,0 +1,124 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/damon/core: implement target type damos filter
+Date: Wed, 2 Aug 2023 21:43:07 +0000
+
+One DAMON context can have multiple monitoring targets, and DAMOS schemes
+are applied to all targets.  In some cases, users need to apply different
+scheme to different targets.  Retrieving monitoring results via DAMON
+sysfs interface' 'tried_regions' directory could be one good example. 
+Also, there could be cases that cgroup DAMOS filter is not enough.  All
+such use cases can be worked around by having multiple DAMON contexts
+having only single target, but it is inefficient in terms of resource
+usage, thogh the overhead is not estimated to be huge.
+
+Implement DAMON monitoring target based DAMOS filter for the case.  Like
+address range target DAMOS filter, handle these filters in the DAMON core
+layer, since it is more efficient than doing in operations set layer. 
+This also means that regions that filtered out by monitoring target type
+DAMOS filters are counted as not tried by the scheme.  Hence, target
+granularity monitoring results retrieval via DAMON sysfs interface becomes
+available.
+
+Link: https://lkml.kernel.org/r/20230802214312.110532-9-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: Brendan Higgins <brendanhiggins@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/damon.h |    6 ++++++
+ mm/damon/core.c       |   22 ++++++++++++++++------
+ 2 files changed, 22 insertions(+), 6 deletions(-)
+
+--- a/include/linux/damon.h~mm-damon-core-implement-target-type-damos-filter
++++ a/include/linux/damon.h
+@@ -227,6 +227,7 @@ struct damos_stat {
+  * @DAMOS_FILTER_TYPE_ANON:	Anonymous pages.
+  * @DAMOS_FILTER_TYPE_MEMCG:	Specific memcg's pages.
+  * @DAMOS_FILTER_TYPE_ADDR:	Address range.
++ * @DAMOS_FILTER_TYPE_TARGET:	Data Access Monitoring target.
+  * @NR_DAMOS_FILTER_TYPES:	Number of filter types.
+  *
+  * The anon pages type and memcg type filters are handled by underlying
+@@ -244,6 +245,7 @@ enum damos_filter_type {
+ 	DAMOS_FILTER_TYPE_ANON,
+ 	DAMOS_FILTER_TYPE_MEMCG,
+ 	DAMOS_FILTER_TYPE_ADDR,
++	DAMOS_FILTER_TYPE_TARGET,
+ 	NR_DAMOS_FILTER_TYPES,
+ };
+ 
+@@ -253,6 +255,9 @@ enum damos_filter_type {
+  * @matching:	If the matching page should filtered out or in.
+  * @memcg_id:	Memcg id of the question if @type is DAMOS_FILTER_MEMCG.
+  * @addr_range:	Address range if @type is DAMOS_FILTER_TYPE_ADDR.
++ * @target_idx:	Index of the &struct damon_target of
++ *		&damon_ctx->adaptive_targets if @type is
++ *		DAMOS_FILTER_TYPE_TARGET.
+  * @list:	List head for siblings.
+  *
+  * Before applying the &damos->action to a memory region, DAMOS checks if each
+@@ -266,6 +271,7 @@ struct damos_filter {
+ 	union {
+ 		unsigned short memcg_id;
+ 		struct damon_addr_range addr_range;
++		int target_idx;
+ 	};
+ 	struct list_head list;
+ };
+--- a/mm/damon/core.c~mm-damon-core-implement-target-type-damos-filter
++++ a/mm/damon/core.c
+@@ -878,13 +878,23 @@ static void damos_update_stat(struct dam
+ 	s->stat.sz_applied += sz_applied;
+ }
+ 
+-static bool __damos_filter_out(struct damon_target *t, struct damon_region *r,
+-		struct damos_filter *filter)
++static bool __damos_filter_out(struct damon_ctx *ctx, struct damon_target *t,
++		struct damon_region *r, struct damos_filter *filter)
+ {
+ 	bool matched = false;
++	struct damon_target *ti;
++	int target_idx = 0;
+ 	unsigned long start, end;
+ 
+ 	switch (filter->type) {
++	case DAMOS_FILTER_TYPE_TARGET:
++		damon_for_each_target(ti, ctx) {
++			if (ti == t)
++				break;
++			target_idx++;
++		}
++		matched = target_idx == filter->target_idx;
++		break;
+ 	case DAMOS_FILTER_TYPE_ADDR:
+ 		start = ALIGN_DOWN(filter->addr_range.start, DAMON_MIN_REGION);
+ 		end = ALIGN_DOWN(filter->addr_range.end, DAMON_MIN_REGION);
+@@ -916,13 +926,13 @@ static bool __damos_filter_out(struct da
+ 	return matched == filter->matching;
+ }
+ 
+-static bool damos_filter_out(struct damon_target *t, struct damon_region *r,
+-		struct damos *s)
++static bool damos_filter_out(struct damon_ctx *ctx, struct damon_target *t,
++		struct damon_region *r, struct damos *s)
+ {
+ 	struct damos_filter *filter;
+ 
+ 	damos_for_each_filter(filter, s) {
+-		if (__damos_filter_out(t, r, filter))
++		if (__damos_filter_out(ctx, t, r, filter))
+ 			return true;
+ 	}
+ 	return false;
+@@ -945,7 +955,7 @@ static void damos_apply_scheme(struct da
+ 				goto update_stat;
+ 			damon_split_region_at(t, r, sz);
+ 		}
+-		if (damos_filter_out(t, r, s))
++		if (damos_filter_out(c, t, r, s))
+ 			return;
+ 		ktime_get_coarse_ts64(&begin);
+ 		if (c->callback.before_damos_apply)
+_
