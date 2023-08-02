@@ -1,0 +1,110 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: openrisc: implement the new page table range API
+Date: Wed, 2 Aug 2023 16:13:47 +0100
+
+Add PFN_PTE_SHIFT, update_mmu_cache_range() and flush_dcache_folio(). 
+Change the PG_arch_1 (aka PG_dcache_dirty) flag from being per-page to
+per-folio.
+
+Link: https://lkml.kernel.org/r/20230802151406.3735276-20-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Jonas Bonn <jonas@southpole.se>
+Cc: Stefan Kristiansson <stefan.kristiansson@saunalahti.fi>
+Cc: Stafford Horne <shorne@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/openrisc/include/asm/cacheflush.h |    8 +++++++-
+ arch/openrisc/include/asm/pgtable.h    |   15 ++++++++++-----
+ arch/openrisc/mm/cache.c               |   12 ++++++++----
+ 3 files changed, 25 insertions(+), 10 deletions(-)
+
+--- a/arch/openrisc/include/asm/cacheflush.h~openrisc-implement-the-new-page-table-range-api
++++ a/arch/openrisc/include/asm/cacheflush.h
+@@ -56,10 +56,16 @@ static inline void sync_icache_dcache(st
+  */
+ #define PG_dc_clean                  PG_arch_1
+ 
++static inline void flush_dcache_folio(struct folio *folio)
++{
++	clear_bit(PG_dc_clean, &folio->flags);
++}
++#define flush_dcache_folio flush_dcache_folio
++
+ #define ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE 1
+ static inline void flush_dcache_page(struct page *page)
+ {
+-	clear_bit(PG_dc_clean, &page->flags);
++	flush_dcache_folio(page_folio(page));
+ }
+ 
+ #define flush_icache_user_page(vma, page, addr, len)	\
+--- a/arch/openrisc/include/asm/pgtable.h~openrisc-implement-the-new-page-table-range-api
++++ a/arch/openrisc/include/asm/pgtable.h
+@@ -46,7 +46,7 @@ extern void paging_init(void);
+  * hook is made available.
+  */
+ #define set_pte(pteptr, pteval) ((*(pteptr)) = (pteval))
+-#define set_pte_at(mm, addr, ptep, pteval) set_pte(ptep, pteval)
++
+ /*
+  * (pmds are folded into pgds so this doesn't get actually called,
+  * but the define is needed for a generic inline function.)
+@@ -357,6 +357,7 @@ static inline unsigned long pmd_page_vad
+ #define __pmd_offset(address) \
+ 	(((address) >> PMD_SHIFT) & (PTRS_PER_PMD-1))
+ 
++#define PFN_PTE_SHIFT		PAGE_SHIFT
+ #define pte_pfn(x)		((unsigned long)(((x).pte)) >> PAGE_SHIFT)
+ #define pfn_pte(pfn, prot)  __pte((((pfn) << PAGE_SHIFT)) | pgprot_val(prot))
+ 
+@@ -379,13 +380,17 @@ static inline void update_tlb(struct vm_
+ extern void update_cache(struct vm_area_struct *vma,
+ 	unsigned long address, pte_t *pte);
+ 
+-static inline void update_mmu_cache(struct vm_area_struct *vma,
+-	unsigned long address, pte_t *pte)
++static inline void update_mmu_cache_range(struct vm_fault *vmf,
++		struct vm_area_struct *vma, unsigned long address,
++		pte_t *ptep, unsigned int nr)
+ {
+-	update_tlb(vma, address, pte);
+-	update_cache(vma, address, pte);
++	update_tlb(vma, address, ptep);
++	update_cache(vma, address, ptep);
+ }
+ 
++#define update_mmu_cache(vma, addr, ptep) \
++	update_mmu_cache_range(NULL, vma, addr, ptep, 1)
++
+ /* __PHX__ FIXME, SWAP, this probably doesn't work */
+ 
+ /*
+--- a/arch/openrisc/mm/cache.c~openrisc-implement-the-new-page-table-range-api
++++ a/arch/openrisc/mm/cache.c
+@@ -43,15 +43,19 @@ void update_cache(struct vm_area_struct
+ 	pte_t *pte)
+ {
+ 	unsigned long pfn = pte_val(*pte) >> PAGE_SHIFT;
+-	struct page *page = pfn_to_page(pfn);
+-	int dirty = !test_and_set_bit(PG_dc_clean, &page->flags);
++	struct folio *folio = page_folio(pfn_to_page(pfn));
++	int dirty = !test_and_set_bit(PG_dc_clean, &folio->flags);
+ 
+ 	/*
+ 	 * Since icaches do not snoop for updated data on OpenRISC, we
+ 	 * must write back and invalidate any dirty pages manually. We
+ 	 * can skip data pages, since they will not end up in icaches.
+ 	 */
+-	if ((vma->vm_flags & VM_EXEC) && dirty)
+-		sync_icache_dcache(page);
++	if ((vma->vm_flags & VM_EXEC) && dirty) {
++		unsigned int nr = folio_nr_pages(folio);
++
++		while (nr--)
++			sync_icache_dcache(folio_page(folio, nr));
++	}
+ }
+ 
+_
