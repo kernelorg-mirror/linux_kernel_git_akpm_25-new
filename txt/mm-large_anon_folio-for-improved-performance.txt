@@ -1,0 +1,72 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: mm: LARGE_ANON_FOLIO for improved performance
+Date: Thu, 10 Aug 2023 15:29:40 +0100
+
+Introduce LARGE_ANON_FOLIO feature, which allows anonymous memory to be
+allocated in large folios of a determined order.  All pages of the large
+folio are pte-mapped during the same page fault, significantly reducing
+the number of page faults.  The number of per-page operations (e.g.  ref
+counting, rmap management lru list management) are also significantly
+reduced since those ops now become per-folio.
+
+The new behaviour is hidden behind the new LARGE_ANON_FOLIO Kconfig, which
+defaults to disabled for now; The long term aim is for this to defaut to
+enabled, but there are some risks around internal fragmentation that need
+to be better understood first.
+
+Large anonymous folio (LAF) allocation is integrated with the existing
+(PMD-order) THP and single (S) page allocation according to this policy,
+where fallback (>) is performed for various reasons, such as the proposed
+folio order not fitting within the bounds of the VMA, etc:
+
+                | prctl=dis | prctl=ena   | prctl=ena     | prctl=ena
+                | sysfs=X   | sysfs=never | sysfs=madvise | sysfs=always
+----------------|-----------|-------------|---------------|-------------
+no hint         | S         | LAF>S       | LAF>S         | THP>LAF>S
+MADV_HUGEPAGE   | S         | LAF>S       | THP>LAF>S     | THP>LAF>S
+MADV_NOHUGEPAGE | S         | S           | S             | S
+
+This approach ensures that we don't violate existing hints to only
+allocate single pages - this is required for QEMU's VM live migration
+implementation to work correctly - while allowing us to use LAF
+independently of THP (when sysfs=never).  This makes wide scale
+performance characterization simpler, while avoiding exposing any new ABI
+to user space.
+
+When using LAF for allocation, the folio order is determined as follows:
+The return value of arch_wants_pte_order() is used.  For vmas that have
+not explicitly opted-in to use transparent hugepages (e.g.  where
+sysfs=madvise and the vma does not have MADV_HUGEPAGE or sysfs=never),
+then arch_wants_pte_order() is limited to 64K (or PAGE_SIZE, whichever is
+bigger).  This allows for a performance boost without requiring any
+explicit opt-in from the workload while limitting internal fragmentation.
+
+If the preferred order can't be used (e.g.  because the folio would breach
+the bounds of the vma, or because ptes in the region are already mapped)
+then we fall back to a suitable lower order; first
+PAGE_ALLOC_COSTLY_ORDER, then order-0.
+
+arch_wants_pte_order() can be overridden by the architecture if desired. 
+Some architectures (e.g.  arm64) can coalsece TLB entries if a contiguous
+set of ptes map physically contigious, naturally aligned memory, so this
+mechanism allows the architecture to optimize as required.
+
+Here we add the default implementation of arch_wants_pte_order(), used
+when the architecture does not define it, which returns -1, implying that
+the HW has no preference.  In this case, mm will choose it's own default
+order.
+
+Link: https://lkml.kernel.org/r/20230810142942.3169679-4-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Huang, Ying <ying.huang@intel.com>
+Cc: Itaru Kitayama <itaru.kitayama@gmail.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yin Fengwei <fengwei.yin@intel.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
