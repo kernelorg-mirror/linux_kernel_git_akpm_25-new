@@ -1,0 +1,114 @@
+From: Mateusz Guzik <mjguzik@gmail.com>
+Subject: kernel/fork: stop playing lockless games for exe_file replacement
+Date: Mon, 14 Aug 2023 19:21:40 +0200
+
+xchg originated in 6e399cd144d8 ("prctl: avoid using mmap_sem for exe_file
+serialization").  While the commit message does not explain *why* the
+change, I found the original submission [1] which ultimately claims it
+cleans things up by removing dependency of exe_file on the semaphore.
+
+However, fe69d560b5bd ("kernel/fork: always deny write access to current
+MM exe_file") added a semaphore up/down cycle to synchronize the state of
+exe_file against fork, defeating the point of the original change.
+
+This is on top of semaphore trips already present both in the replacing
+function and prctl (the only consumer).
+
+Normally replacing exe_file does not happen for busy processes, thus
+write-locking is not an impediment to performance in the intended use
+case.  If someone keeps invoking the routine for a busy processes they are
+trying to play dirty and that's another reason to avoid any trickery.
+
+As such I think the atomic here only adds complexity for no benefit.
+
+Just write-lock around the replacement.
+
+I also note that replacement races against the mapping check loop as
+nothing synchronizes actual assignment with with said checks but I am not
+addressing it in this patch.  (Is the loop of any use to begin with?)
+
+Link: https://lore.kernel.org/linux-mm/1424979417.10344.14.camel@stgolabs.net/ [1]
+Link: https://lkml.kernel.org/r/20230814172140.1777161-1-mjguzik@gmail.com
+Signed-off-by: Mateusz Guzik <mjguzik@gmail.com>
+Acked-by: Oleg Nesterov <oleg@redhat.com>
+Cc: "Christian Brauner (Microsoft)" <brauner@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/exec.c     |    4 ++--
+ kernel/fork.c |   22 +++++++++-------------
+ 2 files changed, 11 insertions(+), 15 deletions(-)
+
+--- a/fs/exec.c~kernel-fork-stop-playing-lockless-games-for-exe_file-replacement
++++ a/fs/exec.c
+@@ -1277,8 +1277,8 @@ int begin_new_exec(struct linux_binprm *
+ 
+ 	/*
+ 	 * Must be called _before_ exec_mmap() as bprm->mm is
+-	 * not visible until then. This also enables the update
+-	 * to be lockless.
++	 * not visible until then. Doing it here also ensures
++	 * we don't race against replace_mm_exe_file().
+ 	 */
+ 	retval = set_mm_exe_file(bprm->mm, bprm->file);
+ 	if (retval)
+--- a/kernel/fork.c~kernel-fork-stop-playing-lockless-games-for-exe_file-replacement
++++ a/kernel/fork.c
+@@ -1396,8 +1396,8 @@ EXPORT_SYMBOL_GPL(mmput_async);
+  * This changes mm's executable file (shown as symlink /proc/[pid]/exe).
+  *
+  * Main users are mmput() and sys_execve(). Callers prevent concurrent
+- * invocations: in mmput() nobody alive left, in execve task is single
+- * threaded.
++ * invocations: in mmput() nobody alive left, in execve it happens before
++ * the new mm is made visible to anyone.
+  *
+  * Can only fail if new_exe_file != NULL.
+  */
+@@ -1432,9 +1432,7 @@ int set_mm_exe_file(struct mm_struct *mm
+ /**
+  * replace_mm_exe_file - replace a reference to the mm's executable file
+  *
+- * This changes mm's executable file (shown as symlink /proc/[pid]/exe),
+- * dealing with concurrent invocation and without grabbing the mmap lock in
+- * write mode.
++ * This changes mm's executable file (shown as symlink /proc/[pid]/exe).
+  *
+  * Main user is sys_prctl(PR_SET_MM_MAP/EXE_FILE).
+  */
+@@ -1464,22 +1462,20 @@ int replace_mm_exe_file(struct mm_struct
+ 			return ret;
+ 	}
+ 
+-	/* set the new file, lockless */
+ 	ret = deny_write_access(new_exe_file);
+ 	if (ret)
+ 		return -EACCES;
+ 	get_file(new_exe_file);
+ 
+-	old_exe_file = xchg(&mm->exe_file, new_exe_file);
++	/* set the new file */
++	mmap_write_lock(mm);
++	old_exe_file = rcu_dereference_raw(mm->exe_file);
++	rcu_assign_pointer(mm->exe_file, new_exe_file);
++	mmap_write_unlock(mm);
++
+ 	if (old_exe_file) {
+-		/*
+-		 * Don't race with dup_mmap() getting the file and disallowing
+-		 * write access while someone might open the file writable.
+-		 */
+-		mmap_read_lock(mm);
+ 		allow_write_access(old_exe_file);
+ 		fput(old_exe_file);
+-		mmap_read_unlock(mm);
+ 	}
+ 	return 0;
+ }
+_
