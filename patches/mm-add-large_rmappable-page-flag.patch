@@ -1,0 +1,179 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: add large_rmappable page flag
+Date: Wed, 16 Aug 2023 16:11:56 +0100
+
+Stored in the first tail page's flags, this flag replaces the destructor. 
+That removes the last of the destructors, so remove all references to
+folio_dtor and compound_dtor.
+
+Link: https://lkml.kernel.org/r/20230816151201.3655946-9-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Yanteng Si <siyanteng@loongson.cn>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/kdump/vmcoreinfo.rst |    4 ++--
+ include/linux/mm.h                             |   13 -------------
+ include/linux/mm_types.h                       |    2 --
+ include/linux/page-flags.h                     |    7 ++++++-
+ kernel/crash_core.c                            |    1 -
+ mm/huge_memory.c                               |    4 ++--
+ mm/internal.h                                  |    1 -
+ mm/page_alloc.c                                |    7 +------
+ 8 files changed, 11 insertions(+), 28 deletions(-)
+
+--- a/Documentation/admin-guide/kdump/vmcoreinfo.rst~mm-add-large_rmappable-page-flag
++++ a/Documentation/admin-guide/kdump/vmcoreinfo.rst
+@@ -141,8 +141,8 @@ nodemask_t
+ The size of a nodemask_t type. Used to compute the number of online
+ nodes.
+ 
+-(page, flags|_refcount|mapping|lru|_mapcount|private|compound_dtor|compound_order|compound_head)
+--------------------------------------------------------------------------------------------------
++(page, flags|_refcount|mapping|lru|_mapcount|private|compound_order|compound_head)
++----------------------------------------------------------------------------------
+ 
+ User-space tools compute their values based on the offset of these
+ variables. The variables are used when excluding unnecessary pages.
+--- a/include/linux/mm.h~mm-add-large_rmappable-page-flag
++++ a/include/linux/mm.h
+@@ -1272,19 +1272,6 @@ void folio_copy(struct folio *dst, struc
+ 
+ unsigned long nr_free_buffer_pages(void);
+ 
+-enum compound_dtor_id {
+-	COMPOUND_PAGE_DTOR,
+-	TRANSHUGE_PAGE_DTOR,
+-	NR_COMPOUND_DTORS,
+-};
+-
+-static inline void folio_set_compound_dtor(struct folio *folio,
+-		enum compound_dtor_id compound_dtor)
+-{
+-	VM_BUG_ON_FOLIO(compound_dtor >= NR_COMPOUND_DTORS, folio);
+-	folio->_folio_dtor = compound_dtor;
+-}
+-
+ void destroy_large_folio(struct folio *folio);
+ 
+ /* Returns the number of bytes in this potentially compound page. */
+--- a/include/linux/mm_types.h~mm-add-large_rmappable-page-flag
++++ a/include/linux/mm_types.h
+@@ -264,7 +264,6 @@ static inline struct page *encoded_page_
+  * @_refcount: Do not access this member directly.  Use folio_ref_count()
+  *    to find how many references there are to this folio.
+  * @memcg_data: Memory Control Group data.
+- * @_folio_dtor: Which destructor to use for this folio.
+  * @_folio_order: Do not use directly, call folio_order().
+  * @_entire_mapcount: Do not use directly, call folio_entire_mapcount().
+  * @_nr_pages_mapped: Do not use directly, call folio_mapcount().
+@@ -318,7 +317,6 @@ struct folio {
+ 			unsigned long _flags_1;
+ 			unsigned long _head_1;
+ 	/* public: */
+-			unsigned char _folio_dtor;
+ 			unsigned char _folio_order;
+ 			atomic_t _entire_mapcount;
+ 			atomic_t _nr_pages_mapped;
+--- a/include/linux/page-flags.h~mm-add-large_rmappable-page-flag
++++ a/include/linux/page-flags.h
+@@ -190,6 +190,7 @@ enum pageflags {
+ 	/* At least one page in this folio has the hwpoison flag set */
+ 	PG_has_hwpoisoned = PG_error,
+ 	PG_hugetlb = PG_active,
++	PG_large_rmappable = PG_workingset, /* anon or file-backed */
+ };
+ 
+ #define PAGEFLAGS_MASK		((1UL << NR_PAGEFLAGS) - 1)
+@@ -806,6 +807,9 @@ static inline void ClearPageCompound(str
+ 	BUG_ON(!PageHead(page));
+ 	ClearPageHead(page);
+ }
++PAGEFLAG(LargeRmappable, large_rmappable, PF_SECOND)
++#else
++TESTPAGEFLAG_FALSE(LargeRmappable, large_rmappable)
+ #endif
+ 
+ #define PG_head_mask ((1UL << PG_head))
+@@ -1077,7 +1081,8 @@ static __always_inline void __ClearPageA
+  * the CHECK_AT_FREE flags above, so need to be cleared.
+  */
+ #define PAGE_FLAGS_SECOND						\
+-	(1UL << PG_has_hwpoisoned	| 1UL << PG_hugetlb)
++	(1UL << PG_has_hwpoisoned	| 1UL << PG_hugetlb |		\
++	 1UL << PG_large_rmappable)
+ 
+ #define PAGE_FLAGS_PRIVATE				\
+ 	(1UL << PG_private | 1UL << PG_private_2)
+--- a/kernel/crash_core.c~mm-add-large_rmappable-page-flag
++++ a/kernel/crash_core.c
+@@ -455,7 +455,6 @@ static int __init crash_save_vmcoreinfo_
+ 	VMCOREINFO_OFFSET(page, lru);
+ 	VMCOREINFO_OFFSET(page, _mapcount);
+ 	VMCOREINFO_OFFSET(page, private);
+-	VMCOREINFO_OFFSET(folio, _folio_dtor);
+ 	VMCOREINFO_OFFSET(folio, _folio_order);
+ 	VMCOREINFO_OFFSET(page, compound_head);
+ 	VMCOREINFO_OFFSET(pglist_data, node_zones);
+--- a/mm/huge_memory.c~mm-add-large_rmappable-page-flag
++++ a/mm/huge_memory.c
+@@ -581,7 +581,7 @@ void folio_prep_large_rmappable(struct f
+ {
+ 	VM_BUG_ON_FOLIO(folio_order(folio) < 2, folio);
+ 	INIT_LIST_HEAD(&folio->_deferred_list);
+-	folio_set_compound_dtor(folio, TRANSHUGE_PAGE_DTOR);
++	folio_set_large_rmappable(folio);
+ }
+ 
+ static inline bool is_transparent_hugepage(struct page *page)
+@@ -593,7 +593,7 @@ static inline bool is_transparent_hugepa
+ 
+ 	folio = page_folio(page);
+ 	return is_huge_zero_page(&folio->page) ||
+-	       folio->_folio_dtor == TRANSHUGE_PAGE_DTOR;
++		folio_test_large_rmappable(folio);
+ }
+ 
+ static unsigned long __thp_get_unmapped_area(struct file *filp,
+--- a/mm/internal.h~mm-add-large_rmappable-page-flag
++++ a/mm/internal.h
+@@ -419,7 +419,6 @@ static inline void prep_compound_head(st
+ {
+ 	struct folio *folio = (struct folio *)page;
+ 
+-	folio_set_compound_dtor(folio, COMPOUND_PAGE_DTOR);
+ 	folio_set_order(folio, order);
+ 	atomic_set(&folio->_entire_mapcount, -1);
+ 	atomic_set(&folio->_nr_pages_mapped, 0);
+--- a/mm/page_alloc.c~mm-add-large_rmappable-page-flag
++++ a/mm/page_alloc.c
+@@ -572,9 +572,6 @@ static inline void free_the_page(struct
+  * The remaining PAGE_SIZE pages are called "tail pages". PageTail() is encoded
+  * in bit 0 of page->compound_head. The rest of bits is pointer to head page.
+  *
+- * The first tail page's ->compound_dtor describes how to destroy the
+- * compound page.
+- *
+  * The first tail page's ->compound_order holds the order of allocation.
+  * This usage means that zero-order pages may not be compound.
+  */
+@@ -593,14 +590,12 @@ void prep_compound_page(struct page *pag
+ 
+ void destroy_large_folio(struct folio *folio)
+ {
+-	enum compound_dtor_id dtor = folio->_folio_dtor;
+-
+ 	if (folio_test_hugetlb(folio)) {
+ 		free_huge_folio(folio);
+ 		return;
+ 	}
+ 
+-	if (folio_test_transhuge(folio) && dtor == TRANSHUGE_PAGE_DTOR)
++	if (folio_test_large_rmappable(folio))
+ 		folio_undo_large_rmappable(folio);
+ 
+ 	mem_cgroup_uncharge(folio);
+_
