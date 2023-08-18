@@ -1,0 +1,142 @@
+From: Peter Xu <peterx@redhat.com>
+Subject: mm: wire up tail page poisoning over ->mappings
+Date: Tue, 15 Aug 2023 17:06:59 -0400
+
+Tail pages have a sanity check on ->mapping fields, not all of them but
+only upon index>2, for now.  It's because we reused ->mapping fields of
+the tail pages index=1,2 for other things.
+
+Define a macro for "max index of tail pages that got ->mapping field
+reused" on top of folio definition, because when we grow folio tail pages
+we'd want to boost this too together.
+
+Then wire everything up using that macro.
+
+Don't try to poison the ->mapping field in prep_compound_tail() for tail
+pages <=TAIL_MAPPING_REUSED_MAX because it's wrong.  For example, the 1st
+tail page already reused ->mapping field as _nr_pages_mapped.  It didn't
+already blow up only because we luckily always prepare tail pages before
+preparing the head, then prep_compound_head() will update
+folio->_nr_pages_mapped so as to void the poisoning.  This should make it
+always safe again, even e.g.  if we prep the head first.
+
+Clean up free_tail_page_prepare() along the way on checking ->mapping
+poisoning to also leverage the new macro.
+
+Link: https://lkml.kernel.org/r/20230815210659.430010-1-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm_types.h |   11 +++++++++++
+ mm/huge_memory.c         |    6 +++---
+ mm/internal.h            |    3 ++-
+ mm/page_alloc.c          |   28 +++++++++++-----------------
+ 4 files changed, 27 insertions(+), 21 deletions(-)
+
+--- a/include/linux/mm_types.h~mm-wire-up-tail-page-poisoning-over-mappings
++++ a/include/linux/mm_types.h
+@@ -248,6 +248,17 @@ static inline struct page *encoded_page_
+ 	return (struct page *)(~ENCODE_PAGE_BITS & (unsigned long)page);
+ }
+ 
++/*
++ * This macro defines the maximum tail pages (of a folio) that can have the
++ * page->mapping field reused.
++ *
++ * When the tail page's mapping field reused, it'll be exempted from
++ * ->mapping poisoning and checks.  Also see the macro TAIL_MAPPING.
++ *
++ * When grow the folio struct, please consider growing this too.
++ */
++#define  TAIL_MAPPING_REUSED_MAX  (2)
++
+ /**
+  * struct folio - Represents a contiguous set of bytes.
+  * @flags: Identical to the page flags.
+--- a/mm/huge_memory.c~mm-wire-up-tail-page-poisoning-over-mappings
++++ a/mm/huge_memory.c
+@@ -2439,9 +2439,9 @@ static void __split_huge_page_tail(struc
+ 			 (1L << PG_dirty) |
+ 			 LRU_GEN_MASK | LRU_REFS_MASK));
+ 
+-	/* ->mapping in first and second tail page is replaced by other uses */
+-	VM_BUG_ON_PAGE(tail > 2 && page_tail->mapping != TAIL_MAPPING,
+-			page_tail);
++	/* ->mapping in <=TAIL_MAPPING_REUSED_MAX tail pages are reused */
++	VM_BUG_ON_PAGE(tail > TAIL_MAPPING_REUSED_MAX &&
++		       page_tail->mapping != TAIL_MAPPING, page_tail);
+ 	page_tail->mapping = head->mapping;
+ 	page_tail->index = head->index + tail;
+ 
+--- a/mm/internal.h~mm-wire-up-tail-page-poisoning-over-mappings
++++ a/mm/internal.h
+@@ -429,7 +429,8 @@ static inline void prep_compound_tail(st
+ {
+ 	struct page *p = head + tail_idx;
+ 
+-	p->mapping = TAIL_MAPPING;
++	if (tail_idx > TAIL_MAPPING_REUSED_MAX)
++		p->mapping = TAIL_MAPPING;
+ 	set_compound_head(p, head);
+ 	set_page_private(p, 0);
+ }
+--- a/mm/page_alloc.c~mm-wire-up-tail-page-poisoning-over-mappings
++++ a/mm/page_alloc.c
+@@ -968,7 +968,7 @@ static inline bool is_check_pages_enable
+ static int free_tail_page_prepare(struct page *head_page, struct page *page)
+ {
+ 	struct folio *folio = (struct folio *)head_page;
+-	int ret = 1;
++	int ret = 1, index = page - head_page;
+ 
+ 	/*
+ 	 * We rely page->lru.next never has bit 0 set, unless the page
+@@ -980,9 +980,9 @@ static int free_tail_page_prepare(struct
+ 		ret = 0;
+ 		goto out;
+ 	}
+-	switch (page - head_page) {
+-	case 1:
+-		/* the first tail page: these may be in place of ->mapping */
++
++	/* Sanity check the first tail page */
++	if (index == 1) {
+ 		if (unlikely(folio_entire_mapcount(folio))) {
+ 			bad_page(page, "nonzero entire_mapcount");
+ 			goto out;
+@@ -995,20 +995,14 @@ static int free_tail_page_prepare(struct
+ 			bad_page(page, "nonzero pincount");
+ 			goto out;
+ 		}
+-		break;
+-	case 2:
+-		/*
+-		 * the second tail page: ->mapping is
+-		 * deferred_list.next -- ignore value.
+-		 */
+-		break;
+-	default:
+-		if (page->mapping != TAIL_MAPPING) {
+-			bad_page(page, "corrupted mapping in tail page");
+-			goto out;
+-		}
+-		break;
+ 	}
++
++	/* Sanity check the rest tail pages over ->mapping */
++	if (index > TAIL_MAPPING_REUSED_MAX && page->mapping != TAIL_MAPPING) {
++		bad_page(page, "corrupted mapping in tail page");
++		goto out;
++	}
++
+ 	if (unlikely(!PageTail(page))) {
+ 		bad_page(page, "PageTail not set");
+ 		goto out;
+_
