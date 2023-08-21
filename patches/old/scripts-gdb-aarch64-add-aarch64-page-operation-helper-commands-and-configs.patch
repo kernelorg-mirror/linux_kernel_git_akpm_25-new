@@ -1,6 +1,6 @@
 From: Kuan-Ying Lee <Kuan-Ying.Lee@mediatek.com>
 Subject: scripts/gdb/aarch64: add aarch64 page operation helper commands and configs
-Date: Tue, 25 Jul 2023 17:34:54 +0800
+Date: Tue, 8 Aug 2023 16:30:14 +0800
 
 1. Move page table debugging from mm.py to pgtable.py.
 
@@ -12,7 +12,7 @@ Date: Tue, 25 Jul 2023 17:34:54 +0800
 
 4. Only support CONFIG_SPARSEMEM_VMEMMAP=y now.
 
-Link: https://lkml.kernel.org/r/20230725093458.30064-5-Kuan-Ying.Lee@mediatek.com
+Link: https://lkml.kernel.org/r/20230808083020.22254-5-Kuan-Ying.Lee@mediatek.com
 Signed-off-by: Kuan-Ying Lee <Kuan-Ying.Lee@mediatek.com>
 Cc: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
 Cc: Chinwen Chang <chinwen.chang@mediatek.com>
@@ -21,37 +21,15 @@ Cc: Qun-Wei Lin <qun-wei.lin@mediatek.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- scripts/gdb/linux/constants.py.in |   31 +
- scripts/gdb/linux/mm.py           |  583 ++++++++++++++++++----------
+ scripts/gdb/linux/constants.py.in |   23 +
+ scripts/gdb/linux/mm.py           |  586 ++++++++++++++++++----------
  scripts/gdb/linux/pgtable.py      |  222 ++++++++++
  scripts/gdb/vmlinux-gdb.py        |    3 
- 4 files changed, 633 insertions(+), 206 deletions(-)
+ 4 files changed, 628 insertions(+), 206 deletions(-)
 
 --- a/scripts/gdb/linux/constants.py.in~scripts-gdb-aarch64-add-aarch64-page-operation-helper-commands-and-configs
 +++ a/scripts/gdb/linux/constants.py.in
-@@ -20,6 +20,7 @@
- #include <linux/of_fdt.h>
- #include <linux/radix-tree.h>
- #include <linux/threads.h>
-+#include <asm/memory.h>
- 
- /* We need to stringify expanded macros so that they can be parsed */
- 
-@@ -86,6 +87,13 @@ LX_GDBPARSED(RADIX_TREE_MAP_SIZE)
- LX_GDBPARSED(RADIX_TREE_MAP_SHIFT)
- LX_GDBPARSED(RADIX_TREE_MAP_MASK)
- 
-+/* asm/memory.h */
-+if IS_BUILTIN(CONFIG_ARM64):
-+    LX_GDBPARSED(PAGE_OFFSET)
-+    LX_GDBPARSED(VA_BITS)
-+    LX_GDBPARSED(VA_BITS_MIN)
-+    LX_GDBPARSED(MODULES_VSIZE)
-+
- /* Kernel Configs */
- LX_CONFIG(CONFIG_GENERIC_CLOCKEVENTS)
- LX_CONFIG(CONFIG_GENERIC_CLOCKEVENTS_BROADCAST)
-@@ -102,3 +110,26 @@ LX_CONFIG(CONFIG_X86_MCE_AMD)
+@@ -105,3 +105,26 @@ LX_CONFIG(CONFIG_X86_MCE_AMD)
  LX_CONFIG(CONFIG_X86_MCE)
  LX_CONFIG(CONFIG_X86_IO_APIC)
  LX_CONFIG(CONFIG_HAVE_KVM)
@@ -80,7 +58,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +LX_CONFIG(CONFIG_DEBUG_VIRTUAL)
 --- a/scripts/gdb/linux/mm.py~scripts-gdb-aarch64-add-aarch64-page-operation-helper-commands-and-configs
 +++ a/scripts/gdb/linux/mm.py
-@@ -1,222 +1,395 @@
+@@ -1,222 +1,398 @@
 -# SPDX-License-Identifier: GPL-2.0-only
 +# SPDX-License-Identifier: GPL-2.0
  #
@@ -148,10 +126,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +        self.PAGE_MASK = (~(self.PAGE_SIZE - 1)) & ((1 << 64) - 1)
 +
 +        self.VA_BITS = constants.LX_CONFIG_ARM64_VA_BITS
-+        self.VA_BITS_MIN = constants.LX_VA_BITS_MIN
 +        if self.VA_BITS > 48:
++            self.VA_BITS_MIN = 48
 +            self.vabits_actual = gdb.parse_and_eval('vabits_actual')
 +        else:
++            self.VA_BITS_MIN = self.VA_BITS
 +            self.vabits_actual = self.VA_BITS
 +        self.kimage_voffset = gdb.parse_and_eval('kimage_voffset') & ((1 << 64) - 1)
 +
@@ -212,8 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +        self.struct_page_size = utils.get_page_type().sizeof
 +        self.STRUCT_PAGE_MAX_SHIFT = (int)(math.log(self.struct_page_size, 2))
 +
-+        self.PAGE_OFFSET = constants.LX_PAGE_OFFSET
-+        self.MODULES_VSIZE = constants.LX_MODULES_VSIZE
++        self.PAGE_OFFSET = self._PAGE_OFFSET(self.VA_BITS)
 +        self.MODULES_VADDR = self._PAGE_END(self.VA_BITS_MIN)
 +        self.MODULES_END = self.MODULES_VADDR + self.MODULES_VSIZE
 +
@@ -303,12 +281,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +            return False
 +        return self.early_section(ms) or self.pfn_section_valid(ms, pfn)
 +
++    def _PAGE_OFFSET(self, va):
++        return (-(1 << (va))) & 0xffffffffffffffff
++
 +    def _PAGE_END(self, va):
 +        return (-(1 << (va - 1))) & 0xffffffffffffffff
 +
 +    def kasan_reset_tag(self, addr):
 +        if constants.LX_CONFIG_KASAN_SW_TAGS or constants.LX_CONFIG_KASAN_HW_TAGS:
-+            return addr | (0xff << 56)
++            return int(addr) | (0xff << 56)
 +        else:
 +            return addr
 +
@@ -570,7 +551,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """PFN to struct page"""
 +
 +    def __init__(self):
-+        super(LxPFN2Page, self).__init__("lx-pfn_to_page", gdb.COMMAND_DATA)
++        super(LxPFN2Page, self).__init__("lx-pfn_to_page", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -584,7 +565,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """struct page to PFN"""
 +
 +    def __init__(self):
-+        super(LxPage2PFN, self).__init__("lx-page_to_pfn", gdb.COMMAND_DATA)
++        super(LxPage2PFN, self).__init__("lx-page_to_pfn", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -599,7 +580,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """struct page to linear mapping address"""
 +
 +    def __init__(self):
-+        super(LxPageAddress, self).__init__("lx-page_address", gdb.COMMAND_DATA)
++        super(LxPageAddress, self).__init__("lx-page_address", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -614,7 +595,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """struct page to physical address"""
 +
 +    def __init__(self):
-+        super(LxPage2Phys, self).__init__("lx-page_to_phys", gdb.COMMAND_DATA)
++        super(LxPage2Phys, self).__init__("lx-page_to_phys", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -629,7 +610,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """virtual address to physical address"""
 +
 +    def __init__(self):
-+        super(LxVirt2Phys, self).__init__("lx-virt_to_phys", gdb.COMMAND_DATA)
++        super(LxVirt2Phys, self).__init__("lx-virt_to_phys", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -643,7 +624,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """virtual address to struct page"""
 +
 +    def __init__(self):
-+        super(LxVirt2Page, self).__init__("lx-virt_to_page", gdb.COMMAND_DATA)
++        super(LxVirt2Page, self).__init__("lx-virt_to_page", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -657,7 +638,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """symbol address to PFN"""
 +
 +    def __init__(self):
-+        super(LxSym2PFN, self).__init__("lx-sym_to_pfn", gdb.COMMAND_DATA)
++        super(LxSym2PFN, self).__init__("lx-sym_to_pfn", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)
@@ -671,7 +652,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    """PFN to kernel address"""
 +
 +    def __init__(self):
-+        super(LxPFN2Kaddr, self).__init__("lx-pfn_to_kaddr", gdb.COMMAND_DATA)
++        super(LxPFN2Kaddr, self).__init__("lx-pfn_to_kaddr", gdb.COMMAND_USER)
 +
 +    def invoke(self, arg, from_tty):
 +        argv = gdb.string_to_argv(arg)

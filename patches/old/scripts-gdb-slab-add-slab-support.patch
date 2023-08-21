@@ -1,6 +1,6 @@
 From: Kuan-Ying Lee <Kuan-Ying.Lee@mediatek.com>
 Subject: scripts/gdb/slab: add slab support
-Date: Tue, 25 Jul 2023 17:34:57 +0800
+Date: Tue, 8 Aug 2023 16:30:17 +0800
 
 Add 'lx-slabinfo' and 'lx-slabtrace' support.
 
@@ -42,7 +42,7 @@ Example output like below:
 (gdb) lx-slabtrace --cache_name kmalloc-1k --free
 428 <not-available> age=4294958600 pid=0 cpus=0,
 
-Link: https://lkml.kernel.org/r/20230725093458.30064-8-Kuan-Ying.Lee@mediatek.com
+Link: https://lkml.kernel.org/r/20230808083020.22254-8-Kuan-Ying.Lee@mediatek.com
 Signed-off-by: Kuan-Ying Lee <Kuan-Ying.Lee@mediatek.com>
 Cc: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
 Cc: Chinwen Chang <chinwen.chang@mediatek.com>
@@ -52,9 +52,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  scripts/gdb/linux/constants.py.in |   13 +
- scripts/gdb/linux/slab.py         |  322 ++++++++++++++++++++++++++++
+ scripts/gdb/linux/slab.py         |  326 ++++++++++++++++++++++++++++
  scripts/gdb/vmlinux-gdb.py        |    1 
- 3 files changed, 336 insertions(+)
+ 3 files changed, 340 insertions(+)
 
 --- a/scripts/gdb/linux/constants.py.in~scripts-gdb-slab-add-slab-support
 +++ a/scripts/gdb/linux/constants.py.in
@@ -64,11 +64,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/radix-tree.h>
 +#include <linux/slab.h>
  #include <linux/threads.h>
- #include <asm/memory.h>
  
-@@ -99,6 +100,16 @@ if IS_BUILTIN(CONFIG_ARM64):
- LX_GDBPARSED(PAGE_EXT_OWNER)
- LX_GDBPARSED(PAGE_EXT_OWNER_ALLOCATED)
+ /* We need to stringify expanded macros so that they can be parsed */
+@@ -95,6 +96,16 @@ if IS_BUILTIN(CONFIG_PAGE_OWNER):
+     LX_GDBPARSED(PAGE_EXT_OWNER)
+     LX_GDBPARSED(PAGE_EXT_OWNER_ALLOCATED)
  
 +/* linux/slab.h */
 +LX_GDBPARSED(SLAB_RED_ZONE)
@@ -83,7 +83,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /* Kernel Configs */
  LX_CONFIG(CONFIG_GENERIC_CLOCKEVENTS)
  LX_CONFIG(CONFIG_GENERIC_CLOCKEVENTS_BROADCAST)
-@@ -140,3 +151,5 @@ if IS_BUILTIN(CONFIG_NUMA):
+@@ -136,3 +147,5 @@ if IS_BUILTIN(CONFIG_NUMA):
  LX_CONFIG(CONFIG_DEBUG_VIRTUAL)
  LX_CONFIG(CONFIG_STACKDEPOT)
  LX_CONFIG(CONFIG_PAGE_OWNER)
@@ -91,7 +91,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +LX_CONFIG(CONFIG_SLAB_FREELIST_HARDENED)
 --- /dev/null
 +++ a/scripts/gdb/linux/slab.py
-@@ -0,0 +1,322 @@
+@@ -0,0 +1,326 @@
 +# SPDX-License-Identifier: GPL-2.0
 +#
 +# Copyright (c) 2023 MediaTek Inc.
@@ -117,14 +117,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +OO_SHIFT = 16
 +OO_MASK = (1 << OO_SHIFT) - 1
 +
-+slab_type = utils.CachedType("struct slab")
-+slab_ptr_type = slab_type.get_type().pointer()
-+kmem_cache_type = utils.CachedType("struct kmem_cache")
-+kmem_cache_ptr_type = kmem_cache_type.get_type().pointer()
++if constants.LX_CONFIG_SLUB_DEBUG:
++    slab_type = utils.CachedType("struct slab")
++    slab_ptr_type = slab_type.get_type().pointer()
++    kmem_cache_type = utils.CachedType("struct kmem_cache")
++    kmem_cache_ptr_type = kmem_cache_type.get_type().pointer()
++    freeptr_t = utils.CachedType("freeptr_t")
++    freeptr_t_ptr = freeptr_t.get_type().pointer()
 +
-+track_type = gdb.lookup_type('struct track')
-+track_alloc = int(gdb.parse_and_eval('TRACK_ALLOC'))
-+track_free = int(gdb.parse_and_eval('TRACK_FREE'))
++    track_type = gdb.lookup_type('struct track')
++    track_alloc = int(gdb.parse_and_eval('TRACK_ALLOC'))
++    track_free = int(gdb.parse_and_eval('TRACK_FREE'))
 +
 +def slab_folio(slab):
 +    return slab.cast(gdb.lookup_type("struct folio").pointer())
@@ -187,19 +190,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +    ((x & 0xff00000000000000) >> 56))
 +    return result
 +
-+def freelist_ptr(cache, ptr, ptr_addr):
++def freelist_ptr_decode(cache, ptr, ptr_addr):
 +    if constants.LX_CONFIG_SLAB_FREELIST_HARDENED:
-+        return ptr ^ cache['random'] ^ swab64(int(ptr_addr))
++        return ptr['v'] ^ cache['random'] ^ swab64(int(ptr_addr))
 +    else:
-+        return ptr
-+
-+def freelist_dereference(cache, ptr_addr):
-+    ptr = ptr_addr.cast(utils.get_ulong_type().pointer()).dereference()
-+    return freelist_ptr(cache, ptr, ptr_addr)
++        return ptr['v']
 +
 +def get_freepointer(cache, obj):
 +    obj = mm.page_ops().ops.kasan_reset_tag(obj)
-+    return freelist_dereference(cache, obj + cache['offset'])
++    ptr_addr = obj + cache['offset']
++    p = ptr_addr.cast(freeptr_t_ptr).dereference()
++    return freelist_ptr_decode(cache, p, ptr_addr)
 +
 +def loc_exist(loc_track, addr, handle, waste):
 +    for loc in loc_track:
@@ -349,6 +350,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +        super(LxSlabTrace, self).__init__("lx-slabtrace", gdb.COMMAND_DATA)
 +
 +    def invoke(self, arg, from_tty):
++        if not constants.LX_CONFIG_SLUB_DEBUG:
++            raise gdb.GdbError("CONFIG_SLUB_DEBUG is not enabled")
++
 +        argv = gdb.string_to_argv(arg)
 +        alloc = track_alloc # default show alloc_traces
 +
