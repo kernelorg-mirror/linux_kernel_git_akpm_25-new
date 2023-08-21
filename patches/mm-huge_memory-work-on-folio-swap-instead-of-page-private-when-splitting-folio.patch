@@ -1,0 +1,97 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/huge_memory: work on folio->swap instead of page->private when splitting folio
+Date: Mon, 21 Aug 2023 18:08:49 +0200
+
+Let's work on folio->swap instead.  While at it, use folio_test_anon() and
+folio_test_swapcache() -- the original folio remains valid even after
+splitting (but is then an order-0 folio).
+
+We can probably convert a lot more to folios in that code, let's focus on
+folio->swap handling only for now.
+
+Link: https://lkml.kernel.org/r/20230821160849.531668-5-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   29 +++++++++++++++--------------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+--- a/mm/huge_memory.c~mm-huge_memory-work-on-folio-swap-instead-of-page-private-when-splitting-folio
++++ a/mm/huge_memory.c
+@@ -2401,10 +2401,16 @@ static void lru_add_page_tail(struct pag
+ 	}
+ }
+ 
+-static void __split_huge_page_tail(struct page *head, int tail,
++static void __split_huge_page_tail(struct folio *folio, int tail,
+ 		struct lruvec *lruvec, struct list_head *list)
+ {
++	struct page *head = &folio->page;
+ 	struct page *page_tail = head + tail;
++	/*
++	 * Careful: new_folio is not a "real" folio before we cleared PageTail.
++	 * Don't pass it around before clear_compound_head().
++	 */
++	struct folio *new_folio = (struct folio *)page_tail;
+ 
+ 	VM_BUG_ON_PAGE(atomic_read(&page_tail->_mapcount) != -1, page_tail);
+ 
+@@ -2453,8 +2459,8 @@ static void __split_huge_page_tail(struc
+ 		VM_WARN_ON_ONCE_PAGE(true, page_tail);
+ 		page_tail->private = 0;
+ 	}
+-	if (PageSwapCache(head))
+-		set_page_private(page_tail, (unsigned long)head->private + tail);
++	if (folio_test_swapcache(folio))
++		new_folio->swap.val = folio->swap.val + tail;
+ 
+ 	/* Page flags must be visible before we make the page non-compound. */
+ 	smp_wmb();
+@@ -2500,11 +2506,9 @@ static void __split_huge_page(struct pag
+ 	/* complete memcg works before add pages to LRU */
+ 	split_page_memcg(head, nr);
+ 
+-	if (PageAnon(head) && PageSwapCache(head)) {
+-		swp_entry_t entry = { .val = page_private(head) };
+-
+-		offset = swp_offset(entry);
+-		swap_cache = swap_address_space(entry);
++	if (folio_test_anon(folio) && folio_test_swapcache(folio)) {
++		offset = swp_offset(folio->swap);
++		swap_cache = swap_address_space(folio->swap);
+ 		xa_lock(&swap_cache->i_pages);
+ 	}
+ 
+@@ -2514,7 +2518,7 @@ static void __split_huge_page(struct pag
+ 	ClearPageHasHWPoisoned(head);
+ 
+ 	for (i = nr - 1; i >= 1; i--) {
+-		__split_huge_page_tail(head, i, lruvec, list);
++		__split_huge_page_tail(folio, i, lruvec, list);
+ 		/* Some pages can be beyond EOF: drop them from page cache */
+ 		if (head[i].index >= end) {
+ 			struct folio *tail = page_folio(head + i);
+@@ -2559,11 +2563,8 @@ static void __split_huge_page(struct pag
+ 
+ 	remap_page(folio, nr);
+ 
+-	if (PageSwapCache(head)) {
+-		swp_entry_t entry = { .val = page_private(head) };
+-
+-		split_swap_cluster(entry);
+-	}
++	if (folio_test_swapcache(folio))
++		split_swap_cluster(folio->swap);
+ 
+ 	for (i = 0; i < nr; i++) {
+ 		struct page *subpage = head + i;
+_

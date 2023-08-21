@@ -1,0 +1,223 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/swap: stop using page->private on tail pages for THP_SWAP
+Date: Mon, 21 Aug 2023 18:08:46 +0200
+
+Patch series "mm/swap: stop using page->private on tail pages for THP_SWAP
++ cleanups".
+
+This series stops using page->private on tail pages for THP_SWAP, replaces
+folio->private by folio->swap for swapcache folios, and starts using
+"new_folio" for tail pages that we are splitting to remove the usage of
+page->private for swapcache handling completely.
+
+
+This patch (of 4):
+
+Let's stop using page->private on tail pages, making it possible to just
+unconditionally reuse that field in the tail pages of large folios.
+
+The remaining usage of the private field for THP_SWAP is in the THP
+splitting code (mm/huge_memory.c), that we'll handle separately later.
+
+Update the THP_SWAP documentation and sanity checks in mm_types.h and
+__split_huge_page_tail().
+
+Link: https://lkml.kernel.org/r/20230821160849.531668-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20230821160849.531668-2-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/mm/mteswap.c  |    5 +++--
+ include/linux/mm_types.h |   12 +-----------
+ include/linux/swap.h     |    9 +++++++++
+ mm/huge_memory.c         |   15 ++++++---------
+ mm/memory.c              |    2 +-
+ mm/rmap.c                |    2 +-
+ mm/swap_state.c          |    5 +++--
+ mm/swapfile.c            |    4 ++--
+ 8 files changed, 26 insertions(+), 28 deletions(-)
+
+--- a/arch/arm64/mm/mteswap.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/arch/arm64/mm/mteswap.c
+@@ -33,8 +33,9 @@ int mte_save_tags(struct page *page)
+ 
+ 	mte_save_page_tags(page_address(page), tag_storage);
+ 
+-	/* page_private contains the swap entry.val set in do_swap_page */
+-	ret = xa_store(&mte_pages, page_private(page), tag_storage, GFP_KERNEL);
++	/* lookup the swap entry.val from the page */
++	ret = xa_store(&mte_pages, page_swap_entry(page).val, tag_storage,
++		       GFP_KERNEL);
+ 	if (WARN(xa_is_err(ret), "Failed to store MTE tags")) {
+ 		mte_free_tag_storage(tag_storage);
+ 		return xa_err(ret);
+--- a/include/linux/mm_types.h~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/include/linux/mm_types.h
+@@ -333,11 +333,8 @@ struct folio {
+ 			atomic_t _pincount;
+ #ifdef CONFIG_64BIT
+ 			unsigned int _folio_nr_pages;
+-			/* 4 byte gap here */
+-	/* private: the union with struct page is transitional */
+-			/* Fix THP_SWAP to not use tail->private */
+-			unsigned long _private_1;
+ #endif
++	/* private: the union with struct page is transitional */
+ 		};
+ 		struct page __page_1;
+ 	};
+@@ -358,9 +355,6 @@ struct folio {
+ 	/* public: */
+ 			struct list_head _deferred_list;
+ 	/* private: the union with struct page is transitional */
+-			unsigned long _avail_2a;
+-			/* Fix THP_SWAP to not use tail->private */
+-			unsigned long _private_2a;
+ 		};
+ 		struct page __page_2;
+ 	};
+@@ -385,9 +379,6 @@ FOLIO_MATCH(memcg_data, memcg_data);
+ 			offsetof(struct page, pg) + sizeof(struct page))
+ FOLIO_MATCH(flags, _flags_1);
+ FOLIO_MATCH(compound_head, _head_1);
+-#ifdef CONFIG_64BIT
+-FOLIO_MATCH(private, _private_1);
+-#endif
+ #undef FOLIO_MATCH
+ #define FOLIO_MATCH(pg, fl)						\
+ 	static_assert(offsetof(struct folio, fl) ==			\
+@@ -396,7 +387,6 @@ FOLIO_MATCH(flags, _flags_2);
+ FOLIO_MATCH(compound_head, _head_2);
+ FOLIO_MATCH(flags, _flags_2a);
+ FOLIO_MATCH(compound_head, _head_2a);
+-FOLIO_MATCH(private, _private_2a);
+ #undef FOLIO_MATCH
+ 
+ /**
+--- a/include/linux/swap.h~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/include/linux/swap.h
+@@ -339,6 +339,15 @@ static inline swp_entry_t folio_swap_ent
+ 	return entry;
+ }
+ 
++static inline swp_entry_t page_swap_entry(struct page *page)
++{
++	struct folio *folio = page_folio(page);
++	swp_entry_t entry = folio_swap_entry(folio);
++
++	entry.val += page - &folio->page;
++	return entry;
++}
++
+ static inline void folio_set_swap_entry(struct folio *folio, swp_entry_t entry)
+ {
+ 	folio->private = (void *)entry.val;
+--- a/mm/huge_memory.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/mm/huge_memory.c
+@@ -2446,18 +2446,15 @@ static void __split_huge_page_tail(struc
+ 	page_tail->index = head->index + tail;
+ 
+ 	/*
+-	 * page->private should not be set in tail pages with the exception
+-	 * of swap cache pages that store the swp_entry_t in tail pages.
+-	 * Fix up and warn once if private is unexpectedly set.
+-	 *
+-	 * What of 32-bit systems, on which folio->_pincount overlays
+-	 * head[1].private?  No problem: THP_SWAP is not enabled on 32-bit, and
+-	 * pincount must be 0 for folio_ref_freeze() to have succeeded.
++	 * page->private should not be set in tail pages. Fix up and warn once
++	 * if private is unexpectedly set.
+ 	 */
+-	if (!folio_test_swapcache(page_folio(head))) {
+-		VM_WARN_ON_ONCE_PAGE(page_tail->private != 0, page_tail);
++	if (unlikely(page_tail->private)) {
++		VM_WARN_ON_ONCE_PAGE(true, page_tail);
+ 		page_tail->private = 0;
+ 	}
++	if (PageSwapCache(head))
++		set_page_private(page_tail, (unsigned long)head->private + tail);
+ 
+ 	/* Page flags must be visible before we make the page non-compound. */
+ 	smp_wmb();
+--- a/mm/memory.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/mm/memory.c
+@@ -3882,7 +3882,7 @@ vm_fault_t do_swap_page(struct vm_fault
+ 		 * changed.
+ 		 */
+ 		if (unlikely(!folio_test_swapcache(folio) ||
+-			     page_private(page) != entry.val))
++			     page_swap_entry(page).val != entry.val))
+ 			goto out_page;
+ 
+ 		/*
+--- a/mm/rmap.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/mm/rmap.c
+@@ -1647,7 +1647,7 @@ static bool try_to_unmap_one(struct foli
+ 			 */
+ 			dec_mm_counter(mm, mm_counter(&folio->page));
+ 		} else if (folio_test_anon(folio)) {
+-			swp_entry_t entry = { .val = page_private(subpage) };
++			swp_entry_t entry = page_swap_entry(subpage);
+ 			pte_t swp_pte;
+ 			/*
+ 			 * Store the swap location in the pte.
+--- a/mm/swapfile.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/mm/swapfile.c
+@@ -3369,7 +3369,7 @@ struct swap_info_struct *swp_swap_info(s
+ 
+ struct swap_info_struct *page_swap_info(struct page *page)
+ {
+-	swp_entry_t entry = { .val = page_private(page) };
++	swp_entry_t entry = page_swap_entry(page);
+ 	return swp_swap_info(entry);
+ }
+ 
+@@ -3384,7 +3384,7 @@ EXPORT_SYMBOL_GPL(swapcache_mapping);
+ 
+ pgoff_t __page_file_index(struct page *page)
+ {
+-	swp_entry_t swap = { .val = page_private(page) };
++	swp_entry_t swap = page_swap_entry(page);
+ 	return swp_offset(swap);
+ }
+ EXPORT_SYMBOL_GPL(__page_file_index);
+--- a/mm/swap_state.c~mm-swap-stop-using-page-private-on-tail-pages-for-thp_swap
++++ a/mm/swap_state.c
+@@ -100,6 +100,7 @@ int add_to_swap_cache(struct folio *foli
+ 
+ 	folio_ref_add(folio, nr);
+ 	folio_set_swapcache(folio);
++	folio_set_swap_entry(folio, entry);
+ 
+ 	do {
+ 		xas_lock_irq(&xas);
+@@ -113,7 +114,6 @@ int add_to_swap_cache(struct folio *foli
+ 				if (shadowp)
+ 					*shadowp = old;
+ 			}
+-			set_page_private(folio_page(folio, i), entry.val + i);
+ 			xas_store(&xas, folio);
+ 			xas_next(&xas);
+ 		}
+@@ -154,9 +154,10 @@ void __delete_from_swap_cache(struct fol
+ 	for (i = 0; i < nr; i++) {
+ 		void *entry = xas_store(&xas, shadow);
+ 		VM_BUG_ON_PAGE(entry != folio, entry);
+-		set_page_private(folio_page(folio, i), 0);
+ 		xas_next(&xas);
+ 	}
++	entry.val = 0;
++	folio_set_swap_entry(folio, entry);
+ 	folio_clear_swapcache(folio);
+ 	address_space->nrpages -= nr;
+ 	__node_stat_mod_folio(folio, NR_FILE_PAGES, -nr);
+_

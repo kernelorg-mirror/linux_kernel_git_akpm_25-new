@@ -1,0 +1,52 @@
+From: Tong Tiangen <tongtiangen@huawei.com>
+Subject: mm: memory-failure: use rcu lock instead of tasklist_lock when collect_procs()
+Date: Mon, 21 Aug 2023 17:13:12 +0800
+
+We found a softlock issue in our test, analyzed the logs, and found that
+the relevant CPU call trace as follows:
+
+CPU0:
+  _do_fork
+    -> copy_process()
+      -> write_lock_irq(&tasklist_lock)  //Disable irq,waiting for
+      					 //tasklist_lock
+
+CPU1:
+  wp_page_copy()
+    ->pte_offset_map_lock()
+      -> spin_lock(&page->ptl);        //Hold page->ptl
+    -> ptep_clear_flush()
+      -> flush_tlb_others() ...
+        -> smp_call_function_many()
+          -> arch_send_call_function_ipi_mask()
+            -> csd_lock_wait()         //Waiting for other CPUs respond
+	                               //IPI
+
+CPU2:
+  collect_procs_anon()
+    -> read_lock(&tasklist_lock)       //Hold tasklist_lock
+      ->for_each_process(tsk)
+        -> page_mapped_in_vma()
+          -> page_vma_mapped_walk()
+	    -> map_pte()
+              ->spin_lock(&page->ptl)  //Waiting for page->ptl
+
+We can see that CPU1 waiting for CPU0 respond IPI，CPU0 waiting for CPU2
+unlock tasklist_lock, CPU2 waiting for CPU1 unlock page->ptl. As a result,
+softlockup is triggered.
+
+For collect_procs_anon(), we will not modify the tasklist, but only perform
+read traversal. Therefore, we can use rcu lock instead of spin lock
+tasklist_lock, from this, we can break the softlock chain above.
+
+The same logic can also be applied to:
+ - collect_procs_file()
+ - collect_procs_fsdax()
+ - collect_procs_ksm()
+
+Link: https://lkml.kernel.org/r/20230821091312.2034844-1-tongtiangen@huawei.com
+Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
+Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Matthew Wilcox <willy@infradead.org>
