@@ -8,8 +8,13 @@ to per-folio which makes __dma_page_dev_to_cpu() a bit more exciting.
 Also add flush_cache_pages(), even though this isn't used by generic code
 (yet?)
 
+[m.szyprowski@samsung.com: fix potential endless loop in __dma_page_dev_to_cpu()]
+  Link: https://lkml.kernel.org/r/20230809172737.3574190-1-m.szyprowski@samsung.com
+[willy@infradead.org: fix folio conversion in __dma_page_dev_to_cpu()]
+  Link: https://lkml.kernel.org/r/20230823191852.1556561-1-willy@infradead.org
 Link: https://lkml.kernel.org/r/20230802151406.3735276-10-willy@infradead.org
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Marek Szyprowski <m.szyprowski@samsung.com>
 Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
 Reviewed-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -21,13 +26,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/arm/mm/copypage-v4mc.c       |    5 -
  arch/arm/mm/copypage-v6.c         |    5 -
  arch/arm/mm/copypage-xscale.c     |    5 -
- arch/arm/mm/dma-mapping.c         |   22 +++---
+ arch/arm/mm/dma-mapping.c         |   26 +++----
  arch/arm/mm/fault-armv.c          |   16 ++--
  arch/arm/mm/flush.c               |   99 ++++++++++++++++------------
  arch/arm/mm/mm.h                  |    2 
  arch/arm/mm/mmu.c                 |   14 ++-
  arch/arm/mm/nommu.c               |    6 +
- 12 files changed, 132 insertions(+), 85 deletions(-)
+ 12 files changed, 135 insertions(+), 86 deletions(-)
 
 --- a/arch/arm/include/asm/cacheflush.h~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/include/asm/cacheflush.h
@@ -187,21 +192,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/arch/arm/mm/dma-mapping.c~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/mm/dma-mapping.c
-@@ -695,6 +695,7 @@ static void __dma_page_cpu_to_dev(struct
- static void __dma_page_dev_to_cpu(struct page *page, unsigned long off,
- 	size_t size, enum dma_data_direction dir)
- {
-+	struct folio *folio = page_folio(page);
- 	phys_addr_t paddr = page_to_phys(page) + off;
- 
- 	/* FIXME: non-speculating: not required */
-@@ -709,19 +710,18 @@ static void __dma_page_dev_to_cpu(struct
+@@ -709,19 +709,21 @@ static void __dma_page_dev_to_cpu(struct
  	 * Mark the D-cache clean for these pages to avoid extra flushing.
  	 */
  	if (dir != DMA_TO_DEVICE && size >= PAGE_SIZE) {
 -		unsigned long pfn;
 -		size_t left = size;
-+		ssize_t left = size;
++		struct folio *folio = pfn_folio(paddr / PAGE_SIZE);
 +		size_t offset = offset_in_folio(folio, paddr);
  
 -		pfn = page_to_pfn(page) + off / PAGE_SIZE;
@@ -209,18 +206,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (off) {
 -			pfn++;
 -			left -= PAGE_SIZE - off;
-+		if (offset) {
-+			left -= folio_size(folio) - offset;
-+			folio = folio_next(folio);
- 		}
+-		}
 -		while (left >= PAGE_SIZE) {
 -			page = pfn_to_page(pfn++);
 -			set_bit(PG_dcache_clean, &page->flags);
 -			left -= PAGE_SIZE;
++		for (;;) {
++			size_t sz = folio_size(folio) - offset;
 +
-+		while (left >= (ssize_t)folio_size(folio)) {
-+			set_bit(PG_dcache_clean, &folio->flags);
-+			left -= folio_size(folio);
++			if (size < sz)
++				break;
++			if (!offset)
++				set_bit(PG_dcache_clean, &folio->flags);
++			offset = 0;
++			size -= sz;
++			if (!size)
++				break;
 +			folio = folio_next(folio);
  		}
  	}
