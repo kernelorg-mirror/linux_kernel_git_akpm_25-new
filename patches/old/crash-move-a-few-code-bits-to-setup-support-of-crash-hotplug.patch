@@ -1,8 +1,8 @@
 From: Eric DeVolder <eric.devolder@oracle.com>
 Subject: crash: move a few code bits to setup support of crash hotplug
-Date: Fri, 11 Aug 2023 13:06:35 -0400
+Date: Mon, 14 Aug 2023 17:44:39 -0400
 
-Patch series "crash: Kernel handling of CPU and memory hot un/plug", v27.
+Patch series "crash: Kernel handling of CPU and memory hot un/plug", v28.
 
 Once the kdump service is loaded, if changes to CPUs or memory occur,
 either by hot un/plug or off/onlining, the crash elfcorehdr must also be
@@ -55,8 +55,8 @@ of minor changes to userspace:
    which adds the -s to select kexec_file_load() syscall.
 
 This kernel patchset also supports kexec_load() with a modified kexec
-userspace utility. A working changeset to the kexec userspace utility
-is posted to the kexec-tools mailing list here:
+userspace utility.  A working changeset to the kexec userspace utility is
+posted to the kexec-tools mailing list here:
 
  http://lists.infradead.org/pipermail/kexec/2023-May/027049.html
 
@@ -74,10 +74,13 @@ syscall.  To also support the kexec_load() syscall, a few bits of code
 need to be move outside of CONFIG_KEXEC_FILE.  As such, these bits are
 moved out of kexec_file.c and into a common location crash_core.c.
 
+In addition, struct crash_mem and crash_notes were moved to new locales so
+that PROC_KCORE, which sets CRASH_CORE alone, builds correctly.
+
 No functionality change intended.
 
-Link: https://lkml.kernel.org/r/20230811170642.6696-1-eric.devolder@oracle.com
-Link: https://lkml.kernel.org/r/20230811170642.6696-2-eric.devolder@oracle.com
+Link: https://lkml.kernel.org/r/20230814214446.6659-1-eric.devolder@oracle.com
+Link: https://lkml.kernel.org/r/20230814214446.6659-2-eric.devolder@oracle.com
 Signed-off-by: Eric DeVolder <eric.devolder@oracle.com>
 Reviewed-by: Sourabh Jain <sourabhjain@linux.ibm.com>
 Acked-by: Hari Bathini <hbathini@linux.ibm.com>
@@ -109,16 +112,27 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/kexec.h |   30 +++---
- kernel/crash_core.c   |  182 ++++++++++++++++++++++++++++++++++++++++
- kernel/kexec_file.c   |  181 ---------------------------------------
- 3 files changed, 197 insertions(+), 196 deletions(-)
+ include/linux/crash_core.h |   20 +++
+ include/linux/kexec.h      |   15 --
+ kernel/crash_core.c        |  218 +++++++++++++++++++++++++++++++++++
+ kernel/kexec_core.c        |   37 -----
+ kernel/kexec_file.c        |  181 -----------------------------
+ 5 files changed, 238 insertions(+), 233 deletions(-)
 
---- a/include/linux/kexec.h~crash-move-a-few-code-bits-to-setup-support-of-crash-hotplug
-+++ a/include/linux/kexec.h
-@@ -105,6 +105,21 @@ struct compat_kexec_segment {
- };
- #endif
+--- a/include/linux/crash_core.h~crash-move-a-few-code-bits-to-setup-support-of-crash-hotplug
++++ a/include/linux/crash_core.h
+@@ -28,6 +28,8 @@
+ 				     VMCOREINFO_BYTES)
+ 
+ typedef u32 note_buf_t[CRASH_CORE_NOTE_BYTES/4];
++/* Per cpu memory for storing cpu states in case of system crash. */
++extern note_buf_t __percpu *crash_notes;
+ 
+ void crash_update_vmcoreinfo_safecopy(void *ptr);
+ void crash_save_vmcoreinfo(void);
+@@ -84,4 +86,22 @@ int parse_crashkernel_high(char *cmdline
+ int parse_crashkernel_low(char *cmdline, unsigned long long system_ram,
+ 		unsigned long long *crash_size, unsigned long long *crash_base);
  
 +/* Alignment required for elf header segment */
 +#define ELF_CORE_HEADER_ALIGN   4096
@@ -135,10 +149,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +extern int crash_prepare_elf64_headers(struct crash_mem *mem, int need_kernel_map,
 +				       void **addr, unsigned long *sz);
 +
- #ifdef CONFIG_KEXEC_FILE
- struct purgatory_info {
- 	/*
-@@ -230,21 +245,6 @@ static inline int arch_kexec_locate_mem_
++struct kimage;
++struct kexec_segment;
++
+ #endif /* LINUX_CRASH_CORE_H */
+--- a/include/linux/kexec.h~crash-move-a-few-code-bits-to-setup-support-of-crash-hotplug
++++ a/include/linux/kexec.h
+@@ -230,21 +230,6 @@ static inline int arch_kexec_locate_mem_
  }
  #endif
  
@@ -170,7 +187,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include <asm/page.h>
  #include <asm/sections.h>
-@@ -314,6 +315,187 @@ static int __init parse_crashkernel_dumm
+@@ -18,6 +19,9 @@
+ 
+ #include "kallsyms_internal.h"
+ 
++/* Per cpu memory for storing cpu states in case of system crash. */
++note_buf_t __percpu *crash_notes;
++
+ /* vmcoreinfo stuff */
+ unsigned char *vmcoreinfo_data;
+ size_t vmcoreinfo_size;
+@@ -314,6 +318,187 @@ static int __init parse_crashkernel_dumm
  }
  early_param("crashkernel", parse_crashkernel_dummy);
  
@@ -358,6 +385,96 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  Elf_Word *append_elf_note(Elf_Word *buf, char *name, unsigned int type,
  			  void *data, size_t data_len)
  {
+@@ -515,3 +700,36 @@ static int __init crash_save_vmcoreinfo_
+ }
+ 
+ subsys_initcall(crash_save_vmcoreinfo_init);
++
++static int __init crash_notes_memory_init(void)
++{
++	/* Allocate memory for saving cpu registers. */
++	size_t size, align;
++
++	/*
++	 * crash_notes could be allocated across 2 vmalloc pages when percpu
++	 * is vmalloc based . vmalloc doesn't guarantee 2 continuous vmalloc
++	 * pages are also on 2 continuous physical pages. In this case the
++	 * 2nd part of crash_notes in 2nd page could be lost since only the
++	 * starting address and size of crash_notes are exported through sysfs.
++	 * Here round up the size of crash_notes to the nearest power of two
++	 * and pass it to __alloc_percpu as align value. This can make sure
++	 * crash_notes is allocated inside one physical page.
++	 */
++	size = sizeof(note_buf_t);
++	align = min(roundup_pow_of_two(sizeof(note_buf_t)), PAGE_SIZE);
++
++	/*
++	 * Break compile if size is bigger than PAGE_SIZE since crash_notes
++	 * definitely will be in 2 pages with that.
++	 */
++	BUILD_BUG_ON(size > PAGE_SIZE);
++
++	crash_notes = __alloc_percpu(size, align);
++	if (!crash_notes) {
++		pr_warn("Memory allocation for saving cpu register states failed\n");
++		return -ENOMEM;
++	}
++	return 0;
++}
++subsys_initcall(crash_notes_memory_init);
+--- a/kernel/kexec_core.c~crash-move-a-few-code-bits-to-setup-support-of-crash-hotplug
++++ a/kernel/kexec_core.c
+@@ -49,9 +49,6 @@
+ 
+ atomic_t __kexec_lock = ATOMIC_INIT(0);
+ 
+-/* Per cpu memory for storing cpu states in case of system crash. */
+-note_buf_t __percpu *crash_notes;
+-
+ /* Flag to indicate we are going to kexec a new kernel */
+ bool kexec_in_progress = false;
+ 
+@@ -1218,40 +1215,6 @@ void crash_save_cpu(struct pt_regs *regs
+ 	final_note(buf);
+ }
+ 
+-static int __init crash_notes_memory_init(void)
+-{
+-	/* Allocate memory for saving cpu registers. */
+-	size_t size, align;
+-
+-	/*
+-	 * crash_notes could be allocated across 2 vmalloc pages when percpu
+-	 * is vmalloc based . vmalloc doesn't guarantee 2 continuous vmalloc
+-	 * pages are also on 2 continuous physical pages. In this case the
+-	 * 2nd part of crash_notes in 2nd page could be lost since only the
+-	 * starting address and size of crash_notes are exported through sysfs.
+-	 * Here round up the size of crash_notes to the nearest power of two
+-	 * and pass it to __alloc_percpu as align value. This can make sure
+-	 * crash_notes is allocated inside one physical page.
+-	 */
+-	size = sizeof(note_buf_t);
+-	align = min(roundup_pow_of_two(sizeof(note_buf_t)), PAGE_SIZE);
+-
+-	/*
+-	 * Break compile if size is bigger than PAGE_SIZE since crash_notes
+-	 * definitely will be in 2 pages with that.
+-	 */
+-	BUILD_BUG_ON(size > PAGE_SIZE);
+-
+-	crash_notes = __alloc_percpu(size, align);
+-	if (!crash_notes) {
+-		pr_warn("Memory allocation for saving cpu register states failed\n");
+-		return -ENOMEM;
+-	}
+-	return 0;
+-}
+-subsys_initcall(crash_notes_memory_init);
+-
+-
+ /*
+  * Move into place and start executing a preloaded standalone
+  * executable.  If nothing was preloaded return an error.
 --- a/kernel/kexec_file.c~crash-move-a-few-code-bits-to-setup-support-of-crash-hotplug
 +++ a/kernel/kexec_file.c
 @@ -1151,184 +1151,3 @@ int kexec_purgatory_get_set_symbol(struc

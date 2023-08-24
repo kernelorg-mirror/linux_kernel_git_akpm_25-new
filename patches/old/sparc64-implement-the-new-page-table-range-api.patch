@@ -1,13 +1,12 @@
 From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
 Subject: sparc64: implement the new page table range API
-Date: Mon, 10 Jul 2023 21:43:27 +0100
+Date: Wed, 2 Aug 2023 16:13:54 +0100
 
 Add set_ptes(), update_mmu_cache_range(), flush_dcache_folio() and
 flush_icache_pages().  Convert the PG_dcache_dirty flag from being
 per-page to per-folio.
 
-[akpm@linux-foundation.org: s/folio_flushable_mapping/folio_flushable_mapping/]
-Link: https://lkml.kernel.org/r/20230710204339.3554919-27-willy@infradead.org
+Link: https://lkml.kernel.org/r/20230802151406.3735276-27-willy@infradead.org
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
 Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
 Cc: "David S. Miller" <davem@davemloft.net>
@@ -15,11 +14,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  arch/sparc/include/asm/cacheflush_64.h |   18 +++--
- arch/sparc/include/asm/pgtable_64.h    |   24 +++++--
+ arch/sparc/include/asm/pgtable_64.h    |   29 ++++++--
  arch/sparc/kernel/smp_64.c             |   56 ++++++++++------
  arch/sparc/mm/init_64.c                |   78 +++++++++++++----------
  arch/sparc/mm/tlb.c                    |    5 -
- 5 files changed, 116 insertions(+), 65 deletions(-)
+ 5 files changed, 119 insertions(+), 67 deletions(-)
 
 --- a/arch/sparc/include/asm/cacheflush_64.h~sparc64-implement-the-new-page-table-range-api
 +++ a/arch/sparc/include/asm/cacheflush_64.h
@@ -58,7 +57,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			 unsigned long uaddr, void *kaddr,
 --- a/arch/sparc/include/asm/pgtable_64.h~sparc64-implement-the-new-page-table-range-api
 +++ a/arch/sparc/include/asm/pgtable_64.h
-@@ -927,8 +927,19 @@ static inline void __set_pte_at(struct m
+@@ -86,6 +86,7 @@ extern unsigned long VMALLOC_END;
+ #define vmemmap			((struct page *)VMEMMAP_BASE)
+ 
+ #include <linux/sched.h>
++#include <asm/tlbflush.h>
+ 
+ bool kern_addr_valid(unsigned long addr);
+ 
+@@ -927,8 +928,21 @@ static inline void __set_pte_at(struct m
  	maybe_tlb_batch_add(mm, addr, ptep, orig, fullmm, PAGE_SHIFT);
  }
  
@@ -67,6 +74,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static inline void set_ptes(struct mm_struct *mm, unsigned long addr,
 +		pte_t *ptep, pte_t pte, unsigned int nr)
 +{
++	arch_enter_lazy_mmu_mode();
 +	for (;;) {
 +		__set_pte_at(mm, addr, ptep, pte, 0);
 +		if (--nr == 0)
@@ -75,12 +83,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		pte_val(pte) += PAGE_SIZE;
 +		addr += PAGE_SIZE;
 +	}
++	arch_leave_lazy_mmu_mode();
 +}
 +#define set_ptes set_ptes
  
  #define pte_clear(mm,addr,ptep)		\
  	set_pte_at((mm), (addr), (ptep), __pte(0UL))
-@@ -947,8 +958,8 @@ static inline void __set_pte_at(struct m
+@@ -947,8 +961,8 @@ static inline void __set_pte_at(struct m
  									\
  		if (pfn_valid(this_pfn) &&				\
  		    (((old_addr) ^ (new_addr)) & (1 << 13)))		\
@@ -91,7 +100,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}								\
  	newpte;								\
  })
-@@ -963,7 +974,10 @@ struct seq_file;
+@@ -963,7 +977,10 @@ struct seq_file;
  void mmu_info(struct seq_file *);
  
  struct vm_area_struct;
@@ -103,6 +112,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
  void update_mmu_cache_pmd(struct vm_area_struct *vma, unsigned long addr,
  			  pmd_t *pmd);
+@@ -1121,8 +1138,6 @@ static inline bool pte_access_permitted(
+ }
+ #define pte_access_permitted pte_access_permitted
+ 
+-#include <asm/tlbflush.h>
+-
+ /* We provide our own get_unmapped_area to cope with VA holes and
+  * SHM area cache aliasing for userland.
+  */
 --- a/arch/sparc/kernel/smp_64.c~sparc64-implement-the-new-page-table-range-api
 +++ a/arch/sparc/kernel/smp_64.c
 @@ -921,20 +921,26 @@ extern unsigned long xcall_flush_dcache_
@@ -120,12 +138,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		__flush_dcache_page(folio_address(folio) + i * PAGE_SIZE,
  			    ((tlb_type == spitfire) &&
 -			     page_mapping_file(page) != NULL));
-+			     folio_flushable_mapping(folio) != NULL));
++			     folio_flush_mapping(folio) != NULL));
  #else
 -	if (page_mapping_file(page) != NULL &&
 -	    tlb_type == spitfire)
 -		__flush_icache_page(__pa(page_address(page)));
-+	if (folio_flushable_mapping(folio) != NULL &&
++	if (folio_flush_mapping(folio) != NULL &&
 +	    tlb_type == spitfire) {
 +		unsigned long pfn = folio_pfn(folio)
 +		for (i = 0; i < nr; i++)
@@ -153,7 +171,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (tlb_type == spitfire) {
  			data0 = ((u64)&xcall_flush_dcache_page_spitfire);
 -			if (page_mapping_file(page) != NULL)
-+			if (folio_flushable_mapping(folio) != NULL)
++			if (folio_flush_mapping(folio) != NULL)
  				data0 |= ((u64)1 << 32);
  		} else if (tlb_type == cheetah || tlb_type == cheetah_plus) {
  #ifdef DCACHE_ALIASING_POSSIBLE
@@ -194,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (tlb_type == spitfire) {
  		data0 = ((u64)&xcall_flush_dcache_page_spitfire);
 -		if (page_mapping_file(page) != NULL)
-+		if (folio_flushable_mapping(folio) != NULL)
++		if (folio_flush_mapping(folio) != NULL)
  			data0 |= ((u64)1 << 32);
  	} else if (tlb_type == cheetah || tlb_type == cheetah_plus) {
  #ifdef DCACHE_ALIASING_POSSIBLE
@@ -244,12 +262,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	for (i = 0; i < nr; i++)
 +		__flush_dcache_page(folio_address(folio) + i * PAGE_SIZE,
 +				    ((tlb_type == spitfire) &&
-+				     folio_flushable_mapping(folio) != NULL));
++				     folio_flush_mapping(folio) != NULL));
  #else
 -	if (page_mapping_file(page) != NULL &&
 -	    tlb_type == spitfire)
 -		__flush_icache_page(__pa(page_address(page)));
-+	if (folio_flushable_mapping(folio) != NULL &&
++	if (folio_flush_mapping(folio) != NULL &&
 +	    tlb_type == spitfire) {
 +		for (i = 0; i < nr; i++)
 +			__flush_icache_page((pfn + i) * PAGE_SIZE);
@@ -374,7 +392,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	this_cpu = get_cpu();
  
 -	mapping = page_mapping_file(page);
-+	mapping = folio_flushable_mapping(folio);
++	mapping = folio_flush_mapping(folio);
  	if (mapping && !mapping_mapped(mapping)) {
 -		int dirty = test_bit(PG_dcache_dirty, &page->flags);
 +		bool dirty = test_bit(PG_dcache_dirty, &folio->flags);
@@ -435,7 +453,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		/* A real file page? */
 -		mapping = page_mapping_file(page);
-+		mapping = folio_flushable_mapping(folio);
++		mapping = folio_flush_mapping(folio);
  		if (!mapping)
  			goto no_cache_flush;
  

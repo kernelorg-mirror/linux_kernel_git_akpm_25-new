@@ -1,26 +1,34 @@
 From: Yosry Ahmed <yosryahmed@google.com>
 Subject: mm: memcg: use rstat for non-hierarchical stats
-Date: Wed, 19 Jul 2023 17:46:13 +0000
+Date: Wed, 26 Jul 2023 15:32:23 +0000
 
-Currently, memcg uses rstat to maintain hierarchical stats.  The rstat
-framework keeps track of which cgroups have updates on which cpus.
+Currently, memcg uses rstat to maintain aggregated hierarchical stats. 
+Counters are maintained for hierarchical stats at each memcg.  Rstat
+tracks which cgroups have updates on which cpus to keep those counters
+fresh on the read-side.
 
-For non-hierarchical stats, as memcg moved to rstat, they are no longer
-readily available as counters.  Instead, the percpu counters for a given
-stat need to be summed to get the non-hierarchical stat value.  This
-causes a performance regression when reading non-hierarchical stats on
-kernels where memcg moved to using rstat.  This is especially visible when
-reading memory.stat on cgroup v1.  There are also some code paths internal
-to the kernel that read such non-hierarchical stats.
+Non-hierarchical stats are currently not covered by rstat.  Their per-cpu
+counters are summed up on every read, which is expensive.  The original
+implementation did the same.  At some point before rstat, non-hierarchical
+aggregated counters were introduced by commit a983b5ebee57 ("mm:
+memcontrol: fix excessive complexity in memory.stat reporting").  However,
+those counters were updated on the performance critical write-side, which
+caused regressions, so they were later removed by commit 815744d75152
+("mm: memcontrol: don't batch updates of local VM stats and events").  See
+[1] for more detailed history.
 
-It is inefficient to iterate and sum counters in all cpus when the rstat
-framework knows exactly when a percpu counter has an update.  Instead,
-maintain cpu-aggregated non-hierarchical counters for each stat.  During
-an rstat flush, keep those updated as well.  When reading non-hierarchical
-stats, we no longer need to iterate cpus, we just need to read the
-maintainer counters, similar to hierarchical stats.
+Kernel versions in between a983b5ebee57 & 815744d75152 (a year and a half)
+enjoyed cheap reads of non-hierarchical stats, specifically on cgroup v1. 
+When moving to more recent kernels, a performance regression for reading
+non-hierarchical stats is observed.
 
-A caveat is that we now a stats flush before reading
+Now that we have rstat, we know exactly which percpu counters have updates
+for each stat.  We can maintain non-hierarchical counters again, making
+reads much more efficient, without affecting the performance critical
+write-side.  Hence, add non-hierarchical (i.e local) counters for the
+stats, and extend rstat flushing to keep those up-to-date.
+
+A caveat is that we now need a stats flush before reading
 local/non-hierarchical stats through {memcg/lruvec}_page_state_local() or
 memcg_events_local(), where we previously only needed a flush to read
 hierarchical stats.  Most contexts reading non-hierarchical stats are
@@ -29,8 +37,9 @@ count_shadow_nodes().
 
 With this patch, reading memory.stat from 1000 memcgs is 3x faster on a
 machine with 256 cpus on cgroup v1:
+
  # for i in $(seq 1000); do mkdir /sys/fs/cgroup/memory/cg$i; done
- # time cat /dev/cgroup/memory/cg*/memory.stat > /dev/null
+ # time cat /sys/fs/cgroup/memory/cg*/memory.stat > /dev/null
  real	 0m0.125s
  user	 0m0.005s
  sys	 0m0.120s
@@ -40,20 +49,74 @@ After:
  user	 0m0.005s
  sys	 0m0.027s
 
-Link: https://lkml.kernel.org/r/20230719174613.3062124-1-yosryahmed@google.com
+To make sure there are no regressions on cgroup v2, I ran an artificial
+reclaim/refault stress test [2] that creates (NR_CPUS * 2) cgroups,
+assigns them limits, runs a worker process in each cgroup that allocates
+tmpfs memory equal to quadruple the limit (to invoke reclaim
+continuously), and then reads back the entire file (to invoke refaults). 
+All workers are run in parallel, and zram is used as a swapping backend. 
+Both reclaim and refault have conditional stats flushing.  I ran this on a
+machine with 112 cpus, once on mm-unstable, and once on mm-unstable with
+this patch reverted.
+
+(1) A few runs without this patch:
+
+ # time ./stress_reclaim_refault.sh
+ real 0m9.949s
+ user 0m0.496s
+ sys 14m44.974s
+
+ # time ./stress_reclaim_refault.sh
+ real 0m10.049s
+ user 0m0.486s
+ sys 14m55.791s
+
+ # time ./stress_reclaim_refault.sh
+ real 0m9.984s
+ user 0m0.481s
+ sys 14m53.841s
+
+(2) A few runs with this patch:
+
+ # time ./stress_reclaim_refault.sh
+ real 0m9.885s
+ user 0m0.486s
+ sys 14m48.753s
+
+ # time ./stress_reclaim_refault.sh
+ real 0m9.903s
+ user 0m0.495s
+ sys 14m48.339s
+
+ # time ./stress_reclaim_refault.sh
+ real 0m9.861s
+ user 0m0.507s
+ sys 14m49.317s
+
+No regressions are observed with this patch. There is actually a very
+slight improvement. If I have to guess, maybe it's because we avoid
+the percpu loop in count_shadow_nodes() when calling
+lruvec_page_state_local(), but I could not prove this using perf, it's
+probably in the noise.
+
+[1] https://lore.kernel.org/lkml/20230725201811.GA1231514@cmpxchg.org/
+[2] https://lore.kernel.org/lkml/CAJD7tkb17x=qwoO37uxyYXLEUVp15BQKR+Xfh7Sg9Hx-wTQ_=w@mail.gmail.com/
+
+Link: https://lkml.kernel.org/r/20230803185046.1385770-1-yosryahmed@google.com
+Link: https://lkml.kernel.org/r/20230726153223.821757-2-yosryahmed@google.com
 Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
 Acked-by: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Michal Hocko <mhocko@kernel.org>
+Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+Acked-by: Michal Hocko <mhocko@suse.com>
 Cc: Muchun Song <muchun.song@linux.dev>
-Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Shakeel Butt <shakeelb@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/memcontrol.h |    7 ++++---
- mm/memcontrol.c            |   32 +++++++++++++++++++-------------
- mm/workingset.c            |    1 +
- 3 files changed, 24 insertions(+), 16 deletions(-)
+ include/linux/memcontrol.h |    7 ++-
+ mm/memcontrol.c            |   67 +++++++++++++++++++----------------
+ mm/workingset.c            |    1 
+ 3 files changed, 43 insertions(+), 32 deletions(-)
 
 --- a/include/linux/memcontrol.h~mm-memcg-use-rstat-for-non-hierarchical-stats
 +++ a/include/linux/memcontrol.h
@@ -67,7 +130,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Pending child counts during tree propagation */
  	long state_pending[NR_VM_NODE_STAT_ITEMS];
  };
-@@ -1019,14 +1022,12 @@ static inline unsigned long lruvec_page_
+@@ -1018,14 +1021,12 @@ static inline unsigned long lruvec_page_
  {
  	struct mem_cgroup_per_node *pn;
  	long x = 0;
@@ -127,7 +190,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
-@@ -5517,7 +5514,7 @@ static void mem_cgroup_css_rstat_flush(s
+@@ -5516,7 +5513,7 @@ static void mem_cgroup_css_rstat_flush(s
  	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
  	struct mem_cgroup *parent = parent_mem_cgroup(memcg);
  	struct memcg_vmstats_percpu *statc;
@@ -136,7 +199,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int i, nid;
  
  	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
-@@ -5533,9 +5530,11 @@ static void mem_cgroup_css_rstat_flush(s
+@@ -5532,19 +5529,23 @@ static void mem_cgroup_css_rstat_flush(s
  			memcg->vmstats->state_pending[i] = 0;
  
  		/* Add CPU changes on this level since the last flush */
@@ -149,15 +212,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			statc->state_prev[i] = v;
  		}
  
-@@ -5544,6 +5543,7 @@ static void mem_cgroup_css_rstat_flush(s
- 
+-		if (!delta)
+-			continue;
+-
  		/* Aggregate counts on this level and propagate upwards */
- 		memcg->vmstats->state[i] += delta;
-+		memcg->vmstats->state_local[i] += delta_cpu;
- 		if (parent)
- 			parent->vmstats->state_pending[i] += delta;
+-		memcg->vmstats->state[i] += delta;
+-		if (parent)
+-			parent->vmstats->state_pending[i] += delta;
++		if (delta_cpu)
++			memcg->vmstats->state_local[i] += delta_cpu;
++
++		if (delta) {
++			memcg->vmstats->state[i] += delta;
++			if (parent)
++				parent->vmstats->state_pending[i] += delta;
++		}
  	}
-@@ -5553,9 +5553,11 @@ static void mem_cgroup_css_rstat_flush(s
+ 
+ 	for (i = 0; i < NR_MEMCG_EVENTS; i++) {
+@@ -5552,18 +5553,22 @@ static void mem_cgroup_css_rstat_flush(s
  		if (delta)
  			memcg->vmstats->events_pending[i] = 0;
  
@@ -170,15 +243,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			statc->events_prev[i] = v;
  		}
  
-@@ -5563,6 +5565,7 @@ static void mem_cgroup_css_rstat_flush(s
- 			continue;
+-		if (!delta)
+-			continue;
++		if (delta_cpu)
++			memcg->vmstats->events_local[i] += delta_cpu;
  
- 		memcg->vmstats->events[i] += delta;
-+		memcg->vmstats->events_local[i] += delta_cpu;
- 		if (parent)
- 			parent->vmstats->events_pending[i] += delta;
+-		memcg->vmstats->events[i] += delta;
+-		if (parent)
+-			parent->vmstats->events_pending[i] += delta;
++		if (delta) {
++			memcg->vmstats->events[i] += delta;
++			if (parent)
++				parent->vmstats->events_pending[i] += delta;
++		}
  	}
-@@ -5582,9 +5585,11 @@ static void mem_cgroup_css_rstat_flush(s
+ 
+ 	for_each_node_state(nid, N_MEMORY) {
+@@ -5581,18 +5586,22 @@ static void mem_cgroup_css_rstat_flush(s
  			if (delta)
  				pn->lruvec_stats.state_pending[i] = 0;
  
@@ -191,14 +272,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				lstatc->state_prev[i] = v;
  			}
  
-@@ -5592,6 +5597,7 @@ static void mem_cgroup_css_rstat_flush(s
- 				continue;
+-			if (!delta)
+-				continue;
++			if (delta_cpu)
++				pn->lruvec_stats.state_local[i] += delta_cpu;
  
- 			pn->lruvec_stats.state[i] += delta;
-+			pn->lruvec_stats.state_local[i] += delta_cpu;
- 			if (ppn)
- 				ppn->lruvec_stats.state_pending[i] += delta;
+-			pn->lruvec_stats.state[i] += delta;
+-			if (ppn)
+-				ppn->lruvec_stats.state_pending[i] += delta;
++			if (delta) {
++				pn->lruvec_stats.state[i] += delta;
++				if (ppn)
++					ppn->lruvec_stats.state_pending[i] += delta;
++			}
  		}
+ 	}
+ }
 --- a/mm/workingset.c~mm-memcg-use-rstat-for-non-hierarchical-stats
 +++ a/mm/workingset.c
 @@ -664,6 +664,7 @@ static unsigned long count_shadow_nodes(

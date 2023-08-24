@@ -1,6 +1,6 @@
 From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
 Subject: arm: implement the new page table range API
-Date: Mon, 10 Jul 2023 21:43:10 +0100
+Date: Wed, 2 Aug 2023 16:13:37 +0100
 
 Add set_ptes(), update_mmu_cache_range(), flush_dcache_folio() and
 flush_icache_pages().  Change the PG_dcache_clear flag from being per-page
@@ -8,9 +8,13 @@ to per-folio which makes __dma_page_dev_to_cpu() a bit more exciting.
 Also add flush_cache_pages(), even though this isn't used by generic code
 (yet?)
 
-[akpm@linux-foundation.org: s/folio_flushable_mapping/folio_flushable_mapping/]
-Link: https://lkml.kernel.org/r/20230710204339.3554919-10-willy@infradead.org
+[m.szyprowski@samsung.com: fix potential endless loop in __dma_page_dev_to_cpu()]
+  Link: https://lkml.kernel.org/r/20230809172737.3574190-1-m.szyprowski@samsung.com
+[willy@infradead.org: fix folio conversion in __dma_page_dev_to_cpu()]
+  Link: https://lkml.kernel.org/r/20230823191852.1556561-1-willy@infradead.org
+Link: https://lkml.kernel.org/r/20230802151406.3735276-10-willy@infradead.org
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Marek Szyprowski <m.szyprowski@samsung.com>
 Acked-by: Mike Rapoport (IBM) <rppt@kernel.org>
 Reviewed-by: Russell King (Oracle) <rmk+kernel@armlinux.org.uk>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -22,13 +26,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/arm/mm/copypage-v4mc.c       |    5 -
  arch/arm/mm/copypage-v6.c         |    5 -
  arch/arm/mm/copypage-xscale.c     |    5 -
- arch/arm/mm/dma-mapping.c         |   22 +++---
+ arch/arm/mm/dma-mapping.c         |   26 +++----
  arch/arm/mm/fault-armv.c          |   16 ++--
  arch/arm/mm/flush.c               |   99 ++++++++++++++++------------
  arch/arm/mm/mm.h                  |    2 
  arch/arm/mm/mmu.c                 |   14 ++-
  arch/arm/mm/nommu.c               |    6 +
- 12 files changed, 132 insertions(+), 85 deletions(-)
+ 12 files changed, 135 insertions(+), 86 deletions(-)
 
 --- a/arch/arm/include/asm/cacheflush.h~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/include/asm/cacheflush.h
@@ -149,7 +153,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (!test_and_set_bit(PG_dcache_clean, &from->flags))
 -		__flush_dcache_page(page_mapping_file(from), from);
 +	if (!test_and_set_bit(PG_dcache_clean, &src->flags))
-+		__flush_dcache_folio(folio_flushable_mapping(src), src);
++		__flush_dcache_folio(folio_flush_mapping(src), src);
  
  	raw_spin_lock(&minicache_lock);
  
@@ -166,7 +170,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (!test_and_set_bit(PG_dcache_clean, &from->flags))
 -		__flush_dcache_page(page_mapping_file(from), from);
 +	if (!test_and_set_bit(PG_dcache_clean, &src->flags))
-+		__flush_dcache_folio(folio_flushable_mapping(src), src);
++		__flush_dcache_folio(folio_flush_mapping(src), src);
  
  	/* FIXME: not highmem safe */
  	discard_old_kernel_data(page_address(to));
@@ -182,27 +186,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (!test_and_set_bit(PG_dcache_clean, &from->flags))
 -		__flush_dcache_page(page_mapping_file(from), from);
 +	if (!test_and_set_bit(PG_dcache_clean, &src->flags))
-+		__flush_dcache_folio(folio_flushable_mapping(src), src);
++		__flush_dcache_folio(folio_flush_mapping(src), src);
  
  	raw_spin_lock(&minicache_lock);
  
 --- a/arch/arm/mm/dma-mapping.c~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/mm/dma-mapping.c
-@@ -695,6 +695,7 @@ static void __dma_page_cpu_to_dev(struct
- static void __dma_page_dev_to_cpu(struct page *page, unsigned long off,
- 	size_t size, enum dma_data_direction dir)
- {
-+	struct folio *folio = page_folio(page);
- 	phys_addr_t paddr = page_to_phys(page) + off;
- 
- 	/* FIXME: non-speculating: not required */
-@@ -709,19 +710,18 @@ static void __dma_page_dev_to_cpu(struct
+@@ -709,19 +709,21 @@ static void __dma_page_dev_to_cpu(struct
  	 * Mark the D-cache clean for these pages to avoid extra flushing.
  	 */
  	if (dir != DMA_TO_DEVICE && size >= PAGE_SIZE) {
 -		unsigned long pfn;
 -		size_t left = size;
-+		ssize_t left = size;
++		struct folio *folio = pfn_folio(paddr / PAGE_SIZE);
 +		size_t offset = offset_in_folio(folio, paddr);
  
 -		pfn = page_to_pfn(page) + off / PAGE_SIZE;
@@ -210,25 +206,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (off) {
 -			pfn++;
 -			left -= PAGE_SIZE - off;
-+		if (offset) {
-+			left -= folio_size(folio) - offset;
-+			folio = folio_next(folio);
- 		}
+-		}
 -		while (left >= PAGE_SIZE) {
 -			page = pfn_to_page(pfn++);
 -			set_bit(PG_dcache_clean, &page->flags);
 -			left -= PAGE_SIZE;
++		for (;;) {
++			size_t sz = folio_size(folio) - offset;
 +
-+		while (left >= (ssize_t)folio_size(folio)) {
-+			set_bit(PG_dcache_clean, &folio->flags);
-+			left -= folio_size(folio);
++			if (size < sz)
++				break;
++			if (!offset)
++				set_bit(PG_dcache_clean, &folio->flags);
++			offset = 0;
++			size -= sz;
++			if (!size)
++				break;
 +			folio = folio_next(folio);
  		}
  	}
  }
 --- a/arch/arm/mm/fault-armv.c~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/mm/fault-armv.c
-@@ -181,12 +181,12 @@ make_coherent(struct address_space *mapp
+@@ -180,12 +180,12 @@ make_coherent(struct address_space *mapp
   *
   * Note that the pte lock will be held.
   */
@@ -244,7 +244,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!pfn_valid(pfn))
  		return;
-@@ -195,13 +195,13 @@ void update_mmu_cache(struct vm_area_str
+@@ -194,13 +194,13 @@ void update_mmu_cache(struct vm_area_str
  	 * The zero page is never written to, so never has any dirty
  	 * cache lines, and therefore never needs to be flushed.
  	 */
@@ -257,7 +257,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (!test_and_set_bit(PG_dcache_clean, &page->flags))
 -		__flush_dcache_page(mapping, page);
 +	folio = page_folio(pfn_to_page(pfn));
-+	mapping = folio_flushable_mapping(folio);
++	mapping = folio_flush_mapping(folio);
 +	if (!test_and_set_bit(PG_dcache_clean, &folio->flags))
 +		__flush_dcache_folio(mapping, folio);
  	if (mapping) {
@@ -400,7 +400,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	folio = page_folio(pfn_to_page(pfn));
  	if (cache_is_vipt_aliasing())
 -		mapping = page_mapping_file(page);
-+		mapping = folio_flushable_mapping(folio);
++		mapping = folio_flush_mapping(folio);
  	else
  		mapping = NULL;
  
@@ -437,7 +437,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
 -	mapping = page_mapping_file(page);
-+	mapping = folio_flushable_mapping(folio);
++	mapping = folio_flush_mapping(folio);
  
  	if (!cache_ops_need_broadcast() &&
 -	    mapping && !page_mapcount(page))
@@ -480,7 +480,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * ARM specific vm_struct->flags bits.
 --- a/arch/arm/mm/mmu.c~arm-implement-the-new-page-table-range-api
 +++ a/arch/arm/mm/mmu.c
-@@ -1788,7 +1788,7 @@ void __init paging_init(const struct mac
+@@ -1789,7 +1789,7 @@ void __init paging_init(const struct mac
  	bootmem_init();
  
  	empty_zero_page = virt_to_page(zero_page);
@@ -489,7 +489,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  void __init early_mm_init(const struct machine_desc *mdesc)
-@@ -1797,8 +1797,8 @@ void __init early_mm_init(const struct m
+@@ -1798,8 +1798,8 @@ void __init early_mm_init(const struct m
  	early_paging_init(mdesc);
  }
  
@@ -500,7 +500,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	unsigned long ext = 0;
  
-@@ -1808,5 +1808,11 @@ void set_pte_at(struct mm_struct *mm, un
+@@ -1809,5 +1809,11 @@ void set_pte_at(struct mm_struct *mm, un
  		ext |= PTE_EXT_NG;
  	}
  
