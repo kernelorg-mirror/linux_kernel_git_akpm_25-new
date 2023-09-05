@@ -1,6 +1,6 @@
 From: Tong Tiangen <tongtiangen@huawei.com>
 Subject: mm: memory-failure: use rcu lock instead of tasklist_lock when collect_procs()
-Date: Mon, 21 Aug 2023 17:13:12 +0800
+Date: Mon, 28 Aug 2023 10:25:27 +0800
 
 We found a softlock issue in our test, analyzed the logs, and found that
 the relevant CPU call trace as follows:
@@ -35,18 +35,40 @@ We can see that CPU1 waiting for CPU0 respond IPI，CPU0 waiting for CPU2
 unlock tasklist_lock, CPU2 waiting for CPU1 unlock page->ptl. As a result,
 softlockup is triggered.
 
-For collect_procs_anon(), we will not modify the tasklist, but only perform
-read traversal. Therefore, we can use rcu lock instead of spin lock
-tasklist_lock, from this, we can break the softlock chain above.
+For collect_procs_anon(), what we're doing is task list iteration, during
+the iteration, with the help of call_rcu(), the task_struct object is freed
+only after one or more grace periods elapse. the logic as follows:
+
+release_task()
+  -> __exit_signal()
+    -> __unhash_process()
+      -> list_del_rcu()
+
+  -> put_task_struct_rcu_user()
+    -> call_rcu(&task->rcu, delayed_put_task_struct)
+
+delayed_put_task_struct()
+  -> put_task_struct()
+  -> if (refcount_sub_and_test())
+     	__put_task_struct()
+          -> free_task()
+
+Therefore, under the protection of the rcu lock, we can safely use
+get_task_struct() to ensure a safe reference to task_struct during the
+iteration.
+
+By removing the use of tasklist_lock in task list iteration, we can break
+the softlock chain above.
 
 The same logic can also be applied to:
  - collect_procs_file()
  - collect_procs_fsdax()
  - collect_procs_ksm()
 
-Link: https://lkml.kernel.org/r/20230821091312.2034844-1-tongtiangen@huawei.com
+Link: https://lkml.kernel.org/r/20230828022527.241693-1-tongtiangen@huawei.com
 Signed-off-by: Tong Tiangen <tongtiangen@huawei.com>
 Acked-by: Naoya Horiguchi <naoya.horiguchi@nec.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Miaohe Lin <linmiaohe@huawei.com>
-Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Paul E. McKenney <paulmck@kernel.org>
