@@ -1,0 +1,321 @@
+From: Qi Zheng <zhengqi.arch@bytedance.com>
+Subject: mm: shrinker: make memcg slab shrink lockless
+Date: Mon, 11 Sep 2023 17:44:42 +0800
+
+Like global slab shrink, this commit also uses refcount+RCU method to make
+memcg slab shrink lockless.
+
+Use the following script to do slab shrink stress test:
+
+```
+
+DIR="/root/shrinker/memcg/mnt"
+
+do_create()
+{
+    mkdir -p /sys/fs/cgroup/memory/test
+    echo 4G > /sys/fs/cgroup/memory/test/memory.limit_in_bytes
+    for i in `seq 0 $1`;
+    do
+        mkdir -p /sys/fs/cgroup/memory/test/$i;
+        echo $$ > /sys/fs/cgroup/memory/test/$i/cgroup.procs;
+        mkdir -p $DIR/$i;
+    done
+}
+
+do_mount()
+{
+    for i in `seq $1 $2`;
+    do
+        mount -t tmpfs $i $DIR/$i;
+    done
+}
+
+do_touch()
+{
+    for i in `seq $1 $2`;
+    do
+        echo $$ > /sys/fs/cgroup/memory/test/$i/cgroup.procs;
+        dd if=/dev/zero of=$DIR/$i/file$i bs=1M count=1 &
+    done
+}
+
+case "$1" in
+  touch)
+    do_touch $2 $3
+    ;;
+  test)
+    do_create 4000
+    do_mount 0 4000
+    do_touch 0 3000
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+```
+
+Save the above script, then run test and touch commands. Then we can use
+the following perf command to view hotspots:
+
+perf top -U -F 999
+
+1) Before applying this patchset:
+
+  33.15%  [kernel]          [k] down_read_trylock
+  25.38%  [kernel]          [k] shrink_slab
+  21.75%  [kernel]          [k] up_read
+   4.45%  [kernel]          [k] _find_next_bit
+   2.27%  [kernel]          [k] do_shrink_slab
+   1.80%  [kernel]          [k] intel_idle_irq
+   1.79%  [kernel]          [k] shrink_lruvec
+   0.67%  [kernel]          [k] xas_descend
+   0.41%  [kernel]          [k] mem_cgroup_iter
+   0.40%  [kernel]          [k] shrink_node
+   0.38%  [kernel]          [k] list_lru_count_one
+
+2) After applying this patchset:
+
+  64.56%  [kernel]          [k] shrink_slab
+  12.18%  [kernel]          [k] do_shrink_slab
+   3.30%  [kernel]          [k] __rcu_read_unlock
+   2.61%  [kernel]          [k] shrink_lruvec
+   2.49%  [kernel]          [k] __rcu_read_lock
+   1.93%  [kernel]          [k] intel_idle_irq
+   0.89%  [kernel]          [k] shrink_node
+   0.81%  [kernel]          [k] mem_cgroup_iter
+   0.77%  [kernel]          [k] mem_cgroup_calculate_protection
+   0.66%  [kernel]          [k] list_lru_count_one
+
+We can see that the first perf hotspot becomes shrink_slab, which is what
+we expect.
+
+Link: https://lkml.kernel.org/r/20230911094444.68966-44-zhengqi.arch@bytedance.com
+Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Cc: Alasdair Kergon <agk@redhat.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
+Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+Cc: Andreas Gruenbacher <agruenba@redhat.com>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Bob Peterson <rpeterso@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Carlos Llamas <cmllamas@google.com>
+Cc: Chandan Babu R <chandan.babu@oracle.com>
+Cc: Chao Yu <chao@kernel.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Cc: Chuck Lever <cel@kernel.org>
+Cc: Coly Li <colyli@suse.de>
+Cc: Dai Ngo <Dai.Ngo@oracle.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Airlie <airlied@gmail.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Sterba <dsterba@suse.com>
+Cc: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Cc: Gao Xiang <hsiangkao@linux.alibaba.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Huang Rui <ray.huang@amd.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jaegeuk Kim <jaegeuk@kernel.org>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Jeff Layton <jlayton@kernel.org>
+Cc: Jeffle Xu <jefflexu@linux.alibaba.com>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Juergen Gross <jgross@suse.com>
+Cc: Kent Overstreet <kent.overstreet@gmail.com>
+Cc: Kirill Tkhai <tkhai@ya.ru>
+Cc: Marijn Suijten <marijn.suijten@somainline.org>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Mike Snitzer <snitzer@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Nadav Amit <namit@vmware.com>
+Cc: Neil Brown <neilb@suse.de>
+Cc: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Cc: Olga Kornievskaia <kolga@netapp.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Rob Herring <robh@kernel.org>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Sean Paul <sean@poorly.run>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Stefano Stabellini <sstabellini@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Cc: Yue Hu <huyue2@coolpad.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/shrinker.c |   85 +++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 66 insertions(+), 19 deletions(-)
+
+--- a/mm/shrinker.c~mm-shrinker-make-memcg-slab-shrink-lockless
++++ a/mm/shrinker.c
+@@ -218,7 +218,6 @@ static int shrinker_memcg_alloc(struct s
+ 		return -ENOSYS;
+ 
+ 	down_write(&shrinker_rwsem);
+-	/* This may call shrinker, so it must use down_read_trylock() */
+ 	id = idr_alloc(&shrinker_idr, shrinker, 0, 0, GFP_KERNEL);
+ 	if (id < 0)
+ 		goto unlock;
+@@ -252,10 +251,15 @@ static long xchg_nr_deferred_memcg(int n
+ {
+ 	struct shrinker_info *info;
+ 	struct shrinker_info_unit *unit;
++	long nr_deferred;
+ 
+-	info = shrinker_info_protected(memcg, nid);
++	rcu_read_lock();
++	info = rcu_dereference(memcg->nodeinfo[nid]->shrinker_info);
+ 	unit = info->unit[shrinker_id_to_index(shrinker->id)];
+-	return atomic_long_xchg(&unit->nr_deferred[shrinker_id_to_offset(shrinker->id)], 0);
++	nr_deferred = atomic_long_xchg(&unit->nr_deferred[shrinker_id_to_offset(shrinker->id)], 0);
++	rcu_read_unlock();
++
++	return nr_deferred;
+ }
+ 
+ static long add_nr_deferred_memcg(long nr, int nid, struct shrinker *shrinker,
+@@ -263,10 +267,16 @@ static long add_nr_deferred_memcg(long n
+ {
+ 	struct shrinker_info *info;
+ 	struct shrinker_info_unit *unit;
++	long nr_deferred;
+ 
+-	info = shrinker_info_protected(memcg, nid);
++	rcu_read_lock();
++	info = rcu_dereference(memcg->nodeinfo[nid]->shrinker_info);
+ 	unit = info->unit[shrinker_id_to_index(shrinker->id)];
+-	return atomic_long_add_return(nr, &unit->nr_deferred[shrinker_id_to_offset(shrinker->id)]);
++	nr_deferred =
++		atomic_long_add_return(nr, &unit->nr_deferred[shrinker_id_to_offset(shrinker->id)]);
++	rcu_read_unlock();
++
++	return nr_deferred;
+ }
+ 
+ void reparent_shrinker_deferred(struct mem_cgroup *memcg)
+@@ -463,18 +473,54 @@ static unsigned long shrink_slab_memcg(g
+ 	if (!mem_cgroup_online(memcg))
+ 		return 0;
+ 
+-	if (!down_read_trylock(&shrinker_rwsem))
+-		return 0;
+-
+-	info = shrinker_info_protected(memcg, nid);
++	/*
++	 * lockless algorithm of memcg shrink.
++	 *
++	 * The shrinker_info may be freed asynchronously via RCU in the
++	 * expand_one_shrinker_info(), so the rcu_read_lock() needs to be used
++	 * to ensure the existence of the shrinker_info.
++	 *
++	 * The shrinker_info_unit is never freed unless its corresponding memcg
++	 * is destroyed. Here we already hold the refcount of memcg, so the
++	 * memcg will not be destroyed, and of course shrinker_info_unit will
++	 * not be freed.
++	 *
++	 * So in the memcg shrink:
++	 *  step 1: use rcu_read_lock() to guarantee existence of the
++	 *          shrinker_info.
++	 *  step 2: after getting shrinker_info_unit we can safely release the
++	 *          RCU lock.
++	 *  step 3: traverse the bitmap and calculate shrinker_id
++	 *  step 4: use rcu_read_lock() to guarantee existence of the shrinker.
++	 *  step 5: use shrinker_id to find the shrinker, then use
++	 *          shrinker_try_get() to guarantee existence of the shrinker,
++	 *          then we can release the RCU lock to do do_shrink_slab() that
++	 *          may sleep.
++	 *  step 6: do shrinker_put() paired with step 5 to put the refcount,
++	 *          if the refcount reaches 0, then wake up the waiter in
++	 *          shrinker_free() by calling complete().
++	 *          Note: here is different from the global shrink, we don't
++	 *                need to acquire the RCU lock to guarantee existence of
++	 *                the shrinker, because we don't need to use this
++	 *                shrinker to traverse the next shrinker in the bitmap.
++	 *  step 7: we have already exited the read-side of rcu critical section
++	 *          before calling do_shrink_slab(), the shrinker_info may be
++	 *          released in expand_one_shrinker_info(), so go back to step 1
++	 *          to reacquire the shrinker_info.
++	 */
++again:
++	rcu_read_lock();
++	info = rcu_dereference(memcg->nodeinfo[nid]->shrinker_info);
+ 	if (unlikely(!info))
+ 		goto unlock;
+ 
+-	for (; index < shrinker_id_to_index(info->map_nr_max); index++) {
++	if (index < shrinker_id_to_index(info->map_nr_max)) {
+ 		struct shrinker_info_unit *unit;
+ 
+ 		unit = info->unit[index];
+ 
++		rcu_read_unlock();
++
+ 		for_each_set_bit(offset, unit->map, SHRINKER_UNIT_BITS) {
+ 			struct shrink_control sc = {
+ 				.gfp_mask = gfp_mask,
+@@ -484,12 +530,14 @@ static unsigned long shrink_slab_memcg(g
+ 			struct shrinker *shrinker;
+ 			int shrinker_id = calc_shrinker_id(index, offset);
+ 
++			rcu_read_lock();
+ 			shrinker = idr_find(&shrinker_idr, shrinker_id);
+-			if (unlikely(!shrinker || !(shrinker->flags & SHRINKER_REGISTERED))) {
+-				if (!shrinker)
+-					clear_bit(offset, unit->map);
++			if (unlikely(!shrinker || !shrinker_try_get(shrinker))) {
++				clear_bit(offset, unit->map);
++				rcu_read_unlock();
+ 				continue;
+ 			}
++			rcu_read_unlock();
+ 
+ 			/* Call non-slab shrinkers even though kmem is disabled */
+ 			if (!memcg_kmem_online() &&
+@@ -522,15 +570,14 @@ static unsigned long shrink_slab_memcg(g
+ 					set_shrinker_bit(memcg, nid, shrinker_id);
+ 			}
+ 			freed += ret;
+-
+-			if (rwsem_is_contended(&shrinker_rwsem)) {
+-				freed = freed ? : 1;
+-				goto unlock;
+-			}
++			shrinker_put(shrinker);
+ 		}
++
++		index++;
++		goto again;
+ 	}
+ unlock:
+-	up_read(&shrinker_rwsem);
++	rcu_read_unlock();
+ 	return freed;
+ }
+ #else /* !CONFIG_MEMCG */
+_

@@ -1,0 +1,67 @@
+From: Alexander Potapenko <glider@google.com>
+Subject: kmsan: simplify kmsan_internal_memmove_metadata()
+Date: Mon, 11 Sep 2023 16:56:59 +0200
+
+kmsan_internal_memmove_metadata() is the function that implements copying
+metadata every time memcpy()/memmove() is called.  Because shadow memory
+stores 1 byte per each byte of kernel memory, copying the shadow is
+trivial and can be done by a single memmove() call.
+
+Origins, on the other hand, are stored as 4-byte values corresponding to
+every aligned 4 bytes of kernel memory.  Therefore, if either the source
+or the destination of kmsan_internal_memmove_metadata() is unaligned, the
+number of origin slots corresponding to the source or destination may
+differ:
+
+  1) memcpy(0xffff888080a00000, 0xffff888080900000, 4)
+     copies 1 origin slot into 1 origin slot:
+
+     src (0xffff888080900000): xxxx
+     src origins:              o111
+     dst (0xffff888080a00000): xxxx
+     dst origins:              o111
+
+  2) memcpy(0xffff888080a00001, 0xffff888080900000, 4)
+     copies 1 origin slot into 2 origin slots:
+
+     src (0xffff888080900000): xxxx
+     src origins:              o111
+     dst (0xffff888080a00000): .xxx x...
+     dst origins:              o111 o111
+
+  3) memcpy(0xffff888080a00000, 0xffff888080900001, 4)
+     copies 2 origin slots into 1 origin slot:
+
+     src (0xffff888080900000): .xxx x...
+     src origins:              o111 o222
+     dst (0xffff888080a00000): xxxx
+     dst origins:              o111
+                           (or o222)
+
+Previously, kmsan_internal_memmove_metadata() tried to solve this problem
+by copying min(src_slots, dst_slots) as is and cloning the missing slot on
+one of the ends, if needed.
+
+This was error-prone even in the simple cases where 4 bytes were copied,
+and did not account for situations where the total number of nonzero
+origin slots could have increased by more than one after copying:
+
+  memcpy(0xffff888080a00000, 0xffff888080900002, 8)
+
+  src (0xffff888080900002): ..xx .... xx..
+  src origins:              o111 0000 o222
+  dst (0xffff888080a00000): xx.. ..xx
+                            o111 0000
+                        (or 0000 o222)
+
+The new implementation simply copies the shadow byte by byte, and updates
+the corresponding origin slot, if the shadow byte is nonzero.  This
+approach can handle complex cases with mixed initialized and uninitialized
+bytes.  Similarly to KMSAN inline instrumentation, latter writes to bytes
+sharing the same origin slots take precedence.
+
+Link: https://lkml.kernel.org/r/20230911145702.2663753-1-glider@google.com
+Fixes: f80be4571b19 ("kmsan: add KMSAN runtime core")
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Acked-by: Marco Elver <elver@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>

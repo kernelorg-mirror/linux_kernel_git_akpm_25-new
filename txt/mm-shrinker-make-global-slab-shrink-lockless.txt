@@ -1,0 +1,171 @@
+From: Qi Zheng <zhengqi.arch@bytedance.com>
+Subject: mm: shrinker: make global slab shrink lockless
+Date: Mon, 11 Sep 2023 17:44:41 +0800
+
+The shrinker_rwsem is a global read-write lock in shrinkers subsystem,
+which protects most operations such as slab shrink, registration and
+unregistration of shrinkers, etc. This can easily cause problems in the
+following cases.
+
+1) When the memory pressure is high and there are many filesystems
+   mounted or unmounted at the same time, slab shrink will be affected
+   (down_read_trylock() failed).
+
+   Such as the real workload mentioned by Kirill Tkhai:
+
+   ```
+   One of the real workloads from my experience is start
+   of an overcommitted node containing many starting
+   containers after node crash (or many resuming containers
+   after reboot for kernel update). In these cases memory
+   pressure is huge, and the node goes round in long reclaim.
+   ```
+
+2) If a shrinker is blocked (such as the case mentioned
+   in [1]) and a writer comes in (such as mount a fs),
+   then this writer will be blocked and cause all
+   subsequent shrinker-related operations to be blocked.
+
+Even if there is no competitor when shrinking slab, there may still be a
+problem. The down_read_trylock() may become a perf hotspot with frequent
+calls to shrink_slab(). Because of the poor multicore scalability of
+atomic operations, this can lead to a significant drop in IPC
+(instructions per cycle).
+
+We used to implement the lockless slab shrink with SRCU [2], but then
+kernel test robot reported -88.8% regression in
+stress-ng.ramfs.ops_per_sec test case [3], so we reverted it [4].
+
+This commit uses the refcount+RCU method [5] proposed by Dave Chinner
+to re-implement the lockless global slab shrink. The memcg slab shrink is
+handled in the subsequent patch.
+
+For now, all shrinker instances are converted to dynamically allocated and
+will be freed by call_rcu(). So we can use rcu_read_{lock,unlock}() to
+ensure that the shrinker instance is valid.
+
+And the shrinker instance will not be run again after unregistration. So
+the structure that records the pointer of shrinker instance can be safely
+freed without waiting for the RCU read-side critical section.
+
+In this way, while we implement the lockless slab shrink, we don't need to
+be blocked in unregister_shrinker().
+
+The following are the test results:
+
+stress-ng --timeout 60 --times --verify --metrics-brief --ramfs 9 &
+
+1) Before applying this patchset:
+
+setting to a 60 second run per stressor
+dispatching hogs: 9 ramfs
+stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+                          (secs)    (secs)    (secs)   (real time) (usr+sys time)
+ramfs            473062     60.00      8.00    279.13      7884.12        1647.59
+for a 60.01s run time:
+   1440.34s available CPU time
+      7.99s user time   (  0.55%)
+    279.13s system time ( 19.38%)
+    287.12s total time  ( 19.93%)
+load average: 7.12 2.99 1.15
+successful run completed in 60.01s (1 min, 0.01 secs)
+
+2) After applying this patchset:
+
+setting to a 60 second run per stressor
+dispatching hogs: 9 ramfs
+stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+                          (secs)    (secs)    (secs)   (real time) (usr+sys time)
+ramfs            477165     60.00      8.13    281.34      7952.55        1648.40
+for a 60.01s run time:
+   1440.33s available CPU time
+      8.12s user time   (  0.56%)
+    281.34s system time ( 19.53%)
+    289.46s total time  ( 20.10%)
+load average: 6.98 3.03 1.19
+successful run completed in 60.01s (1 min, 0.01 secs)
+
+We can see that the ops/s has hardly changed.
+
+[1]. https://lore.kernel.org/lkml/20191129214541.3110-1-ptikhomirov@virtuozzo.com/
+[2]. https://lore.kernel.org/lkml/20230313112819.38938-1-zhengqi.arch@bytedance.com/
+[3]. https://lore.kernel.org/lkml/202305230837.db2c233f-yujie.liu@intel.com/
+[4]. https://lore.kernel.org/all/20230609081518.3039120-1-qi.zheng@linux.dev/
+[5]. https://lore.kernel.org/lkml/ZIJhou1d55d4H1s0@dread.disaster.area/
+
+Link: https://lkml.kernel.org/r/20230911094444.68966-43-zhengqi.arch@bytedance.com
+Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Abhinav Kumar <quic_abhinavk@quicinc.com>
+Cc: Alasdair Kergon <agk@redhat.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
+Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+Cc: Andreas Gruenbacher <agruenba@redhat.com>
+Cc: Anna Schumaker <anna@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Bob Peterson <rpeterso@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Carlos Llamas <cmllamas@google.com>
+Cc: Chandan Babu R <chandan.babu@oracle.com>
+Cc: Chao Yu <chao@kernel.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christian Koenig <christian.koenig@amd.com>
+Cc: Chuck Lever <cel@kernel.org>
+Cc: Coly Li <colyli@suse.de>
+Cc: Dai Ngo <Dai.Ngo@oracle.com>
+Cc: Daniel Vetter <daniel@ffwll.ch>
+Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Airlie <airlied@gmail.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Sterba <dsterba@suse.com>
+Cc: Dmitry Baryshkov <dmitry.baryshkov@linaro.org>
+Cc: Gao Xiang <hsiangkao@linux.alibaba.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Huang Rui <ray.huang@amd.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jaegeuk Kim <jaegeuk@kernel.org>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Jeff Layton <jlayton@kernel.org>
+Cc: Jeffle Xu <jefflexu@linux.alibaba.com>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Juergen Gross <jgross@suse.com>
+Cc: Kent Overstreet <kent.overstreet@gmail.com>
+Cc: Kirill Tkhai <tkhai@ya.ru>
+Cc: Marijn Suijten <marijn.suijten@somainline.org>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Mike Snitzer <snitzer@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Nadav Amit <namit@vmware.com>
+Cc: Neil Brown <neilb@suse.de>
+Cc: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Cc: Olga Kornievskaia <kolga@netapp.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Rob Clark <robdclark@gmail.com>
+Cc: Rob Herring <robh@kernel.org>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Sean Paul <sean@poorly.run>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Stefano Stabellini <sstabellini@kernel.org>
+Cc: Steven Price <steven.price@arm.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tomeu Vizoso <tomeu.vizoso@collabora.com>
+Cc: Tom Talpey <tom@talpey.com>
+Cc: Trond Myklebust <trond.myklebust@hammerspace.com>
+Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Cc: Yue Hu <huyue2@coolpad.com>

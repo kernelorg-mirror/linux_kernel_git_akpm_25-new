@@ -1,0 +1,110 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: page_alloc: remove pcppage migratetype caching
+Date: Mon, 11 Sep 2023 15:41:42 -0400
+
+Patch series "mm: page_alloc: freelist migratetype hygiene", v2.
+
+This is a breakout series from the huge page allocator patches[1].
+
+While testing and benchmarking the series incrementally, as per reviewer
+request, it became apparent that there are several sources of freelist
+migratetype violations that later patches in the series hid.
+
+Those violations occur when pages of one migratetype end up on the
+freelists of another type.  This encourages incompatible page mixing down
+the line, where allocation requests ask for one migrate type, but receives
+pages of another.  This defeats the mobility grouping.
+
+The series addresses those causes.  The last patch adds type checks on all
+freelist movements to rule out any violations.  I used these checks to
+identify the violations fixed up in the preceding patches.
+
+The series is a breakout, but has merit on its own: Less type mixing means
+improved grouping, means less work for compaction, means higher THP
+success rate and lower allocation latencies.  The results can be seen in a
+mixed workload that stresses the machine with a kernel build job while
+periodically attempting to allocate batches of THP.  The data is averaged
+over 50 consecutive defconfig builds:
+
+                                                        VANILLA      PATCHED-CLEANLISTS
+Hugealloc Time median                     14642.00 (    +0.00%)   10506.00 (   -28.25%)
+Hugealloc Time min                         4820.00 (    +0.00%)    4783.00 (    -0.77%)
+Hugealloc Time max                      6786868.00 (    +0.00%) 6556624.00 (    -3.39%)
+Kbuild Real time                            240.03 (    +0.00%)     241.45 (    +0.59%)
+Kbuild User time                           1195.49 (    +0.00%)    1195.69 (    +0.02%)
+Kbuild System time                           96.44 (    +0.00%)      97.03 (    +0.61%)
+THP fault alloc                           11490.00 (    +0.00%)   11802.30 (    +2.72%)
+THP fault fallback                          782.62 (    +0.00%)     478.88 (   -38.76%)
+THP fault fail rate %                         6.38 (    +0.00%)       3.90 (   -33.52%)
+Direct compact stall                        297.70 (    +0.00%)     224.56 (   -24.49%)
+Direct compact fail                         265.98 (    +0.00%)     191.56 (   -27.87%)
+Direct compact success                       31.72 (    +0.00%)      33.00 (    +3.91%)
+Direct compact success rate %                13.11 (    +0.00%)      17.26 (   +29.43%)
+Compact daemon scanned migrate          1673661.58 (    +0.00%) 1591682.18 (    -4.90%)
+Compact daemon scanned free             2711252.80 (    +0.00%) 2615217.78 (    -3.54%)
+Compact direct scanned migrate           384998.62 (    +0.00%)  261689.42 (   -32.03%)
+Compact direct scanned free              966308.94 (    +0.00%)  667459.76 (   -30.93%)
+Compact migrate scanned daemon %             80.86 (    +0.00%)      83.34 (    +3.02%)
+Compact free scanned daemon %                74.41 (    +0.00%)      78.26 (    +5.10%)
+Alloc stall                                 338.06 (    +0.00%)     440.72 (   +30.28%)
+Pages kswapd scanned                    1356339.42 (    +0.00%) 1402313.42 (    +3.39%)
+Pages kswapd reclaimed                   581309.08 (    +0.00%)  587956.82 (    +1.14%)
+Pages direct scanned                      56384.18 (    +0.00%)  141095.04 (  +150.24%)
+Pages direct reclaimed                    17055.54 (    +0.00%)   22427.96 (   +31.50%)
+Pages scanned kswapd %                       96.38 (    +0.00%)      93.60 (    -2.86%)
+Swap out                                  41528.00 (    +0.00%)   47969.92 (   +15.51%)
+Swap in                                    6541.42 (    +0.00%)    9093.30 (   +39.01%)
+File refaults                            127666.50 (    +0.00%)  135766.84 (    +6.34%)
+
+
+This patch (of 6):
+
+The idea behind the cache is to save get_pageblock_migratetype() lookups
+during bulk freeing.  A microbenchmark suggests this isn't helping,
+though.  The pcp migratetype can get stale, which means that bulk freeing
+has an extra branch to check if the pageblock was isolated while on the
+pcp.
+
+While the variance overlaps, the cache write and the branch seem to make
+this a net negative.  The following test allocates and frees batches of
+10,000 pages (~3x the pcp high marks to trigger flushing):
+
+Before:
+          8,668.48 msec task-clock                       #   99.735 CPUs utilized               ( +-  2.90% )
+                19      context-switches                 #    4.341 /sec                        ( +-  3.24% )
+                 0      cpu-migrations                   #    0.000 /sec
+            17,440      page-faults                      #    3.984 K/sec                       ( +-  2.90% )
+    41,758,692,473      cycles                           #    9.541 GHz                         ( +-  2.90% )
+   126,201,294,231      instructions                     #    5.98  insn per cycle              ( +-  2.90% )
+    25,348,098,335      branches                         #    5.791 G/sec                       ( +-  2.90% )
+        33,436,921      branch-misses                    #    0.26% of all branches             ( +-  2.90% )
+
+         0.0869148 +- 0.0000302 seconds time elapsed  ( +-  0.03% )
+
+After:
+          8,444.81 msec task-clock                       #   99.726 CPUs utilized               ( +-  2.90% )
+                22      context-switches                 #    5.160 /sec                        ( +-  3.23% )
+                 0      cpu-migrations                   #    0.000 /sec
+            17,443      page-faults                      #    4.091 K/sec                       ( +-  2.90% )
+    40,616,738,355      cycles                           #    9.527 GHz                         ( +-  2.90% )
+   126,383,351,792      instructions                     #    6.16  insn per cycle              ( +-  2.90% )
+    25,224,985,153      branches                         #    5.917 G/sec                       ( +-  2.90% )
+        32,236,793      branch-misses                    #    0.25% of all branches             ( +-  2.90% )
+
+         0.0846799 +- 0.0000412 seconds time elapsed  ( +-  0.05% )
+
+A side effect is that this also ensures that pages whose pageblock gets
+stolen while on the pcplist end up on the right freelist and we don't
+perform potentially type-incompatible buddy merges (or skip merges when we
+shouldn't), whis is likely beneficial to long-term fragmentation
+management, although the effects would be harder to measure.  Settle for
+simpler and faster code as justification here.
+
+Link: https://lkml.kernel.org/r/20230911195023.247694-1-hannes@cmpxchg.org
+Link: https://lkml.kernel.org/r/20230911195023.247694-2-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
