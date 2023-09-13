@@ -1,0 +1,115 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: lib/stackdepot: allow users to evict stack traces
+Date: Wed, 13 Sep 2023 19:14:41 +0200
+
+Add stack_depot_put, a function that decrements the reference counter on a
+stack record and removes it from the stack depot once the counter reaches
+0.
+
+Internally, when removing a stack record, the function unlinks it from the
+hash table bucket and returns to the freelist.
+
+With this change, the users of stack depot can call stack_depot_put when
+keeping a stack trace in the stack depot is not needed anymore.  This
+allows avoiding polluting the stack depot with irrelevant stack traces and
+thus have more space to store the relevant ones before the stack depot
+reaches its capacity.
+
+Link: https://lkml.kernel.org/r/1a3ea1e6b82f95eea644875756e12daba6c4cc7f.1694625260.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/stackdepot.h |   14 ++++++++++++++
+ lib/stackdepot.c           |   35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+--- a/include/linux/stackdepot.h~lib-stackdepot-allow-users-to-evict-stack-traces
++++ a/include/linux/stackdepot.h
+@@ -97,6 +97,8 @@ static inline int stack_depot_early_init
+  *
+  * If STACK_DEPOT_FLAG_GET is set in @depot_flags, stack depot will increment
+  * the refcount on the saved stack trace if it already exists in stack depot.
++ * Users of this flag must also call stack_depot_put() when keeping the stack
++ * trace is no longer required to avoid overflowing the refcount.
+  *
+  * If the provided stack trace comes from the interrupt context, only the part
+  * up to the interrupt entry is saved.
+@@ -163,6 +165,18 @@ int stack_depot_snprint(depot_stack_hand
+ 		       int spaces);
+ 
+ /**
++ * stack_depot_put - Drop a reference to a stack trace from stack depot
++ *
++ * @handle:	Stack depot handle returned from stack_depot_save()
++ *
++ * The stack trace is evicted from stack depot once all references to it have
++ * been dropped (once the number of stack_depot_evict() calls matches the
++ * number of stack_depot_save_flags() calls with STACK_DEPOT_FLAG_GET set for
++ * this stack trace).
++ */
++void stack_depot_put(depot_stack_handle_t handle);
++
++/**
+  * stack_depot_set_extra_bits - Set extra bits in a stack depot handle
+  *
+  * @handle:	Stack depot handle returned from stack_depot_save()
+--- a/lib/stackdepot.c~lib-stackdepot-allow-users-to-evict-stack-traces
++++ a/lib/stackdepot.c
+@@ -398,6 +398,14 @@ static struct stack_record *depot_fetch_
+ 	return stack;
+ }
+ 
++/* Links stack into the freelist. */
++static void depot_free_stack(struct stack_record *stack)
++{
++	lockdep_assert_held_write(&pool_rwlock);
++
++	list_add(&stack->list, &free_stacks);
++}
++
+ /* Calculates the hash for a stack. */
+ static inline u32 hash_stack(unsigned long *entries, unsigned int size)
+ {
+@@ -580,6 +588,33 @@ unsigned int stack_depot_fetch(depot_sta
+ }
+ EXPORT_SYMBOL_GPL(stack_depot_fetch);
+ 
++void stack_depot_put(depot_stack_handle_t handle)
++{
++	struct stack_record *stack;
++	unsigned long flags;
++
++	if (!handle || stack_depot_disabled)
++		return;
++
++	write_lock_irqsave(&pool_rwlock, flags);
++
++	stack = depot_fetch_stack(handle);
++	if (WARN_ON(!stack))
++		goto out;
++
++	if (refcount_dec_and_test(&stack->count)) {
++		/* Unlink stack from the hash table. */
++		list_del(&stack->list);
++
++		/* Free stack. */
++		depot_free_stack(stack);
++	}
++
++out:
++	write_unlock_irqrestore(&pool_rwlock, flags);
++}
++EXPORT_SYMBOL_GPL(stack_depot_put);
++
+ void stack_depot_print(depot_stack_handle_t stack)
+ {
+ 	unsigned long *entries;
+_

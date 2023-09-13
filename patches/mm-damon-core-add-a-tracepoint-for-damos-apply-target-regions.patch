@@ -1,0 +1,154 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/damon/core: add a tracepoint for damos apply target regions
+Date: Wed, 13 Sep 2023 02:20:49 +0000
+
+Patch series "mm/damon: add a tracepoint for damos apply target regions",
+v2.
+
+DAMON provides damon_aggregated tracepoint to let users record full
+monitoring results.  Sometimes, users need to record monitoring results of
+specific pattern.  DAMOS tried regions directory of DAMON sysfs interface
+allows it, but the interface is mainly designed for snapshots and
+therefore would be inefficient for such recording.  Implement yet another
+tracepoint for efficient support of the usecase.
+
+
+This patch (of 2):
+
+DAMON provides damon_aggregated tracepoint, which exposes details of each
+region and its access monitoring results.  It is useful for getting whole
+monitoring results, e.g., for recording purposes.
+
+For investigations of DAMOS, DAMON Sysfs interface provides DAMOS
+statistics and tried_regions directory.  But, those provides only
+statistics and snapshots.  If the scheme is frequently applied and if the
+user needs to know every detail of DAMOS behavior, the snapshot-based
+interface could be insufficient and expensive.
+
+As a last resort, userspace users need to record the all monitoring
+results via damon_aggregated tracepoint and simulate how DAMOS would
+worked.  It is unnecessarily complicated.  DAMON kernel API users,
+meanwhile, can do that easily via before_damos_apply() callback field of
+'struct damon_callback', though.
+
+Add a tracepoint that will be called just after before_damos_apply()
+callback for more convenient investigations of DAMOS.  The tracepoint
+exposes all details about each regions, similar to damon_aggregated
+tracepoint.
+
+Please note that DAMOS is currently not only for memory management but
+also for query-like efficient monitoring results retrievals (when 'stat'
+action is used).  Until now, only statistics or snapshots were supported. 
+Addition of this tracepoint allows efficient full recording of DAMOS-based
+filtered monitoring results.
+
+Link: https://lkml.kernel.org/r/20230913022050.2109-1-sj@kernel.org
+Link: https://lkml.kernel.org/r/20230913022050.2109-2-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/trace/events/damon.h |   39 +++++++++++++++++++++++++++++++++
+ mm/damon/core.c              |   32 ++++++++++++++++++++++++++-
+ 2 files changed, 70 insertions(+), 1 deletion(-)
+
+--- a/include/trace/events/damon.h~mm-damon-core-add-a-tracepoint-for-damos-apply-target-regions
++++ a/include/trace/events/damon.h
+@@ -9,6 +9,45 @@
+ #include <linux/types.h>
+ #include <linux/tracepoint.h>
+ 
++TRACE_EVENT_CONDITION(damos_before_apply,
++
++	TP_PROTO(unsigned int context_idx, unsigned int scheme_idx,
++		unsigned int target_idx, struct damon_region *r,
++		unsigned int nr_regions, bool do_trace),
++
++	TP_ARGS(context_idx, target_idx, scheme_idx, r, nr_regions, do_trace),
++
++	TP_CONDITION(do_trace),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, context_idx)
++		__field(unsigned int, scheme_idx)
++		__field(unsigned long, target_idx)
++		__field(unsigned long, start)
++		__field(unsigned long, end)
++		__field(unsigned int, nr_accesses)
++		__field(unsigned int, age)
++		__field(unsigned int, nr_regions)
++	),
++
++	TP_fast_assign(
++		__entry->context_idx = context_idx;
++		__entry->scheme_idx = scheme_idx;
++		__entry->target_idx = target_idx;
++		__entry->start = r->ar.start;
++		__entry->end = r->ar.end;
++		__entry->nr_accesses = r->nr_accesses;
++		__entry->age = r->age;
++		__entry->nr_regions = nr_regions;
++	),
++
++	TP_printk("ctx_idx=%u scheme_idx=%u target_idx=%lu nr_regions=%u %lu-%lu: %u %u",
++			__entry->context_idx, __entry->scheme_idx,
++			__entry->target_idx, __entry->nr_regions,
++			__entry->start, __entry->end,
++			__entry->nr_accesses, __entry->age)
++);
++
+ TRACE_EVENT(damon_aggregated,
+ 
+ 	TP_PROTO(unsigned int target_id, struct damon_region *r,
+--- a/mm/damon/core.c~mm-damon-core-add-a-tracepoint-for-damos-apply-target-regions
++++ a/mm/damon/core.c
+@@ -950,6 +950,33 @@ static void damos_apply_scheme(struct da
+ 	struct timespec64 begin, end;
+ 	unsigned long sz_applied = 0;
+ 	int err = 0;
++	/*
++	 * We plan to support multiple context per kdamond, as DAMON sysfs
++	 * implies with 'nr_contexts' file.  Nevertheless, only single context
++	 * per kdamond is supported for now.  So, we can simply use '0' context
++	 * index here.
++	 */
++	unsigned int cidx = 0;
++	struct damos *siter;		/* schemes iterator */
++	unsigned int sidx = 0;
++	struct damon_target *titer;	/* targets iterator */
++	unsigned int tidx = 0;
++	bool do_trace = false;
++
++	/* get indices for trace_damos_before_apply() */
++	if (trace_damos_before_apply_enabled()) {
++		damon_for_each_scheme(siter, c) {
++			if (siter == s)
++				break;
++			sidx++;
++		}
++		damon_for_each_target(titer, c) {
++			if (titer == t)
++				break;
++			tidx++;
++		}
++		do_trace = true;
++	}
+ 
+ 	if (c->ops.apply_scheme) {
+ 		if (quota->esz && quota->charged_sz + sz > quota->esz) {
+@@ -964,8 +991,11 @@ static void damos_apply_scheme(struct da
+ 		ktime_get_coarse_ts64(&begin);
+ 		if (c->callback.before_damos_apply)
+ 			err = c->callback.before_damos_apply(c, t, r, s);
+-		if (!err)
++		if (!err) {
++			trace_damos_before_apply(cidx, sidx, tidx, r,
++					damon_nr_regions(t), do_trace);
+ 			sz_applied = c->ops.apply_scheme(c, t, r, s);
++		}
+ 		ktime_get_coarse_ts64(&end);
+ 		quota->total_charged_ns += timespec64_to_ns(&end) -
+ 			timespec64_to_ns(&begin);
+_
