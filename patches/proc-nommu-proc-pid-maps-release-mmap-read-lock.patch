@@ -1,0 +1,85 @@
+From: Ben Wolsieffer <Ben.Wolsieffer@hefring.com>
+Subject: proc: nommu: /proc/<pid>/maps: release mmap read lock
+Date: Thu, 14 Sep 2023 12:30:20 -0400
+
+On NOMMU, when running "cat /proc/1/maps" twice the second run hangs.
+
+The no-MMU implementation of /proc/<pid>/map doesn't normally release the
+mmap read lock, because it uses !IS_ERR_OR_NULL(_vml) to determine whether
+to release the lock.  Since _vml is NULL when the end of the mappings is
+reached, the lock is not released.
+
+This code was incorrectly adapted from the MMU implementation, which at
+the time released the lock in m_next() before returning the last entry.
+
+The MMU implementation has diverged further from the no-MMU version since
+then, so this patch brings their locking and error handling into sync,
+fixing the bug and hopefully avoiding similar issues in the future.
+
+Link: https://lkml.kernel.org/r/20230914163019.4050530-2-ben.wolsieffer@hefring.com
+Fixes: 47fecca15c09 ("fs/proc/task_nommu.c: don't use priv->task->mm")
+Signed-off-by: Ben Wolsieffer <ben.wolsieffer@hefring.com>
+Cc: Giulio Benetti <giulio.benetti@benettiengineering.com>
+Cc: Greg Ungerer <gerg@uclinux.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/proc/task_nommu.c |   27 +++++++++++++++------------
+ 1 file changed, 15 insertions(+), 12 deletions(-)
+
+--- a/fs/proc/task_nommu.c~proc-nommu-proc-pid-maps-release-mmap-read-lock
++++ a/fs/proc/task_nommu.c
+@@ -192,11 +192,16 @@ static void *m_start(struct seq_file *m,
+ 		return ERR_PTR(-ESRCH);
+ 
+ 	mm = priv->mm;
+-	if (!mm || !mmget_not_zero(mm))
++	if (!mm || !mmget_not_zero(mm)) {
++		put_task_struct(priv->task);
++		priv->task = NULL;
+ 		return NULL;
++	}
+ 
+ 	if (mmap_read_lock_killable(mm)) {
+ 		mmput(mm);
++		put_task_struct(priv->task);
++		priv->task = NULL;
+ 		return ERR_PTR(-EINTR);
+ 	}
+ 
+@@ -205,23 +210,21 @@ static void *m_start(struct seq_file *m,
+ 	if (vma)
+ 		return vma;
+ 
+-	mmap_read_unlock(mm);
+-	mmput(mm);
+ 	return NULL;
+ }
+ 
+-static void m_stop(struct seq_file *m, void *_vml)
++static void m_stop(struct seq_file *m, void *v)
+ {
+ 	struct proc_maps_private *priv = m->private;
++	struct mm_struct *mm = priv->mm;
+ 
+-	if (!IS_ERR_OR_NULL(_vml)) {
+-		mmap_read_unlock(priv->mm);
+-		mmput(priv->mm);
+-	}
+-	if (priv->task) {
+-		put_task_struct(priv->task);
+-		priv->task = NULL;
+-	}
++	if (!priv->task)
++		return;
++
++	mmap_read_unlock(mm);
++	mmput(mm);
++	put_task_struct(priv->task);
++	priv->task = NULL;
+ }
+ 
+ static void *m_next(struct seq_file *m, void *_p, loff_t *pos)
+_
