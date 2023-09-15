@@ -1,0 +1,87 @@
+From: Mike Kravetz <mike.kravetz@oracle.com>
+Subject: hugetlb: optimize update_and_free_pages_bulk to avoid lock cycles
+Date: Fri, 15 Sep 2023 15:15:38 -0700
+
+update_and_free_pages_bulk is designed to free a list of hugetlb pages
+back to their associated lower level allocators.  This may require
+allocating vmemmmap pages associated with each hugetlb page.  The
+hugetlb page destructor must be changed before pages are freed to lower
+level allocators.  However, the destructor must be changed under the
+hugetlb lock.  This means there is potentially one lock cycle per page.
+
+Minimize the number of lock cycles in update_and_free_pages_bulk by:
+1) allocating necessary vmemmap for all hugetlb pages on the list
+2) take hugetlb lock and clear destructor for all pages on the list
+3) free all pages on list back to low level allocators
+
+Link: https://lkml.kernel.org/r/20230915221548.552084-6-mike.kravetz@oracle.com
+Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Acked-by: James Houghton <jthoughton@google.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joao Martins <joao.m.martins@oracle.com>
+Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/hugetlb.c |   39 +++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+
+--- a/mm/hugetlb.c~hugetlb-optimize-update_and_free_pages_bulk-to-avoid-lock-cycles
++++ a/mm/hugetlb.c
+@@ -1830,7 +1830,46 @@ static void update_and_free_hugetlb_foli
+ static void update_and_free_pages_bulk(struct hstate *h, struct list_head *list)
+ {
+ 	struct folio *folio, *t_folio;
++	bool clear_dtor = false;
+ 
++	/*
++	 * First allocate required vmemmmap (if necessary) for all folios on
++	 * list.  If vmemmap can not be allocated, we can not free folio to
++	 * lower level allocator, so add back as hugetlb surplus page.
++	 * add_hugetlb_folio() removes the page from THIS list.
++	 * Use clear_dtor to note if vmemmap was successfully allocated for
++	 * ANY page on the list.
++	 */
++	list_for_each_entry_safe(folio, t_folio, list, lru) {
++		if (folio_test_hugetlb_vmemmap_optimized(folio)) {
++			if (hugetlb_vmemmap_restore(h, &folio->page)) {
++				spin_lock_irq(&hugetlb_lock);
++				add_hugetlb_folio(h, folio, true);
++				spin_unlock_irq(&hugetlb_lock);
++			} else
++				clear_dtor = true;
++		}
++	}
++
++	/*
++	 * If vmemmmap allocation was performed on any folio above, take lock
++	 * to clear destructor of all folios on list.  This avoids the need to
++	 * lock/unlock for each individual folio.
++	 * The assumption is vmemmap allocation was performed on all or none
++	 * of the folios on the list.  This is true expect in VERY rare cases.
++	 */
++	if (clear_dtor) {
++		spin_lock_irq(&hugetlb_lock);
++		list_for_each_entry(folio, list, lru)
++			__clear_hugetlb_destructor(h, folio);
++		spin_unlock_irq(&hugetlb_lock);
++	}
++
++	/*
++	 * Free folios back to low level allocators.  vmemmap and destructors
++	 * were taken care of above, so update_and_free_hugetlb_folio will
++	 * not need to take hugetlb lock.
++	 */
+ 	list_for_each_entry_safe(folio, t_folio, list, lru) {
+ 		update_and_free_hugetlb_folio(h, folio, false);
+ 		cond_resched();
+_
