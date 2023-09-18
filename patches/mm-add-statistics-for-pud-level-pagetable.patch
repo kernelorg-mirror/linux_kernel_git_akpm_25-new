@@ -1,0 +1,149 @@
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+Subject: mm: add statistics for PUD level pagetable
+Date: Mon, 18 Sep 2023 14:31:42 +0800
+
+Recently, we found that cross-die access to pagetable pages on ARM64
+machines can cause performance fluctuations in our business.  Currently,
+there are no PMU events available to track this situation on our ARM64
+machines, so accurate pagetable accounting can help to analyze this issue,
+but now the PUD level pagetable accounting is missed.
+
+So introduce pagetable_pud_ctor/dtor() to help to get accurate PUD
+pagetable accounting, as well as converting the architectures which use
+generic PUD pagetable allocation to add corresponding PUD pagetable
+accounting.  Moreover this patch will mark the PUD level pagetable with
+PG_table flag, which will help to do sanity validation in
+unpoison_memory().
+
+On my testing machine, I can see more pagetables statistics after the patch
+with page-types tool:
+
+Before patch:
+        flags           page-count      MB  symbolic-flags                     long-symbolic-flags
+0x0000000004000000           27326      106  __________________________g_________________       pgtable
+After patch:
+0x0000000004000000           27541      107  __________________________g_________________       pgtable
+
+Link: https://lkml.kernel.org/r/876c71c03a7e69c17722a690e3225a4f7b172fb2.1695017383.git.baolin.wang@linux.alibaba.com
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/include/asm/tlb.h         |    5 ++++-
+ arch/loongarch/include/asm/pgalloc.h |    1 +
+ arch/mips/include/asm/pgalloc.h      |    1 +
+ arch/x86/mm/pgtable.c                |    3 +++
+ include/asm-generic/pgalloc.h        |    7 ++++++-
+ include/linux/mm.h                   |   16 ++++++++++++++++
+ 6 files changed, 31 insertions(+), 2 deletions(-)
+
+--- a/arch/arm64/include/asm/tlb.h~mm-add-statistics-for-pud-level-pagetable
++++ a/arch/arm64/include/asm/tlb.h
+@@ -96,7 +96,10 @@ static inline void __pmd_free_tlb(struct
+ static inline void __pud_free_tlb(struct mmu_gather *tlb, pud_t *pudp,
+ 				  unsigned long addr)
+ {
+-	tlb_remove_ptdesc(tlb, virt_to_ptdesc(pudp));
++	struct ptdesc *ptdesc = virt_to_ptdesc(pudp);
++
++	pagetable_pud_dtor(ptdesc);
++	tlb_remove_ptdesc(tlb, ptdesc);
+ }
+ #endif
+ 
+--- a/arch/loongarch/include/asm/pgalloc.h~mm-add-statistics-for-pud-level-pagetable
++++ a/arch/loongarch/include/asm/pgalloc.h
+@@ -84,6 +84,7 @@ static inline pud_t *pud_alloc_one(struc
+ 
+ 	if (!ptdesc)
+ 		return NULL;
++	pagetable_pud_ctor(ptdesc);
+ 	pud = ptdesc_address(ptdesc);
+ 
+ 	pud_init(pud);
+--- a/arch/mips/include/asm/pgalloc.h~mm-add-statistics-for-pud-level-pagetable
++++ a/arch/mips/include/asm/pgalloc.h
+@@ -95,6 +95,7 @@ static inline pud_t *pud_alloc_one(struc
+ 
+ 	if (!ptdesc)
+ 		return NULL;
++	pagetable_pud_ctor(ptdesc);
+ 	pud = ptdesc_address(ptdesc);
+ 
+ 	pud_init(pud);
+--- a/arch/x86/mm/pgtable.c~mm-add-statistics-for-pud-level-pagetable
++++ a/arch/x86/mm/pgtable.c
+@@ -76,6 +76,9 @@ void ___pmd_free_tlb(struct mmu_gather *
+ #if CONFIG_PGTABLE_LEVELS > 3
+ void ___pud_free_tlb(struct mmu_gather *tlb, pud_t *pud)
+ {
++	struct ptdesc *ptdesc = virt_to_ptdesc(pud);
++
++	pagetable_pud_dtor(ptdesc);
+ 	paravirt_release_pud(__pa(pud) >> PAGE_SHIFT);
+ 	paravirt_tlb_remove_table(tlb, virt_to_page(pud));
+ }
+--- a/include/asm-generic/pgalloc.h~mm-add-statistics-for-pud-level-pagetable
++++ a/include/asm-generic/pgalloc.h
+@@ -169,6 +169,8 @@ static inline pud_t *__pud_alloc_one(str
+ 	ptdesc = pagetable_alloc(gfp, 0);
+ 	if (!ptdesc)
+ 		return NULL;
++
++	pagetable_pud_ctor(ptdesc);
+ 	return ptdesc_address(ptdesc);
+ }
+ 
+@@ -190,8 +192,11 @@ static inline pud_t *pud_alloc_one(struc
+ 
+ static inline void __pud_free(struct mm_struct *mm, pud_t *pud)
+ {
++	struct ptdesc *ptdesc = virt_to_ptdesc(pud);
++
+ 	BUG_ON((unsigned long)pud & (PAGE_SIZE-1));
+-	pagetable_free(virt_to_ptdesc(pud));
++	pagetable_pud_dtor(ptdesc);
++	pagetable_free(ptdesc);
+ }
+ 
+ #ifndef __HAVE_ARCH_PUD_FREE
+--- a/include/linux/mm.h~mm-add-statistics-for-pud-level-pagetable
++++ a/include/linux/mm.h
+@@ -3049,6 +3049,22 @@ static inline spinlock_t *pud_lock(struc
+ 	return ptl;
+ }
+ 
++static inline void pagetable_pud_ctor(struct ptdesc *ptdesc)
++{
++	struct folio *folio = ptdesc_folio(ptdesc);
++
++	__folio_set_pgtable(folio);
++	lruvec_stat_add_folio(folio, NR_PAGETABLE);
++}
++
++static inline void pagetable_pud_dtor(struct ptdesc *ptdesc)
++{
++	struct folio *folio = ptdesc_folio(ptdesc);
++
++	__folio_clear_pgtable(folio);
++	lruvec_stat_sub_folio(folio, NR_PAGETABLE);
++}
++
+ extern void __init pagecache_init(void);
+ extern void free_initmem(void);
+ 
+_

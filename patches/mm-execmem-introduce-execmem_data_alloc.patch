@@ -1,0 +1,202 @@
+From: "Mike Rapoport (IBM)" <rppt@kernel.org>
+Subject: mm/execmem: introduce execmem_data_alloc()
+Date: Mon, 18 Sep 2023 10:29:48 +0300
+
+Data related to code allocations, such as module data section, need to
+comply with architecture constraints for its placement and its allocation
+right now was done using execmem_text_alloc().
+
+Create a dedicated API for allocating data related to code allocations and
+allow architectures to define address ranges for data allocations.
+
+Since currently this is only relevant for powerpc variants that use the
+VMALLOC address space for module data allocations, automatically reuse
+address ranges defined for text unless address range for data is
+explicitly defined by an architecture.
+
+With separation of code and data allocations, data sections of the modules
+are now mapped as PAGE_KERNEL rather than PAGE_KERNEL_EXEC which was a
+default on many architectures.
+
+Link: https://lkml.kernel.org/r/20230918072955.2507221-7-rppt@kernel.org
+Signed-off-by: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Björn Töpel <bjorn@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Dinh Nguyen <dinguyen@kernel.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nadav Amit <nadav.amit@gmail.com>
+Cc: "Naveen N. Rao" <naveen.n.rao@linux.ibm.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Puranjay Mohan <puranjay12@gmail.com>
+Cc: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Cc: Russell King (Oracle) <linux@armlinux.org.uk>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/powerpc/kernel/module.c |   12 ++++++++++++
+ include/linux/execmem.h      |   19 +++++++++++++++++++
+ kernel/module/main.c         |   15 +++------------
+ mm/execmem.c                 |   17 ++++++++++++++++-
+ 4 files changed, 50 insertions(+), 13 deletions(-)
+
+--- a/arch/powerpc/kernel/module.c~mm-execmem-introduce-execmem_data_alloc
++++ a/arch/powerpc/kernel/module.c
+@@ -95,6 +95,9 @@ static struct execmem_params execmem_par
+ 		[EXECMEM_DEFAULT] = {
+ 			.alignment = 1,
+ 		},
++		[EXECMEM_MODULE_DATA] = {
++			.alignment = 1,
++		},
+ 	},
+ };
+ 
+@@ -103,7 +106,12 @@ struct execmem_params __init *execmem_ar
+ 	pgprot_t prot = strict_module_rwx_enabled() ? PAGE_KERNEL : PAGE_KERNEL_EXEC;
+ 	struct execmem_range *range = &execmem_params.ranges[EXECMEM_DEFAULT];
+ 
++	/*
++	 * BOOK3S_32 and 8xx define MODULES_VADDR for text allocations and
++	 * allow allocating data in the entire vmalloc space
++	 */
+ #ifdef MODULES_VADDR
++	struct execmem_range *data = &execmem_params.ranges[EXECMEM_MODULE_DATA];
+ 	unsigned long limit = (unsigned long)_etext - SZ_32M;
+ 
+ 	/* First try within 32M limit from _etext to avoid branch trampolines */
+@@ -116,6 +124,10 @@ struct execmem_params __init *execmem_ar
+ 		range->start = MODULES_VADDR;
+ 		range->end = MODULES_END;
+ 	}
++	data->start = VMALLOC_START;
++	data->end = VMALLOC_END;
++	data->pgprot = PAGE_KERNEL;
++	data->alignment = 1;
+ #else
+ 	range->start = VMALLOC_START;
+ 	range->end = VMALLOC_END;
+--- a/include/linux/execmem.h~mm-execmem-introduce-execmem_data_alloc
++++ a/include/linux/execmem.h
+@@ -29,6 +29,7 @@
+  * @EXECMEM_KPROBES: parameters for kprobes
+  * @EXECMEM_FTRACE: parameters for ftrace
+  * @EXECMEM_BPF: parameters for BPF
++ * @EXECMEM_MODULE_DATA: parameters for module data sections
+  * @EXECMEM_TYPE_MAX:
+  */
+ enum execmem_type {
+@@ -37,6 +38,7 @@ enum execmem_type {
+ 	EXECMEM_KPROBES,
+ 	EXECMEM_FTRACE,
+ 	EXECMEM_BPF,
++	EXECMEM_MODULE_DATA,
+ 	EXECMEM_TYPE_MAX,
+ };
+ 
+@@ -108,6 +110,23 @@ struct execmem_params *execmem_arch_para
+ void *execmem_text_alloc(enum execmem_type type, size_t size);
+ 
+ /**
++ * execmem_data_alloc - allocate memory for data coupled to code
++ * @type: type of the allocation
++ * @size: how many bytes of memory are required
++ *
++ * Allocates memory that will contain data coupled with executable code,
++ * like data sections in kernel modules.
++ *
++ * The memory will have protections defined by architecture.
++ *
++ * The allocated memory will reside in an area that does not impose
++ * restrictions on the addressing modes.
++ *
++ * Return: a pointer to the allocated memory or %NULL
++ */
++void *execmem_data_alloc(enum execmem_type type, size_t size);
++
++/**
+  * execmem_free - free executable memory
+  * @ptr: pointer to the memory that should be freed
+  */
+--- a/kernel/module/main.c~mm-execmem-introduce-execmem_data_alloc
++++ a/kernel/module/main.c
+@@ -1188,25 +1188,16 @@ void __weak module_arch_freeing_init(str
+ {
+ }
+ 
+-static bool mod_mem_use_vmalloc(enum mod_mem_type type)
+-{
+-	return IS_ENABLED(CONFIG_ARCH_WANTS_MODULES_DATA_IN_VMALLOC) &&
+-		mod_mem_type_is_core_data(type);
+-}
+-
+ static void *module_memory_alloc(unsigned int size, enum mod_mem_type type)
+ {
+-	if (mod_mem_use_vmalloc(type))
+-		return vzalloc(size);
++	if (mod_mem_type_is_data(type))
++		return execmem_data_alloc(EXECMEM_MODULE_DATA, size);
+ 	return execmem_text_alloc(EXECMEM_MODULE_TEXT, size);
+ }
+ 
+ static void module_memory_free(void *ptr, enum mod_mem_type type)
+ {
+-	if (mod_mem_use_vmalloc(type))
+-		vfree(ptr);
+-	else
+-		execmem_free(ptr);
++	execmem_free(ptr);
+ }
+ 
+ static void free_mod_mem(struct module *mod)
+--- a/mm/execmem.c~mm-execmem-introduce-execmem_data_alloc
++++ a/mm/execmem.c
+@@ -53,11 +53,23 @@ static void *execmem_alloc(size_t size,
+ 	return kasan_reset_tag(p);
+ }
+ 
++static inline bool execmem_range_is_data(enum execmem_type type)
++{
++	return type == EXECMEM_MODULE_DATA;
++}
++
+ void *execmem_text_alloc(enum execmem_type type, size_t size)
+ {
+ 	return execmem_alloc(size, &execmem_params.ranges[type]);
+ }
+ 
++void *execmem_data_alloc(enum execmem_type type, size_t size)
++{
++	WARN_ON_ONCE(!execmem_range_is_data(type));
++
++	return execmem_alloc(size, &execmem_params.ranges[type]);
++}
++
+ void execmem_free(void *ptr)
+ {
+ 	/*
+@@ -93,7 +105,10 @@ static void execmem_init_missing(struct
+ 		struct execmem_range *r = &p->ranges[i];
+ 
+ 		if (!r->start) {
+-			r->pgprot = default_range->pgprot;
++			if (execmem_range_is_data(i))
++				r->pgprot = PAGE_KERNEL;
++			else
++				r->pgprot = default_range->pgprot;
+ 			r->alignment = default_range->alignment;
+ 			r->start = default_range->start;
+ 			r->end = default_range->end;
+_
