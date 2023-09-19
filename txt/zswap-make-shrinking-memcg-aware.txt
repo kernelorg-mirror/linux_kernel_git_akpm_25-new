@@ -1,0 +1,103 @@
+From: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Subject: zswap: make shrinking memcg-aware
+Date: Tue, 19 Sep 2023 10:14:46 -0700
+
+Patch series "workload-specific and memory pressure-driven zswap
+writeback", v2.
+
+There are currently several issues with zswap writeback:
+
+1. There is only a single global LRU for zswap. This makes it impossible
+   to perform worload-specific shrinking - an memcg under memory
+   pressure cannot determine which pages in the pool it owns, and often
+   ends up writing pages from other memcgs. This issue has been
+   previously observed in practice and mitigated by simply disabling
+   memcg-initiated shrinking:
+
+   https://lore.kernel.org/all/20230530232435.3097106-1-nphamcs@gmail.com/T/#u
+
+   But this solution leaves a lot to be desired, as we still do not have an
+   avenue for an memcg to free up its own memory locked up in zswap.
+
+2. We only shrink the zswap pool when the user-defined limit is hit.
+   This means that if we set the limit too high, cold data that are
+   unlikely to be used again will reside in the pool, wasting precious
+   memory. It is hard to predict how much zswap space will be needed
+   ahead of time, as this depends on the workload (specifically, on
+   factors such as memory access patterns and compressibility of the
+   memory pages).
+
+This patch series solves these issues by separating the global zswap
+LRU into per-memcg and per-NUMA LRUs, and performs workload-specific
+(i.e memcg- and NUMA-aware) zswap writeback under memory pressure. The
+new shrinker does not have any parameter that must be tuned by the
+user, and can be opted in or out on a per-memcg basis.
+
+On a benchmark that we have run:
+
+(without the shrinker)
+real -- mean: 153.27s, median: 153.199s
+sys -- mean: 541.652s, median: 541.903s
+user -- mean: 4384.9673999999995s, median: 4385.471s
+
+(with the shrinker)
+real -- mean: 151.4956s, median: 151.456s
+sys -- mean: 461.14639999999997s, median: 465.656s
+user -- mean: 4384.7118s, median: 4384.675s
+
+We observed a 14-15% reduction in kernel CPU time, which translated to
+over 1% reduction in real time.
+
+On another benchmark, where there was a lot more cold memory residing in
+zswap, we observed even more pronounced gains:
+
+(without the shrinker)
+real -- mean: 157.52519999999998s, median: 157.281s
+sys -- mean: 769.3082s, median: 780.545s
+user -- mean: 4378.1622s, median: 4378.286s
+
+(with the shrinker)
+real -- mean: 152.9608s, median: 152.845s
+sys -- mean: 517.4446s, median: 506.749s
+user -- mean: 4387.694s, median: 4387.935s
+
+Here, we saw around 32-35% reduction in kernel CPU time, which
+translated to 2.8% reduction in real time. These results confirm our
+hypothesis that the shrinker is more helpful the more cold memory we
+have.
+
+
+This patch (of 2):
+
+Currently, we only have a single global LRU for zswap.  This makes it
+impossible to perform worload-specific shrinking - an memcg cannot
+determine which pages in the pool it owns, and often ends up writing pages
+from other memcgs.  This issue has been previously observed in practice
+and mitigated by simply disabling memcg-initiated shrinking:
+
+https://lore.kernel.org/all/20230530232435.3097106-1-nphamcs@gmail.com/T/#u
+
+This patch fully resolves the issue by replacing the global zswap LRU
+with memcg- and NUMA-specific LRUs, and modify the reclaim logic:
+
+a) When a store attempt hits an memcg limit, it now triggers a
+   synchronous reclaim attempt that, if successful, allows the new
+   hotter page to be accepted by zswap.
+b) If the store attempt instead hits the global zswap limit, it will
+   trigger an asynchronous reclaim attempt, in which an memcg is
+   selected for reclaim in a round-robin-like fashion.
+
+Link: https://lkml.kernel.org/r/20230919171447.2712746-1-nphamcs@gmail.com
+Link: https://lkml.kernel.org/r/20230919171447.2712746-2-nphamcs@gmail.com
+Signed-off-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Co-developed-by: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>
