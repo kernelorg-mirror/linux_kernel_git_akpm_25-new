@@ -1,0 +1,84 @@
+From: Eric DeVolder <eric.devolder@oracle.com>
+Subject: kexec: change locking mechanism to a mutex
+Date: Thu, 21 Sep 2023 17:59:38 -0400
+
+Scaled up testing has revealed that the kexec_trylock() implementation
+leads to failures within the crash hotplug infrastructure due to the
+inability to acquire the lock, specifically the message:
+
+ crash hp: kexec_trylock() failed, elfcorehdr may be inaccurate
+
+When hotplug events occur, the crash hotplug infrastructure first attempts
+to obtain the lock via the kexec_trylock().  However, the implementation
+either acquires the lock, or fails and returns; there is no waiting on the
+lock.  Here is the comment/explanation from
+kernel/kexec_internal.h:kexec_trylock():
+
+ * Whatever is used to serialize accesses to the kexec_crash_image needs to be
+ * NMI safe, as __crash_kexec() can happen during nmi_panic(), so here we use a
+ * "simple" atomic variable that is acquired with a cmpxchg().
+
+While this in theory can happen for either CPU or memory hoptlug, this
+problem is most prone to occur for memory hotplug.
+
+When memory is hot plugged, the memory is converted into smaller 128MiB
+memblocks (typically).  As each memblock is processed, a kernel thread and
+a udev event thread are created.  The udev thread tries for the lock via
+the reading of the sysfs node /sys/devices/system/memory/crash_hotplug
+node, and the kernel worker thread tries for the lock upon entering the
+crash hotplug infrastructure.
+
+These threads then compete for the kexec lock.
+
+For example, a 1GiB DIMM is converted into 8 memblocks, each spawning two
+threads for a total of 16 threads that create a small "swarm" all trying
+to acquire the lock.  The larger the DIMM, the more the memblocks and the
+larger the swarm.
+
+At the root of the problem is the atomic lock behind kexec_trylock(); it
+works well for low lock traffic; ie loading/unloading a capture kernel,
+things that happen basically once.  But with the introduction of crash
+hotplug, the traffic through the lock increases significantly, and more
+importantly in bursts occurring at roughly the same time.  Thus there is a
+need to wait on the lock.
+
+A possible workaround is to simply retry the lock, say up to N times. 
+There is, of course, the problem of determining a value of N that works
+for all implementations, and for all the other call sites of
+kexec_trylock().  Not ideal.
+
+The design decision to use the atomic lock is described in the comment
+from kexec_internal.h, cited above.  However, examining the code of
+__crash_kexec():
+
+        if (kexec_trylock()) {
+                if (kexec_crash_image) {
+                        ...
+                }
+                kexec_unlock();
+        }
+
+reveals that the use of kexec_trylock() here is actually a "best effort"
+due to the atomic lock.  This atomic lock, prior to crash hotplug, would
+almost always be assured (another kexec syscall could hold the lock and
+prevent this, but that is about it).
+
+So at the point where the capture kernel would be invoked, if the lock is
+not obtained, then kdump doesn't occur.
+
+It is possible to instead use a mutex with proper waiting, and utilize
+mutex_trylock() as the "best effort" in __crash_kexec().  The use of a
+mutex then avoids all the lock acquisition problems that were revealed by
+the crash hotplug activity.
+
+Convert the atomic lock to a mutex.
+
+Link: https://lkml.kernel.org/r/20230921215938.2192-1-eric.devolder@oracle.com
+Signed-off-by: Eric DeVolder <eric.devolder@oracle.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Cc: Sourabh Jain <sourabhjain@linux.ibm.com>
+Cc: Vivek Goyal <vgoyal@redhat.com>
