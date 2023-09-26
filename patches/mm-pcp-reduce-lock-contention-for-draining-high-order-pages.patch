@@ -1,0 +1,146 @@
+From: Huang Ying <ying.huang@intel.com>
+Subject: mm, pcp: reduce lock contention for draining high-order pages
+Date: Tue, 26 Sep 2023 14:09:04 +0800
+
+In commit f26b3fa04611 ("mm/page_alloc: limit number of high-order pages
+on PCP during bulk free"), the PCP (Per-CPU Pageset) will be drained when
+PCP is mostly used for high-order pages freeing to improve the cache-hot
+pages reusing between page allocating and freeing CPUs.
+
+On system with small per-CPU data cache, pages shouldn't be cached before
+draining to guarantee cache-hot.  But on a system with large per-CPU data
+cache, more pages can be cached before draining to reduce zone lock
+contention.
+
+So, in this patch, instead of draining without any caching, "batch" pages
+will be cached in PCP before draining if the per-CPU data cache size is
+more than "4 * batch".
+
+On a 2-socket Intel server with 128 logical CPU, with the patch, the
+network bandwidth of the UNIX (AF_UNIX) test case of lmbench test suite
+with 16-pair processes increase 72.2%.  The cycles% of the spinlock
+contention (mostly for zone lock) decreases from 45.8% to 21.2%.  The
+number of PCP draining for high order pages freeing (free_high) decreases
+89.8%.  The cache miss rate keeps 0.3%.
+
+Link: https://lkml.kernel.org/r/20230926060911.266511-4-ying.huang@intel.com
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <jweiner@redhat.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Arjan van de Ven <arjan@linux.intel.com>
+Cc: Sudeep Holla <sudeep.holla@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/base/cacheinfo.c |    2 ++
+ include/linux/gfp.h      |    1 +
+ include/linux/mmzone.h   |    1 +
+ mm/page_alloc.c          |   37 ++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 40 insertions(+), 1 deletion(-)
+
+--- a/drivers/base/cacheinfo.c~mm-pcp-reduce-lock-contention-for-draining-high-order-pages
++++ a/drivers/base/cacheinfo.c
+@@ -943,6 +943,7 @@ static int cacheinfo_cpu_online(unsigned
+ 	if (rc)
+ 		goto err;
+ 	update_data_cache_size(true, cpu);
++	setup_pcp_cacheinfo();
+ 	return 0;
+ err:
+ 	free_cache_attributes(cpu);
+@@ -956,6 +957,7 @@ static int cacheinfo_cpu_pre_down(unsign
+ 
+ 	free_cache_attributes(cpu);
+ 	update_data_cache_size(false, cpu);
++	setup_pcp_cacheinfo();
+ 	return 0;
+ }
+ 
+--- a/include/linux/gfp.h~mm-pcp-reduce-lock-contention-for-draining-high-order-pages
++++ a/include/linux/gfp.h
+@@ -325,6 +325,7 @@ void drain_all_pages(struct zone *zone);
+ void drain_local_pages(struct zone *zone);
+ 
+ void page_alloc_init_late(void);
++void setup_pcp_cacheinfo(void);
+ 
+ /*
+  * gfp_allowed_mask is set to GFP_BOOT_MASK during early boot to restrict what
+--- a/include/linux/mmzone.h~mm-pcp-reduce-lock-contention-for-draining-high-order-pages
++++ a/include/linux/mmzone.h
+@@ -689,6 +689,7 @@ enum zone_watermarks {
+ #define wmark_pages(z, i) (z->_watermark[i] + z->watermark_boost)
+ 
+ #define	PCPF_PREV_FREE_HIGH_ORDER	0x01
++#define	PCPF_FREE_HIGH_BATCH		0x02
+ 
+ struct per_cpu_pages {
+ 	spinlock_t lock;	/* Protects lists field */
+--- a/mm/page_alloc.c~mm-pcp-reduce-lock-contention-for-draining-high-order-pages
++++ a/mm/page_alloc.c
+@@ -52,6 +52,7 @@
+ #include <linux/psi.h>
+ #include <linux/khugepaged.h>
+ #include <linux/delayacct.h>
++#include <linux/cacheinfo.h>
+ #include <asm/div64.h>
+ #include "internal.h"
+ #include "shuffle.h"
+@@ -2415,7 +2416,9 @@ static void free_unref_page_commit(struc
+ 	 */
+ 	if (order && order <= PAGE_ALLOC_COSTLY_ORDER) {
+ 		free_high = (pcp->free_factor &&
+-			     (pcp->flags & PCPF_PREV_FREE_HIGH_ORDER));
++			     (pcp->flags & PCPF_PREV_FREE_HIGH_ORDER) &&
++			     (!(pcp->flags & PCPF_FREE_HIGH_BATCH) ||
++			      pcp->count >= READ_ONCE(pcp->batch)));
+ 		pcp->flags |= PCPF_PREV_FREE_HIGH_ORDER;
+ 	} else if (pcp->flags & PCPF_PREV_FREE_HIGH_ORDER) {
+ 		pcp->flags &= ~PCPF_PREV_FREE_HIGH_ORDER;
+@@ -5448,6 +5451,38 @@ static void zone_pcp_update(struct zone
+ 	mutex_unlock(&pcp_batch_high_lock);
+ }
+ 
++static void zone_pcp_update_cacheinfo(struct zone *zone)
++{
++	int cpu;
++	struct per_cpu_pages *pcp;
++	struct cpu_cacheinfo *cci;
++
++	for_each_online_cpu(cpu) {
++		pcp = per_cpu_ptr(zone->per_cpu_pageset, cpu);
++		cci = get_cpu_cacheinfo(cpu);
++		/*
++		 * If per-CPU data cache is large enough, up to
++		 * "batch" high-order pages can be cached in PCP for
++		 * consecutive freeing.  This can reduce zone lock
++		 * contention without hurting cache-hot pages sharing.
++		 */
++		spin_lock(&pcp->lock);
++		if ((cci->size_data >> PAGE_SHIFT) > 4 * pcp->batch)
++			pcp->flags |= PCPF_FREE_HIGH_BATCH;
++		else
++			pcp->flags &= ~PCPF_FREE_HIGH_BATCH;
++		spin_unlock(&pcp->lock);
++	}
++}
++
++void setup_pcp_cacheinfo(void)
++{
++	struct zone *zone;
++
++	for_each_populated_zone(zone)
++		zone_pcp_update_cacheinfo(zone);
++}
++
+ /*
+  * Allocate per cpu pagesets and initialize them.
+  * Before this call only boot pagesets were available.
+_
