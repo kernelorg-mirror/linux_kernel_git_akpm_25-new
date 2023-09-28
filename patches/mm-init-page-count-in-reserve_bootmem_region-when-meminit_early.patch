@@ -1,0 +1,113 @@
+From: Yajun Deng <yajun.deng@linux.dev>
+Subject: mm: init page count in reserve_bootmem_region when MEMINIT_EARLY
+Date: Thu, 28 Sep 2023 16:33:02 +0800
+
+memmap_init_range() would init page count of all pages, but the free pages
+count would be reset in __free_pages_core().  There are opposite
+operations.  It's unnecessary and time-consuming when it's MEMINIT_EARLY
+context.
+
+Init page count in reserve_bootmem_region when in MEMINIT_EARLY context,
+and check the page count before reset it.
+
+At the same time, the INIT_LIST_HEAD in reserve_bootmem_region isn't
+need, as it already done in __init_single_page.
+
+The following data was tested on an x86 machine with 190GB of RAM.
+
+before:
+free_low_memory_core_early()    341ms
+
+after:
+free_low_memory_core_early()    285ms
+
+Link: https://lkml.kernel.org/r/20230928083302.386202-3-yajun.deng@linux.dev
+Signed-off-by: Yajun Deng <yajun.deng@linux.dev>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mm_init.c    |   18 +++++++++++++-----
+ mm/page_alloc.c |   20 ++++++++++++--------
+ 2 files changed, 25 insertions(+), 13 deletions(-)
+
+--- a/mm/mm_init.c~mm-init-page-count-in-reserve_bootmem_region-when-meminit_early
++++ a/mm/mm_init.c
+@@ -718,7 +718,7 @@ static void __meminit init_reserved_page
+ 		if (zone_spans_pfn(zone, pfn))
+ 			break;
+ 	}
+-	__init_single_page(pfn_to_page(pfn), pfn, zid, nid, INIT_PAGE_COUNT);
++	__init_single_page(pfn_to_page(pfn), pfn, zid, nid, 0);
+ }
+ #else
+ static inline void pgdat_set_deferred_range(pg_data_t *pgdat) {}
+@@ -756,8 +756,8 @@ void __meminit reserve_bootmem_region(ph
+ 
+ 			init_reserved_page(start_pfn, nid);
+ 
+-			/* Avoid false-positive PageTail() */
+-			INIT_LIST_HEAD(&page->lru);
++			/* Init page count for reserved region */
++			init_page_count(page);
+ 
+ 			/*
+ 			 * no need for atomic set_bit because the struct
+@@ -888,9 +888,17 @@ void __meminit memmap_init_range(unsigne
+ 		}
+ 
+ 		page = pfn_to_page(pfn);
+-		__init_single_page(page, pfn, zone, nid, INIT_PAGE_COUNT);
+-		if (context == MEMINIT_HOTPLUG)
++
++		/* If the context is MEMINIT_EARLY, we will init page count and
++		 * mark page reserved in reserve_bootmem_region, the free region
++		 * wouldn't have page count and we will check the pages count
++		 * in __free_pages_core.
++		 */
++		__init_single_page(page, pfn, zone, nid, 0);
++		if (context == MEMINIT_HOTPLUG) {
++			init_page_count(page);
+ 			__SetPageReserved(page);
++		}
+ 
+ 		/*
+ 		 * Usually, we want to mark the pageblock MIGRATE_MOVABLE,
+--- a/mm/page_alloc.c~mm-init-page-count-in-reserve_bootmem_region-when-meminit_early
++++ a/mm/page_alloc.c
+@@ -1289,18 +1289,22 @@ void __free_pages_core(struct page *page
+ 	unsigned int loop;
+ 
+ 	/*
+-	 * When initializing the memmap, __init_single_page() sets the refcount
+-	 * of all pages to 1 ("allocated"/"not free"). We have to set the
+-	 * refcount of all involved pages to 0.
++	 * When initializing the memmap, memmap_init_range sets the refcount
++	 * of all pages to 1 ("reserved" and "free") in hotplug context. We
++	 * have to set the refcount of all involved pages to 0. Otherwise,
++	 * we don't do it, as reserve_bootmem_region only set the refcount on
++	 * reserve region ("reserved") in early context.
+ 	 */
+-	prefetchw(p);
+-	for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
+-		prefetchw(p + 1);
++	if (page_count(page)) {
++		prefetchw(p);
++		for (loop = 0; loop < (nr_pages - 1); loop++, p++) {
++			prefetchw(p + 1);
++			__ClearPageReserved(p);
++			set_page_count(p, 0);
++		}
+ 		__ClearPageReserved(p);
+ 		set_page_count(p, 0);
+ 	}
+-	__ClearPageReserved(p);
+-	set_page_count(p, 0);
+ 
+ 	atomic_long_add(nr_pages, &page_zone(page)->managed_pages);
+ 
+_
