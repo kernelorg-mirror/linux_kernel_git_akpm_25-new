@@ -1,0 +1,157 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: kmem: scoped objcg protection
+Date: Fri, 29 Sep 2023 11:00:54 -0700
+
+Switch to a scope-based protection of the objcg pointer on slab/kmem
+allocation paths.  Instead of using the get_() semantics in the
+pre-allocation hook and put the reference afterwards, let's rely on the
+fact that objcg is pinned by the scope.
+
+It's possible because:
+1) if the objcg is received from the current task struct, the task is
+   keeping a reference to the objcg.
+2) if the objcg is received from an active memcg (remote charging),
+   the memcg is pinned by the scope and has a reference to the
+   corresponding objcg.
+
+Link: https://lkml.kernel.org/r/20230929180056.1122002-5-roman.gushchin@linux.dev
+Signed-off-by: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memcontrol.h |    6 ++++
+ mm/memcontrol.c            |   46 +++++++++++++++++++++++++++++++++--
+ mm/slab.h                  |   10 ++-----
+ 3 files changed, 53 insertions(+), 9 deletions(-)
+
+--- a/include/linux/memcontrol.h~mm-kmem-scoped-objcg-protection
++++ a/include/linux/memcontrol.h
+@@ -1775,6 +1775,12 @@ bool mem_cgroup_kmem_disabled(void);
+ int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order);
+ void __memcg_kmem_uncharge_page(struct page *page, int order);
+ 
++/*
++ * The returned objcg pointer is safe to use without additional
++ * protection within a scope, refer to the implementation for the
++ * additional details.
++ */
++struct obj_cgroup *current_obj_cgroup(void);
+ struct obj_cgroup *get_obj_cgroup_from_current(void);
+ struct obj_cgroup *get_obj_cgroup_from_folio(struct folio *folio);
+ 
+--- a/mm/memcontrol.c~mm-kmem-scoped-objcg-protection
++++ a/mm/memcontrol.c
+@@ -3114,6 +3114,48 @@ from_memcg:
+ 	return objcg;
+ }
+ 
++__always_inline struct obj_cgroup *current_obj_cgroup(void)
++{
++	struct mem_cgroup *memcg;
++	struct obj_cgroup *objcg;
++
++	if (in_task()) {
++		memcg = current->active_memcg;
++		if (unlikely(memcg))
++			goto from_memcg;
++
++		objcg = READ_ONCE(current->objcg);
++		if (unlikely(current_objcg_needs_update(objcg)))
++			objcg = current_objcg_update(objcg);
++		/*
++		 * Objcg reference is kept by the task, so it's safe
++		 * to use the objcg by the current task.
++		 */
++		return objcg;
++	} else {
++		memcg = this_cpu_read(int_active_memcg);
++		if (unlikely(memcg))
++			goto from_memcg;
++	}
++	return NULL;
++
++from_memcg:
++	for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg)) {
++		/*
++		 * Memcg pointer is protected by scope (see set_active_memcg())
++		 * and is pinning the corresponding objcg, so objcg can't go
++		 * away and can be used within the scope without any additional
++		 * protection.
++		 */
++		objcg = rcu_dereference_check(memcg->objcg, 1);
++		if (likely(objcg))
++			break;
++		objcg = NULL;
++	}
++
++	return objcg;
++}
++
+ struct obj_cgroup *get_obj_cgroup_from_folio(struct folio *folio)
+ {
+ 	struct obj_cgroup *objcg;
+@@ -3208,15 +3250,15 @@ int __memcg_kmem_charge_page(struct page
+ 	struct obj_cgroup *objcg;
+ 	int ret = 0;
+ 
+-	objcg = get_obj_cgroup_from_current();
++	objcg = current_obj_cgroup();
+ 	if (objcg) {
+ 		ret = obj_cgroup_charge_pages(objcg, gfp, 1 << order);
+ 		if (!ret) {
++			obj_cgroup_get(objcg);
+ 			page->memcg_data = (unsigned long)objcg |
+ 				MEMCG_DATA_KMEM;
+ 			return 0;
+ 		}
+-		obj_cgroup_put(objcg);
+ 	}
+ 	return ret;
+ }
+--- a/mm/slab.h~mm-kmem-scoped-objcg-protection
++++ a/mm/slab.h
+@@ -484,7 +484,7 @@ static inline bool memcg_slab_pre_alloc_
+ 	if (!(flags & __GFP_ACCOUNT) && !(s->flags & SLAB_ACCOUNT))
+ 		return true;
+ 
+-	objcg = get_obj_cgroup_from_current();
++	objcg = current_obj_cgroup();
+ 	if (!objcg)
+ 		return true;
+ 
+@@ -497,17 +497,14 @@ static inline bool memcg_slab_pre_alloc_
+ 		css_put(&memcg->css);
+ 
+ 		if (ret)
+-			goto out;
++			return false;
+ 	}
+ 
+ 	if (obj_cgroup_charge(objcg, flags, objects * obj_full_size(s)))
+-		goto out;
++		return false;
+ 
+ 	*objcgp = objcg;
+ 	return true;
+-out:
+-	obj_cgroup_put(objcg);
+-	return false;
+ }
+ 
+ static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+@@ -542,7 +539,6 @@ static inline void memcg_slab_post_alloc
+ 			obj_cgroup_uncharge(objcg, obj_full_size(s));
+ 		}
+ 	}
+-	obj_cgroup_put(objcg);
+ }
+ 
+ static inline void memcg_slab_free_hook(struct kmem_cache *s, struct slab *slab,
+_

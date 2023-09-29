@@ -1,0 +1,116 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: kmem: optimize get_obj_cgroup_from_current()
+Date: Fri, 29 Sep 2023 11:00:51 -0700
+
+Patch series "mm: improve performance of accounted kernel memory
+allocations".
+
+This patchset improves the performance of accounted kernel memory
+allocations by ~30% as measured by a micro-benchmark [1].  The benchmark
+is very straightforward: 1M of 64 bytes-large kmalloc() allocations.
+
+Below are results with the disabled kernel memory accounting, the original
+state and with this patchset applied.
+
+|             | Kmem disabled | Original | Patched |  Delta |
+|-------------+---------------+----------+---------+--------|
+| User cgroup |         29764 |    84548 |   59078 | -30.0% |
+| Root cgroup |         29742 |    48342 |   31501 | -34.8% |
+
+As we can see, the patchset removes the majority of the overhead when
+there is no actual accounting (a task belongs to the root memory cgroup)
+and almost halves the accounting overhead otherwise.
+
+The main idea is to get rid of unnecessary memcg to objcg conversions and
+switch to a scope-based protection of objcgs, which eliminates extra
+operations with objcg reference counters under a rcu read lock.  More
+details are provided in individual commit descriptions.
+
+
+This patch (of 5):
+
+Manually inline memcg_kmem_bypass() and active_memcg() to speed up
+get_obj_cgroup_from_current() by avoiding duplicate in_task() checks and
+active_memcg() readings.
+
+Also add a likely() macro to __get_obj_cgroup_from_memcg():
+obj_cgroup_tryget() should succeed at almost all times except a very
+unlikely race with the memcg deletion path.
+
+Link: https://lkml.kernel.org/r/20230929180056.1122002-2-roman.gushchin@linux.dev
+Signed-off-by: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
+Acked-by: Shakeel Butt <shakeelb@google.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol.c |   34 ++++++++++++++--------------------
+ 1 file changed, 14 insertions(+), 20 deletions(-)
+
+--- a/mm/memcontrol.c~mm-kmem-optimize-get_obj_cgroup_from_current
++++ a/mm/memcontrol.c
+@@ -1086,19 +1086,6 @@ struct mem_cgroup *get_mem_cgroup_from_m
+ }
+ EXPORT_SYMBOL(get_mem_cgroup_from_mm);
+ 
+-static __always_inline bool memcg_kmem_bypass(void)
+-{
+-	/* Allow remote memcg charging from any context. */
+-	if (unlikely(active_memcg()))
+-		return false;
+-
+-	/* Memcg to charge can't be determined. */
+-	if (!in_task() || !current->mm || (current->flags & PF_KTHREAD))
+-		return true;
+-
+-	return false;
+-}
+-
+ /**
+  * mem_cgroup_iter - iterate over memory cgroup hierarchy
+  * @root: hierarchy root
+@@ -3047,7 +3034,7 @@ static struct obj_cgroup *__get_obj_cgro
+ 
+ 	for (; !mem_cgroup_is_root(memcg); memcg = parent_mem_cgroup(memcg)) {
+ 		objcg = rcu_dereference(memcg->objcg);
+-		if (objcg && obj_cgroup_tryget(objcg))
++		if (likely(objcg && obj_cgroup_tryget(objcg)))
+ 			break;
+ 		objcg = NULL;
+ 	}
+@@ -3056,16 +3043,23 @@ static struct obj_cgroup *__get_obj_cgro
+ 
+ __always_inline struct obj_cgroup *get_obj_cgroup_from_current(void)
+ {
+-	struct obj_cgroup *objcg = NULL;
+ 	struct mem_cgroup *memcg;
++	struct obj_cgroup *objcg;
+ 
+-	if (memcg_kmem_bypass())
+-		return NULL;
++	if (in_task()) {
++		memcg = current->active_memcg;
++
++		/* Memcg to charge can't be determined. */
++		if (likely(!memcg) && (!current->mm || (current->flags & PF_KTHREAD)))
++			return NULL;
++	} else {
++		memcg = this_cpu_read(int_active_memcg);
++		if (likely(!memcg))
++			return NULL;
++	}
+ 
+ 	rcu_read_lock();
+-	if (unlikely(active_memcg()))
+-		memcg = active_memcg();
+-	else
++	if (!memcg)
+ 		memcg = mem_cgroup_from_task(current);
+ 	objcg = __get_obj_cgroup_from_memcg(memcg);
+ 	rcu_read_unlock();
+_
