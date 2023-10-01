@@ -1,0 +1,67 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: shmem: _add_to_page_cache() before shmem_inode_acct_blocks()
+Date: Fri, 29 Sep 2023 20:32:40 -0700 (PDT)
+
+There has been a recurring problem, that when a tmpfs volume is being
+filled by racing threads, some fail with ENOSPC (or consequent SIGBUS or
+EFAULT) even though all allocations were within the permitted size.
+
+This was a problem since early days, but magnified and complicated by the
+addition of huge pages.  We have often worked around it by adding some
+slop to the tmpfs size, but it's hard to say how much is needed, and some
+users prefer not to do that e.g.  keeping sparse files in a tightly
+tailored tmpfs helps to prevent accidental writing to holes.
+
+This comes from the allocation sequence:
+1. check page cache for existing folio
+2. check and reserve from vm_enough_memory
+3. check and account from size of tmpfs
+4. if huge, check page cache for overlapping folio
+5. allocate physical folio, huge or small
+6. check and charge from mem cgroup limit
+7. add to page cache (but maybe another folio already got in).
+
+Concurrent tasks allocating at the same position could deplete the size
+allowance and fail.  Doing vm_enough_memory and size checks before the
+folio allocation was intentional (to limit the load on the page allocator
+from this source) and still has some virtue; but memory cgroup never did
+that, so I think it's better reordered to favour predictable behaviour.
+
+1. check page cache for existing folio
+2. if huge, check page cache for overlapping folio
+3. allocate physical folio, huge or small
+4. check and charge from mem cgroup limit
+5. add to page cache (but maybe another folio already got in)
+6. check and reserve from vm_enough_memory
+7. check and account from size of tmpfs.
+
+The folio lock held from allocation onwards ensures that the !uptodate
+folio cannot be used by others, and can safely be deleted from the cache
+if checks 6 or 7 subsequently fail (and those waiting on folio lock
+already check that the folio was not truncated once they get the lock);
+and the early addition to page cache ensures that racers find it before
+they try to duplicate the accounting.
+
+Seize the opportunity to tidy up shmem_get_folio_gfp()'s ENOSPC retrying,
+which can be combined inside the new shmem_alloc_and_add_folio(): doing 2
+splits twice (once huge, once nonhuge) is not exactly equivalent to trying
+5 splits (and giving up early on huge), but let's keep it simple unless
+more complication proves necessary.
+
+Userfaultfd is a foreign country: they do things differently there, and
+for good reason - to avoid mmap_lock deadlock.  Leave ordering in
+shmem_mfill_atomic_pte() untouched for now, but I would rather like to
+mesh it better with shmem_get_folio_gfp() in the future.
+
+Link: https://lkml.kernel.org/r/22ddd06-d919-33b-1219-56335c1bf28e@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Carlos Maiolino <cem@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Chuck Lever <chuck.lever@oracle.com>
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Tim Chen <tim.c.chen@intel.com>
