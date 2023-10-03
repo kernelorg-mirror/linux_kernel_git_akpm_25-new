@@ -1,0 +1,158 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: hugetlbfs: drop shared NUMA mempolicy pretence
+Date: Tue, 3 Oct 2023 02:15:09 -0700 (PDT)
+
+A series of mempolicy patches.  Mostly cleanups in mm/mempolicy.c, but
+finally removing the pseudo-vma from shmem folio allocation, and removing
+the mmap_lock around folio migration for mbind and migrate_pages syscalls.
+
+
+This patch (of 12):
+
+hugetlbfs_fallocate() goes through the motions of pasting a shared NUMA
+mempolicy onto its pseudo-vma, but how could there ever be a shared NUMA
+mempolicy for this file?  hugetlb_vm_ops has never offered a set_policy
+method, and hugetlbfs_parse_param() has never supported any mpol options
+for a mount-wide default policy.
+
+It's just an illusion: clean it away so as not to confuse others, giving
+us more freedom to adjust shmem's set_policy/get_policy implementation. 
+But hugetlbfs_inode_info is still required, just to accommodate seals.
+
+Yes, shared NUMA mempolicy support could be added to hugetlbfs, with a
+set_policy method and/or mpol mount option (Andi's first posting did
+include an admitted-unsatisfactory hugetlb_set_policy()); but it seems
+that nobody has bothered to add that in the nineteen years since v2.6.7
+made it possible, and there is at least one company that has invested
+enough into hugetlbfs, that I guess they have learnt well enough how to
+manage its NUMA, without needing shared mempolicy.
+
+Remove linux/mempolicy.h from linux/hugetlb.h: include linux/pagemap.h in
+its place, because hugetlb.h's recently added use of filemap_lock_folio()
+requires that (although most .configs and .c's get it in some other way).
+
+Link: https://lkml.kernel.org/r/ebc0987e-beff-8bfb-9283-234c2cbd17c5@google.com
+Link: https://lkml.kernel.org/r/cae82d4b-904a-faaf-282a-34fcc188c81f@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Tejun heo <tj@kernel.org>
+Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Yang Shi <shy828301@gmail.com>
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c    |   41 --------------------------------------
+ include/linux/hugetlb.h |    3 --
+ 2 files changed, 2 insertions(+), 42 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~hugetlbfs-drop-shared-numa-mempolicy-pretence
++++ a/fs/hugetlbfs/inode.c
+@@ -83,29 +83,6 @@ static const struct fs_parameter_spec hu
+ 	{}
+ };
+ 
+-#ifdef CONFIG_NUMA
+-static inline void hugetlb_set_vma_policy(struct vm_area_struct *vma,
+-					struct inode *inode, pgoff_t index)
+-{
+-	vma->vm_policy = mpol_shared_policy_lookup(&HUGETLBFS_I(inode)->policy,
+-							index);
+-}
+-
+-static inline void hugetlb_drop_vma_policy(struct vm_area_struct *vma)
+-{
+-	mpol_cond_put(vma->vm_policy);
+-}
+-#else
+-static inline void hugetlb_set_vma_policy(struct vm_area_struct *vma,
+-					struct inode *inode, pgoff_t index)
+-{
+-}
+-
+-static inline void hugetlb_drop_vma_policy(struct vm_area_struct *vma)
+-{
+-}
+-#endif
+-
+ /*
+  * Mask used when checking the page offset value passed in via system
+  * calls.  This value will be converted to a loff_t which is signed.
+@@ -853,8 +830,7 @@ static long hugetlbfs_fallocate(struct f
+ 
+ 	/*
+ 	 * Initialize a pseudo vma as this is required by the huge page
+-	 * allocation routines.  If NUMA is configured, use page index
+-	 * as input to create an allocation policy.
++	 * allocation routines.
+ 	 */
+ 	vma_init(&pseudo_vma, mm);
+ 	vm_flags_init(&pseudo_vma, VM_HUGETLB | VM_MAYSHARE | VM_SHARED);
+@@ -902,9 +878,7 @@ static long hugetlbfs_fallocate(struct f
+ 		 * folios in these areas, we need to consume the reserves
+ 		 * to keep reservation accounting consistent.
+ 		 */
+-		hugetlb_set_vma_policy(&pseudo_vma, inode, index);
+ 		folio = alloc_hugetlb_folio(&pseudo_vma, addr, 0);
+-		hugetlb_drop_vma_policy(&pseudo_vma);
+ 		if (IS_ERR(folio)) {
+ 			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+ 			error = PTR_ERR(folio);
+@@ -1283,18 +1257,6 @@ static struct inode *hugetlbfs_alloc_ino
+ 		hugetlbfs_inc_free_inodes(sbinfo);
+ 		return NULL;
+ 	}
+-
+-	/*
+-	 * Any time after allocation, hugetlbfs_destroy_inode can be called
+-	 * for the inode.  mpol_free_shared_policy is unconditionally called
+-	 * as part of hugetlbfs_destroy_inode.  So, initialize policy here
+-	 * in case of a quick call to destroy.
+-	 *
+-	 * Note that the policy is initialized even if we are creating a
+-	 * private inode.  This simplifies hugetlbfs_destroy_inode.
+-	 */
+-	mpol_shared_policy_init(&p->policy, NULL);
+-
+ 	return &p->vfs_inode;
+ }
+ 
+@@ -1306,7 +1268,6 @@ static void hugetlbfs_free_inode(struct
+ static void hugetlbfs_destroy_inode(struct inode *inode)
+ {
+ 	hugetlbfs_inc_free_inodes(HUGETLBFS_SB(inode->i_sb));
+-	mpol_free_shared_policy(&HUGETLBFS_I(inode)->policy);
+ }
+ 
+ static const struct address_space_operations hugetlbfs_aops = {
+--- a/include/linux/hugetlb.h~hugetlbfs-drop-shared-numa-mempolicy-pretence
++++ a/include/linux/hugetlb.h
+@@ -30,7 +30,7 @@ void free_huge_folio(struct folio *folio
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+ 
+-#include <linux/mempolicy.h>
++#include <linux/pagemap.h>
+ #include <linux/shm.h>
+ #include <asm/tlbflush.h>
+ 
+@@ -513,7 +513,6 @@ static inline struct hugetlbfs_sb_info *
+ }
+ 
+ struct hugetlbfs_inode_info {
+-	struct shared_policy policy;
+ 	struct inode vfs_inode;
+ 	unsigned int seals;
+ };
+_
