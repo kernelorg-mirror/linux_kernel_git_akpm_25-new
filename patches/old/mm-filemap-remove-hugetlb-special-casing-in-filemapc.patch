@@ -1,6 +1,6 @@
 From: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Subject: mm/filemap: remove hugetlb special casing in filemap.c
-Date: Mon, 11 Sep 2023 14:53:19 -0700
+Date: Tue, 26 Sep 2023 12:20:17 -0700
 
 Remove special cased hugetlb handling code within the page cache by
 changing the granularity of ->index to the base page size rather than the
@@ -172,33 +172,87 @@ This patch passes libhugetlbfs tests and LTP hugetlb tests
 
 page migration was also tested using Mike Kravetz's test program.[8]
 
-[1]: https://lore.kernel.org/linux-mm/20230519220142.212051-1-sidhartha.kumar@oracle.com/T/
-[2]: https://lore.kernel.org/lkml/20230609194947.37196-1-sidhartha.kumar@oracle.com/
-[3]: https://lore.kernel.org/lkml/ZLtVlJA+V2+2yjxc@casper.infradead.org/T/
-[4]: https://lore.kernel.org/lkml/20230811233939.GA105247@monkey/T/
-[5]: https://lore.kernel.org/linux-mm/202308151231.L2pfzOmu-lkp@intel.com/T/#t
-[6]: https://lore.kernel.org/linux-mm/20230815191932.273054-1-sidhartha.kumar@oracle.com/T/
-[7]: https://lore.kernel.org/linux-mm/ZOTtK1Kfa5gCS3Gb@casper.infradead.org/T/
-[8]: https://lore.kernel.org/linux-mm/20230907001832.GA63356@monkey/T/#m35ed80fc2bb21d613bc4cc8771159d6ae0b5a264
-
-Link: https://lkml.kernel.org/r/20230911215319.644224-1-sidhartha.kumar@oracle.com
+[dan.carpenter@linaro.org: fix an NULL vs IS_ERR() bug]
+  Link: https://lkml.kernel.org/r/1772c296-1417-486f-8eef-171af2192681@moroto.mountain
+Link: https://lkml.kernel.org/r/20230926192017.98183-1-sidhartha.kumar@oracle.com
 Signed-off-by: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Signed-off-by: Dan Carpenter <dan.carpenter@linaro.org>
+Reported-and-tested-by: syzbot+c225dea486da4d5592bd@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=c225dea486da4d5592bd
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Mike Kravetz <mike.kravetz@oracle.com>
 Cc: Muchun Song <songmuchun@bytedance.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/hugetlbfs/inode.c    |   15 ++++++++-------
+ fs/hugetlbfs/inode.c    |   37 +++++++++++++++++++------------------
  include/linux/hugetlb.h |   12 ++++++++++++
  include/linux/pagemap.h |   32 ++------------------------------
  mm/filemap.c            |   34 ++++++++++------------------------
  mm/hugetlb.c            |   32 ++++++--------------------------
  mm/migrate.c            |    6 +++---
- 6 files changed, 41 insertions(+), 90 deletions(-)
+ 6 files changed, 52 insertions(+), 101 deletions(-)
 
 --- a/fs/hugetlbfs/inode.c~mm-filemap-remove-hugetlb-special-casing-in-filemapc
 +++ a/fs/hugetlbfs/inode.c
+@@ -334,7 +334,7 @@ static ssize_t hugetlbfs_read_iter(struc
+ 	ssize_t retval = 0;
+ 
+ 	while (iov_iter_count(to)) {
+-		struct page *page;
++		struct folio *folio;
+ 		size_t nr, copied, want;
+ 
+ 		/* nr is the maximum number of bytes to copy from this page */
+@@ -352,18 +352,18 @@ static ssize_t hugetlbfs_read_iter(struc
+ 		}
+ 		nr = nr - offset;
+ 
+-		/* Find the page */
+-		page = find_lock_page(mapping, index);
+-		if (unlikely(page == NULL)) {
++		/* Find the folio */
++		folio = filemap_lock_hugetlb_folio(h, mapping, index);
++		if (IS_ERR(folio)) {
+ 			/*
+ 			 * We have a HOLE, zero out the user-buffer for the
+ 			 * length of the hole or request.
+ 			 */
+ 			copied = iov_iter_zero(nr, to);
+ 		} else {
+-			unlock_page(page);
++			folio_unlock(folio);
+ 
+-			if (!PageHWPoison(page))
++			if (!folio_test_has_hwpoisoned(folio))
+ 				want = nr;
+ 			else {
+ 				/*
+@@ -371,19 +371,19 @@ static ssize_t hugetlbfs_read_iter(struc
+ 				 * touching the 1st raw HWPOISON subpage after
+ 				 * offset.
+ 				 */
+-				want = adjust_range_hwpoison(page, offset, nr);
++				want = adjust_range_hwpoison(&folio->page, offset, nr);
+ 				if (want == 0) {
+-					put_page(page);
++					folio_put(folio);
+ 					retval = -EIO;
+ 					break;
+ 				}
+ 			}
+ 
+ 			/*
+-			 * We have the page, copy it to user space buffer.
++			 * We have the folio, copy it to user space buffer.
+ 			 */
+-			copied = copy_page_to_iter(page, offset, want, to);
+-			put_page(page);
++			copied = copy_folio_to_iter(folio, offset, want, to);
++			folio_put(folio);
+ 		}
+ 		offset += copied;
+ 		retval += copied;
 @@ -661,21 +661,20 @@ static void remove_inode_hugepages(struc
  {
  	struct hstate *h = hstate_inode(inode);
@@ -268,7 +322,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <asm/hugetlb.h>
  
  #ifndef is_hugepage_only_range
-@@ -1005,6 +1011,12 @@ static inline struct hugepage_subpool *h
+@@ -1007,6 +1013,12 @@ static inline struct hugepage_subpool *h
  {
  	return NULL;
  }
@@ -490,7 +544,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * vma_kernel_pagesize - Page size granularity for this VMA.
   * @vma: The user mapping.
-@@ -2076,20 +2069,6 @@ struct address_space *hugetlb_page_mappi
+@@ -2074,20 +2067,6 @@ struct address_space *hugetlb_page_mappi
  	return NULL;
  }
  
@@ -511,7 +565,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static struct folio *alloc_buddy_hugetlb_folio(struct hstate *h,
  		gfp_t gfp_mask, int nid, nodemask_t *nmask,
  		nodemask_t *node_alloc_noretry)
-@@ -5722,7 +5701,7 @@ static bool hugetlbfs_pagecache_present(
+@@ -5772,7 +5751,7 @@ static bool hugetlbfs_pagecache_present(
  			struct vm_area_struct *vma, unsigned long address)
  {
  	struct address_space *mapping = vma->vm_file->f_mapping;
@@ -520,7 +574,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct folio *folio;
  
  	folio = filemap_get_folio(mapping, idx);
-@@ -5739,6 +5718,7 @@ int hugetlb_add_to_page_cache(struct fol
+@@ -5789,6 +5768,7 @@ int hugetlb_add_to_page_cache(struct fol
  	struct hstate *h = hstate_inode(inode);
  	int err;
  
@@ -528,7 +582,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	__folio_set_locked(folio);
  	err = __filemap_add_folio(mapping, folio, idx, GFP_KERNEL, NULL);
  
-@@ -5846,7 +5826,7 @@ static vm_fault_t hugetlb_no_page(struct
+@@ -5896,7 +5876,7 @@ static vm_fault_t hugetlb_no_page(struct
  	 * before we get page_table_lock.
  	 */
  	new_folio = false;
@@ -537,7 +591,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (IS_ERR(folio)) {
  		size = i_size_read(mapping->host) >> huge_page_shift(h);
  		if (idx >= size)
-@@ -6155,7 +6135,7 @@ vm_fault_t hugetlb_fault(struct mm_struc
+@@ -6205,7 +6185,7 @@ vm_fault_t hugetlb_fault(struct mm_struc
  		/* Just decrements count, does not deallocate */
  		vma_end_reservation(h, vma, haddr);
  
@@ -546,7 +600,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (IS_ERR(pagecache_folio))
  			pagecache_folio = NULL;
  	}
-@@ -6287,7 +6267,7 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_
+@@ -6338,7 +6318,7 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_
  
  	if (is_continue) {
  		ret = -EFAULT;
@@ -557,7 +611,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		folio_in_pagecache = true;
 --- a/mm/migrate.c~mm-filemap-remove-hugetlb-special-casing-in-filemapc
 +++ a/mm/migrate.c
-@@ -521,7 +521,7 @@ int migrate_huge_page_move_mapping(struc
+@@ -524,7 +524,7 @@ int migrate_huge_page_move_mapping(struc
  	int expected_count;
  
  	xas_lock_irq(&xas);
@@ -566,7 +620,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!folio_ref_freeze(src, expected_count)) {
  		xas_unlock_irq(&xas);
  		return -EAGAIN;
-@@ -530,11 +530,11 @@ int migrate_huge_page_move_mapping(struc
+@@ -533,11 +533,11 @@ int migrate_huge_page_move_mapping(struc
  	dst->index = src->index;
  	dst->mapping = src->mapping;
  

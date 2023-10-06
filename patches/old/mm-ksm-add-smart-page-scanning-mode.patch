@@ -1,47 +1,43 @@
 From: Stefan Roesch <shr@devkernel.io>
 Subject: mm/ksm: add "smart" page scanning mode
-Date: Mon, 18 Sep 2023 11:58:13 -0700
+Date: Mon, 25 Sep 2023 21:09:36 -0700
 
-Patch series "Smart scanning mode for KSM", v2.
+Patch series "Smart scanning mode for KSM", v3.
 
 This patch series adds "smart scanning" for KSM.
 
 What is smart scanning?
 =======================
-KSM evaluates all the candidate pages for each scan.  It does not use
-historic information from previous scans.  This has the effect that
-candidate pages that couldn't be used for KSM de-duplication continue to
-be evaluated for each scan.
+KSM evaluates all the candidate pages for each scan. It does not use historic
+information from previous scans. This has the effect that candidate pages that
+couldn't be used for KSM de-duplication continue to be evaluated for each scan.
 
-The idea of "smart scanning" is to keep historic information.  With the
-historic information we can temporarily skip the candidate page for one or
-several scans.
+The idea of "smart scanning" is to keep historic information. With the historic
+information we can temporarily skip the candidate page for one or several scans.
 
 Details:
 ========
-"Smart scanning" is to keep two small counters to store if the page has
-been used for KSM.  One counter stores how often we already tried to use
-the page for KSM and the other counter stores when a page will be used as
-a candidate page again.
+"Smart scanning" is to keep two small counters to store if the page has been
+used for KSM. One counter stores how often we already tried to use the page for
+KSM and the other counter stores how often we skip a page.
 
 How often we skip the candidate page depends how often a page failed KSM
-de-duplication.  The code skips a maximum of 8 times.  During testing this
-has shown to be a good compromise for different workloads.
+de-duplication. The code skips a maximum of 8 times. During testing this has
+shown to be a good compromise for different workloads.
 
 New sysfs knob:
 ===============
-Smart scanning is not enabled by default.  With
-/sys/kernel/mm/ksm/smart_scan smart scanning can be enabled.
+Smart scanning is not enabled by default. With /sys/kernel/mm/ksm/smart_scan
+smart scanning can be enabled.
 
 Monitoring:
 ===========
-To monitor how effective smart scanning is a new sysfs knob has been
-introduced.  /sys/kernel/mm/pages_skipped report how many pages have been
-skipped by smart scanning.
+To monitor how effective smart scanning is a new sysfs knob has been introduced.
+/sys/kernel/mm/pages_skipped report how many pages have been skipped by smart
+scanning.
 
 Results:
 ========
-
 - Various workloads have shown a 20% - 25% reduction in page scans
   For the instagram workload for instance, the number of pages scanned has been
   reduced from over 20M pages per scan to less than 15M pages.
@@ -66,9 +62,10 @@ page scanning of certain pages for a while if de-deduplication for this
 page has not been successful in the past.
 
 To do this it introduces two new fields in the ksm_rmap_item structure:
-age and skip_age.  age, is the KSM age and skip_age is the age for how
-long page scanning of this page is skipped.  The age field is incremented
-each time the page is scanned and the page cannot be de-duplicated.
+age and remaining_skips.  age, is the KSM age and remaining_skips
+determines how often scanning of this page is skipped.  The age field is
+incremented each time the page is scanned and the page cannot be de-
+duplicated.  age updated is capped at U8_MAX.
 
 How often a page is skipped is dependent how often de-duplication has been
 tried so far and the number of skips is currently limited to 8.  This
@@ -81,18 +78,19 @@ The feature has shown to be very effective: upt to 25% of the page scans
 can be eliminated; the pages_to_scan rate can be reduced by 40 - 50% and a
 similar de-duplication rate can be maintained.
 
-Link: https://lkml.kernel.org/r/20230918185816.1518366-1-shr@devkernel.io
-Link: https://lkml.kernel.org/r/20230918185816.1518366-2-shr@devkernel.io
+[akpm@linux-foundation.org: make ksm_smart_scan default true, for testing]
+Link: https://lkml.kernel.org/r/20230926040939.516161-1-shr@devkernel.io
+Link: https://lkml.kernel.org/r/20230926040939.516161-2-shr@devkernel.io
 Signed-off-by: Stefan Roesch <shr@devkernel.io>
-Cc: David Hildenbrand <david@redhat.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Rik van Riel <riel@surriel.com>
-Cc: Hugh Dickins <hughd@google.com>
+Cc: Stefan Roesch <shr@devkernel.io>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/ksm.c |  108 +++++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 108 insertions(+)
+ mm/ksm.c |  104 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 104 insertions(+)
 
 --- a/mm/ksm.c~mm-ksm-add-smart-page-scanning-mode
 +++ a/mm/ksm.c
@@ -110,30 +108,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * @head: pointer to stable_node heading this list in the stable tree
   * @hlist: link into hlist of rmap_items hanging off that stable_node
 + * @age: number of scan iterations since creation
-+ * @skip_age: skip rmap item until age reaches skip_age
++ * @remaining_skips: how many scans to skip
   */
  struct ksm_rmap_item {
  	struct ksm_rmap_item *rmap_list;
-@@ -212,6 +216,8 @@ struct ksm_rmap_item {
- 			struct hlist_node hlist;
- 		};
- 	};
+@@ -205,6 +209,8 @@ struct ksm_rmap_item {
+ 	struct mm_struct *mm;
+ 	unsigned long address;		/* + low bits used for flags below */
+ 	unsigned int oldchecksum;	/* when unstable */
 +	rmap_age_t age;
-+	rmap_age_t skip_age;
- };
- 
- #define SEQNR_MASK	0x0ff	/* low bits of unstable tree seqnr */
-@@ -281,6 +287,9 @@ static unsigned int zero_checksum __read
++	rmap_age_t remaining_skips;
+ 	union {
+ 		struct rb_node node;	/* when node of unstable tree */
+ 		struct {		/* when listed from stable tree */
+@@ -281,6 +287,10 @@ static unsigned int zero_checksum __read
  /* Whether to merge empty (zeroed) pages with actual zero pages */
  static bool ksm_use_zero_pages __read_mostly;
  
-+/* Skip pages that couldn't be de-duplicated previously  */
-+static bool ksm_smart_scan;
++/* Skip pages that couldn't be de-duplicated previously */
++/* Default to true at least temporarily, for testing */
++static bool ksm_smart_scan = true;
 +
  /* The number of zero pages which is placed by KSM */
  unsigned long ksm_zero_pages;
  
-@@ -2305,6 +2314,78 @@ static struct ksm_rmap_item *get_next_rm
+@@ -2305,6 +2315,73 @@ static struct ksm_rmap_item *get_next_rm
  	return rmap_item;
  }
  
@@ -178,41 +177,36 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (PageKsm(page))
 +		return false;
 +
++	age = rmap_item->age;
++	if (age != U8_MAX)
++		rmap_item->age++;
++
 +	/*
 +	 * Smaller ages are not skipped, they need to get a chance to go
 +	 * through the different phases of the KSM merging.
 +	 */
-+	age = rmap_item->age;
-+	rmap_item->age = (rmap_item->age + 1) & 0xFF;
-+
 +	if (age < 3)
 +		return false;
 +
 +	/*
-+	 * Page has been skipped and reached its target age to re-enable
-+	 * scanning the page.
++	 * Are we still allowed to skip? If not, then don't skip it
++	 * and determine how much more often we are allowed to skip next.
 +	 */
-+	if (rmap_item->skip_age == age) {
-+		rmap_item->skip_age = 0;
++	if (!rmap_item->remaining_skips) {
++		rmap_item->remaining_skips = skip_age(age);
 +		return false;
 +	}
 +
-+	/*
-+	 * Skip the page and calculate skip_age on when to re-enable scanning
-+	 * for this page.
-+	 */
-+	if (rmap_item->skip_age == 0) {
-+		rmap_item->skip_age = (age + skip_age(age)) & 0xFF;
-+		remove_rmap_item_from_tree(rmap_item);
-+	}
-+
++	/* Skip this page */
++	rmap_item->remaining_skips--;
++	remove_rmap_item_from_tree(rmap_item);
 +	return true;
 +}
 +
  static struct ksm_rmap_item *scan_get_next_rmap_item(struct page **page)
  {
  	struct mm_struct *mm;
-@@ -2409,6 +2490,10 @@ next_mm:
+@@ -2409,6 +2486,10 @@ next_mm:
  				if (rmap_item) {
  					ksm_scan.rmap_list =
  							&rmap_item->rmap_list;
@@ -223,7 +217,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  					ksm_scan.address += PAGE_SIZE;
  				} else
  					put_page(*page);
-@@ -3449,6 +3534,28 @@ static ssize_t full_scans_show(struct ko
+@@ -3449,6 +3530,28 @@ static ssize_t full_scans_show(struct ko
  }
  KSM_ATTR_RO(full_scans);
  
@@ -252,7 +246,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static struct attribute *ksm_attrs[] = {
  	&sleep_millisecs_attr.attr,
  	&pages_to_scan_attr.attr,
-@@ -3469,6 +3576,7 @@ static struct attribute *ksm_attrs[] = {
+@@ -3469,6 +3572,7 @@ static struct attribute *ksm_attrs[] = {
  	&stable_node_chains_prune_millisecs_attr.attr,
  	&use_zero_pages_attr.attr,
  	&general_profit_attr.attr,
