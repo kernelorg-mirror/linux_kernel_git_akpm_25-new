@@ -1,0 +1,108 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: iomap: protect read_bytes_pending with the state_lock
+Date: Wed, 4 Oct 2023 17:53:02 +0100
+
+Perform one atomic operation (acquiring the spinlock) instead of two
+(spinlock & atomic_sub) per read completion.
+
+Link: https://lkml.kernel.org/r/20231004165317.1061855-3-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Albert Ou <aou@eecs.berkeley.edu>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Richard Henderson <richard.henderson@linaro.org>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/iomap/buffered-io.c |   37 +++++++++++++++++++++++++------------
+ 1 file changed, 25 insertions(+), 12 deletions(-)
+
+--- a/fs/iomap/buffered-io.c~iomap-protect-read_bytes_pending-with-the-state_lock
++++ a/fs/iomap/buffered-io.c
+@@ -29,9 +29,9 @@ typedef int (*iomap_punch_t)(struct inod
+  * and I/O completions.
+  */
+ struct iomap_folio_state {
+-	atomic_t		read_bytes_pending;
+-	atomic_t		write_bytes_pending;
+ 	spinlock_t		state_lock;
++	unsigned int		read_bytes_pending;
++	atomic_t		write_bytes_pending;
+ 
+ 	/*
+ 	 * Each block has two bits in this bitmap:
+@@ -183,7 +183,7 @@ static void ifs_free(struct folio *folio
+ 
+ 	if (!ifs)
+ 		return;
+-	WARN_ON_ONCE(atomic_read(&ifs->read_bytes_pending));
++	WARN_ON_ONCE(ifs->read_bytes_pending != 0);
+ 	WARN_ON_ONCE(atomic_read(&ifs->write_bytes_pending));
+ 	WARN_ON_ONCE(ifs_is_fully_uptodate(folio, ifs) !=
+ 			folio_test_uptodate(folio));
+@@ -250,19 +250,29 @@ static void iomap_adjust_read_range(stru
+ 	*lenp = plen;
+ }
+ 
+-static void iomap_finish_folio_read(struct folio *folio, size_t offset,
++static void iomap_finish_folio_read(struct folio *folio, size_t off,
+ 		size_t len, int error)
+ {
+ 	struct iomap_folio_state *ifs = folio->private;
++	bool uptodate = !error;
++	bool finished = true;
+ 
+-	if (unlikely(error)) {
+-		folio_clear_uptodate(folio);
+-		folio_set_error(folio);
+-	} else {
+-		iomap_set_range_uptodate(folio, offset, len);
++	if (ifs) {
++		unsigned long flags;
++
++		spin_lock_irqsave(&ifs->state_lock, flags);
++		if (!error)
++			uptodate = ifs_set_range_uptodate(folio, ifs, off, len);
++		ifs->read_bytes_pending -= len;
++		finished = !ifs->read_bytes_pending;
++		spin_unlock_irqrestore(&ifs->state_lock, flags);
+ 	}
+ 
+-	if (!ifs || atomic_sub_and_test(len, &ifs->read_bytes_pending))
++	if (error)
++		folio_set_error(folio);
++	if (uptodate)
++		folio_mark_uptodate(folio);
++	if (finished)
+ 		folio_unlock(folio);
+ }
+ 
+@@ -360,8 +370,11 @@ static loff_t iomap_readpage_iter(const
+ 	}
+ 
+ 	ctx->cur_folio_in_bio = true;
+-	if (ifs)
+-		atomic_add(plen, &ifs->read_bytes_pending);
++	if (ifs) {
++		spin_lock_irq(&ifs->state_lock);
++		ifs->read_bytes_pending += plen;
++		spin_unlock_irq(&ifs->state_lock);
++	}
+ 
+ 	sector = iomap_sector(iomap, pos);
+ 	if (!ctx->bio ||
+_

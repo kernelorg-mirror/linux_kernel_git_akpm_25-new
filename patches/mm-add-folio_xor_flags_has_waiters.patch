@@ -1,0 +1,95 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: add folio_xor_flags_has_waiters()
+Date: Wed, 4 Oct 2023 17:53:15 +0100
+
+Optimise folio_end_read() by setting the uptodate bit at the same time we
+clear the unlock bit.  This saves at least one memory barrier and one
+write-after-write hazard.
+
+Link: https://lkml.kernel.org/r/20231004165317.1061855-16-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Albert Ou <aou@eecs.berkeley.edu>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andreas Dilger <adilger.kernel@dilger.ca>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Richard Henderson <richard.henderson@linaro.org>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/page-flags.h |   19 +++++++++++++++++++
+ mm/filemap.c               |   14 +++++++++++---
+ 2 files changed, 30 insertions(+), 3 deletions(-)
+
+--- a/include/linux/page-flags.h~mm-add-folio_xor_flags_has_waiters
++++ a/include/linux/page-flags.h
+@@ -693,6 +693,25 @@ TESTPAGEFLAG_FALSE(Ksm, ksm)
+ u64 stable_page_flags(struct page *page);
+ 
+ /**
++ * folio_xor_flags_has_waiters - Change some folio flags.
++ * @folio: The folio.
++ * @mask: Bits set in this word will be changed.
++ *
++ * This must only be used for flags which are changed with the folio
++ * lock held.  For example, it is unsafe to use for PG_dirty as that
++ * can be set without the folio lock held.  It can also only be used
++ * on flags which are in the range 0-6 as some of the implementations
++ * only affect those bits.
++ *
++ * Return: Whether there are tasks waiting on the folio.
++ */
++static inline bool folio_xor_flags_has_waiters(struct folio *folio,
++		unsigned long mask)
++{
++	return xor_unlock_is_negative_byte(mask, folio_flags(folio, 0));
++}
++
++/**
+  * folio_test_uptodate - Is this folio up to date?
+  * @folio: The folio.
+  *
+--- a/mm/filemap.c~mm-add-folio_xor_flags_has_waiters
++++ a/mm/filemap.c
+@@ -1497,7 +1497,7 @@ void folio_unlock(struct folio *folio)
+ 	BUILD_BUG_ON(PG_waiters != 7);
+ 	BUILD_BUG_ON(PG_locked > 7);
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+-	if (xor_unlock_is_negative_byte(1 << PG_locked, folio_flags(folio, 0)))
++	if (folio_xor_flags_has_waiters(folio, 1 << PG_locked))
+ 		folio_wake_bit(folio, PG_locked);
+ }
+ EXPORT_SYMBOL(folio_unlock);
+@@ -1518,9 +1518,17 @@ EXPORT_SYMBOL(folio_unlock);
+  */
+ void folio_end_read(struct folio *folio, bool success)
+ {
++	unsigned long mask = 1 << PG_locked;
++
++	/* Must be in bottom byte for x86 to work */
++	BUILD_BUG_ON(PG_uptodate > 7);
++	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
++	VM_BUG_ON_FOLIO(folio_test_uptodate(folio), folio);
++
+ 	if (likely(success))
+-		folio_mark_uptodate(folio);
+-	folio_unlock(folio);
++		mask |= 1 << PG_uptodate;
++	if (folio_xor_flags_has_waiters(folio, mask))
++		folio_wake_bit(folio, PG_locked);
+ }
+ EXPORT_SYMBOL(folio_end_read);
+ 
+_

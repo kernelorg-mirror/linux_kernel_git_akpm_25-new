@@ -1,0 +1,139 @@
+From: Breno Leitao <leitao@debian.org>
+Subject: selftests/mm: add a new test for madv and hugetlb
+Date: Thu, 5 Oct 2023 09:39:22 -0700
+
+Create a selftest that exercises the race between page faults and
+madvise(MADV_DONTNEED) in the same huge page. Do it by running two
+threads that touches the huge page and madvise(MADV_DONTNEED) at the same
+time.
+
+In case of a SIGBUS coming at pagefault, the test should fail, since we
+hit the bug.
+
+The test doesn't have a signal handler, and if it fails, it fails like
+the following
+
+  ----------------------------------
+  running ./hugetlb_fault_after_madv
+  ----------------------------------
+  ./run_vmtests.sh: line 186: 595563 Bus error    (core dumped) "$@"
+  [FAIL]
+
+This selftest goes together with the fix of the bug[1] itself.
+
+[1] https://lore.kernel.org/all/20231001005659.2185316-1-riel@surriel.com/#r
+
+Link: https://lkml.kernel.org/r/20231005163922.87568-3-leitao@debian.org
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Reviewed-by: Rik van Riel <riel@surriel.com>
+Tested-by: Rik van Riel <riel@surriel.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ tools/testing/selftests/mm/Makefile                   |    1 
+ tools/testing/selftests/mm/hugetlb_fault_after_madv.c |   73 ++++++++++
+ tools/testing/selftests/mm/run_vmtests.sh             |    4 
+ 3 files changed, 78 insertions(+)
+
+--- /dev/null
++++ a/tools/testing/selftests/mm/hugetlb_fault_after_madv.c
+@@ -0,0 +1,73 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "vm_util.h"
++#include "../kselftest.h"
++
++#define MMAP_SIZE (1 << 21)
++#define INLOOP_ITER 100
++
++char *huge_ptr;
++
++/* Touch the memory while it is being madvised() */
++void *touch(void *unused)
++{
++	char *ptr = (char *)huge_ptr;
++
++	for (int i = 0; i < INLOOP_ITER; i++)
++		ptr[0] = '.';
++
++	return NULL;
++}
++
++void *madv(void *unused)
++{
++	usleep(rand() % 10);
++
++	for (int i = 0; i < INLOOP_ITER; i++)
++		madvise(huge_ptr, MMAP_SIZE, MADV_DONTNEED);
++
++	return NULL;
++}
++
++int main(void)
++{
++	unsigned long free_hugepages;
++	pthread_t thread1, thread2;
++	/*
++	 * On kernel 6.4, we are able to reproduce the problem with ~1000
++	 * interactions
++	 */
++	int max = 10000;
++
++	srand(getpid());
++
++	free_hugepages = get_free_hugepages();
++	if (free_hugepages != 1) {
++		ksft_exit_skip("This test needs one and only one page to execute. Got %lu\n",
++			       free_hugepages);
++	}
++
++	while (max--) {
++		huge_ptr = mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE,
++				MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
++				-1, 0);
++
++		if ((unsigned long)huge_ptr == -1)
++			ksft_exit_skip("Failed to allocated huge page\n");
++
++		pthread_create(&thread1, NULL, madv, NULL);
++		pthread_create(&thread2, NULL, touch, NULL);
++
++		pthread_join(thread1, NULL);
++		pthread_join(thread2, NULL);
++		munmap(huge_ptr, MMAP_SIZE);
++	}
++
++	return KSFT_PASS;
++}
+--- a/tools/testing/selftests/mm/Makefile~selftests-mm-add-a-new-test-for-madv-and-hugetlb
++++ a/tools/testing/selftests/mm/Makefile
+@@ -69,6 +69,7 @@ TEST_GEN_FILES += split_huge_page_test
+ TEST_GEN_FILES += ksm_tests
+ TEST_GEN_FILES += ksm_functional_tests
+ TEST_GEN_FILES += mdwe_test
++TEST_GEN_FILES += hugetlb_fault_after_madv
+ 
+ ifneq ($(ARCH),arm64)
+ TEST_GEN_PROGS += soft-dirty
+--- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-add-a-new-test-for-madv-and-hugetlb
++++ a/tools/testing/selftests/mm/run_vmtests.sh
+@@ -223,6 +223,10 @@ CATEGORY="hugetlb" run_test ./hugepage-m
+ CATEGORY="hugetlb" run_test ./hugepage-vmemmap
+ CATEGORY="hugetlb" run_test ./hugetlb-madvise
+ 
++# For this test, we need one and just one huge page
++echo 1 > /proc/sys/vm/nr_hugepages
++CATEGORY="hugetlb" run_test ./hugetlb_fault_after_madv
++
+ if test_selected "hugetlb"; then
+ 	echo "NOTE: These hugetlb tests provide minimal coverage.  Use"
+ 	echo "      https://github.com/libhugetlbfs/libhugetlbfs.git for"
+_
