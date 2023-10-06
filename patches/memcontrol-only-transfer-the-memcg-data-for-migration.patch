@@ -1,0 +1,142 @@
+From: Nhat Pham <nphamcs@gmail.com>
+Subject: memcontrol: only transfer the memcg data for migration
+Date: Fri, 6 Oct 2023 11:46:27 -0700
+
+For most migration use cases, only transfer the memcg data from the old
+folio to the new folio, and clear the old folio's memcg data.  No charging
+and uncharging will be done.
+
+This shaves off some work on the migration path, and avoids the temporary
+double charging of a folio during its migration.
+
+The only exception is replace_page_cache_folio(), which will use the old
+mem_cgroup_migrate() (now renamed to mem_cgroup_replace_folio).  In that
+context, the isolation of the old page isn't quite as thorough as with
+migration, so we cannot use our new implementation directly.
+
+This patch is the result of the following discussion on the new hugetlb
+memcg accounting behavior:
+
+https://lore.kernel.org/lkml/20231003171329.GB314430@monkey/
+
+Link: https://lkml.kernel.org/r/20231006184629.155543-3-nphamcs@gmail.com
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Frank van der Linden <fvdl@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Tejun heo <tj@kernel.org>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Zefan Li <lizefan.x@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memcontrol.h |    7 ++++++
+ mm/filemap.c               |    2 -
+ mm/memcontrol.c            |   40 ++++++++++++++++++++++++++++++++---
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+--- a/include/linux/memcontrol.h~memcontrol-only-transfer-the-memcg-data-for-migration
++++ a/include/linux/memcontrol.h
+@@ -724,6 +724,8 @@ static inline void mem_cgroup_uncharge_l
+ 
+ void mem_cgroup_cancel_charge(struct mem_cgroup *memcg, unsigned int nr_pages);
+ 
++void mem_cgroup_replace_folio(struct folio *old, struct folio *new);
++
+ void mem_cgroup_migrate(struct folio *old, struct folio *new);
+ 
+ /**
+@@ -1301,6 +1303,11 @@ static inline void mem_cgroup_cancel_cha
+ {
+ }
+ 
++static inline void mem_cgroup_replace_folio(struct folio *old,
++		struct folio *new)
++{
++}
++
+ static inline void mem_cgroup_migrate(struct folio *old, struct folio *new)
+ {
+ }
+--- a/mm/filemap.c~memcontrol-only-transfer-the-memcg-data-for-migration
++++ a/mm/filemap.c
+@@ -816,7 +816,7 @@ void replace_page_cache_folio(struct fol
+ 	new->mapping = mapping;
+ 	new->index = offset;
+ 
+-	mem_cgroup_migrate(old, new);
++	mem_cgroup_replace_folio(old, new);
+ 
+ 	xas_lock_irq(&xas);
+ 	xas_store(&xas, new);
+--- a/mm/memcontrol.c~memcontrol-only-transfer-the-memcg-data-for-migration
++++ a/mm/memcontrol.c
+@@ -7428,16 +7428,17 @@ void __mem_cgroup_uncharge_list(struct l
+ }
+ 
+ /**
+- * mem_cgroup_migrate - Charge a folio's replacement.
++ * mem_cgroup_replace_folio - Charge a folio's replacement.
+  * @old: Currently circulating folio.
+  * @new: Replacement folio.
+  *
+  * Charge @new as a replacement folio for @old. @old will
+- * be uncharged upon free.
++ * be uncharged upon free. This is only used by the page cache
++ * (in replace_page_cache_folio()).
+  *
+  * Both folios must be locked, @new->mapping must be set up.
+  */
+-void mem_cgroup_migrate(struct folio *old, struct folio *new)
++void mem_cgroup_replace_folio(struct folio *old, struct folio *new)
+ {
+ 	struct mem_cgroup *memcg;
+ 	long nr_pages = folio_nr_pages(new);
+@@ -7476,6 +7477,39 @@ void mem_cgroup_migrate(struct folio *ol
+ 	local_irq_restore(flags);
+ }
+ 
++/**
++ * mem_cgroup_migrate - Transfer the memcg data from the old to the new folio.
++ * @old: Currently circulating folio.
++ * @new: Replacement folio.
++ *
++ * Transfer the memcg data from the old folio to the new folio for migration.
++ * The old folio's data info will be cleared. Note that the memory counters
++ * will remain unchanged throughout the process.
++ *
++ * Both folios must be locked, @new->mapping must be set up.
++ */
++void mem_cgroup_migrate(struct folio *old, struct folio *new)
++{
++	struct mem_cgroup *memcg;
++
++	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
++	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
++	VM_BUG_ON_FOLIO(folio_test_anon(old) != folio_test_anon(new), new);
++	VM_BUG_ON_FOLIO(folio_nr_pages(old) != folio_nr_pages(new), new);
++
++	if (mem_cgroup_disabled())
++		return;
++
++	memcg = folio_memcg(old);
++	VM_WARN_ON_ONCE_FOLIO(!memcg, old);
++	if (!memcg)
++		return;
++
++	/* Transfer the charge and the css ref */
++	commit_charge(new, memcg);
++	old->memcg_data = 0;
++}
++
+ DEFINE_STATIC_KEY_FALSE(memcg_sockets_enabled_key);
+ EXPORT_SYMBOL(memcg_sockets_enabled_key);
+ 
+_
