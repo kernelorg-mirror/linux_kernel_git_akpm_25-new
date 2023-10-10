@@ -1,0 +1,90 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: mm: memcg: restore subtree stats flushing
+Date: Tue, 10 Oct 2023 03:21:16 +0000
+
+Stats flushing for memcg currently follows the following rules:
+- Always flush the entire memcg hierarchy (i.e. flush the root).
+- Only one flusher is allowed at a time. If someone else tries to flush
+  concurrently, they skip and return immediately.
+- A periodic flusher flushes all the stats every 2 seconds.
+
+The reason this approach is followed is because all flushes are
+serialized by a global rstat spinlock. On the memcg side, flushing is
+invoked from userspace reads as well as in-kernel flushers (e.g.
+reclaim, refault, etc). This approach aims to avoid serializing all
+flushers on the global lock, which can cause a significant performance
+hit under high concurrency.
+
+This approach has the following problems:
+- Occasionally a userspace read of the stats of a non-root cgroup will
+  be too expensive as it has to flush the entire hierarchy [1].
+- Sometimes the stats accuracy are compromised if there is an ongoing
+  flush, and we skip and return before the subtree of interest is
+  actually flushed, yielding stale stats (by up to 2s due to periodic
+  flushing). This is more visible when reading stats from userspace,
+  but can also affect in-kernel flushers.
+
+The latter problem is particulary a concern when userspace reads stats
+after an event occurs, but gets stats from before the event. Examples:
+- When memory usage / pressure spikes, a userspace OOM handler may look
+  at the stats of different memcgs to select a victim based on various
+  heuristics (e.g. how much private memory will be freed by killing
+  this). Reading stale stats from before the usage spike in this case
+  may cause a wrongful OOM kill.
+- A proactive reclaimer may read the stats after writing to
+  memory.reclaim to measure the success of the reclaim operation. Stale
+  stats from before reclaim may give a false negative.
+- Reading the stats of a parent and a child memcg may be inconsistent
+  (child larger than parent), if the flush doesn't happen when the
+  parent is read, but happens when the child is read.
+
+As for in-kernel flushers, they will occasionally get stale stats. No
+regressions are currently known from this, but if there are regressions,
+they would be very difficult to debug and link to the source of the
+problem.
+
+This patch aims to fix these problems by restoring subtree flushing,
+and removing the unified/coalesced flushing logic that skips flushing if
+there is an ongoing flush. This change would introduce a significant
+regression with global stats flushing thresholds. With per-memcg stats
+flushing thresholds, this seems to perform really well. The thresholds
+protect the underlying lock from unnecessary contention.
+
+Add a mutex to protect the underlying rstat lock from excessive memcg
+flushing. The thresholds are re-checked after the mutex is grabbed to
+make sure that a concurrent flush did not already get the subtree we are
+trying to flush. A call to cgroup_rstat_flush() is not cheap, even if
+there are no pending updates.
+
+This patch was tested in two ways to ensure the latency of flushing is
+up to bar, on a machine with 384 cpus:
+- A synthetic test with 5000 concurrent workers in 500 cgroups doing
+  allocations and reclaim, as well as 1000 readers for memory.stat
+  (variation of [2]). No regressions were noticed in the total runtime.
+  Note that significant regressions in this test are observed with
+  global stats thresholds, but not with per-memcg thresholds.
+
+- A synthetic stress test for concurrently reading memcg stats while
+  memory allocation/freeing workers are running in the background,
+  provided by Wei Xu [3]. With 250k threads reading the stats every
+  100ms in 50k cgroups, 99.9% of reads take <= 50us. Less than 0.01%
+  of reads take more than 1ms, and no reads take more than 100ms.
+
+[1] https://lore.kernel.org/lkml/CABWYdi0c6__rh-K7dcM_pkf9BJdTRtAU08M43KO9ME4-dsgfoQ@mail.gmail.com/
+[2] https://lore.kernel.org/lkml/CAJD7tka13M-zVZTyQJYL1iUAYvuQ1fcHbCjcOBZcz6POYTV-4g@mail.gmail.com/
+[3] https://lore.kernel.org/lkml/CAAPL-u9D2b=iF5Lf_cRnKxUfkiEe0AMDTu6yhrUAzX0b6a6rDg@mail.gmail.com/
+
+Link: https://lkml.kernel.org/r/20231010032117.1577496-6-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Tested-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Cc: Greg Thelen <gthelen@google.com>
+Cc: Ivan Babrou <ivan@cloudflare.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Tejun heo <tj@kernel.org>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Wei Xu <weixugc@google.com>
