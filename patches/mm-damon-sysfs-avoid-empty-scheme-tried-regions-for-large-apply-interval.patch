@@ -1,0 +1,130 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/damon/sysfs: avoid empty scheme tried regions for large apply interval
+Date: Thu, 12 Oct 2023 19:22:54 +0000
+
+DAMON_SYSFS assumes all schemes will be applied for at least one DAMON
+monitoring results snapshot within one aggregation interval, or makes no
+sense to wait for it while DAMON is deactivated by the watermarks.  That
+for deactivated status still makes sense, but the aggregation interval
+based assumption is invalid now because each scheme can has its own apply
+interval.  For schemes having larger than the aggregation or watermarks
+check interval, DAMOS tried regions update request can be finished without
+the update.  Avoid the case by explicitly checking the status of the
+schemes tried regions update and watermarks based DAMON deactivation.
+
+Link: https://lkml.kernel.org/r/20231012192256.33556-3-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/damon/sysfs-common.h  |    2 ++
+ mm/damon/sysfs-schemes.c |   16 ++++++++++++++++
+ mm/damon/sysfs.c         |   34 ++++++++++++++++++++++++++++++----
+ 3 files changed, 48 insertions(+), 4 deletions(-)
+
+--- a/mm/damon/sysfs.c~mm-damon-sysfs-avoid-empty-scheme-tried-regions-for-large-apply-interval
++++ a/mm/damon/sysfs.c
+@@ -1336,12 +1336,13 @@ static int damon_sysfs_commit_input(stru
+ 
+ /*
+  * damon_sysfs_cmd_request_callback() - DAMON callback for handling requests.
+- * @c:	The DAMON context of the callback.
++ * @c:		The DAMON context of the callback.
++ * @active:	Whether @c is not deactivated due to watermarks.
+  *
+  * This function is periodically called back from the kdamond thread for @c.
+  * Then, it checks if there is a waiting DAMON sysfs request and handles it.
+  */
+-static int damon_sysfs_cmd_request_callback(struct damon_ctx *c)
++static int damon_sysfs_cmd_request_callback(struct damon_ctx *c, bool active)
+ {
+ 	struct damon_sysfs_kdamond *kdamond;
+ 	bool total_bytes_only = false;
+@@ -1373,6 +1374,13 @@ static int damon_sysfs_cmd_request_callb
+ 				goto keep_lock_out;
+ 			}
+ 		} else {
++			/*
++			 * Continue regions updating if DAMON is till
++			 * active and the update for all schemes is not
++			 * finished.
++			 */
++			if (active && !damos_sysfs_regions_upd_done())
++				goto keep_lock_out;
+ 			err = damon_sysfs_upd_schemes_regions_stop(kdamond);
+ 			damon_sysfs_schemes_regions_updating = false;
+ 		}
+@@ -1392,6 +1400,24 @@ keep_lock_out:
+ 	return err;
+ }
+ 
++static int damon_sysfs_after_wmarks_check(struct damon_ctx *c)
++{
++	/*
++	 * after_wmarks_check() is called back while the context is deactivated
++	 * by watermarks.
++	 */
++	return damon_sysfs_cmd_request_callback(c, false);
++}
++
++static int damon_sysfs_after_aggregation(struct damon_ctx *c)
++{
++	/*
++	 * after_aggregation() is called back only while the context is not
++	 * deactivated by watermarks.
++	 */
++	return damon_sysfs_cmd_request_callback(c, true);
++}
++
+ static struct damon_ctx *damon_sysfs_build_ctx(
+ 		struct damon_sysfs_context *sys_ctx)
+ {
+@@ -1407,8 +1433,8 @@ static struct damon_ctx *damon_sysfs_bui
+ 		return ERR_PTR(err);
+ 	}
+ 
+-	ctx->callback.after_wmarks_check = damon_sysfs_cmd_request_callback;
+-	ctx->callback.after_aggregation = damon_sysfs_cmd_request_callback;
++	ctx->callback.after_wmarks_check = damon_sysfs_after_wmarks_check;
++	ctx->callback.after_aggregation = damon_sysfs_after_aggregation;
+ 	ctx->callback.before_terminate = damon_sysfs_before_terminate;
+ 	return ctx;
+ }
+--- a/mm/damon/sysfs-common.h~mm-damon-sysfs-avoid-empty-scheme-tried-regions-for-large-apply-interval
++++ a/mm/damon/sysfs-common.h
+@@ -49,6 +49,8 @@ int damon_sysfs_schemes_update_regions_s
+ 		struct damon_sysfs_schemes *sysfs_schemes,
+ 		struct damon_ctx *ctx, bool total_bytes_only);
+ 
++bool damos_sysfs_regions_upd_done(void);
++
+ int damon_sysfs_schemes_update_regions_stop(struct damon_ctx *ctx);
+ 
+ int damon_sysfs_schemes_clear_regions(
+--- a/mm/damon/sysfs-schemes.c~mm-damon-sysfs-avoid-empty-scheme-tried-regions-for-large-apply-interval
++++ a/mm/damon/sysfs-schemes.c
+@@ -1904,6 +1904,22 @@ int damon_sysfs_schemes_update_regions_s
+ 	return 0;
+ }
+ 
++bool damos_sysfs_regions_upd_done(void)
++{
++	struct damon_sysfs_schemes *sysfs_schemes =
++		damon_sysfs_schemes_for_damos_callback;
++	struct damon_sysfs_scheme_regions *sysfs_regions;
++	int i;
++
++	for (i = 0; i < sysfs_schemes->nr; i++) {
++		sysfs_regions = sysfs_schemes->schemes_arr[i]->tried_regions;
++		if (sysfs_regions->upd_status !=
++				DAMOS_TRIED_REGIONS_UPD_FINISHED)
++			return false;
++	}
++	return true;
++}
++
+ /*
+  * Called from damon_sysfs_cmd_request_callback under damon_sysfs_lock.  Caller
+  * should unlock damon_sysfs_lock which held before
+_

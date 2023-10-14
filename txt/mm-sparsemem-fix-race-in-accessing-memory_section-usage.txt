@@ -1,0 +1,62 @@
+From: Charan Teja Kalla <quic_charante@quicinc.com>
+Subject: mm/sparsemem: fix race in accessing memory_section->usage
+Date: Fri, 13 Oct 2023 18:34:27 +0530
+
+The below race is observed on a PFN which falls into the device memory
+region with the system memory configuration where PFN's are such that
+[ZONE_NORMAL ZONE_DEVICE ZONE_NORMAL].  Since normal zone start and end
+pfn contains the device memory PFN's as well, the compaction triggered
+will try on the device memory PFN's too though they end up in NOP(because
+pfn_to_online_page() returns NULL for ZONE_DEVICE memory sections).  When
+from other core, the section mappings are being removed for the
+ZONE_DEVICE region, that the PFN in question belongs to, on which
+compaction is currently being operated is resulting into the kernel crash
+with CONFIG_SPASEMEM_VMEMAP enabled.
+
+compact_zone()			memunmap_pages
+-------------			---------------
+__pageblock_pfn_to_page
+   ......
+ (a)pfn_valid():
+     valid_section()//return true
+			      (b)__remove_pages()->
+				  sparse_remove_section()->
+				    section_deactivate():
+				    [Free the array ms->usage and set
+				     ms->usage = NULL]
+     pfn_section_valid()
+     [Access ms->usage which
+     is NULL]
+
+NOTE: From the above it can be said that the race is reduced to between
+the pfn_valid()/pfn_section_valid() and the section deactivate with
+SPASEMEM_VMEMAP enabled.
+
+The commit b943f045a9af("mm/sparse: fix kernel crash with
+pfn_section_valid check") tried to address the same problem by clearing
+the SECTION_HAS_MEM_MAP with the expectation of valid_section() returns
+false thus ms->usage is not accessed.
+
+Fix this issue by the below steps:
+
+a) Clear SECTION_HAS_MEM_MAP before freeing the ->usage.
+
+b) RCU protected read side critical section will either return NULL
+   when SECTION_HAS_MEM_MAP is cleared or can successfully access ->usage.
+
+c) Synchronize the rcu on the write side and free the ->usage.  No
+   attempt will be made to access ->usage after this as the
+   SECTION_HAS_MEM_MAP is cleared thus valid_section() return false.
+
+Since the section_deactivate() is a rare operation and will come in the
+hot remove path, impact of synchronize_rcu() should be negligble.
+
+Link: https://lkml.kernel.org/r/1697202267-23600-1-git-send-email-quic_charante@quicinc.com
+Fixes: f46edbd1b151 ("mm/sparsemem: add helpers track active portions of a section at boot")
+Signed-off-by: Charan Teja Kalla <quic_charante@quicinc.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
