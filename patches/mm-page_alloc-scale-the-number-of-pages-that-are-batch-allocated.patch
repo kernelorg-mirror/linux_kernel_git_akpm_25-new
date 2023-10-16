@@ -1,0 +1,130 @@
+From: Huang Ying <ying.huang@intel.com>
+Subject: mm, page_alloc: scale the number of pages that are batch allocated
+Date: Mon, 16 Oct 2023 13:29:58 +0800
+
+When a task is allocating a large number of order-0 pages, it may acquire
+the zone->lock multiple times allocating pages in batches.  This may
+unnecessarily contend on the zone lock when allocating very large number
+of pages.  This patch adapts the size of the batch based on the recent
+pattern to scale the batch size for subsequent allocations.
+
+On a 2-socket Intel server with 224 logical CPU, we run 8 kbuild instances
+in parallel (each with `make -j 28`) in 8 cgroup.  This simulates the
+kbuild server that is used by 0-Day kbuild service.  With the patch, the
+cycles% of the spinlock contention (mostly for zone lock) decreases from
+12.6% to 11.0% (with PCP size == 367).
+
+Link: https://lkml.kernel.org/r/20231016053002.756205-6-ying.huang@intel.com
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Suggested-by: Mel Gorman <mgorman@techsingularity.net>
+Acked-by: Mel Gorman <mgorman@techsingularity.net>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <jweiner@redhat.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Arjan van de Ven <arjan@linux.intel.com>
+Cc: Sudeep Holla <sudeep.holla@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmzone.h |    3 +-
+ mm/page_alloc.c        |   53 +++++++++++++++++++++++++++++++--------
+ 2 files changed, 45 insertions(+), 11 deletions(-)
+
+--- a/include/linux/mmzone.h~mm-page_alloc-scale-the-number-of-pages-that-are-batch-allocated
++++ a/include/linux/mmzone.h
+@@ -709,9 +709,10 @@ struct per_cpu_pages {
+ 	int high;		/* high watermark, emptying needed */
+ 	int batch;		/* chunk size for buddy add/remove */
+ 	u8 flags;		/* protected by pcp->lock */
++	u8 alloc_factor;	/* batch scaling factor during allocate */
+ 	u8 free_factor;		/* batch scaling factor during free */
+ #ifdef CONFIG_NUMA
+-	short expire;		/* When 0, remote pagesets are drained */
++	u8 expire;		/* When 0, remote pagesets are drained */
+ #endif
+ 
+ 	/* Lists of pages, one per migrate type stored on the pcp-lists */
+--- a/mm/page_alloc.c~mm-page_alloc-scale-the-number-of-pages-that-are-batch-allocated
++++ a/mm/page_alloc.c
+@@ -2409,6 +2409,12 @@ static void free_unref_page_commit(struc
+ 	int pindex;
+ 	bool free_high = false;
+ 
++	/*
++	 * On freeing, reduce the number of pages that are batch allocated.
++	 * See nr_pcp_alloc() where alloc_factor is increased for subsequent
++	 * allocations.
++	 */
++	pcp->alloc_factor >>= 1;
+ 	__count_vm_events(PGFREE, 1 << order);
+ 	pindex = order_to_pindex(migratetype, order);
+ 	list_add(&page->pcp_list, &pcp->lists[pindex]);
+@@ -2715,6 +2721,42 @@ struct page *rmqueue_buddy(struct zone *
+ 	return page;
+ }
+ 
++static int nr_pcp_alloc(struct per_cpu_pages *pcp, int order)
++{
++	int high, batch, max_nr_alloc;
++
++	high = READ_ONCE(pcp->high);
++	batch = READ_ONCE(pcp->batch);
++
++	/* Check for PCP disabled or boot pageset */
++	if (unlikely(high < batch))
++		return 1;
++
++	/*
++	 * Double the number of pages allocated each time there is subsequent
++	 * allocation of order-0 pages without any freeing.
++	 */
++	if (!order) {
++		max_nr_alloc = max(high - pcp->count - batch, batch);
++		batch <<= pcp->alloc_factor;
++		if (batch <= max_nr_alloc &&
++		    pcp->alloc_factor < CONFIG_PCP_BATCH_SCALE_MAX)
++			pcp->alloc_factor++;
++		batch = min(batch, max_nr_alloc);
++	}
++
++	/*
++	 * Scale batch relative to order if batch implies free pages
++	 * can be stored on the PCP. Batch can be 1 for small zones or
++	 * for boot pagesets which should never store free pages as
++	 * the pages may belong to arbitrary zones.
++	 */
++	if (batch > 1)
++		batch = max(batch >> order, 2);
++
++	return batch;
++}
++
+ /* Remove page from the per-cpu list, caller must protect the list */
+ static inline
+ struct page *__rmqueue_pcplist(struct zone *zone, unsigned int order,
+@@ -2727,18 +2769,9 @@ struct page *__rmqueue_pcplist(struct zo
+ 
+ 	do {
+ 		if (list_empty(list)) {
+-			int batch = READ_ONCE(pcp->batch);
++			int batch = nr_pcp_alloc(pcp, order);
+ 			int alloced;
+ 
+-			/*
+-			 * Scale batch relative to order if batch implies
+-			 * free pages can be stored on the PCP. Batch can
+-			 * be 1 for small zones or for boot pagesets which
+-			 * should never store free pages as the pages may
+-			 * belong to arbitrary zones.
+-			 */
+-			if (batch > 1)
+-				batch = max(batch >> order, 2);
+ 			alloced = rmqueue_bulk(zone, order,
+ 					batch, list,
+ 					migratetype, alloc_flags);
+_

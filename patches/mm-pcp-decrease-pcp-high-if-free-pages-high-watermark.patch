@@ -1,0 +1,113 @@
+From: Huang Ying <ying.huang@intel.com>
+Subject: mm, pcp: decrease PCP high if free pages < high watermark
+Date: Mon, 16 Oct 2023 13:30:01 +0800
+
+One target of PCP is to minimize pages in PCP if the system free pages is
+too few.  To reach that target, when page reclaiming is active for the
+zone (ZONE_RECLAIM_ACTIVE), we will stop increasing PCP high in allocating
+path, decrease PCP high and free some pages in freeing path.  But this may
+be too late because the background page reclaiming may introduce latency
+for some workloads.  So, in this patch, during page allocation we will
+detect whether the number of free pages of the zone is below high
+watermark.  If so, we will stop increasing PCP high in allocating path,
+decrease PCP high and free some pages in freeing path.  With this, we can
+reduce the possibility of the premature background page reclaiming caused
+by too large PCP.
+
+The high watermark checking is done in allocating path to reduce the
+overhead in hotter freeing path.
+
+Link: https://lkml.kernel.org/r/20231016053002.756205-9-ying.huang@intel.com
+Signed-off-by: "Huang, Ying" <ying.huang@intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <jweiner@redhat.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Arjan van de Ven <arjan@linux.intel.com>
+Cc: Sudeep Holla <sudeep.holla@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmzone.h |    1 +
+ mm/page_alloc.c        |   33 +++++++++++++++++++++++++++++++--
+ 2 files changed, 32 insertions(+), 2 deletions(-)
+
+--- a/include/linux/mmzone.h~mm-pcp-decrease-pcp-high-if-free-pages-high-watermark
++++ a/include/linux/mmzone.h
+@@ -1030,6 +1030,7 @@ enum zone_flags {
+ 					 * Cleared when kswapd is woken.
+ 					 */
+ 	ZONE_RECLAIM_ACTIVE,		/* kswapd may be scanning the zone. */
++	ZONE_BELOW_HIGH,		/* zone is below high watermark. */
+ };
+ 
+ static inline unsigned long zone_managed_pages(struct zone *zone)
+--- a/mm/page_alloc.c~mm-pcp-decrease-pcp-high-if-free-pages-high-watermark
++++ a/mm/page_alloc.c
+@@ -2443,7 +2443,13 @@ static int nr_pcp_high(struct per_cpu_pa
+ 		return min(batch << 2, pcp->high);
+ 	}
+ 
+-	if (pcp->count >= high && high_min != high_max) {
++	if (high_min == high_max)
++		return high;
++
++	if (test_bit(ZONE_BELOW_HIGH, &zone->flags)) {
++		pcp->high = max(high - (batch << pcp->free_factor), high_min);
++		high = max(pcp->count, high_min);
++	} else if (pcp->count >= high) {
+ 		int need_high = (batch << pcp->free_factor) + batch;
+ 
+ 		/* pcp->high should be large enough to hold batch freed pages */
+@@ -2493,6 +2499,10 @@ static void free_unref_page_commit(struc
+ 	if (pcp->count >= high) {
+ 		free_pcppages_bulk(zone, nr_pcp_free(pcp, batch, high, free_high),
+ 				   pcp, pindex);
++		if (test_bit(ZONE_BELOW_HIGH, &zone->flags) &&
++		    zone_watermark_ok(zone, 0, high_wmark_pages(zone),
++				      ZONE_MOVABLE, 0))
++			clear_bit(ZONE_BELOW_HIGH, &zone->flags);
+ 	}
+ }
+ 
+@@ -2799,7 +2809,7 @@ static int nr_pcp_alloc(struct per_cpu_p
+ 	 * If we had larger pcp->high, we could avoid to allocate from
+ 	 * zone.
+ 	 */
+-	if (high_min != high_max && !test_bit(ZONE_RECLAIM_ACTIVE, &zone->flags))
++	if (high_min != high_max && !test_bit(ZONE_BELOW_HIGH, &zone->flags))
+ 		high = pcp->high = min(high + batch, high_max);
+ 
+ 	if (!order) {
+@@ -3261,6 +3271,25 @@ retry:
+ 			}
+ 		}
+ 
++		/*
++		 * Detect whether the number of free pages is below high
++		 * watermark.  If so, we will decrease pcp->high and free
++		 * PCP pages in free path to reduce the possibility of
++		 * premature page reclaiming.  Detection is done here to
++		 * avoid to do that in hotter free path.
++		 */
++		if (test_bit(ZONE_BELOW_HIGH, &zone->flags))
++			goto check_alloc_wmark;
++
++		mark = high_wmark_pages(zone);
++		if (zone_watermark_fast(zone, order, mark,
++					ac->highest_zoneidx, alloc_flags,
++					gfp_mask))
++			goto try_this_zone;
++		else
++			set_bit(ZONE_BELOW_HIGH, &zone->flags);
++
++check_alloc_wmark:
+ 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
+ 		if (!zone_watermark_fast(zone, order, mark,
+ 				       ac->highest_zoneidx, alloc_flags,
+_

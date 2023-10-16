@@ -1,6 +1,6 @@
 From: Roman Gushchin <roman.gushchin@linux.dev>
 Subject: mm: kmem: add direct objcg pointer to task_struct
-Date: Fri, 29 Sep 2023 11:00:52 -0700
+Date: Mon, 9 Oct 2023 17:09:26 -0700
 
 To charge a freshly allocated kernel object to a memory cgroup, the kernel
 needs to obtain an objcg pointer.  Currently it does it indirectly by
@@ -35,11 +35,12 @@ while the task is alive.
 
 This commit doesn't change the way the remote memcg charging works.
 
-Link: https://lkml.kernel.org/r/20230929180056.1122002-3-roman.gushchin@linux.dev
+Link: https://lkml.kernel.org/r/20231010000929.450702-3-roman.gushchin@linux.dev
 Signed-off-by: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Tested-by: Naresh Kamboju <naresh.kamboju@linaro.org>
 Cc: David Rientjes <rientjes@google.com>
 Cc: Dennis Zhou <dennis@kernel.org>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Shakeel Butt <shakeelb@google.com>
@@ -47,30 +48,10 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/memcontrol.h |   10 +++
- include/linux/sched.h      |    4 +
- mm/memcontrol.c            |  111 ++++++++++++++++++++++++++++++++---
- 3 files changed, 116 insertions(+), 9 deletions(-)
+ include/linux/sched.h |    4 +
+ mm/memcontrol.c       |  130 +++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 125 insertions(+), 9 deletions(-)
 
---- a/include/linux/memcontrol.h~mm-kmem-add-direct-objcg-pointer-to-task_struct
-+++ a/include/linux/memcontrol.h
-@@ -544,6 +544,16 @@ static inline bool folio_memcg_kmem(stru
- 	return folio->memcg_data & MEMCG_DATA_KMEM;
- }
- 
-+static inline bool current_objcg_needs_update(struct obj_cgroup *objcg)
-+{
-+	return (struct obj_cgroup *)((unsigned long)objcg & 0x1);
-+}
-+
-+static inline struct obj_cgroup *
-+current_objcg_without_update_flag(struct obj_cgroup *objcg)
-+{
-+	return (struct obj_cgroup *)((unsigned long)objcg & ~0x1);
-+}
- 
- #else
- static inline bool folio_memcg_kmem(struct folio *folio)
 --- a/include/linux/sched.h~mm-kmem-add-direct-objcg-pointer-to-task_struct
 +++ a/include/linux/sched.h
 @@ -1443,6 +1443,10 @@ struct task_struct {
@@ -86,55 +67,67 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
 --- a/mm/memcontrol.c~mm-kmem-add-direct-objcg-pointer-to-task_struct
 +++ a/mm/memcontrol.c
-@@ -3041,6 +3041,47 @@ static struct obj_cgroup *__get_obj_cgro
+@@ -249,6 +249,8 @@ struct mem_cgroup *vmpressure_to_memcg(s
+ 	return container_of(vmpr, struct mem_cgroup, vmpressure);
+ }
+ 
++#define CURRENT_OBJCG_UPDATE_FLAG 0x1UL
++
+ #ifdef CONFIG_MEMCG_KMEM
+ static DEFINE_SPINLOCK(objcg_lock);
+ 
+@@ -3107,6 +3109,50 @@ static struct obj_cgroup *__get_obj_cgro
  	return objcg;
  }
  
-+static struct obj_cgroup *current_objcg_update(struct obj_cgroup *old)
++static struct obj_cgroup *current_objcg_update(void)
 +{
 +	struct mem_cgroup *memcg;
-+	struct obj_cgroup *objcg = NULL, *tmp = old;
++	struct obj_cgroup *old, *objcg = NULL;
 +
-+	old = current_objcg_without_update_flag(old);
-+	if (old)
-+		obj_cgroup_put(old);
-+
-+	rcu_read_lock();
 +	do {
-+		/* Atomically drop the update bit, */
-+		WARN_ON_ONCE(cmpxchg(&current->objcg, tmp, 0) != tmp);
++		/* Atomically drop the update bit. */
++		old = xchg(&current->objcg, NULL);
++		if (old) {
++			old = (struct obj_cgroup *)
++				((unsigned long)old & ~CURRENT_OBJCG_UPDATE_FLAG);
++			if (old)
++				obj_cgroup_put(old);
 +
-+		/* ...obtain the new objcg pointer */
++			old = NULL;
++		}
++
++		/* Obtain the new objcg pointer. */
++		rcu_read_lock();
 +		memcg = mem_cgroup_from_task(current);
++		/*
++		 * The current task can be asynchronously moved to another
++		 * memcg and the previous memcg can be offlined. So let's
++		 * get the memcg pointer and try get a reference to objcg
++		 * under a rcu read lock.
++		 */
 +		for (; memcg != root_mem_cgroup; memcg = parent_mem_cgroup(memcg)) {
 +			objcg = rcu_dereference(memcg->objcg);
-+			if (objcg && obj_cgroup_tryget(objcg))
++			if (likely(objcg && obj_cgroup_tryget(objcg)))
 +				break;
 +			objcg = NULL;
 +		}
++		rcu_read_unlock();
 +
 +		/*
-+		 * ...and try atomically set up a new objcg pointer. If it
++		 * Try set up a new objcg pointer atomically. If it
 +		 * fails, it means the update flag was set concurrently, so
 +		 * the whole procedure should be repeated.
 +		 */
-+		tmp = 0;
-+	} while (!try_cmpxchg(&current->objcg, &tmp, objcg));
-+	rcu_read_unlock();
++	} while (!try_cmpxchg(&current->objcg, &old, objcg));
 +
 +	return objcg;
-+}
-+
-+static inline void current_objcg_set_needs_update(struct task_struct *task)
-+{
-+	/* atomically set the update bit */
-+	set_bit(0, (unsigned long *)&current->objcg);
 +}
 +
  __always_inline struct obj_cgroup *get_obj_cgroup_from_current(void)
  {
  	struct mem_cgroup *memcg;
-@@ -3048,19 +3089,26 @@ __always_inline struct obj_cgroup *get_o
+@@ -3114,19 +3160,26 @@ __always_inline struct obj_cgroup *get_o
  
  	if (in_task()) {
  		memcg = current->active_memcg;
@@ -145,8 +138,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (likely(!memcg) && (!current->mm || (current->flags & PF_KTHREAD)))
 -			return NULL;
 +		objcg = READ_ONCE(current->objcg);
-+		if (unlikely(current_objcg_needs_update(objcg)))
-+			objcg = current_objcg_update(objcg);
++		if (unlikely((unsigned long)objcg & CURRENT_OBJCG_UPDATE_FLAG))
++			objcg = current_objcg_update();
 +
 +		if (objcg) {
 +			obj_cgroup_get(objcg);
@@ -168,7 +161,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	objcg = __get_obj_cgroup_from_memcg(memcg);
  	rcu_read_unlock();
  	return objcg;
-@@ -6400,6 +6448,7 @@ static void mem_cgroup_move_task(void)
+@@ -6469,6 +6522,7 @@ static void mem_cgroup_move_task(void)
  		mem_cgroup_clear_mc();
  	}
  }
@@ -176,7 +169,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #else	/* !CONFIG_MMU */
  static int mem_cgroup_can_attach(struct cgroup_taskset *tset)
  {
-@@ -6413,8 +6462,27 @@ static void mem_cgroup_move_task(void)
+@@ -6482,8 +6536,39 @@ static void mem_cgroup_move_task(void)
  }
  #endif
  
@@ -185,17 +178,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	/*
 +	 * Set the update flag to cause task->objcg to be initialized lazily
-+	 * on the first allocation.
++	 * on the first allocation. It can be done without any synchronization
++	 * because it's always performed on the current task, so does
++	 * current_objcg_update().
 +	 */
-+	task->objcg = (struct obj_cgroup *)0x1;
++	task->objcg = (struct obj_cgroup *)CURRENT_OBJCG_UPDATE_FLAG;
 +}
 +
 +static void mem_cgroup_exit(struct task_struct *task)
 +{
-+	struct obj_cgroup *objcg = current_objcg_without_update_flag(task->objcg);
++	struct obj_cgroup *objcg = task->objcg;
 +
++	objcg = (struct obj_cgroup *)
++		((unsigned long)objcg & ~CURRENT_OBJCG_UPDATE_FLAG);
 +	if (objcg)
 +		obj_cgroup_put(objcg);
++
++	/*
++	 * Some kernel allocations can happen after this point,
++	 * but let's ignore them. It can be done without any synchronization
++	 * because it's always performed on the current task, so does
++	 * current_objcg_update().
++	 */
++	task->objcg = NULL;
 +}
 +#endif
 +
@@ -205,7 +210,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct task_struct *task;
  	struct cgroup_subsys_state *css;
-@@ -6432,10 +6500,29 @@ static void mem_cgroup_attach(struct cgr
+@@ -6501,10 +6586,31 @@ static void mem_cgroup_attach(struct cgr
  	task_unlock(task);
  }
  #else
@@ -218,8 +223,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct task_struct *task;
 +	struct cgroup_subsys_state *css;
 +
-+	cgroup_taskset_for_each(task, css, tset)
-+		current_objcg_set_needs_update(task);
++	cgroup_taskset_for_each(task, css, tset) {
++		/* atomically set the update bit */
++		set_bit(0, (unsigned long *)&current->objcg);
++	}
 +}
 +#else
 +static void mem_cgroup_kmem_attach(struct cgroup_taskset *tset) {}
@@ -236,7 +243,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
  {
-@@ -6845,9 +6932,15 @@ struct cgroup_subsys memory_cgrp_subsys
+@@ -6914,9 +7020,15 @@ struct cgroup_subsys memory_cgrp_subsys
  	.css_reset = mem_cgroup_css_reset,
  	.css_rstat_flush = mem_cgroup_css_rstat_flush,
  	.can_attach = mem_cgroup_can_attach,
