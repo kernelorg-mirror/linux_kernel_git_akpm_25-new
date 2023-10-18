@@ -1,45 +1,165 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/migrate: correct nr_failed in migrate_pages_sync()
-Date: Mon, 9 Oct 2023 16:32:31 -0400
+Date: Mon, 16 Oct 2023 11:41:56 -0400
 
-In the upstream tree, large folios can be migrated via move_pages()
-syscall and there is no VM_BUG_ON in do_move_pages_to_node() but pages
-left in the source page list will not be returned to LRU lists.  This is
-from my code inspection and I have not reproduced it on upstream tree yet.
+nr_failed was missing the large folio splits from migrate_pages_batch()
+and can cause a mismatch between migrate_pages() return value and the
+number of not migrated pages, i.e., when the return value of
+migrate_pages() is 0, there are still pages left in the from page list. 
+It will happen when a non-PMD THP large folio fails to migrate due to
+-ENOMEM and is split successfully but not all the split pages are not
+migrated, migrate_pages_batch() would return non-zero, but
+astats.nr_thp_split =3D 0.  nr_failed would be 0 and returned to the
+caller of migrate_pages(), but the not migrated pages are left in the from
+page list without being added back to LRU lists.
 
-nr_failed was missing the rc value from migrate_pages_batch() and can
-cause a mismatch between migrate_pages() return value and the number of
-not migrated pages, i.e., when the return value of migrate_pages() is 0,
-there are still pages left in the from page list.  It will happen when a
-non-PMD THP large folio fails to migrate due to -ENOMEM and is split
-successfully but not all the split pages are not migrated,
-migrate_pages_batch() would return non-zero, but astats.nr_thp_split =
-0.  nr_failed would be 0 and returned to the caller of migrate_pages(),
-but the not migrated pages are left in the from page list without being
-added back to LRU lists.
+Fix it by adding a new nr_split counter for large folio splits and adding
+it to nr_failed in migrate_page_sync() after migrate_pages_batch() is
+done.
 
-Link: https://lkml.kernel.org/r/20231009203231.1715845-2-zi.yan@sent.com
+Link: https://lkml.kernel.org/r/20231016154156.1948815-1-zi.yan@sent.com
 Fixes: 2ef7dbb26990 ("migrate_pages: try migrate in batch asynchronously firstly")
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Huang Ying <ying.huang@intel.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/migrate.c |    2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ include/trace/events/migrate.h |   24 ++++++++++++++----------
+ mm/migrate.c                   |   15 +++++++++++----
+ 2 files changed, 25 insertions(+), 14 deletions(-)
 
+--- a/include/trace/events/migrate.h~mm-migrate-correct-nr_failed-in-migrate_pages_sync
++++ a/include/trace/events/migrate.h
+@@ -49,10 +49,11 @@ TRACE_EVENT(mm_migrate_pages,
+ 
+ 	TP_PROTO(unsigned long succeeded, unsigned long failed,
+ 		 unsigned long thp_succeeded, unsigned long thp_failed,
+-		 unsigned long thp_split, enum migrate_mode mode, int reason),
++		 unsigned long thp_split, unsigned long large_folio_split,
++		 enum migrate_mode mode, int reason),
+ 
+ 	TP_ARGS(succeeded, failed, thp_succeeded, thp_failed,
+-		thp_split, mode, reason),
++		thp_split, large_folio_split, mode, reason),
+ 
+ 	TP_STRUCT__entry(
+ 		__field(	unsigned long,		succeeded)
+@@ -60,26 +61,29 @@ TRACE_EVENT(mm_migrate_pages,
+ 		__field(	unsigned long,		thp_succeeded)
+ 		__field(	unsigned long,		thp_failed)
+ 		__field(	unsigned long,		thp_split)
++		__field(	unsigned long,		large_folio_split)
+ 		__field(	enum migrate_mode,	mode)
+ 		__field(	int,			reason)
+ 	),
+ 
+ 	TP_fast_assign(
+-		__entry->succeeded	= succeeded;
+-		__entry->failed		= failed;
+-		__entry->thp_succeeded	= thp_succeeded;
+-		__entry->thp_failed	= thp_failed;
+-		__entry->thp_split	= thp_split;
+-		__entry->mode		= mode;
+-		__entry->reason		= reason;
++		__entry->succeeded			= succeeded;
++		__entry->failed				= failed;
++		__entry->thp_succeeded		= thp_succeeded;
++		__entry->thp_failed			= thp_failed;
++		__entry->thp_split			= thp_split;
++		__entry->large_folio_split	= large_folio_split;
++		__entry->mode				= mode;
++		__entry->reason				= reason;
+ 	),
+ 
+-	TP_printk("nr_succeeded=%lu nr_failed=%lu nr_thp_succeeded=%lu nr_thp_failed=%lu nr_thp_split=%lu mode=%s reason=%s",
++	TP_printk("nr_succeeded=%lu nr_failed=%lu nr_thp_succeeded=%lu nr_thp_failed=%lu nr_thp_split=%lu nr_split=%lu mode=%s reason=%s",
+ 		__entry->succeeded,
+ 		__entry->failed,
+ 		__entry->thp_succeeded,
+ 		__entry->thp_failed,
+ 		__entry->thp_split,
++		__entry->large_folio_split,
+ 		__print_symbolic(__entry->mode, MIGRATE_MODE),
+ 		__print_symbolic(__entry->reason, MIGRATE_REASON))
+ );
 --- a/mm/migrate.c~mm-migrate-correct-nr_failed-in-migrate_pages_sync
 +++ a/mm/migrate.c
-@@ -1834,7 +1834,7 @@ static int migrate_pages_sync(struct lis
+@@ -1495,6 +1495,7 @@ struct migrate_pages_stats {
+ 	int nr_thp_succeeded;	/* THP migrated successfully */
+ 	int nr_thp_failed;	/* THP failed to be migrated */
+ 	int nr_thp_split;	/* THP split before migrating */
++	int nr_split;	/* Large folio (include THP) split before migrating */
+ };
+ 
+ /*
+@@ -1614,6 +1615,7 @@ static int migrate_pages_batch(struct li
+ 	int nr_retry_pages = 0;
+ 	int pass = 0;
+ 	bool is_thp = false;
++	bool is_large = false;
+ 	struct folio *folio, *folio2, *dst = NULL, *dst2;
+ 	int rc, rc_saved = 0, nr_pages;
+ 	LIST_HEAD(unmap_folios);
+@@ -1629,7 +1631,8 @@ static int migrate_pages_batch(struct li
+ 		nr_retry_pages = 0;
+ 
+ 		list_for_each_entry_safe(folio, folio2, from, lru) {
+-			is_thp = folio_test_large(folio) && folio_test_pmd_mappable(folio);
++			is_large = folio_test_large(folio);
++			is_thp = is_large && folio_test_pmd_mappable(folio);
+ 			nr_pages = folio_nr_pages(folio);
+ 
+ 			cond_resched();
+@@ -1649,6 +1652,7 @@ static int migrate_pages_batch(struct li
+ 				stats->nr_thp_failed++;
+ 				if (!try_split_folio(folio, split_folios)) {
+ 					stats->nr_thp_split++;
++					stats->nr_split++;
+ 					continue;
+ 				}
+ 				stats->nr_failed_pages += nr_pages;
+@@ -1677,11 +1681,12 @@ static int migrate_pages_batch(struct li
+ 				nr_failed++;
+ 				stats->nr_thp_failed += is_thp;
+ 				/* Large folio NUMA faulting doesn't split to retry. */
+-				if (folio_test_large(folio) && !nosplit) {
++				if (is_large && !nosplit) {
+ 					int ret = try_split_folio(folio, split_folios);
+ 
+ 					if (!ret) {
+ 						stats->nr_thp_split += is_thp;
++						stats->nr_split++;
+ 						break;
+ 					} else if (reason == MR_LONGTERM_PIN &&
+ 						   ret == -EAGAIN) {
+@@ -1827,6 +1832,7 @@ static int migrate_pages_sync(struct lis
+ 	stats->nr_succeeded += astats.nr_succeeded;
+ 	stats->nr_thp_succeeded += astats.nr_thp_succeeded;
+ 	stats->nr_thp_split += astats.nr_thp_split;
++	stats->nr_split += astats.nr_split;
+ 	if (rc < 0) {
+ 		stats->nr_failed_pages += astats.nr_failed_pages;
+ 		stats->nr_thp_failed += astats.nr_thp_failed;
+@@ -1834,7 +1840,7 @@ static int migrate_pages_sync(struct lis
  		return rc;
  	}
  	stats->nr_thp_failed += astats.nr_thp_split;
 -	nr_failed += astats.nr_thp_split;
-+	nr_failed += rc + astats.nr_thp_split;
++	nr_failed += astats.nr_split + astats.nr_thp_split;
  	/*
  	 * Fall back to migrate all failed folios one by one synchronously. All
  	 * failed folios except split THPs will be retried, so their failure
+@@ -1969,7 +1975,8 @@ out:
+ 	count_vm_events(THP_MIGRATION_SPLIT, stats.nr_thp_split);
+ 	trace_mm_migrate_pages(stats.nr_succeeded, stats.nr_failed_pages,
+ 			       stats.nr_thp_succeeded, stats.nr_thp_failed,
+-			       stats.nr_thp_split, mode, reason);
++			       stats.nr_thp_split, stats.nr_split, mode,
++			       reason);
+ 
+ 	if (ret_succeeded)
+ 		*ret_succeeded = stats.nr_succeeded;
 _
