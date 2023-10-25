@@ -36,6 +36,8 @@ get_vma_policy() no longer allows a NULL vma: over time I believe we've
 eradicated all the places which used to need it e.g.  swapoff and madvise
 used to pass NULL vma to read_swap_cache_async(), but now know the vma.
 
+[hughd@google.com: handle NULL mpol being passed to __read_swap_cache_async()]
+  Link: https://lkml.kernel.org/r/ea419956-4751-0102-21f7-9c93cb957892@google.com
 Link: https://lkml.kernel.org/r/74e34633-6060-f5e3-aee-7040d43f2e93@google.com
 Link: https://lkml.kernel.org/r/1738368e-bac0-fd11-ed7f-b87142a939fe@google.com
 Signed-off-by: Hugh Dickins <hughd@google.com>
@@ -56,19 +58,22 @@ Cc: Tejun heo <tj@kernel.org>
 Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Cc: Yang Shi <shy828301@gmail.com>
 Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Domenico Cerasuolo <mimmocerasuolo@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/proc/task_mmu.c        |    5 
  include/linux/gfp.h       |   10 
- include/linux/mempolicy.h |   13 -
+ include/linux/mempolicy.h |   20 +
  include/linux/mm.h        |    2 
  ipc/shm.c                 |   21 -
- mm/mempolicy.c            |  381 ++++++++++++++----------------------
+ mm/mempolicy.c            |  379 ++++++++++++++----------------------
  mm/shmem.c                |   94 ++++----
  mm/swap.h                 |    9 
  mm/swap_state.c           |   86 +++++---
- 9 files changed, 299 insertions(+), 322 deletions(-)
+ mm/zswap.c                |    7 
+ 10 files changed, 309 insertions(+), 324 deletions(-)
 
 --- a/fs/proc/task_mmu.c~mempolicy-alloc_pages_mpol-for-numa-policy-without-vma
 +++ a/fs/proc/task_mmu.c
@@ -127,7 +132,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return __folio_alloc_node(gfp, order, numa_node_id());
 --- a/include/linux/mempolicy.h~mempolicy-alloc_pages_mpol-for-numa-policy-without-vma
 +++ a/include/linux/mempolicy.h
-@@ -126,7 +126,9 @@ struct mempolicy *mpol_shared_policy_loo
+@@ -17,6 +17,8 @@
+ 
+ struct mm_struct;
+ 
++#define NO_INTERLEAVE_INDEX (-1UL)	/* use task il_prev for interleaving */
++
+ #ifdef CONFIG_NUMA
+ 
+ /*
+@@ -126,7 +128,9 @@ struct mempolicy *mpol_shared_policy_loo
  
  struct mempolicy *get_task_policy(struct task_struct *p);
  struct mempolicy *__get_vma_policy(struct vm_area_struct *vma,
@@ -138,7 +152,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  bool vma_policy_mof(struct vm_area_struct *vma);
  
  extern void numa_default_policy(void);
-@@ -140,8 +142,6 @@ extern int huge_node(struct vm_area_stru
+@@ -140,8 +144,6 @@ extern int huge_node(struct vm_area_stru
  extern bool init_nodemask_of_mempolicy(nodemask_t *mask);
  extern bool mempolicy_in_oom_domain(struct task_struct *tsk,
  				const nodemask_t *mask);
@@ -147,7 +161,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  extern unsigned int mempolicy_slab_node(void);
  
  extern enum zone_type policy_zone;
-@@ -213,6 +213,13 @@ mpol_shared_policy_lookup(struct shared_
+@@ -179,6 +181,11 @@ extern bool apply_policy_zone(struct mem
+ 
+ struct mempolicy {};
+ 
++static inline struct mempolicy *get_task_policy(struct task_struct *p)
++{
++	return NULL;
++}
++
+ static inline bool mpol_equal(struct mempolicy *a, struct mempolicy *b)
+ {
+ 	return true;
+@@ -213,6 +220,13 @@ mpol_shared_policy_lookup(struct shared_
  	return NULL;
  }
  
@@ -215,16 +241,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/mempolicy.c~mempolicy-alloc_pages_mpol-for-numa-policy-without-vma
 +++ a/mm/mempolicy.c
-@@ -114,6 +114,8 @@
- #define MPOL_MF_INVERT       (MPOL_MF_INTERNAL << 1)	/* Invert check for nodemask */
- #define MPOL_MF_WRLOCK       (MPOL_MF_INTERNAL << 2)	/* Write-lock walked vmas */
- 
-+#define NO_INTERLEAVE_INDEX (-1UL)
-+
- static struct kmem_cache *policy_cache;
- static struct kmem_cache *sn_cache;
- 
-@@ -898,6 +900,7 @@ static long do_get_mempolicy(int *policy
+@@ -898,6 +898,7 @@ static long do_get_mempolicy(int *policy
  	}
  
  	if (flags & MPOL_F_ADDR) {
@@ -232,7 +249,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * Do NOT fall back to task policy if the
  		 * vma/shared policy at addr is NULL.  We
-@@ -909,10 +912,7 @@ static long do_get_mempolicy(int *policy
+@@ -909,10 +910,7 @@ static long do_get_mempolicy(int *policy
  			mmap_read_unlock(mm);
  			return -EFAULT;
  		}
@@ -244,7 +261,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} else if (addr)
  		return -EINVAL;
  
-@@ -1170,6 +1170,15 @@ static struct folio *new_folio(struct fo
+@@ -1170,6 +1168,15 @@ static struct folio *new_folio(struct fo
  			break;
  	}
  
@@ -260,7 +277,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (folio_test_hugetlb(src)) {
  		return alloc_hugetlb_folio_vma(folio_hstate(src),
  				vma, address);
-@@ -1178,9 +1187,6 @@ static struct folio *new_folio(struct fo
+@@ -1178,9 +1185,6 @@ static struct folio *new_folio(struct fo
  	if (folio_test_large(src))
  		gfp = GFP_TRANSHUGE;
  
@@ -270,7 +287,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return vma_alloc_folio(gfp, folio_order(src), vma, address,
  			folio_test_large(src));
  }
-@@ -1690,34 +1696,19 @@ bool vma_migratable(struct vm_area_struc
+@@ -1690,34 +1694,19 @@ bool vma_migratable(struct vm_area_struc
  }
  
  struct mempolicy *__get_vma_policy(struct vm_area_struct *vma,
@@ -312,7 +329,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
   * Returns effective policy for a VMA at specified address.
   * Falls back to current->mempolicy or system default policy, as necessary.
-@@ -1726,14 +1717,18 @@ struct mempolicy *__get_vma_policy(struc
+@@ -1726,14 +1715,18 @@ struct mempolicy *__get_vma_policy(struc
   * freeing by another task.  It is the caller's responsibility to free the
   * extra reference for shared policies.
   */
@@ -335,7 +352,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return pol;
  }
  
-@@ -1743,8 +1738,9 @@ bool vma_policy_mof(struct vm_area_struc
+@@ -1743,8 +1736,9 @@ bool vma_policy_mof(struct vm_area_struc
  
  	if (vma->vm_ops && vma->vm_ops->get_policy) {
  		bool ret = false;
@@ -346,7 +363,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (pol && (pol->flags & MPOL_F_MOF))
  			ret = true;
  		mpol_cond_put(pol);
-@@ -1779,54 +1775,6 @@ bool apply_policy_zone(struct mempolicy
+@@ -1779,54 +1773,6 @@ bool apply_policy_zone(struct mempolicy
  	return zone >= dynamic_policy_zone;
  }
  
@@ -401,7 +418,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /* Do dynamic interleaving for a process */
  static unsigned int interleave_nodes(struct mempolicy *policy)
  {
-@@ -1886,11 +1834,11 @@ unsigned int mempolicy_slab_node(void)
+@@ -1886,11 +1832,11 @@ unsigned int mempolicy_slab_node(void)
  }
  
  /*
@@ -417,7 +434,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	nodemask_t nodemask = pol->nodes;
  	unsigned int target, nnodes;
-@@ -1908,33 +1856,54 @@ static unsigned offset_il_node(struct me
+@@ -1908,33 +1854,54 @@ static unsigned offset_il_node(struct me
  	nnodes = nodes_weight(nodemask);
  	if (!nnodes)
  		return numa_node_id();
@@ -489,7 +506,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  #ifdef CONFIG_HUGETLBFS
-@@ -1950,27 +1919,16 @@ static inline unsigned interleave_nid(st
+@@ -1950,27 +1917,16 @@ static inline unsigned interleave_nid(st
   * to the struct mempolicy for conditional unref after allocation.
   * If the effective policy is 'bind' or 'prefer-many', returns a pointer
   * to the mempolicy's @nodemask for filtering the zonelist.
@@ -522,7 +539,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return nid;
  }
  
-@@ -2048,27 +2006,8 @@ bool mempolicy_in_oom_domain(struct task
+@@ -2048,27 +2004,8 @@ bool mempolicy_in_oom_domain(struct task
  	return ret;
  }
  
@@ -551,7 +568,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct page *page;
  	gfp_t preferred_gfp;
-@@ -2081,7 +2020,7 @@ static struct page *alloc_pages_preferre
+@@ -2081,7 +2018,7 @@ static struct page *alloc_pages_preferre
  	 */
  	preferred_gfp = gfp | __GFP_NOWARN;
  	preferred_gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_NOFAIL);
@@ -560,7 +577,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!page)
  		page = __alloc_pages(gfp, order, nid, NULL);
  
-@@ -2089,55 +2028,29 @@ static struct page *alloc_pages_preferre
+@@ -2089,55 +2026,29 @@ static struct page *alloc_pages_preferre
  }
  
  /**
@@ -632,7 +649,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * For hugepage allocation and non-interleave policy which
  		 * allows the current node (or other explicitly preferred
-@@ -2148,39 +2061,68 @@ struct folio *vma_alloc_folio(gfp_t gfp,
+@@ -2148,39 +2059,68 @@ struct folio *vma_alloc_folio(gfp_t gfp,
  		 * If the policy is interleave or does not allow the current
  		 * node in its nodemask, we allocate the standard way.
  		 */
@@ -719,7 +736,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  EXPORT_SYMBOL(vma_alloc_folio);
  
-@@ -2198,33 +2140,23 @@ EXPORT_SYMBOL(vma_alloc_folio);
+@@ -2198,33 +2138,23 @@ EXPORT_SYMBOL(vma_alloc_folio);
   * flags are used.
   * Return: The page on success or NULL if allocation fails.
   */
@@ -759,7 +776,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	return page_rmappable_folio(alloc_pages(gfp | __GFP_COMP, order));
  }
-@@ -2295,6 +2227,8 @@ unsigned long alloc_pages_bulk_array_mem
+@@ -2295,6 +2225,8 @@ unsigned long alloc_pages_bulk_array_mem
  		unsigned long nr_pages, struct page **page_array)
  {
  	struct mempolicy *pol = &default_policy;
@@ -768,7 +785,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!in_interrupt() && !(gfp & __GFP_THISNODE))
  		pol = get_task_policy(current);
-@@ -2307,9 +2241,10 @@ unsigned long alloc_pages_bulk_array_mem
+@@ -2307,9 +2239,10 @@ unsigned long alloc_pages_bulk_array_mem
  		return alloc_pages_bulk_array_preferred_many(gfp,
  				numa_node_id(), pol, nr_pages, page_array);
  
@@ -782,7 +799,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  int vma_dup_policy(struct vm_area_struct *src, struct vm_area_struct *dst)
-@@ -2496,23 +2431,21 @@ int mpol_misplaced(struct folio *folio,
+@@ -2496,23 +2429,21 @@ int mpol_misplaced(struct folio *folio,
  		   unsigned long addr)
  {
  	struct mempolicy *pol;
@@ -811,7 +828,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	case MPOL_PREFERRED:
 --- a/mm/shmem.c~mempolicy-alloc_pages_mpol-for-numa-policy-without-vma
 +++ a/mm/shmem.c
-@@ -1561,38 +1561,20 @@ static inline struct mempolicy *shmem_ge
+@@ -1544,38 +1544,20 @@ static inline struct mempolicy *shmem_ge
  	return NULL;
  }
  #endif /* CONFIG_NUMA && CONFIG_TMPFS */
@@ -859,7 +876,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!page)
  		return NULL;
-@@ -1626,27 +1608,29 @@ static gfp_t limit_gfp_mask(gfp_t huge_g
+@@ -1609,27 +1591,29 @@ static gfp_t limit_gfp_mask(gfp_t huge_g
  static struct folio *shmem_alloc_hugefolio(gfp_t gfp,
  		struct shmem_inode_info *info, pgoff_t index)
  {
@@ -901,7 +918,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static struct folio *shmem_alloc_and_add_folio(gfp_t gfp,
-@@ -1900,7 +1884,7 @@ static int shmem_swapin_folio(struct ino
+@@ -1883,7 +1867,7 @@ static int shmem_swapin_folio(struct ino
  			count_memcg_event_mm(fault_mm, PGMAJFAULT);
  		}
  		/* Here we actually start the io */
@@ -910,7 +927,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!folio) {
  			error = -ENOMEM;
  			goto failed;
-@@ -2351,15 +2335,41 @@ static int shmem_set_policy(struct vm_ar
+@@ -2334,15 +2318,41 @@ static int shmem_set_policy(struct vm_ar
  }
  
  static struct mempolicy *shmem_get_policy(struct vm_area_struct *vma,
@@ -1199,4 +1216,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  #ifdef CONFIG_SYSFS
+--- a/mm/zswap.c~mempolicy-alloc_pages_mpol-for-numa-policy-without-vma
++++ a/mm/zswap.c
+@@ -24,6 +24,7 @@
+ #include <linux/swap.h>
+ #include <linux/crypto.h>
+ #include <linux/scatterlist.h>
++#include <linux/mempolicy.h>
+ #include <linux/mempool.h>
+ #include <linux/zpool.h>
+ #include <crypto/acompress.h>
+@@ -1057,6 +1058,7 @@ static int zswap_writeback_entry(struct
+ {
+ 	swp_entry_t swpentry = entry->swpentry;
+ 	struct page *page;
++	struct mempolicy *mpol;
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
+ 	struct zpool *pool = zswap_find_zpool(entry);
+@@ -1075,8 +1077,9 @@ static int zswap_writeback_entry(struct
+ 	}
+ 
+ 	/* try to allocate swap cache page */
+-	page = __read_swap_cache_async(swpentry, GFP_KERNEL, NULL, 0,
+-				       &page_was_allocated);
++	mpol = get_task_policy(current);
++	page = __read_swap_cache_async(swpentry, GFP_KERNEL, mpol,
++				NO_INTERLEAVE_INDEX, &page_was_allocated);
+ 	if (!page) {
+ 		ret = -ENOMEM;
+ 		goto fail;
 _
