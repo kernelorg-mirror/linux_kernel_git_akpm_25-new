@@ -1,19 +1,21 @@
 From: "Vishal Moola (Oracle)" <vishal.moola@gmail.com>
 Subject: mm/khugepaged: convert collapse_pte_mapped_thp() to use folios
-Date: Wed, 18 Oct 2023 13:32:13 -0700
+Date: Fri, 20 Oct 2023 11:33:31 -0700
 
 This removes 2 calls to compound_head() and helps convert khugepaged to
 use folios throughout.
 
 Previously, if the address passed to collapse_pte_mapped_thp()
-corresponded to a tail page, the scan would fail immediately.  Using
-filemap_lock_folio() we can get the corresponding folio back and try to
+corresponded to a tail page, the scan would fail immediately. Using
+filemap_lock_folio() we get the corresponding folio back and try to
 operate on the folio instead.
 
-Link: https://lkml.kernel.org/r/20231018203213.50224-6-vishal.moola@gmail.com
+Link: https://lkml.kernel.org/r/20231020183331.10770-6-vishal.moola@gmail.com
 Signed-off-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Reviewed-by: Rik van Riel <riel@surriel.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Yang Shi <shy828301@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
@@ -22,7 +24,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/mm/khugepaged.c~mm-khugepaged-convert-collapse_pte_mapped_thp-to-use-folios
 +++ a/mm/khugepaged.c
-@@ -1475,7 +1475,7 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1477,7 +1477,7 @@ int collapse_pte_mapped_thp(struct mm_st
  	bool notified = false;
  	unsigned long haddr = addr & HPAGE_PMD_MASK;
  	struct vm_area_struct *vma = vma_lookup(mm, haddr);
@@ -31,7 +33,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pte_t *start_pte, *pte;
  	pmd_t *pmd, pgt_pmd;
  	spinlock_t *pml = NULL, *ptl;
-@@ -1508,19 +1508,14 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1510,19 +1510,14 @@ int collapse_pte_mapped_thp(struct mm_st
  	if (userfaultfd_wp(vma))
  		return SCAN_PTE_UFFD_WP;
  
@@ -39,7 +41,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	folio = filemap_lock_folio(vma->vm_file->f_mapping,
  			       linear_page_index(vma, haddr));
 -	if (!hpage)
-+	if (!folio)
++	if (IS_ERR(folio))
  		return SCAN_PAGE_NULL;
  
 -	if (!PageHead(hpage)) {
@@ -55,7 +57,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	result = find_pmd_or_thp_or_none(mm, haddr, &pmd);
-@@ -1534,13 +1529,13 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1536,13 +1531,13 @@ int collapse_pte_mapped_thp(struct mm_st
  		 */
  		goto maybe_install_pmd;
  	default:
@@ -71,7 +73,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* step 1: check all mapped PTEs are to the right huge page */
  	for (i = 0, addr = haddr, pte = start_pte;
-@@ -1565,7 +1560,7 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1567,7 +1562,7 @@ int collapse_pte_mapped_thp(struct mm_st
  		 * Note that uprobe, debugger, or MAP_PRIVATE may change the
  		 * page table, but the new page will not be a subpage of hpage.
  		 */
@@ -80,7 +82,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto abort;
  	}
  
-@@ -1580,7 +1575,7 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1582,7 +1577,7 @@ int collapse_pte_mapped_thp(struct mm_st
  	 * page_table_lock) ptl nests inside pml. The less time we hold pml,
  	 * the better; but userfaultfd's mfill_atomic_pte() on a private VMA
  	 * inserts a valid as-if-COWed PTE without even looking up page cache.
@@ -89,7 +91,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * ptl before pgt_pmd is removed, so uffd private needs pml taken now.
  	 */
  	if (userfaultfd_armed(vma) && !(vma->vm_flags & VM_SHARED))
-@@ -1604,7 +1599,7 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1606,7 +1601,7 @@ int collapse_pte_mapped_thp(struct mm_st
  			continue;
  		/*
  		 * We dropped ptl after the first scan, to do the mmu_notifier:
@@ -98,7 +100,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 * does not stop write faults COWing anon copies from existing
  		 * PTEs; and does not stop those being swapped out or migrated.
  		 */
-@@ -1613,7 +1608,7 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1615,7 +1610,7 @@ int collapse_pte_mapped_thp(struct mm_st
  			goto abort;
  		}
  		page = vm_normal_page(vma, addr, ptent);
@@ -107,7 +109,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto abort;
  
  		/*
-@@ -1632,8 +1627,8 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1634,8 +1629,8 @@ int collapse_pte_mapped_thp(struct mm_st
  
  	/* step 3: set proper refcount and mm_counters. */
  	if (nr_ptes) {
@@ -118,7 +120,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	/* step 4: remove empty page table */
-@@ -1657,14 +1652,14 @@ int collapse_pte_mapped_thp(struct mm_st
+@@ -1659,14 +1654,14 @@ int collapse_pte_mapped_thp(struct mm_st
  maybe_install_pmd:
  	/* step 5: install pmd entry */
  	result = install_pmd
@@ -137,7 +139,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	if (start_pte)
  		pte_unmap_unlock(start_pte, ptl);
-@@ -1672,9 +1667,9 @@ abort:
+@@ -1674,9 +1669,9 @@ abort:
  		spin_unlock(pml);
  	if (notified)
  		mmu_notifier_invalidate_range_end(&range);

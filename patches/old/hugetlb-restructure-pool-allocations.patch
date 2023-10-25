@@ -1,6 +1,6 @@
 From: Mike Kravetz <mike.kravetz@oracle.com>
 Subject: hugetlb: restructure pool allocations
-Date: Thu, 5 Oct 2023 20:20:04 -0700
+Date: Wed, 18 Oct 2023 19:31:04 -0700
 
 Allocation of a hugetlb page for the hugetlb pool is done by the routine
 alloc_pool_huge_page.  This routine will allocate contiguous pages from a
@@ -13,14 +13,15 @@ hugetlb pages at once.  To do this, restructure the hugetlb pool
 allocation code such that vmemmap optimization can be isolated and later
 batched.
 
-The code to allocate hugetlb pages from bootmem was also modified to allow
-batching.
+The code to allocate hugetlb pages from bootmem was also modified to
+allow batching.
 
 No functional changes, only code restructure.
 
-Link: https://lkml.kernel.org/r/20231006032012.296473-3-mike.kravetz@oracle.com
+Link: https://lkml.kernel.org/r/20231019023113.345257-3-mike.kravetz@oracle.com
 Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
 Reviewed-by: Muchun Song <songmuchun@bytedance.com>
+Tested-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
 Cc: Barry Song <21cnbao@gmail.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -33,15 +34,13 @@ Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Naoya Horiguchi <naoya.horiguchi@linux.dev>
 Cc: Oscar Salvador <osalvador@suse.de>
-Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
-Cc: Fam Zheng <fam.zheng@bytedance.com>
-Cc: Punit Agrawal <punit.agrawal@bytedance.com>
 Cc: Usama Arif <usama.arif@bytedance.com>
+Cc: Xiongchun Duan <duanxiongchun@bytedance.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/hugetlb.c |  179 ++++++++++++++++++++++++++++++++++++++-----------
- 1 file changed, 140 insertions(+), 39 deletions(-)
+ mm/hugetlb.c |  180 ++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 141 insertions(+), 39 deletions(-)
 
 --- a/mm/hugetlb.c~hugetlb-restructure-pool-allocations
 +++ a/mm/hugetlb.c
@@ -97,7 +96,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (hstate_is_gigantic(h)) {
  		if (!prep_compound_gigantic_folio(folio, huge_page_order(h))) {
  			/*
-@@ -2238,32 +2237,80 @@ retry:
+@@ -2238,32 +2237,81 @@ retry:
  			return NULL;
  		}
  	}
@@ -149,15 +148,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static void prep_and_add_allocated_folios(struct hstate *h,
 +					struct list_head *folio_list)
 +{
++	unsigned long flags;
 +	struct folio *folio, *tmp_f;
 +
 +	/* Add all new pool pages to free lists in one lock cycle */
-+	spin_lock_irq(&hugetlb_lock);
++	spin_lock_irqsave(&hugetlb_lock, flags);
 +	list_for_each_entry_safe(folio, tmp_f, folio_list, lru) {
 +		__prep_account_new_huge_page(h, folio_nid(folio));
 +		enqueue_hugetlb_folio(h, folio);
 +	}
-+	spin_unlock_irq(&hugetlb_lock);
++	spin_unlock_irqrestore(&hugetlb_lock, flags);
 +}
 +
 +/*
@@ -190,13 +190,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -3284,25 +3331,35 @@ static void __init hugetlb_folio_init_vm
+@@ -3302,25 +3350,35 @@ static void __init hugetlb_folio_init_vm
   */
  static void __init gather_bootmem_prealloc(void)
  {
 +	LIST_HEAD(folio_list);
  	struct huge_bootmem_page *m;
-+	struct hstate *h, *prev_h = NULL;
++	struct hstate *h = NULL, *prev_h = NULL;
  
  	list_for_each_entry(m, &huge_boot_pages, list) {
  		struct page *page = virt_to_page(m);
@@ -229,7 +229,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		/*
  		 * We need to restore the 'stolen' pages to totalram_pages
-@@ -3312,6 +3369,8 @@ static void __init gather_bootmem_preall
+@@ -3330,6 +3388,8 @@ static void __init gather_bootmem_preall
  		adjust_managed_page_count(page, pages_per_huge_page(h));
  		cond_resched();
  	}
@@ -238,7 +238,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void __init hugetlb_hstate_alloc_pages_onenode(struct hstate *h, int nid)
-@@ -3345,9 +3404,22 @@ static void __init hugetlb_hstate_alloc_
+@@ -3363,9 +3423,22 @@ static void __init hugetlb_hstate_alloc_
  	h->max_huge_pages_node[nid] = i;
  }
  
@@ -261,7 +261,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	nodemask_t *node_alloc_noretry;
  	bool node_specific_alloc = false;
  
-@@ -3389,14 +3461,25 @@ static void __init hugetlb_hstate_alloc_
+@@ -3407,14 +3480,25 @@ static void __init hugetlb_hstate_alloc_
  
  	for (i = 0; i < h->max_huge_pages; ++i) {
  		if (hstate_is_gigantic(h)) {
@@ -291,7 +291,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (i < h->max_huge_pages) {
  		char buf[32];
  
-@@ -3530,7 +3613,9 @@ found:
+@@ -3548,7 +3632,9 @@ found:
  static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
  			      nodemask_t *nodes_allowed)
  {
@@ -302,7 +302,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	LIST_HEAD(page_list);
  	NODEMASK_ALLOC(nodemask_t, node_alloc_noretry, GFP_KERNEL);
  
-@@ -3607,7 +3692,8 @@ static int set_max_huge_pages(struct hst
+@@ -3625,7 +3711,8 @@ static int set_max_huge_pages(struct hst
  			break;
  	}
  
@@ -312,7 +312,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * If this allocation races such that we no longer need the
  		 * page, free_huge_folio will handle it by freeing the page
-@@ -3618,15 +3704,32 @@ static int set_max_huge_pages(struct hst
+@@ -3636,15 +3723,32 @@ static int set_max_huge_pages(struct hst
  		/* yield cpu to avoid soft lockup */
  		cond_resched();
  
@@ -349,7 +349,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	/*
-@@ -3652,8 +3755,6 @@ static int set_max_huge_pages(struct hst
+@@ -3670,8 +3774,6 @@ static int set_max_huge_pages(struct hst
  	 * Collect pages to be removed on list without dropping lock
  	 */
  	while (min_count < persistent_huge_pages(h)) {
