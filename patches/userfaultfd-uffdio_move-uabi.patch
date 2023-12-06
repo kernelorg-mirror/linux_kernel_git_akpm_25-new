@@ -1,0 +1,179 @@
+From: Andrea Arcangeli <aarcange@redhat.com>
+Subject: userfaultfd: UFFDIO_MOVE uABI
+Date: Wed, 6 Dec 2023 02:36:56 -0800
+
+Implement the uABI of UFFDIO_MOVE ioctl.
+UFFDIO_COPY performs ~20% better than UFFDIO_MOVE when the application
+needs pages to be allocated [1]. However, with UFFDIO_MOVE, if pages are
+available (in userspace) for recycling, as is usually the case in heap
+compaction algorithms, then we can avoid the page allocation and memcpy
+(done by UFFDIO_COPY). Also, since the pages are recycled in the
+userspace, we avoid the need to release (via madvise) the pages back to
+the kernel [2].
+
+We see over 40% reduction (on a Google pixel 6 device) in the compacting
+thread's completion time by using UFFDIO_MOVE vs.  UFFDIO_COPY.  This was
+measured using a benchmark that emulates a heap compaction implementation
+using userfaultfd (to allow concurrent accesses by application threads). 
+More details of the usecase are explained in [2].  Furthermore,
+UFFDIO_MOVE enables moving swapped-out pages without touching them within
+the same vma.  Today, it can only be done by mremap, however it forces
+splitting the vma.
+
+[1] https://lore.kernel.org/all/1425575884-2574-1-git-send-email-aarcange@redhat.com/
+[2] https://lore.kernel.org/linux-mm/CA+EESO4uO84SSnBhArH4HvLNhaUQ5nZKNKXqxRCyjniNVjp0Aw@mail.gmail.com/
+
+Update for the ioctl_userfaultfd(2)  manpage:
+
+   UFFDIO_MOVE
+       (Since Linux xxx)  Move a continuous memory chunk into the
+       userfault registered range and optionally wake up the blocked
+       thread. The source and destination addresses and the number of
+       bytes to move are specified by the src, dst, and len fields of
+       the uffdio_move structure pointed to by argp:
+
+           struct uffdio_move {
+               __u64 dst;    /* Destination of move */
+               __u64 src;    /* Source of move */
+               __u64 len;    /* Number of bytes to move */
+               __u64 mode;   /* Flags controlling behavior of move */
+               __s64 move;   /* Number of bytes moved, or negated error */
+           };
+
+       The following value may be bitwise ORed in mode to change the
+       behavior of the UFFDIO_MOVE operation:
+
+       UFFDIO_MOVE_MODE_DONTWAKE
+              Do not wake up the thread that waits for page-fault
+              resolution
+
+       UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES
+              Allow holes in the source virtual range that is being moved.
+              When not specified, the holes will result in ENOENT error.
+              When specified, the holes will be accounted as successfully
+              moved memory. This is mostly useful to move hugepage aligned
+              virtual regions without knowing if there are transparent
+              hugepages in the regions or not, but preventing the risk of
+              having to split the hugepage during the operation.
+
+       The move field is used by the kernel to return the number of
+       bytes that was actually moved, or an error (a negated errno-
+       style value).  If the value returned in move doesn't match the
+       value that was specified in len, the operation fails with the
+       error EAGAIN.  The move field is output-only; it is not read by
+       the UFFDIO_MOVE operation.
+
+       The operation may fail for various reasons. Usually, remapping of
+       pages that are not exclusive to the given process fail; once KSM
+       might deduplicate pages or fork() COW-shares pages during fork()
+       with child processes, they are no longer exclusive. Further, the
+       kernel might only perform lightweight checks for detecting whether
+       the pages are exclusive, and return -EBUSY in case that check fails.
+       To make the operation more likely to succeed, KSM should be
+       disabled, fork() should be avoided or MADV_DONTFORK should be
+       configured for the source VMA before fork().
+
+       This ioctl(2) operation returns 0 on success.  In this case, the
+       entire area was moved.  On error, -1 is returned and errno is
+       set to indicate the error.  Possible errors include:
+
+       EAGAIN The number of bytes moved (i.e., the value returned in
+              the move field) does not equal the value that was
+              specified in the len field.
+
+       EINVAL Either dst or len was not a multiple of the system page
+              size, or the range specified by src and len or dst and len
+              was invalid.
+
+       EINVAL An invalid bit was specified in the mode field.
+
+       ENOENT
+              The source virtual memory range has unmapped holes and
+              UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES is not set.
+
+       EEXIST
+              The destination virtual memory range is fully or partially
+              mapped.
+
+       EBUSY
+              The pages in the source virtual memory range are either
+              pinned or not exclusive to the process. The kernel might
+              only perform lightweight checks for detecting whether the
+              pages are exclusive. To make the operation more likely to
+              succeed, KSM should be disabled, fork() should be avoided
+              or MADV_DONTFORK should be configured for the source virtual
+              memory area before fork().
+
+       ENOMEM Allocating memory needed for the operation failed.
+
+       ESRCH
+              The target process has exited at the time of a UFFDIO_MOVE
+              operation.
+
+Link: https://lkml.kernel.org/r/20231206103702.3873743-3-surenb@google.com
+Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Nicolas Geoffray <ngeoffray@google.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: ZhangPeng <zhangpeng362@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/rmap.c |   23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+--- a/mm/rmap.c~userfaultfd-uffdio_move-uabi
++++ a/mm/rmap.c
+@@ -565,6 +565,17 @@ retry:
+ 		}
+ 
+ 		/*
++		 * folio_move_anon_rmap() might have changed the anon_vma as we
++		 * might not hold the folio lock here.
++		 */
++		if (unlikely((unsigned long)READ_ONCE(folio->mapping) !=
++			     anon_mapping)) {
++			up_read(&root_anon_vma->rwsem);
++			rcu_read_unlock();
++			goto retry;
++		}
++
++		/*
+ 		 * If the folio is still mapped, then this anon_vma is still
+ 		 * its anon_vma, and holding the mutex ensures that it will
+ 		 * not go away, see anon_vma_free().
+@@ -600,6 +611,18 @@ retry:
+ 
+ 	/*
+ 	 * folio_move_anon_rmap() might have changed the anon_vma as we might
++	 * not hold the folio lock here.
++	 */
++	if (unlikely((unsigned long)READ_ONCE(folio->mapping) !=
++		     anon_mapping)) {
++		anon_vma_unlock_read(anon_vma);
++		put_anon_vma(anon_vma);
++		anon_vma = NULL;
++		goto retry;
++	}
++
++	/*
++	 * folio_move_anon_rmap() might have changed the anon_vma as we might
+ 	 * not hold the folio lock here.
+ 	 */
+ 	if (unlikely((unsigned long)READ_ONCE(folio->mapping) !=
+_
