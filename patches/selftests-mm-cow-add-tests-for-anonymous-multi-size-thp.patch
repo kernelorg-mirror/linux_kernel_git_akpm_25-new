@@ -1,0 +1,177 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: selftests/mm/cow: add tests for anonymous multi-size THP
+Date: Thu, 7 Dec 2023 16:12:11 +0000
+
+Add tests similar to the existing PMD-sized THP tests, but which operate
+on memory backed by (PTE-mapped) multi-size THP.  This reuses all the
+existing infrastructure.  If the test suite detects that multi-size THP is
+not supported by the kernel, the new tests are skipped.
+
+Link: https://lkml.kernel.org/r/20231207161211.2374093-11-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Tested-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Tested-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Barry Song <v-songbaohua@oppo.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Itaru Kitayama <itaru.kitayama@gmail.com>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yin Fengwei <fengwei.yin@intel.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ tools/testing/selftests/mm/cow.c |   84 ++++++++++++++++++++++++-----
+ 1 file changed, 72 insertions(+), 12 deletions(-)
+
+--- a/tools/testing/selftests/mm/cow.c~selftests-mm-cow-add-tests-for-anonymous-multi-size-thp
++++ a/tools/testing/selftests/mm/cow.c
+@@ -29,15 +29,49 @@
+ #include "../../../../mm/gup_test.h"
+ #include "../kselftest.h"
+ #include "vm_util.h"
++#include "thp_settings.h"
+ 
+ static size_t pagesize;
+ static int pagemap_fd;
+ static size_t pmdsize;
++static int nr_thpsizes;
++static size_t thpsizes[20];
+ static int nr_hugetlbsizes;
+ static size_t hugetlbsizes[10];
+ static int gup_fd;
+ static bool has_huge_zeropage;
+ 
++static int sz2ord(size_t size)
++{
++	return __builtin_ctzll(size / pagesize);
++}
++
++static int detect_thp_sizes(size_t sizes[], int max)
++{
++	int count = 0;
++	unsigned long orders;
++	size_t kb;
++	int i;
++
++	/* thp not supported at all. */
++	if (!pmdsize)
++		return 0;
++
++	orders = 1UL << sz2ord(pmdsize);
++	orders |= thp_supported_orders();
++
++	for (i = 0; orders && count < max; i++) {
++		if (!(orders & (1UL << i)))
++			continue;
++		orders &= ~(1UL << i);
++		kb = (pagesize >> 10) << i;
++		sizes[count++] = kb * 1024;
++		ksft_print_msg("[INFO] detected THP size: %zu KiB\n", kb);
++	}
++
++	return count;
++}
++
+ static void detect_huge_zeropage(void)
+ {
+ 	int fd = open("/sys/kernel/mm/transparent_hugepage/use_zero_page",
+@@ -1101,15 +1135,27 @@ static void run_anon_test_case(struct te
+ 
+ 	run_with_base_page(test_case->fn, test_case->desc);
+ 	run_with_base_page_swap(test_case->fn, test_case->desc);
+-	if (pmdsize) {
+-		run_with_thp(test_case->fn, test_case->desc, pmdsize);
+-		run_with_thp_swap(test_case->fn, test_case->desc, pmdsize);
+-		run_with_pte_mapped_thp(test_case->fn, test_case->desc, pmdsize);
+-		run_with_pte_mapped_thp_swap(test_case->fn, test_case->desc, pmdsize);
+-		run_with_single_pte_of_thp(test_case->fn, test_case->desc, pmdsize);
+-		run_with_single_pte_of_thp_swap(test_case->fn, test_case->desc, pmdsize);
+-		run_with_partial_mremap_thp(test_case->fn, test_case->desc, pmdsize);
+-		run_with_partial_shared_thp(test_case->fn, test_case->desc, pmdsize);
++	for (i = 0; i < nr_thpsizes; i++) {
++		size_t size = thpsizes[i];
++		struct thp_settings settings = *thp_current_settings();
++
++		settings.hugepages[sz2ord(pmdsize)].enabled = THP_NEVER;
++		settings.hugepages[sz2ord(size)].enabled = THP_ALWAYS;
++		thp_push_settings(&settings);
++
++		if (size == pmdsize) {
++			run_with_thp(test_case->fn, test_case->desc, size);
++			run_with_thp_swap(test_case->fn, test_case->desc, size);
++		}
++
++		run_with_pte_mapped_thp(test_case->fn, test_case->desc, size);
++		run_with_pte_mapped_thp_swap(test_case->fn, test_case->desc, size);
++		run_with_single_pte_of_thp(test_case->fn, test_case->desc, size);
++		run_with_single_pte_of_thp_swap(test_case->fn, test_case->desc, size);
++		run_with_partial_mremap_thp(test_case->fn, test_case->desc, size);
++		run_with_partial_shared_thp(test_case->fn, test_case->desc, size);
++
++		thp_pop_settings();
+ 	}
+ 	for (i = 0; i < nr_hugetlbsizes; i++)
+ 		run_with_hugetlb(test_case->fn, test_case->desc,
+@@ -1130,8 +1176,9 @@ static int tests_per_anon_test_case(void
+ {
+ 	int tests = 2 + nr_hugetlbsizes;
+ 
++	tests += 6 * nr_thpsizes;
+ 	if (pmdsize)
+-		tests += 8;
++		tests += 2;
+ 	return tests;
+ }
+ 
+@@ -1689,17 +1736,25 @@ static int tests_per_non_anon_test_case(
+ int main(int argc, char **argv)
+ {
+ 	int err;
++	struct thp_settings default_settings;
+ 
+ 	ksft_print_header();
+ 
+ 	pagesize = getpagesize();
+ 	pmdsize = read_pmd_pagesize();
+ 	if (pmdsize) {
++		/* Only if THP is supported. */
++		thp_read_settings(&default_settings);
++		default_settings.hugepages[sz2ord(pmdsize)].enabled = THP_INHERIT;
++		thp_save_settings();
++		thp_push_settings(&default_settings);
++
+ 		ksft_print_msg("[INFO] detected PMD size: %zu KiB\n",
+ 			       pmdsize / 1024);
+-		ksft_print_msg("[INFO] detected THP size: %zu KiB\n",
+-			       pmdsize / 1024);
++
++		nr_thpsizes = detect_thp_sizes(thpsizes, ARRAY_SIZE(thpsizes));
+ 	}
++
+ 	nr_hugetlbsizes = detect_hugetlb_page_sizes(hugetlbsizes,
+ 						    ARRAY_SIZE(hugetlbsizes));
+ 	detect_huge_zeropage();
+@@ -1717,6 +1772,11 @@ int main(int argc, char **argv)
+ 	run_anon_thp_test_cases();
+ 	run_non_anon_test_cases();
+ 
++	if (pmdsize) {
++		/* Only if THP is supported. */
++		thp_restore_settings();
++	}
++
+ 	err = ksft_get_fail_cnt();
+ 	if (err)
+ 		ksft_exit_fail_msg("%d out of %d tests failed\n",
+_
