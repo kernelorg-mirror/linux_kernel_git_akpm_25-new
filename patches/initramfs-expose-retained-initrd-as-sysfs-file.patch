@@ -1,0 +1,102 @@
+From: Alexander Graf <graf@amazon.com>
+Subject: initramfs: expose retained initrd as sysfs file
+Date: Thu, 7 Dec 2023 23:56:54 +0000
+
+When the kernel command line option "retain_initrd" is set, we do not free
+the initrd memory.  However, we also don't expose it to anyone for
+consumption.  That leaves us in a weird situation where the only user of
+this feature is ppc64 and arm64 specific kexec tooling.
+
+To make it more generally useful, this patch adds a kobject to the
+firmware object that contains the initrd context when "retain_initrd" is
+set.  That way, we can access the initrd any time after boot from user
+space and for example hand it into kexec as --initrd parameter if we want
+to reboot the same initrd.  Or inspect it directly locally.
+
+With this patch applied, there is a new /sys/firmware/initrd file when the
+kernel was booted with an initrd and "retain_initrd" command line option
+is set.
+
+Link: https://lkml.kernel.org/r/20231207235654.16622-1-graf@amazon.com
+Signed-off-by: Alexander Graf <graf@amazon.com>
+Tested-by: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: James Gowans <jgowans@amazon.com>
+Cc: Jan H. Schönherr <jschoenh@amazon.de>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/ABI/testing/sysfs-firmware-initrd |    8 ++++++
+ Documentation/admin-guide/kernel-parameters.txt |    5 ++-
+ init/initramfs.c                                |   18 +++++++++++++-
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+--- /dev/null
++++ a/Documentation/ABI/testing/sysfs-firmware-initrd
+@@ -0,0 +1,8 @@
++What:		/sys/firmware/initrd
++Date:		December 2023
++Contact:	Alexander Graf <graf@amazon.com>
++Description:
++		When the kernel was booted with an initrd and the
++		"retain_initrd" option is set on the kernel command
++		line, /sys/firmware/initrd contains the contents of the
++		initrd that the kernel was booted with.
+--- a/Documentation/admin-guide/kernel-parameters.txt~initramfs-expose-retained-initrd-as-sysfs-file
++++ a/Documentation/admin-guide/kernel-parameters.txt
+@@ -2438,7 +2438,7 @@
+ 			between unregistering the boot console and initializing
+ 			the real console.
+ 
+-	keepinitrd	[HW,ARM]
++	keepinitrd	[HW,ARM] See retain_initrd.
+ 
+ 	kernelcore=	[KNL,X86,IA-64,PPC]
+ 			Format: nn[KMGTPE] | nn% | "mirror"
+@@ -5580,7 +5580,8 @@
+ 			Useful for devices that are detected asynchronously
+ 			(e.g. USB and MMC devices).
+ 
+-	retain_initrd	[RAM] Keep initrd memory after extraction
++	retain_initrd	[RAM] Keep initrd memory after extraction. After boot, it will
++			be accessible via /sys/firmware/initrd.
+ 
+ 	retbleed=	[X86] Control mitigation of RETBleed (Arbitrary
+ 			Speculative Code Execution with Return Instructions)
+--- a/init/initramfs.c~initramfs-expose-retained-initrd-as-sysfs-file
++++ a/init/initramfs.c
+@@ -574,6 +574,16 @@ extern unsigned long __initramfs_size;
+ #include <linux/initrd.h>
+ #include <linux/kexec.h>
+ 
++static ssize_t raw_read(struct file *file, struct kobject *kobj,
++			struct bin_attribute *attr, char *buf,
++			loff_t pos, size_t count)
++{
++	memcpy(buf, attr->private + pos, count);
++	return count;
++}
++
++static BIN_ATTR(initrd, 0440, raw_read, NULL, 0);
++
+ void __init reserve_initrd_mem(void)
+ {
+ 	phys_addr_t start;
+@@ -715,8 +725,14 @@ done:
+ 	 * If the initrd region is overlapped with crashkernel reserved region,
+ 	 * free only memory that is not part of crashkernel region.
+ 	 */
+-	if (!do_retain_initrd && initrd_start && !kexec_free_initrd())
++	if (!do_retain_initrd && initrd_start && !kexec_free_initrd()) {
+ 		free_initrd_mem(initrd_start, initrd_end);
++	} else if (do_retain_initrd && initrd_start) {
++		bin_attr_initrd.size = initrd_end - initrd_start;
++		bin_attr_initrd.private = (void *)initrd_start;
++		if (sysfs_create_bin_file(firmware_kobj, &bin_attr_initrd))
++			pr_err("Failed to create initrd sysfs file");
++	}
+ 	initrd_start = 0;
+ 	initrd_end = 0;
+ 
+_
