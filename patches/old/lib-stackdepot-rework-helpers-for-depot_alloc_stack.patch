@@ -1,6 +1,6 @@
 From: Andrey Konovalov <andreyknvl@google.com>
 Subject: lib/stackdepot: rework helpers for depot_alloc_stack
-Date: Wed, 13 Sep 2023 19:14:32 +0200
+Date: Mon, 20 Nov 2023 18:47:06 +0100
 
 Split code in depot_alloc_stack and depot_init_pool into 3 functions:
 
@@ -14,14 +14,13 @@ Split code in depot_alloc_stack and depot_init_pool into 3 functions:
 3. depot_alloc_stack that calls depot_update_pools and then allocates
    a stack record as before.
 
-This makes it somewhat easier to follow the logic of depot_alloc_stack
-and also serves as a preparation for implementing the eviction of stack
+This makes it somewhat easier to follow the logic of depot_alloc_stack and
+also serves as a preparation for implementing the eviction of stack
 records from the stack depot.
 
-Link: https://lkml.kernel.org/r/bbf482643e882f9f870d80cb35342c61955ea291.1694625260.git.andreyknvl@google.com
+Link: https://lkml.kernel.org/r/71fb144d42b701fcb46708d7f4be6801a4a8270e.1700502145.git.andreyknvl@google.com
 Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
-Cc: Alexander Potapenko <glider@google.com>
-Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Reviewed-by: Alexander Potapenko <glider@google.com>
 Cc: Dmitry Vyukov <dvyukov@google.com>
 Cc: Evgenii Stepanov <eugenis@google.com>
 Cc: Marco Elver <elver@google.com>
@@ -30,12 +29,12 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- lib/stackdepot.c |   87 +++++++++++++++++++++++++--------------------
- 1 file changed, 49 insertions(+), 38 deletions(-)
+ lib/stackdepot.c |   86 +++++++++++++++++++++++++--------------------
+ 1 file changed, 49 insertions(+), 37 deletions(-)
 
 --- a/lib/stackdepot.c~lib-stackdepot-rework-helpers-for-depot_alloc_stack
 +++ a/lib/stackdepot.c
-@@ -219,54 +219,43 @@ out_unlock:
+@@ -225,11 +225,11 @@ out_unlock:
  }
  EXPORT_SYMBOL_GPL(stack_depot_init);
  
@@ -48,7 +47,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 * If the next pool is already initialized or the maximum number of
 +	 * If the next pool is already saved or the maximum number of
  	 * pools is reached, do not use the preallocated memory.
- 	 */
+ 	 * Access next_pool_required non-atomically, as there are no concurrent
+ 	 * write accesses to this variable.
+@@ -237,44 +237,34 @@ static void depot_init_pool(void **preal
  	if (!next_pool_required)
  		return;
  
@@ -76,8 +77,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		 * At this point, either the next pool is initialized or the
 -		 * maximum number of pools is reached. In either case, take
 -		 * note that initializing another pool is not required.
--		 * smp_store_release pairs with smp_load_acquire in
--		 * stack_depot_save.
+-		 * smp_store_release() pairs with smp_load_acquire() in
+-		 * stack_depot_save().
 -		 */
 -		smp_store_release(&next_pool_required, 0);
  	}
@@ -86,7 +87,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * At this point, either the next pool is kept or the maximum
 +	 * number of pools is reached. In either case, take note that
 +	 * keeping another pool is not required.
-+	 * smp_store_release pairs with smp_load_acquire in stack_depot_save.
++	 * smp_store_release() pairs with smp_load_acquire() in
++	 * stack_depot_save().
 +	 */
 +	smp_store_release(&next_pool_required, 0);
  }
@@ -94,7 +96,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -/* Allocates a new stack in a stack depot pool. */
 -static struct stack_record *
 -depot_alloc_stack(unsigned long *entries, int size, u32 hash, void **prealloc)
-+/* Updates refences to the current and the next stack depot pools. */
++/* Updates references to the current and the next stack depot pools. */
 +static bool depot_update_pools(size_t required_size, void **prealloc)
  {
 -	struct stack_record *stack;
@@ -110,7 +112,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  
  		/*
-@@ -276,9 +265,10 @@ depot_alloc_stack(unsigned long *entries
+@@ -284,9 +274,10 @@ depot_alloc_stack(unsigned long *entries
  		 */
  		WRITE_ONCE(pool_index, pool_index + 1);
  		pool_offset = 0;
@@ -119,10 +121,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 * If the maximum number of pools is not reached, take note
 -		 * that the next pool needs to initialized.
 +		 * that the next pool needs to be initialized.
- 		 * smp_store_release pairs with smp_load_acquire in
- 		 * stack_depot_save.
+ 		 * smp_store_release() pairs with smp_load_acquire() in
+ 		 * stack_depot_save().
  		 */
-@@ -286,9 +276,30 @@ depot_alloc_stack(unsigned long *entries
+@@ -294,9 +285,30 @@ depot_alloc_stack(unsigned long *entries
  			smp_store_release(&next_pool_required, 1);
  	}
  
@@ -155,27 +157,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Check if we have a pool to save the stack trace. */
  	if (stack_pools[pool_index] == NULL)
-@@ -322,7 +333,7 @@ static struct stack_record *depot_fetch_
+@@ -330,7 +342,7 @@ static struct stack_record *depot_fetch_
  	union handle_parts parts = { .handle = handle };
  	/*
- 	 * READ_ONCE pairs with potential concurrent write in
--	 * depot_alloc_stack.
-+	 * depot_update_pools.
+ 	 * READ_ONCE() pairs with potential concurrent write in
+-	 * depot_alloc_stack().
++	 * depot_update_pools().
  	 */
  	int pool_index_cached = READ_ONCE(pool_index);
  	void *pool;
-@@ -421,8 +432,8 @@ depot_stack_handle_t __stack_depot_save(
- 	 * Check if another stack pool needs to be initialized. If so, allocate
+@@ -430,7 +442,7 @@ depot_stack_handle_t __stack_depot_save(
  	 * the memory now - we won't be able to do that under the lock.
  	 *
--	 * smp_load_acquire pairs with smp_store_release in depot_alloc_stack
--	 * and depot_init_pool.
-+	 * smp_load_acquire pairs with smp_store_release in depot_update_pools
-+	 * and depot_keep_next_pool.
+ 	 * smp_load_acquire() pairs with smp_store_release() in
+-	 * depot_alloc_stack() and depot_init_pool().
++	 * depot_update_pools() and depot_keep_next_pool().
  	 */
  	if (unlikely(can_alloc && smp_load_acquire(&next_pool_required))) {
  		/*
-@@ -459,7 +470,7 @@ depot_stack_handle_t __stack_depot_save(
+@@ -467,7 +479,7 @@ depot_stack_handle_t __stack_depot_save(
  		 * Stack depot already contains this stack trace, but let's
  		 * keep the preallocated memory for the future.
  		 */
