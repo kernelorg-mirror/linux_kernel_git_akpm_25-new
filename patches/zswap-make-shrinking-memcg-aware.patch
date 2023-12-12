@@ -20,6 +20,10 @@ b) If the store attempt instead hits the global zswap limit, it will
    trigger an asynchronous reclaim attempt, in which an memcg is
    selected for reclaim in a round-robin-like fashion.
 
+[nphamcs@gmail.com: use correct function for the onlineness check, use mem_cgroup_iter_break()]
+  Link: https://lkml.kernel.org/r/20231205195419.2563217-1-nphamcs@gmail.com
+[nphamcs@gmail.com: drop the pool's reference at the end of the writeback step]
+  Link: https://lkml.kernel.org/r/20231206030627.4155634-1-nphamcs@gmail.com
 Link: https://lkml.kernel.org/r/20231130194023.4102148-4-nphamcs@gmail.com
 Signed-off-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
 Co-developed-by: Nhat Pham <nphamcs@gmail.com>
@@ -44,8 +48,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  mm/memcontrol.c            |    2 
  mm/swap.h                  |    3 
  mm/swap_state.c            |   24 ++-
- mm/zswap.c                 |  269 ++++++++++++++++++++++++++++-------
- 6 files changed, 245 insertions(+), 60 deletions(-)
+ mm/zswap.c                 |  268 ++++++++++++++++++++++++++++-------
+ 6 files changed, 245 insertions(+), 59 deletions(-)
 
 --- a/include/linux/memcontrol.h~zswap-make-shrinking-memcg-aware
 +++ a/include/linux/memcontrol.h
@@ -390,7 +394,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Writeback started successfully, the page now belongs to the
-@@ -689,27 +772,93 @@ put_unlock:
+@@ -689,24 +772,91 @@ put_unlock:
  	zswap_entry_put(tree, entry);
  unlock:
  	spin_unlock(&tree->lock);
@@ -461,9 +465,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			goto resched;
 +		}
 +
-+		if (!mem_cgroup_online(memcg)) {
++		if (!mem_cgroup_tryget_online(memcg)) {
 +			/* drop the reference from mem_cgroup_iter() */
-+			mem_cgroup_put(memcg);
++			mem_cgroup_iter_break(NULL, memcg);
 +			pool->next_shrink = NULL;
 +			spin_unlock(&zswap_pools_lock);
 +
@@ -486,11 +490,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +resched:
  		cond_resched();
  	} while (!zswap_can_accept());
--	zswap_pool_put(pool);
- }
- 
- static struct zswap_pool *zswap_pool_create(char *type, char *compressor)
-@@ -767,8 +916,7 @@ static struct zswap_pool *zswap_pool_cre
+ 	zswap_pool_put(pool);
+@@ -767,8 +917,7 @@ static struct zswap_pool *zswap_pool_cre
  	 */
  	kref_init(&pool->kref);
  	INIT_LIST_HEAD(&pool->list);
@@ -500,21 +501,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	INIT_WORK(&pool->shrink_work, shrink_worker);
  
  	zswap_pool_debug("created", pool);
-@@ -834,6 +982,13 @@ static void zswap_pool_destroy(struct zs
+@@ -834,6 +983,13 @@ static void zswap_pool_destroy(struct zs
  
  	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
  	free_percpu(pool->acomp_ctx);
 +	list_lru_destroy(&pool->list_lru);
 +
 +	spin_lock(&zswap_pools_lock);
-+	mem_cgroup_put(pool->next_shrink);
++	mem_cgroup_iter_break(NULL, pool->next_shrink);
 +	pool->next_shrink = NULL;
 +	spin_unlock(&zswap_pools_lock);
 +
  	for (i = 0; i < ZSWAP_NR_ZPOOLS; i++)
  		zpool_destroy_pool(pool->zpools[i]);
  	kfree(pool);
-@@ -1081,7 +1236,7 @@ static int zswap_writeback_entry(struct
+@@ -1081,7 +1237,7 @@ static int zswap_writeback_entry(struct
  	/* try to allocate swap cache page */
  	mpol = get_task_policy(current);
  	page = __read_swap_cache_async(swpentry, GFP_KERNEL, mpol,
@@ -523,7 +524,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!page) {
  		ret = -ENOMEM;
  		goto fail;
-@@ -1147,7 +1302,6 @@ static int zswap_writeback_entry(struct
+@@ -1147,7 +1303,6 @@ static int zswap_writeback_entry(struct
  	/* start writeback */
  	__swap_writepage(page, &wbc);
  	put_page(page);
@@ -531,7 +532,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return ret;
  
-@@ -1204,6 +1358,7 @@ bool zswap_store(struct folio *folio)
+@@ -1204,6 +1359,7 @@ bool zswap_store(struct folio *folio)
  	struct scatterlist input, output;
  	struct crypto_acomp_ctx *acomp_ctx;
  	struct obj_cgroup *objcg = NULL;
@@ -539,7 +540,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct zswap_pool *pool;
  	struct zpool *zpool;
  	unsigned int dlen = PAGE_SIZE;
-@@ -1235,15 +1390,15 @@ bool zswap_store(struct folio *folio)
+@@ -1235,15 +1391,15 @@ bool zswap_store(struct folio *folio)
  		zswap_invalidate_entry(tree, dupentry);
  	}
  	spin_unlock(&tree->lock);
@@ -563,7 +564,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* reclaim space if needed */
  	if (zswap_is_full()) {
-@@ -1260,7 +1415,7 @@ bool zswap_store(struct folio *folio)
+@@ -1260,7 +1416,7 @@ bool zswap_store(struct folio *folio)
  	}
  
  	/* allocate entry */
@@ -572,7 +573,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!entry) {
  		zswap_reject_kmemcache_fail++;
  		goto reject;
-@@ -1287,6 +1442,15 @@ bool zswap_store(struct folio *folio)
+@@ -1287,6 +1443,15 @@ bool zswap_store(struct folio *folio)
  	if (!entry->pool)
  		goto freepage;
  
@@ -588,7 +589,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* compress */
  	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
  
-@@ -1365,9 +1529,8 @@ insert_entry:
+@@ -1365,9 +1530,8 @@ insert_entry:
  		zswap_invalidate_entry(tree, dupentry);
  	}
  	if (entry->length) {
@@ -600,7 +601,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	spin_unlock(&tree->lock);
  
-@@ -1380,6 +1543,7 @@ insert_entry:
+@@ -1380,6 +1544,7 @@ insert_entry:
  
  put_dstmem:
  	mutex_unlock(acomp_ctx->mutex);
@@ -608,7 +609,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	zswap_pool_put(entry->pool);
  freepage:
  	zswap_entry_cache_free(entry);
-@@ -1474,9 +1638,8 @@ freeentry:
+@@ -1474,9 +1639,8 @@ freeentry:
  		zswap_invalidate_entry(tree, entry);
  		folio_mark_dirty(folio);
  	} else if (entry->length) {
