@@ -1,0 +1,211 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: arm64/mm: implement clear_ptes() to optimize exit, munmap, dontneed
+Date: Mon, 18 Dec 2023 10:51:00 +0000
+
+With the core-mm changes in place to batch-clear ptes during
+zap_pte_range(), we can take advantage of this in arm64 to greatly reduce
+the number of tlbis we have to issue, and recover the lost performance in
+exit, munmap and madvise(DONTNEED) incured when adding support for
+transparent contiguous ptes.
+
+If we are clearing a whole contpte range, we can elide first unfolding
+that range and save the tlbis.  We just clear the whole range.
+
+The following microbenchmark results demonstate the effect of this change
+on madvise(DONTNEED) performance for large pte-mapped folios. 
+madvise(dontneed) is called for each page of a 1G populated mapping and
+the total time is measured.  100 iterations per run, 8 runs performed on
+both Apple M2 (VM) and Ampere Altra (bare metal).  Tests performed for
+case where 1G memory is comprised of pte-mapped order-9 folios.  Negative
+is faster, positive is slower, compared to baseline upon which the series
+is based:
+
+| dontneed      |    Apple M2 VM    |    Ampere Altra   |
+| order-9       |-------------------|-------------------|
+| (pte-map)     |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    7.9% |    0.0% |    0.0% |
+| before-change |   -1.3% |    7.0% |   13.0% |    0.0% |
+| after-change  |   -9.9% |    0.9% |   14.1% |    0.0% |
+
+The memory is initially all contpte-mapped and has to be unfolded (which
+requires tlbi for the whole block) when the first page is touched (since
+the test is madvise-ing 1 page at a time).  Ampere Altra has high cost for
+tlbi; this is why cost increases there.
+
+The following microbenchmark results demonstate the recovery (and overall
+improvement) of munmap performance for large pte-mapped folios.  munmap is
+called for a 1G populated mapping and the function runtime is measured. 
+100 iterations per run, 8 runs performed on both Apple M2 (VM) and Ampere
+Altra (bare metal).  Tests performed for case where 1G memory is comprised
+of pte-mapped order-9 folios.  Negative is faster, positive is slower,
+compared to baseline upon which the series is based:
+
+| munmap        |    Apple M2 VM    |    Ampere Altra   |
+| order-9       |-------------------|-------------------|
+| (pte-map)     |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    6.4% |    0.0% |    0.1% |
+| before-change |   43.3% |    1.9% |  375.2% |    0.0% |
+| after-change  |   -6.0% |    1.4% |   -0.6% |    0.2% |
+
+Link: https://lkml.kernel.org/r/20231218105100.172635-17-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Tested-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Oliver Upton <oliver.upton@linux.dev>
+Cc: Suzuki Poulouse <suzuki.poulose@arm.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zenghui Yu <yuzenghui@huawei.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/include/asm/pgtable.h |   42 +++++++++++++++++++++++++++
+ arch/arm64/mm/contpte.c          |   45 +++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+)
+
+--- a/arch/arm64/include/asm/pgtable.h~arm64-mm-implement-clear_ptes-to-optimize-exit-munmap-dontneed
++++ a/arch/arm64/include/asm/pgtable.h
+@@ -953,6 +953,29 @@ static inline pte_t __ptep_get_and_clear
+ 	return pte;
+ }
+ 
++static inline pte_t __clear_ptes(struct mm_struct *mm,
++				 unsigned long address, pte_t *ptep,
++				 unsigned int nr, int full)
++{
++	pte_t orig_pte = __ptep_get_and_clear(mm, address, ptep);
++	unsigned int i;
++	pte_t pte;
++
++	for (i = 1; i < nr; i++) {
++		address += PAGE_SIZE;
++		ptep++;
++		pte = __ptep_get_and_clear(mm, address, ptep);
++
++		if (pte_dirty(pte))
++			orig_pte = pte_mkdirty(orig_pte);
++
++		if (pte_young(pte))
++			orig_pte = pte_mkyoung(orig_pte);
++	}
++
++	return orig_pte;
++}
++
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ #define __HAVE_ARCH_PMDP_HUGE_GET_AND_CLEAR
+ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm,
+@@ -1151,6 +1174,8 @@ extern pte_t contpte_ptep_get(pte_t *pte
+ extern pte_t contpte_ptep_get_lockless(pte_t *orig_ptep);
+ extern void contpte_set_ptes(struct mm_struct *mm, unsigned long addr,
+ 				pte_t *ptep, pte_t pte, unsigned int nr);
++extern pte_t contpte_clear_ptes(struct mm_struct *mm, unsigned long addr,
++				pte_t *ptep, unsigned int nr, int full);
+ extern int contpte_ptep_test_and_clear_young(struct vm_area_struct *vma,
+ 				unsigned long addr, pte_t *ptep);
+ extern int contpte_ptep_clear_flush_young(struct vm_area_struct *vma,
+@@ -1279,6 +1304,22 @@ static inline void pte_clear(struct mm_s
+ 	__pte_clear(mm, addr, ptep);
+ }
+ 
++#define clear_ptes clear_ptes
++static inline pte_t clear_ptes(struct mm_struct *mm,
++				unsigned long addr, pte_t *ptep,
++				unsigned int nr, int full)
++{
++	pte_t pte;
++
++	if (nr == 1) {
++		contpte_try_unfold(mm, addr, ptep, __ptep_get(ptep));
++		pte = __ptep_get_and_clear(mm, addr, ptep);
++	} else
++		pte = contpte_clear_ptes(mm, addr, ptep, nr, full);
++
++	return pte;
++}
++
+ #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
+ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
+ 				unsigned long addr, pte_t *ptep)
+@@ -1366,6 +1407,7 @@ static inline int ptep_set_access_flags(
+ #define set_pte					__set_pte
+ #define set_ptes				__set_ptes
+ #define pte_clear				__pte_clear
++#define clear_ptes				__clear_ptes
+ #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
+ #define ptep_get_and_clear			__ptep_get_and_clear
+ #define __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+--- a/arch/arm64/mm/contpte.c~arm64-mm-implement-clear_ptes-to-optimize-exit-munmap-dontneed
++++ a/arch/arm64/mm/contpte.c
+@@ -293,6 +293,51 @@ void contpte_set_ptes(struct mm_struct *
+ }
+ EXPORT_SYMBOL(contpte_set_ptes);
+ 
++pte_t contpte_clear_ptes(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
++					unsigned int nr, int full)
++{
++	/*
++	 * If we cover a partial contpte block at the beginning or end of the
++	 * batch, unfold if currently folded. This makes it safe to clear some
++	 * of the entries while keeping others. contpte blocks in the middle of
++	 * the range, which are fully covered don't need to be unfolded because
++	 * we will clear the full block.
++	 */
++
++	unsigned int i;
++	pte_t pte;
++	pte_t tail;
++
++	if (!mm_is_user(mm))
++		return __clear_ptes(mm, addr, ptep, nr, full);
++
++	if (ptep != contpte_align_down(ptep) || nr < CONT_PTES)
++		contpte_try_unfold(mm, addr, ptep, __ptep_get(ptep));
++
++	if (ptep + nr != contpte_align_down(ptep + nr))
++		contpte_try_unfold(mm, addr + PAGE_SIZE * (nr - 1),
++				   ptep + nr - 1,
++				   __ptep_get(ptep + nr - 1));
++
++	pte = __ptep_get_and_clear(mm, addr, ptep);
++
++	for (i = 1; i < nr; i++) {
++		addr += PAGE_SIZE;
++		ptep++;
++
++		tail = __ptep_get_and_clear(mm, addr, ptep);
++
++		if (pte_dirty(tail))
++			pte = pte_mkdirty(pte);
++
++		if (pte_young(tail))
++			pte = pte_mkyoung(pte);
++	}
++
++	return pte;
++}
++EXPORT_SYMBOL(contpte_clear_ptes);
++
+ int contpte_ptep_test_and_clear_young(struct vm_area_struct *vma,
+ 					unsigned long addr, pte_t *ptep)
+ {
+_

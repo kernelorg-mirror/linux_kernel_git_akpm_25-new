@@ -1,0 +1,111 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: mm: batch-clear PTE ranges during zap_pte_range()
+Date: Mon, 18 Dec 2023 10:50:47 +0000
+
+Convert zap_pte_range() to copy a batch of ptes in one go.  A given batch
+is determined by the architecture (see pte_batch_remaining()), and maps a
+physically contiguous block of memory, all belonging to the same folio.  A
+pte batch is cleared using the new helper, clear_ptes().
+
+The primary motivation for this change is to reduce the number of tlb
+maintenance operations that the arm64 backend has to perform during exit
+and other syscalls that cause zap_pte_range() (e.g.  munmap,
+madvise(DONTNEED), etc.), as it is about to add transparent support for
+the "contiguous bit" in its ptes.  By clearing ptes using the new
+clear_ptes() API, the backend doesn't have to perform an expensive unfold
+operation when a PTE being cleared is part of a contpte block.  Instead it
+can just clear the whole block immediately.
+
+This code is very performance sensitive, and a significant amount of
+effort has been put into not regressing performance for the order-0 folio
+case.  By default, pte_batch_remaining() always returns 1, which enables
+the compiler to simplify the extra loops that are added for batching and
+produce code that is equivalent (and equally performant) as the previous
+implementation.
+
+This change addresses the core-mm refactoring only, and introduces
+clear_ptes() with a default implementation that calls
+ptep_get_and_clear_full() for each pte in the range.  Note that this API
+returns the pte at the beginning of the batch, but with the dirty and
+young bits set if ANY of the ptes in the cleared batch had those bits set;
+this information is applied to the folio by the core-mm.  Given the batch
+is guaranteed to cover only a single folio, collapsing this state does not
+lose any useful information.
+
+A separate change will implement clear_ptes() in the arm64 backend to
+realize the performance improvement as part of the work to enable contpte
+mappings.
+
+The following microbenchmark results demonstate that there is no
+madvise(dontneed) performance regression (and actually an improvement in
+some cases) after this patch.  madvise(dontneed) is called for each page
+of a 1G populated mapping and the total time is measured.  100 iterations
+per run, 8 runs performed on both Apple M2 (VM) and Ampere Altra (bare
+metal).  Tests performed for case where 1G memory is comprised of order-0
+folios and case where comprised of pte-mapped order-9 folios.  Negative is
+faster, positive is slower, compared to baseline upon which the series is
+based:
+
+| Apple M2 VM   | order-0 (pte-map) | order-9 (pte-map) |
+| dontneed      |-------------------|-------------------|
+| microbench    |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    7.5% |    0.0% |    7.9% |
+| after-change  |   -9.6% |    3.1% |   -4.9% |    8.1% |
+
+| Ampere Altra  | order-0 (pte-map) | order-9 (pte-map) |
+| dontneed      |-------------------|-------------------|
+| microbench    |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    0.1% |    0.0% |    0.0% |
+| after-change  |   -0.2% |    0.1% |   -0.1% |    0.0% |
+
+The following microbenchmark results demonstate that there is no munmap
+performance regression (and actually an improvement in some cases) after
+this patch.  munmap is called for a 1G populated mapping and the time to
+execute the function is measured.  100 iterations per run, 8 runs
+performed on both Apple M2 (VM) and Ampere Altra (bare metal).  Tests
+performed for case where 1G memory is comprised of order-0 folios and case
+where comprised of pte-mapped order-9 folios.  Negative is faster,
+positive is slower, compared to baseline upon which the series is based:
+
+| Apple M2 VM   | order-0 (pte-map) | order-9 (pte-map) |
+| munmap        |-------------------|-------------------|
+| microbench    |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    3.8% |    0.0% |    6.4% |
+| after-change  |   -1.9% |    0.2% |   -4.7% |    0.8% |
+
+| Ampere Altra  | order-0 (pte-map) | order-9 (pte-map) |
+| munmap        |-------------------|-------------------|
+| microbench    |    mean |   stdev |    mean |   stdev |
+|---------------|---------|---------|---------|---------|
+| baseline      |    0.0% |    0.9% |    0.0% |    0.1% |
+| after-change  |   -0.2% |    0.6% |   -3.2% |    0.2% |
+
+Link: https://lkml.kernel.org/r/20231218105100.172635-4-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Tested-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Oliver Upton <oliver.upton@linux.dev>
+Cc: Suzuki Poulouse <suzuki.poulose@arm.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zenghui Yu <yuzenghui@huawei.com>
+Cc: Zi Yan <ziy@nvidia.com>
