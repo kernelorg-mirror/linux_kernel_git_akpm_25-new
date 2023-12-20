@@ -1,6 +1,6 @@
 From: Yosry Ahmed <yosryahmed@google.com>
 Subject: mm: memcg: restore subtree stats flushing
-Date: Tue, 10 Oct 2023 03:21:16 +0000
+Date: Wed, 29 Nov 2023 03:21:53 +0000
 
 Stats flushing for memcg currently follows the following rules:
 - Always flush the entire memcg hierarchy (i.e. flush the root).
@@ -8,12 +8,12 @@ Stats flushing for memcg currently follows the following rules:
   concurrently, they skip and return immediately.
 - A periodic flusher flushes all the stats every 2 seconds.
 
-The reason this approach is followed is because all flushes are
-serialized by a global rstat spinlock. On the memcg side, flushing is
-invoked from userspace reads as well as in-kernel flushers (e.g.
-reclaim, refault, etc). This approach aims to avoid serializing all
-flushers on the global lock, which can cause a significant performance
-hit under high concurrency.
+The reason this approach is followed is because all flushes are serialized
+by a global rstat spinlock.  On the memcg side, flushing is invoked from
+userspace reads as well as in-kernel flushers (e.g.  reclaim, refault,
+etc).  This approach aims to avoid serializing all flushers on the global
+lock, which can cause a significant performance hit under high
+concurrency.
 
 This approach has the following problems:
 - Occasionally a userspace read of the stats of a non-root cgroup will
@@ -38,26 +38,21 @@ after an event occurs, but gets stats from before the event. Examples:
   (child larger than parent), if the flush doesn't happen when the
   parent is read, but happens when the child is read.
 
-As for in-kernel flushers, they will occasionally get stale stats. No
+As for in-kernel flushers, they will occasionally get stale stats.  No
 regressions are currently known from this, but if there are regressions,
 they would be very difficult to debug and link to the source of the
 problem.
 
-This patch aims to fix these problems by restoring subtree flushing,
-and removing the unified/coalesced flushing logic that skips flushing if
-there is an ongoing flush. This change would introduce a significant
-regression with global stats flushing thresholds. With per-memcg stats
-flushing thresholds, this seems to perform really well. The thresholds
-protect the underlying lock from unnecessary contention.
-
-Add a mutex to protect the underlying rstat lock from excessive memcg
-flushing. The thresholds are re-checked after the mutex is grabbed to
-make sure that a concurrent flush did not already get the subtree we are
-trying to flush. A call to cgroup_rstat_flush() is not cheap, even if
-there are no pending updates.
+This patch aims to fix these problems by restoring subtree flushing, and
+removing the unified/coalesced flushing logic that skips flushing if there
+is an ongoing flush.  This change would introduce a significant regression
+with global stats flushing thresholds.  With per-memcg stats flushing
+thresholds, this seems to perform really well.  The thresholds protect the
+underlying lock from unnecessary contention.
 
 This patch was tested in two ways to ensure the latency of flushing is
-up to bar, on a machine with 384 cpus:
+up to par, on a machine with 384 cpus:
+
 - A synthetic test with 5000 concurrent workers in 500 cgroups doing
   allocations and reclaim, as well as 1000 readers for memory.stat
   (variation of [2]). No regressions were noticed in the total runtime.
@@ -74,32 +69,37 @@ up to bar, on a machine with 384 cpus:
 [2] https://lore.kernel.org/lkml/CAJD7tka13M-zVZTyQJYL1iUAYvuQ1fcHbCjcOBZcz6POYTV-4g@mail.gmail.com/
 [3] https://lore.kernel.org/lkml/CAAPL-u9D2b=iF5Lf_cRnKxUfkiEe0AMDTu6yhrUAzX0b6a6rDg@mail.gmail.com/
 
-Link: https://lkml.kernel.org/r/20231010032117.1577496-6-yosryahmed@google.com
+[akpm@linux-foundation.org: fix mm/zswap.c]
+[yosryahmed@google.com: remove stats flushing mutex]
+  Link: https://lkml.kernel.org/r/CAJD7tkZgP3m-VVPn+fF_YuvXeQYK=tZZjJHj=dzD=CcSSpp2qg@mail.gmail.com
+Link: https://lkml.kernel.org/r/20231129032154.3710765-6-yosryahmed@google.com
 Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
 Tested-by: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Acked-by: Shakeel Butt <shakeelb@google.com>
+Cc: Chris Li <chrisl@kernel.org>
 Cc: Greg Thelen <gthelen@google.com>
 Cc: Ivan Babrou <ivan@cloudflare.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Michal Koutny <mkoutny@suse.com>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
-Cc: Shakeel Butt <shakeelb@google.com>
-Cc: Tejun heo <tj@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
 Cc: Waiman Long <longman@redhat.com>
 Cc: Wei Xu <weixugc@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/memcontrol.h |    8 +--
- mm/memcontrol.c            |   73 +++++++++++++++++++++--------------
- mm/vmscan.c                |    2 
- mm/workingset.c            |   10 +++-
- 4 files changed, 56 insertions(+), 37 deletions(-)
+ include/linux/memcontrol.h |    8 ++--
+ mm/memcontrol.c            |   68 ++++++++++++++++++++---------------
+ mm/vmscan.c                |    2 -
+ mm/workingset.c            |   10 +++--
+ mm/zswap.c                 |    2 -
+ 5 files changed, 52 insertions(+), 38 deletions(-)
 
 --- a/include/linux/memcontrol.h~mm-memcg-restore-subtree-stats-flushing
 +++ a/include/linux/memcontrol.h
-@@ -1046,8 +1046,8 @@ static inline unsigned long lruvec_page_
+@@ -1051,8 +1051,8 @@ static inline unsigned long lruvec_page_
  	return x;
  }
  
@@ -110,7 +110,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  void __mod_memcg_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
  			      int val);
-@@ -1548,11 +1548,11 @@ static inline unsigned long lruvec_page_
+@@ -1563,11 +1563,11 @@ static inline unsigned long lruvec_page_
  	return node_page_state(lruvec_pgdat(lruvec), idx);
  }
  
@@ -126,7 +126,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/memcontrol.c~mm-memcg-restore-subtree-stats-flushing
 +++ a/mm/memcontrol.c
-@@ -669,7 +669,6 @@ struct memcg_vmstats {
+@@ -670,7 +670,6 @@ struct memcg_vmstats {
   */
  static void flush_memcg_stats_dwork(struct work_struct *w);
  static DECLARE_DEFERRABLE_WORK(stats_flush_dwork, flush_memcg_stats_dwork);
@@ -134,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static u64 flush_last_time;
  
  #define FLUSH_TIME (2UL*HZ)
-@@ -730,35 +729,45 @@ static inline void memcg_rstat_updated(s
+@@ -731,35 +730,40 @@ static inline void memcg_rstat_updated(s
  	}
  }
  
@@ -174,19 +174,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	if (memcg_should_flush_stats(root_mem_cgroup))
 -		do_flush_stats();
-+	static DEFINE_MUTEX(memcg_stats_flush_mutex);
++	if (mem_cgroup_disabled())
++		return;
 +
 +	if (!memcg)
 +		memcg = root_mem_cgroup;
 +
-+	if (!memcg_should_flush_stats(memcg))
-+		return;
-+
-+	mutex_lock(&memcg_stats_flush_mutex);
-+	/* An overlapping flush may have occurred, check again after locking */
 +	if (memcg_should_flush_stats(memcg))
 +		do_flush_stats(memcg);
-+	mutex_unlock(&memcg_stats_flush_mutex);
  }
  
 -void mem_cgroup_flush_stats_ratelimited(void)
@@ -199,7 +194,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void flush_memcg_stats_dwork(struct work_struct *w)
-@@ -767,7 +776,7 @@ static void flush_memcg_stats_dwork(stru
+@@ -768,7 +772,7 @@ static void flush_memcg_stats_dwork(stru
  	 * Deliberately ignore memcg_should_flush_stats() here so that flushing
  	 * in latency-sensitive paths is as cheap as possible.
  	 */
@@ -208,7 +203,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	queue_delayed_work(system_unbound_wq, &stats_flush_dwork, FLUSH_TIME);
  }
  
-@@ -1642,7 +1651,7 @@ static void memcg_stat_format(struct mem
+@@ -1643,7 +1647,7 @@ static void memcg_stat_format(struct mem
  	 *
  	 * Current memory state:
  	 */
@@ -217,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
  		u64 size;
-@@ -4191,7 +4200,7 @@ static int memcg_numa_stat_show(struct s
+@@ -4193,7 +4197,7 @@ static int memcg_numa_stat_show(struct s
  	int nid;
  	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
  
@@ -226,7 +221,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (stat = stats; stat < stats + ARRAY_SIZE(stats); stat++) {
  		seq_printf(m, "%s=%lu", stat->name,
-@@ -4272,7 +4281,7 @@ static void memcg1_stat_format(struct me
+@@ -4274,7 +4278,7 @@ static void memcg1_stat_format(struct me
  
  	BUILD_BUG_ON(ARRAY_SIZE(memcg1_stat_names) != ARRAY_SIZE(memcg1_stats));
  
@@ -235,7 +230,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < ARRAY_SIZE(memcg1_stats); i++) {
  		unsigned long nr;
-@@ -4768,7 +4777,7 @@ void mem_cgroup_wb_stats(struct bdi_writ
+@@ -4770,7 +4774,7 @@ void mem_cgroup_wb_stats(struct bdi_writ
  	struct mem_cgroup *memcg = mem_cgroup_from_css(wb->memcg_css);
  	struct mem_cgroup *parent;
  
@@ -244,7 +239,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	*pdirty = memcg_page_state(memcg, NR_FILE_DIRTY);
  	*pwriteback = memcg_page_state(memcg, NR_WRITEBACK);
-@@ -6857,7 +6866,7 @@ static int memory_numa_stat_show(struct
+@@ -6865,7 +6869,7 @@ static int memory_numa_stat_show(struct
  	int i;
  	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
  
@@ -253,7 +248,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < ARRAY_SIZE(memory_stats); i++) {
  		int nid;
-@@ -8096,7 +8105,11 @@ bool obj_cgroup_may_zswap(struct obj_cgr
+@@ -8096,7 +8100,11 @@ bool obj_cgroup_may_zswap(struct obj_cgr
  			break;
  		}
  
@@ -266,7 +261,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pages = memcg_page_state(memcg, MEMCG_ZSWAP_B) / PAGE_SIZE;
  		if (pages < max)
  			continue;
-@@ -8161,8 +8174,10 @@ void obj_cgroup_uncharge_zswap(struct ob
+@@ -8161,8 +8169,10 @@ void obj_cgroup_uncharge_zswap(struct ob
  static u64 zswap_current_read(struct cgroup_subsys_state *css,
  			      struct cftype *cft)
  {
@@ -281,7 +276,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int zswap_max_show(struct seq_file *m, void *v)
 --- a/mm/vmscan.c~mm-memcg-restore-subtree-stats-flushing
 +++ a/mm/vmscan.c
-@@ -2246,7 +2246,7 @@ static void prepare_scan_control(pg_data
+@@ -2226,7 +2226,7 @@ static void prepare_scan_control(pg_data
  	 * Flush the memory cgroup stats, so that we read accurate per-memcg
  	 * lruvec stats for heuristics.
  	 */
@@ -316,4 +311,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		lruvec = mem_cgroup_lruvec(sc->memcg, NODE_DATA(sc->nid));
  		for (pages = 0, i = 0; i < NR_LRU_LISTS; i++)
  			pages += lruvec_page_state_local(lruvec,
+--- a/mm/zswap.c~mm-memcg-restore-subtree-stats-flushing
++++ a/mm/zswap.c
+@@ -641,7 +641,7 @@ static unsigned long zswap_shrinker_coun
+ 		return 0;
+ 
+ #ifdef CONFIG_MEMCG_KMEM
+-	mem_cgroup_flush_stats();
++	mem_cgroup_flush_stats(memcg);
+ 	nr_backing = memcg_page_state(memcg, MEMCG_ZSWAP_B) >> PAGE_SHIFT;
+ 	nr_stored = memcg_page_state(memcg, MEMCG_ZSWAPPED);
+ #else
 _

@@ -1,26 +1,29 @@
 From: Ryan Roberts <ryan.roberts@arm.com>
 Subject: selftests/mm/cow: generalize do_run_with_thp() helper
-Date: Fri, 29 Sep 2023 12:44:19 +0100
+Date: Thu, 7 Dec 2023 16:12:10 +0000
 
 do_run_with_thp() prepares (PMD-sized) THP memory into different states
-before running tests. With the introduction of THP orders that are
-smaller than PMD_ORDER, we would like to reuse this logic to also test
-those smaller orders. So let's add a size parameter which tells the
-function what size THP it should operate on.
+before running tests.  With the introduction of multi-size THP, we would
+like to reuse this logic to also test those smaller THP sizes.  So let's
+add a thpsize parameter which tells the function what size THP it should
+operate on.
 
-No functional change intended here, but a separate commit will add new
-tests for smaller order THP, where available.
+A separate commit will utilize this change to add new tests for multi-size
+THP, where available.
 
-Link: https://lkml.kernel.org/r/20230929114421.3761121-9-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20231207161211.2374093-10-ryan.roberts@arm.com
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Tested-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Tested-by: John Hubbard <jhubbard@nvidia.com>
+Cc: Alistair Popple <apopple@nvidia.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Barry Song <v-songbaohua@oppo.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: David Rientjes <rientjes@google.com>
-Cc: Huang Ying <ying.huang@intel.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Itaru Kitayama <itaru.kitayama@gmail.com>
-Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
 Cc: Luis Chamberlain <mcgrof@kernel.org>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
@@ -32,8 +35,8 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/mm/cow.c |  151 ++++++++++++++++-------------
- 1 file changed, 84 insertions(+), 67 deletions(-)
+ tools/testing/selftests/mm/cow.c |  121 ++++++++++++++++-------------
+ 1 file changed, 67 insertions(+), 54 deletions(-)
 
 --- a/tools/testing/selftests/mm/cow.c~selftests-mm-cow-generalize-do_run_with_thp-helper
 +++ a/tools/testing/selftests/mm/cow.c
@@ -46,39 +49,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int nr_hugetlbsizes;
  static size_t hugetlbsizes[10];
  static int gup_fd;
-@@ -734,14 +734,14 @@ enum thp_run {
+@@ -734,7 +734,7 @@ enum thp_run {
  	THP_RUN_PARTIAL_SHARED,
  };
  
 -static void do_run_with_thp(test_fn fn, enum thp_run thp_run)
-+static void do_run_with_thp(test_fn fn, enum thp_run thp_run, size_t size)
++static void do_run_with_thp(test_fn fn, enum thp_run thp_run, size_t thpsize)
  {
  	char *mem, *mmap_mem, *tmp, *mremap_mem = MAP_FAILED;
--	size_t size, mmap_size, mremap_size;
-+	size_t mmap_size, mremap_size;
- 	int ret;
- 
--	/* For alignment purposes, we need twice the thp size. */
--	mmap_size = 2 * thpsize;
-+	/* For alignment purposes, we need twice the requested size. */
-+	mmap_size = 2 * size;
- 	mmap_mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
- 			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
- 	if (mmap_mem == MAP_FAILED) {
-@@ -749,36 +749,40 @@ static void do_run_with_thp(test_fn fn,
- 		return;
- 	}
- 
--	/* We need a THP-aligned memory area. */
--	mem = (char *)(((uintptr_t)mmap_mem + thpsize) & ~(thpsize - 1));
-+	/* We need to naturally align the memory area. */
-+	mem = (char *)(((uintptr_t)mmap_mem + size) & ~(size - 1));
- 
--	ret = madvise(mem, thpsize, MADV_HUGEPAGE);
-+	ret = madvise(mem, size, MADV_HUGEPAGE);
- 	if (ret) {
- 		ksft_test_result_fail("MADV_HUGEPAGE failed\n");
- 		goto munmap;
+ 	size_t size, mmap_size, mremap_size;
+@@ -759,11 +759,11 @@ static void do_run_with_thp(test_fn fn,
  	}
  
  	/*
@@ -89,21 +69,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 */
  	mem[0] = 0;
 -	if (!pagemap_is_populated(pagemap_fd, mem + pagesize)) {
-+	if (!pagemap_is_populated(pagemap_fd, mem + size - pagesize)) {
++	if (!pagemap_is_populated(pagemap_fd, mem + thpsize - pagesize)) {
  		ksft_test_result_skip("Did not get a THP populated\n");
  		goto munmap;
  	}
--	memset(mem, 0, thpsize);
-+	memset(mem, 0, size);
- 
--	size = thpsize;
+@@ -773,12 +773,14 @@ static void do_run_with_thp(test_fn fn,
  	switch (thp_run) {
  	case THP_RUN_PMD:
  	case THP_RUN_PMD_SWAPOUT:
-+		if (size != pmdsize) {
-+			ksft_test_result_fail("test bug: can't PMD-map size\n");
-+			goto munmap;
-+		}
++		assert(thpsize == pmdsize);
  		break;
  	case THP_RUN_PTE:
  	case THP_RUN_PTE_SWAPOUT:
@@ -115,58 +89,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 */
  		ret = mprotect(mem + pagesize, pagesize, PROT_READ);
  		if (ret) {
-@@ -797,7 +801,7 @@ static void do_run_with_thp(test_fn fn,
- 		 * Discard all but a single subpage of that PTE-mapped THP. What
- 		 * remains is a single PTE mapping a single subpage.
- 		 */
--		ret = madvise(mem + pagesize, thpsize - pagesize, MADV_DONTNEED);
-+		ret = madvise(mem + pagesize, size - pagesize, MADV_DONTNEED);
- 		if (ret) {
- 			ksft_test_result_fail("MADV_DONTNEED failed\n");
- 			goto munmap;
-@@ -809,7 +813,7 @@ static void do_run_with_thp(test_fn fn,
- 		 * Remap half of the THP. We need some new memory location
- 		 * for that.
- 		 */
--		mremap_size = thpsize / 2;
-+		mremap_size = size / 2;
- 		mremap_mem = mmap(NULL, mremap_size, PROT_NONE,
- 				  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
- 		if (mem == MAP_FAILED) {
-@@ -830,7 +834,7 @@ static void do_run_with_thp(test_fn fn,
- 		 * child. This will result in some parts of the THP never
- 		 * have been shared.
- 		 */
--		ret = madvise(mem + pagesize, thpsize - pagesize, MADV_DONTFORK);
-+		ret = madvise(mem + pagesize, size - pagesize, MADV_DONTFORK);
- 		if (ret) {
- 			ksft_test_result_fail("MADV_DONTFORK failed\n");
- 			goto munmap;
-@@ -844,7 +848,7 @@ static void do_run_with_thp(test_fn fn,
- 		}
- 		wait(&ret);
- 		/* Allow for sharing all pages again. */
--		ret = madvise(mem + pagesize, thpsize - pagesize, MADV_DOFORK);
-+		ret = madvise(mem + pagesize, size - pagesize, MADV_DOFORK);
- 		if (ret) {
- 			ksft_test_result_fail("MADV_DOFORK failed\n");
- 			goto munmap;
-@@ -875,52 +879,65 @@ munmap:
+@@ -875,52 +877,60 @@ munmap:
  		munmap(mremap_mem, mremap_size);
  }
  
 -static void run_with_thp(test_fn fn, const char *desc)
-+static int sz2ord(size_t size)
-+{
-+	return __builtin_ctzll(size / pagesize);
-+}
-+
 +static void run_with_thp(test_fn fn, const char *desc, size_t size)
  {
 -	ksft_print_msg("[RUN] %s ... with THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PMD);
-+	ksft_print_msg("[RUN] %s ... with order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PMD, size);
  }
  
@@ -175,8 +108,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with swapped-out THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PMD_SWAPOUT);
-+	ksft_print_msg("[RUN] %s ... with swapped-out order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with swapped-out THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PMD_SWAPOUT, size);
  }
  
@@ -185,8 +118,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with PTE-mapped THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PTE);
-+	ksft_print_msg("[RUN] %s ... with PTE-mapped order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with PTE-mapped THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PTE, size);
  }
  
@@ -195,8 +128,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with swapped-out, PTE-mapped THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PTE_SWAPOUT);
-+	ksft_print_msg("[RUN] %s ... with swapped-out, PTE-mapped order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with swapped-out, PTE-mapped THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PTE_SWAPOUT, size);
  }
  
@@ -205,8 +138,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with single PTE of THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_SINGLE_PTE);
-+	ksft_print_msg("[RUN] %s ... with single PTE of order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with single PTE of THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_SINGLE_PTE, size);
  }
  
@@ -215,8 +148,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with single PTE of swapped-out THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_SINGLE_PTE_SWAPOUT);
-+	ksft_print_msg("[RUN] %s ... with single PTE of swapped-out order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with single PTE of swapped-out THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_SINGLE_PTE_SWAPOUT, size);
  }
  
@@ -225,8 +158,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with partially mremap()'ed THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PARTIAL_MREMAP);
-+	ksft_print_msg("[RUN] %s ... with partially mremap()'ed order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with partially mremap()'ed THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PARTIAL_MREMAP, size);
  }
  
@@ -235,13 +168,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	ksft_print_msg("[RUN] %s ... with partially shared THP\n", desc);
 -	do_run_with_thp(fn, THP_RUN_PARTIAL_SHARED);
-+	ksft_print_msg("[RUN] %s ... with partially shared order-%d THP\n",
-+		desc, sz2ord(size));
++	ksft_print_msg("[RUN] %s ... with partially shared THP (%zu kB)\n",
++		desc, size / 1024);
 +	do_run_with_thp(fn, THP_RUN_PARTIAL_SHARED, size);
  }
  
  static void run_with_hugetlb(test_fn fn, const char *desc, size_t hugetlbsize)
-@@ -1091,15 +1108,15 @@ static void run_anon_test_case(struct te
+@@ -1091,15 +1101,15 @@ static void run_anon_test_case(struct te
  
  	run_with_base_page(test_case->fn, test_case->desc);
  	run_with_base_page_swap(test_case->fn, test_case->desc);
@@ -266,7 +199,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	for (i = 0; i < nr_hugetlbsizes; i++)
  		run_with_hugetlb(test_case->fn, test_case->desc,
-@@ -1120,7 +1137,7 @@ static int tests_per_anon_test_case(void
+@@ -1120,7 +1130,7 @@ static int tests_per_anon_test_case(void
  {
  	int tests = 2 + nr_hugetlbsizes;
  
@@ -275,7 +208,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		tests += 8;
  	return tests;
  }
-@@ -1329,7 +1346,7 @@ static void run_anon_thp_test_cases(void
+@@ -1329,7 +1339,7 @@ static void run_anon_thp_test_cases(void
  {
  	int i;
  
@@ -284,7 +217,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return;
  
  	ksft_print_msg("[INFO] Anonymous THP tests\n");
-@@ -1338,13 +1355,13 @@ static void run_anon_thp_test_cases(void
+@@ -1338,13 +1348,13 @@ static void run_anon_thp_test_cases(void
  		struct test_case const *test_case = &anon_thp_test_cases[i];
  
  		ksft_print_msg("[RUN] %s\n", test_case->desc);
@@ -300,7 +233,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  typedef void (*non_anon_test_fn)(char *mem, const char *smem, size_t size);
-@@ -1419,7 +1436,7 @@ static void run_with_huge_zeropage(non_a
+@@ -1419,7 +1429,7 @@ static void run_with_huge_zeropage(non_a
  	}
  
  	/* For alignment purposes, we need twice the thp size. */
@@ -309,7 +242,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mmap_mem = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
  			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
  	if (mmap_mem == MAP_FAILED) {
-@@ -1434,11 +1451,11 @@ static void run_with_huge_zeropage(non_a
+@@ -1434,11 +1444,11 @@ static void run_with_huge_zeropage(non_a
  	}
  
  	/* We need a THP-aligned memory area. */
@@ -325,7 +258,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (ret) {
  		ksft_test_result_fail("MADV_HUGEPAGE failed\n");
  		goto munmap;
-@@ -1457,7 +1474,7 @@ static void run_with_huge_zeropage(non_a
+@@ -1457,7 +1467,7 @@ static void run_with_huge_zeropage(non_a
  		goto munmap;
  	}
  
@@ -334,7 +267,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  munmap:
  	munmap(mmap_mem, mmap_size);
  	if (mmap_smem != MAP_FAILED)
-@@ -1650,7 +1667,7 @@ static void run_non_anon_test_case(struc
+@@ -1650,7 +1660,7 @@ static void run_non_anon_test_case(struc
  	run_with_zeropage(test_case->fn, test_case->desc);
  	run_with_memfd(test_case->fn, test_case->desc);
  	run_with_tmpfile(test_case->fn, test_case->desc);
@@ -343,7 +276,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		run_with_huge_zeropage(test_case->fn, test_case->desc);
  	for (i = 0; i < nr_hugetlbsizes; i++)
  		run_with_memfd_hugetlb(test_case->fn, test_case->desc,
-@@ -1671,7 +1688,7 @@ static int tests_per_non_anon_test_case(
+@@ -1671,7 +1681,7 @@ static int tests_per_non_anon_test_case(
  {
  	int tests = 3 + nr_hugetlbsizes;
  
@@ -352,18 +285,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		tests += 1;
  	return tests;
  }
-@@ -1681,10 +1698,10 @@ int main(int argc, char **argv)
- 	int err;
+@@ -1683,10 +1693,13 @@ int main(int argc, char **argv)
+ 	ksft_print_header();
  
  	pagesize = getpagesize();
 -	thpsize = read_pmd_pagesize();
 -	if (thpsize)
--		ksft_print_msg("[INFO] detected THP size: %zu KiB\n",
--			       thpsize / 1024);
 +	pmdsize = read_pmd_pagesize();
-+	if (pmdsize)
-+		ksft_print_msg("[INFO] detected PMD-mapped THP size: %zu KiB\n",
++	if (pmdsize) {
++		ksft_print_msg("[INFO] detected PMD size: %zu KiB\n",
 +			       pmdsize / 1024);
+ 		ksft_print_msg("[INFO] detected THP size: %zu KiB\n",
+-			       thpsize / 1024);
++			       pmdsize / 1024);
++	}
  	nr_hugetlbsizes = detect_hugetlb_page_sizes(hugetlbsizes,
  						    ARRAY_SIZE(hugetlbsizes));
  	detect_huge_zeropage();
