@@ -1,0 +1,104 @@
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+Subject: mm: memcg: fix split queue list crash when large folio migration
+Date: Wed, 20 Dec 2023 14:51:40 +0800
+
+When running autonuma with enabling multi-size THP, I encountered the
+following kernel crash issue:
+
+[  134.290216] list_del corruption. prev->next should be fffff9ad42e1c490,
+but was dead000000000100. (prev=fffff9ad42399890)
+[  134.290877] kernel BUG at lib/list_debug.c:62!
+[  134.291052] invalid opcode: 0000 [#1] PREEMPT SMP NOPTI
+[  134.291210] CPU: 56 PID: 8037 Comm: numa01 Kdump: loaded Tainted:
+G            E      6.7.0-rc4+ #20
+[  134.291649] RIP: 0010:__list_del_entry_valid_or_report+0x97/0xb0
+......
+[  134.294252] Call Trace:
+[  134.294362]  <TASK>
+[  134.294440]  ? die+0x33/0x90
+[  134.294561]  ? do_trap+0xe0/0x110
+......
+[  134.295681]  ? __list_del_entry_valid_or_report+0x97/0xb0
+[  134.295842]  folio_undo_large_rmappable+0x99/0x100
+[  134.296003]  destroy_large_folio+0x68/0x70
+[  134.296172]  migrate_folio_move+0x12e/0x260
+[  134.296264]  ? __pfx_remove_migration_pte+0x10/0x10
+[  134.296389]  migrate_pages_batch+0x495/0x6b0
+[  134.296523]  migrate_pages+0x1d0/0x500
+[  134.296646]  ? __pfx_alloc_misplaced_dst_folio+0x10/0x10
+[  134.296799]  migrate_misplaced_folio+0x12d/0x2b0
+[  134.296953]  do_numa_page+0x1f4/0x570
+[  134.297121]  __handle_mm_fault+0x2b0/0x6c0
+[  134.297254]  handle_mm_fault+0x107/0x270
+[  134.300897]  do_user_addr_fault+0x167/0x680
+[  134.304561]  exc_page_fault+0x65/0x140
+[  134.307919]  asm_exc_page_fault+0x22/0x30
+
+The reason for the crash is that, the commit 85ce2c517ade ("memcontrol:
+only transfer the memcg data for migration") removed the charging and
+uncharging operations of the migration folios and cleared the memcg data
+of the old folio.
+
+During the subsequent release process of the old large folio in
+destroy_large_folio(), if the large folio needs to be removed from the
+split queue, an incorrect split queue can be obtained (which is
+pgdat->deferred_split_queue) because the old folio's memcg is NULL now. 
+This can lead to list operations being performed under the wrong split
+queue lock protection, resulting in a list crash as above.
+
+After the migration, the old folio is going to be freed, so we can remove
+it from the split queue in mem_cgroup_migrate() a bit earlier before
+clearing the memcg data to avoid getting incorrect split queue.
+
+Link: https://lkml.kernel.org/r/61273e5e9b490682388377c20f52d19de4a80460.1703054559.git.baolin.wang@linux.alibaba.com
+Fixes: 85ce2c517ade ("memcontrol: only transfer the memcg data for migration")
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |    2 +-
+ mm/memcontrol.c  |   11 +++++++++++
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+--- a/mm/huge_memory.c~mm-memcg-fix-split-queue-list-crash-when-large-folio-migration
++++ a/mm/huge_memory.c
+@@ -2823,7 +2823,7 @@ void folio_undo_large_rmappable(struct f
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	if (!list_empty(&folio->_deferred_list)) {
+ 		ds_queue->split_queue_len--;
+-		list_del(&folio->_deferred_list);
++		list_del_init(&folio->_deferred_list);
+ 	}
+ 	spin_unlock_irqrestore(&ds_queue->split_queue_lock, flags);
+ }
+--- a/mm/memcontrol.c~mm-memcg-fix-split-queue-list-crash-when-large-folio-migration
++++ a/mm/memcontrol.c
+@@ -7543,6 +7543,17 @@ void mem_cgroup_migrate(struct folio *ol
+ 
+ 	/* Transfer the charge and the css ref */
+ 	commit_charge(new, memcg);
++	/*
++	 * If the old folio a large folio and is in the split queue, it needs
++	 * to be removed from the split queue now, in case getting an incorrect
++	 * split queue in destroy_large_folio() after the memcg of the old folio
++	 * is cleared.
++	 *
++	 * In addition, the old folio is about to be freed after migration, so
++	 * removing from the split queue a bit earlier seems reasonable.
++	 */
++	if (folio_test_large(old) && folio_test_large_rmappable(old))
++		folio_undo_large_rmappable(old);
+ 	old->memcg_data = 0;
+ }
+ 
+_
