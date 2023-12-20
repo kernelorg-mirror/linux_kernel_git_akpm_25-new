@@ -1,0 +1,131 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: kasan: rename kasan_slab_free_mempool to kasan_mempool_poison_object
+Date: Tue, 19 Dec 2023 23:28:45 +0100
+
+Patch series "kasan: save mempool stack traces".
+
+This series updates KASAN to save alloc and free stack traces for
+secondary-level allocators that cache and reuse allocations internally
+instead of giving them back to the underlying allocator (e.g.  mempool).
+
+As a part of this change, introduce and document a set of KASAN hooks:
+
+bool kasan_mempool_poison_pages(struct page *page, unsigned int order);
+void kasan_mempool_unpoison_pages(struct page *page, unsigned int order);
+bool kasan_mempool_poison_object(void *ptr);
+void kasan_mempool_unpoison_object(void *ptr, size_t size);
+
+and use them in the mempool code.
+
+Besides mempool, skbuff and io_uring also cache allocations and already
+use KASAN hooks to poison those.  Their code is updated to use the new
+mempool hooks.
+
+The new hooks save alloc and free stack traces (for normal kmalloc and
+slab objects; stack traces for large kmalloc objects and page_alloc are
+not supported by KASAN yet), improve the readability of the users' code,
+and also allow the users to prevent double-free and invalid-free bugs; see
+the patches for the details.
+
+
+This patch (of 21):
+
+Rename kasan_slab_free_mempool to kasan_mempool_poison_object.
+
+kasan_slab_free_mempool is a slightly confusing name: it is unclear
+whether this function poisons the object when it is freed into mempool or
+does something when the object is freed from mempool to the underlying
+allocator.
+
+The new name also aligns with other mempool-related KASAN hooks added in
+the following patches in this series.
+
+Link: https://lkml.kernel.org/r/cover.1703024586.git.andreyknvl@google.com
+Link: https://lkml.kernel.org/r/c5618685abb7cdbf9fb4897f565e7759f601da84.1703024586.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Cc: Alexander Lobakin <alobakin@pm.me>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Breno Leitao <leitao@debian.org>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Marco Elver <elver@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kasan.h  |    8 ++++----
+ io_uring/alloc_cache.h |    3 +--
+ mm/kasan/common.c      |    4 ++--
+ mm/mempool.c           |    2 +-
+ 4 files changed, 8 insertions(+), 9 deletions(-)
+
+--- a/include/linux/kasan.h~kasan-rename-kasan_slab_free_mempool-to-kasan_mempool_poison_object
++++ a/include/linux/kasan.h
+@@ -172,11 +172,11 @@ static __always_inline void kasan_kfree_
+ 		__kasan_kfree_large(ptr, _RET_IP_);
+ }
+ 
+-void __kasan_slab_free_mempool(void *ptr, unsigned long ip);
+-static __always_inline void kasan_slab_free_mempool(void *ptr)
++void __kasan_mempool_poison_object(void *ptr, unsigned long ip);
++static __always_inline void kasan_mempool_poison_object(void *ptr)
+ {
+ 	if (kasan_enabled())
+-		__kasan_slab_free_mempool(ptr, _RET_IP_);
++		__kasan_mempool_poison_object(ptr, _RET_IP_);
+ }
+ 
+ void * __must_check __kasan_slab_alloc(struct kmem_cache *s,
+@@ -256,7 +256,7 @@ static inline bool kasan_slab_free(struc
+ 	return false;
+ }
+ static inline void kasan_kfree_large(void *ptr) {}
+-static inline void kasan_slab_free_mempool(void *ptr) {}
++static inline void kasan_mempool_poison_object(void *ptr) {}
+ static inline void *kasan_slab_alloc(struct kmem_cache *s, void *object,
+ 				   gfp_t flags, bool init)
+ {
+--- a/io_uring/alloc_cache.h~kasan-rename-kasan_slab_free_mempool-to-kasan_mempool_poison_object
++++ a/io_uring/alloc_cache.h
+@@ -16,8 +16,7 @@ static inline bool io_alloc_cache_put(st
+ 	if (cache->nr_cached < cache->max_cached) {
+ 		cache->nr_cached++;
+ 		wq_stack_add_head(&entry->node, &cache->list);
+-		/* KASAN poisons object */
+-		kasan_slab_free_mempool(entry);
++		kasan_mempool_poison_object(entry);
+ 		return true;
+ 	}
+ 	return false;
+--- a/mm/kasan/common.c~kasan-rename-kasan_slab_free_mempool-to-kasan_mempool_poison_object
++++ a/mm/kasan/common.c
+@@ -271,7 +271,7 @@ static inline bool ____kasan_kfree_large
+ 
+ 	/*
+ 	 * The object will be poisoned by kasan_poison_pages() or
+-	 * kasan_slab_free_mempool().
++	 * kasan_mempool_poison_object().
+ 	 */
+ 
+ 	return false;
+@@ -282,7 +282,7 @@ void __kasan_kfree_large(void *ptr, unsi
+ 	____kasan_kfree_large(ptr, ip);
+ }
+ 
+-void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
++void __kasan_mempool_poison_object(void *ptr, unsigned long ip)
+ {
+ 	struct folio *folio;
+ 
+--- a/mm/mempool.c~kasan-rename-kasan_slab_free_mempool-to-kasan_mempool_poison_object
++++ a/mm/mempool.c
+@@ -107,7 +107,7 @@ static inline void poison_element(mempoo
+ static __always_inline void kasan_poison_element(mempool_t *pool, void *element)
+ {
+ 	if (pool->alloc == mempool_alloc_slab || pool->alloc == mempool_kmalloc)
+-		kasan_slab_free_mempool(element);
++		kasan_mempool_poison_object(element);
+ 	else if (pool->alloc == mempool_alloc_pages)
+ 		kasan_poison_pages(element, (unsigned long)pool->pool_data,
+ 				   false);
+_

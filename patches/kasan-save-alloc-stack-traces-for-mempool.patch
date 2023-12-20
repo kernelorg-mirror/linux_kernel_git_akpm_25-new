@@ -1,0 +1,116 @@
+From: Andrey Konovalov <andreyknvl@google.com>
+Subject: kasan: save alloc stack traces for mempool
+Date: Tue, 19 Dec 2023 23:28:56 +0100
+
+Update kasan_mempool_unpoison_object to properly poison the redzone and
+save alloc strack traces for kmalloc and slab pools.
+
+As a part of this change, split out and use a unpoison_slab_object helper
+function from __kasan_slab_alloc.
+
+Link: https://lkml.kernel.org/r/05ad235da8347cfe14d496d01b2aaf074b4f607c.1703024586.git.andreyknvl@google.com
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Cc: Alexander Lobakin <alobakin@pm.me>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Breno Leitao <leitao@debian.org>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Evgenii Stepanov <eugenis@google.com>
+Cc: Marco Elver <elver@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kasan.h |    7 +++--
+ mm/kasan/common.c     |   50 ++++++++++++++++++++++++++++++++--------
+ 2 files changed, 44 insertions(+), 13 deletions(-)
+
+--- a/include/linux/kasan.h~kasan-save-alloc-stack-traces-for-mempool
++++ a/include/linux/kasan.h
+@@ -303,9 +303,10 @@ void __kasan_mempool_unpoison_object(voi
+  * mempool).
+  *
+  * This function unpoisons a slab allocation that was previously poisoned via
+- * kasan_mempool_poison_object() without initializing its memory. For the
+- * tag-based modes, this function does not assign a new tag to the allocation
+- * and instead restores the original tags based on the pointer value.
++ * kasan_mempool_poison_object() and saves an alloc stack trace for it without
++ * initializing the allocation's memory. For the tag-based modes, this function
++ * does not assign a new tag to the allocation and instead restores the
++ * original tags based on the pointer value.
+  *
+  * This function operates on all slab allocations including large kmalloc
+  * allocations (the ones returned by kmalloc_large() or by kmalloc() with the
+--- a/mm/kasan/common.c~kasan-save-alloc-stack-traces-for-mempool
++++ a/mm/kasan/common.c
+@@ -277,6 +277,20 @@ void __kasan_kfree_large(void *ptr, unsi
+ 	/* The object will be poisoned by kasan_poison_pages(). */
+ }
+ 
++void unpoison_slab_object(struct kmem_cache *cache, void *object, gfp_t flags,
++			  bool init)
++{
++	/*
++	 * Unpoison the whole object. For kmalloc() allocations,
++	 * poison_kmalloc_redzone() will do precise poisoning.
++	 */
++	kasan_unpoison(object, cache->object_size, init);
++
++	/* Save alloc info (if possible) for non-kmalloc() allocations. */
++	if (kasan_stack_collection_enabled() && !is_kmalloc_cache(cache))
++		kasan_save_alloc_info(cache, object, flags);
++}
++
+ void * __must_check __kasan_slab_alloc(struct kmem_cache *cache,
+ 					void *object, gfp_t flags, bool init)
+ {
+@@ -299,15 +313,8 @@ void * __must_check __kasan_slab_alloc(s
+ 	tag = assign_tag(cache, object, false);
+ 	tagged_object = set_tag(object, tag);
+ 
+-	/*
+-	 * Unpoison the whole object.
+-	 * For kmalloc() allocations, kasan_kmalloc() will do precise poisoning.
+-	 */
+-	kasan_unpoison(tagged_object, cache->object_size, init);
+-
+-	/* Save alloc info (if possible) for non-kmalloc() allocations. */
+-	if (kasan_stack_collection_enabled() && !is_kmalloc_cache(cache))
+-		kasan_save_alloc_info(cache, tagged_object, flags);
++	/* Unpoison the object and save alloc info for non-kmalloc() allocations. */
++	unpoison_slab_object(cache, tagged_object, flags, init);
+ 
+ 	return tagged_object;
+ }
+@@ -482,7 +489,30 @@ bool __kasan_mempool_poison_object(void
+ 
+ void __kasan_mempool_unpoison_object(void *ptr, size_t size, unsigned long ip)
+ {
+-	kasan_unpoison(ptr, size, false);
++	struct slab *slab;
++	gfp_t flags = 0; /* Might be executing under a lock. */
++
++	if (is_kfence_address(kasan_reset_tag(ptr)))
++		return;
++
++	slab = virt_to_slab(ptr);
++
++	/*
++	 * This function can be called for large kmalloc allocation that get
++	 * their memory from page_alloc.
++	 */
++	if (unlikely(!slab)) {
++		kasan_unpoison(ptr, size, false);
++		poison_kmalloc_large_redzone(ptr, size, flags);
++		return;
++	}
++
++	/* Unpoison the object and save alloc info for non-kmalloc() allocations. */
++	unpoison_slab_object(slab->slab_cache, ptr, size, flags);
++
++	/* Poison the redzone and save alloc info for kmalloc() allocations. */
++	if (is_kmalloc_cache(slab->slab_cache))
++		poison_kmalloc_redzone(slab->slab_cache, ptr, size, flags);
+ }
+ 
+ bool __kasan_check_byte(const void *address, unsigned long ip)
+_
