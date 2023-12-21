@@ -1,0 +1,93 @@
+From: Douglas Anderson <dianders@chromium.org>
+Subject: watchdog/hardlockup: use printk_cpu_sync_get_irqsave() to serialize reporting
+Date: Wed, 20 Dec 2023 13:15:36 -0800
+
+If two CPUs end up reporting a hardlockup at the same time then their logs
+could get interleaved which is hard to read.
+
+The interleaving problem was especially bad with the "perf" hardlockup
+detector where the locked up CPU is always the same as the running CPU and
+we end up in show_regs().  show_regs() has no inherent serialization so we
+could mix together two crawls if two hardlockups happened at the same time
+(and if we didn't have `sysctl_hardlockup_all_cpu_backtrace` set).  With
+this change we'll fully serialize hardlockups when using the "perf"
+hardlockup detector.
+
+The interleaving problem was less bad with the "buddy" hardlockup
+detector.  With "buddy" we always end up calling
+`trigger_single_cpu_backtrace(cpu)` on some CPU other than the running
+one.  trigger_single_cpu_backtrace() always at least serializes the
+individual stack crawls because it eventually uses
+printk_cpu_sync_get_irqsave().  Unfortunately the fact that
+trigger_single_cpu_backtrace() eventually calls
+printk_cpu_sync_get_irqsave() (on a different CPU) means that we have to
+drop the "lock" before calling it and we can't fully serialize all
+printouts associated with a given hardlockup.  However, we still do get
+the advantage of serializing the output of print_modules() and
+print_irqtrace_events().
+
+Aside from serializing hardlockups from each other, this change also has
+the advantage of serializing hardlockups and softlockups from each other
+if they happen to happen at the same time since they are both using the
+same "lock".
+
+Even though nobody is expected to hang while holding the lock associated
+with printk_cpu_sync_get_irqsave(), out of an abundance of caution, we
+don't call printk_cpu_sync_get_irqsave() until after we print out about
+the hardlockup.  This makes extra sure that, even if
+printk_cpu_sync_get_irqsave() somehow never runs we at least print that we
+saw the hardlockup.  This is different than the choice made for softlockup
+because hardlockup is really our last resort.
+
+Link: https://lkml.kernel.org/r/20231220131534.3.I6ff691b3b40f0379bc860f80c6e729a0485b5247@changeid
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Cc: John Ogness <john.ogness@linutronix.de>
+Cc: Lecopzer Chen <lecopzer.chen@mediatek.com>
+Cc: Li Zhe <lizhe.67@bytedance.com>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Pingfan Liu <kernelfans@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/watchdog.c |   13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/kernel/watchdog.c~watchdog-hardlockup-use-printk_cpu_sync_get_irqsave-to-serialize-reporting
++++ a/kernel/watchdog.c
+@@ -151,6 +151,7 @@ void watchdog_hardlockup_check(unsigned
+ 	 */
+ 	if (is_hardlockup(cpu)) {
+ 		unsigned int this_cpu = smp_processor_id();
++		unsigned long flags;
+ 
+ 		/* Only print hardlockups once. */
+ 		if (per_cpu(watchdog_hardlockup_warned, cpu))
+@@ -165,7 +166,17 @@ void watchdog_hardlockup_check(unsigned
+ 				return;
+ 		}
+ 
++		/*
++		 * NOTE: we call printk_cpu_sync_get_irqsave() after printing
++		 * the lockup message. While it would be nice to serialize
++		 * that printout, we really want to make sure that if some
++		 * other CPU somehow locked up while holding the lock associated
++		 * with printk_cpu_sync_get_irqsave() that we can still at least
++		 * get the message about the lockup out.
++		 */
+ 		pr_emerg("Watchdog detected hard LOCKUP on cpu %d\n", cpu);
++		printk_cpu_sync_get_irqsave(flags);
++
+ 		print_modules();
+ 		print_irqtrace_events(current);
+ 		if (cpu == this_cpu) {
+@@ -173,7 +184,9 @@ void watchdog_hardlockup_check(unsigned
+ 				show_regs(regs);
+ 			else
+ 				dump_stack();
++			printk_cpu_sync_put_irqrestore(flags);
+ 		} else {
++			printk_cpu_sync_put_irqrestore(flags);
+ 			trigger_single_cpu_backtrace(cpu);
+ 		}
+ 
+_
