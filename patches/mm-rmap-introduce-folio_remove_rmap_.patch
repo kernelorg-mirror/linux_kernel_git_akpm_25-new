@@ -1,0 +1,162 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/rmap: introduce folio_remove_rmap_[pte|ptes|pmd]()
+Date: Wed, 20 Dec 2023 23:44:47 +0100
+
+Let's mimic what we did with folio_add_file_rmap_*() and
+folio_add_anon_rmap_*() so we can similarly replace page_remove_rmap()
+next.
+
+Make the compiler always special-case on the granularity by using
+__always_inline.
+
+We're adding folio_remove_rmap_ptes() handling right away, as we want to
+use that soon for batching rmap operations when unmapping PTE-mapped large
+folios.
+
+Link: https://lkml.kernel.org/r/20231220224504.646757-24-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yin Fengwei <fengwei.yin@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/rmap.h |    6 +++
+ mm/rmap.c            |   80 +++++++++++++++++++++++++++++++++--------
+ 2 files changed, 71 insertions(+), 15 deletions(-)
+
+--- a/include/linux/rmap.h~mm-rmap-introduce-folio_remove_rmap_
++++ a/include/linux/rmap.h
+@@ -243,6 +243,12 @@ void folio_add_file_rmap_pmd(struct foli
+ 		struct vm_area_struct *);
+ void page_remove_rmap(struct page *, struct vm_area_struct *,
+ 		bool compound);
++void folio_remove_rmap_ptes(struct folio *, struct page *, int nr_pages,
++		struct vm_area_struct *);
++#define folio_remove_rmap_pte(folio, page, vma) \
++	folio_remove_rmap_ptes(folio, page, 1, vma)
++void folio_remove_rmap_pmd(struct folio *, struct page *,
++		struct vm_area_struct *);
+ 
+ void hugetlb_add_anon_rmap(struct folio *, struct vm_area_struct *,
+ 		unsigned long address, rmap_t flags);
+--- a/mm/rmap.c~mm-rmap-introduce-folio_remove_rmap_
++++ a/mm/rmap.c
+@@ -1510,25 +1510,37 @@ void page_remove_rmap(struct page *page,
+ 		bool compound)
+ {
+ 	struct folio *folio = page_folio(page);
++
++	if (likely(!compound))
++		folio_remove_rmap_pte(folio, page, vma);
++	else
++		folio_remove_rmap_pmd(folio, page, vma);
++}
++
++static __always_inline void __folio_remove_rmap(struct folio *folio,
++		struct page *page, int nr_pages, struct vm_area_struct *vma,
++		enum rmap_level level)
++{
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+-	int nr = 0, nr_pmdmapped = 0;
+-	bool last;
++	int last, nr = 0, nr_pmdmapped = 0;
+ 	enum node_stat_item idx;
+ 
+-	VM_WARN_ON_FOLIO(folio_test_hugetlb(folio), folio);
+-	VM_BUG_ON_PAGE(compound && !PageHead(page), page);
++	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+ 
+-	/* Is page being unmapped by PTE? Is this its last map to be removed? */
+-	if (likely(!compound)) {
+-		last = atomic_add_negative(-1, &page->_mapcount);
+-		nr = last;
+-		if (last && folio_test_large(folio)) {
+-			nr = atomic_dec_return_relaxed(mapped);
+-			nr = (nr < COMPOUND_MAPPED);
+-		}
+-	} else if (folio_test_pmd_mappable(folio)) {
+-		/* That test is redundant: it's for safety or to optimize out */
++	switch (level) {
++	case RMAP_LEVEL_PTE:
++		do {
++			last = atomic_add_negative(-1, &page->_mapcount);
++			if (last && folio_test_large(folio)) {
++				last = atomic_dec_return_relaxed(mapped);
++				last = (last < COMPOUND_MAPPED);
++			}
+ 
++			if (last)
++				nr++;
++		} while (page++, --nr_pages > 0);
++		break;
++	case RMAP_LEVEL_PMD:
+ 		last = atomic_add_negative(-1, &folio->_entire_mapcount);
+ 		if (last) {
+ 			nr = atomic_sub_return_relaxed(COMPOUND_MAPPED, mapped);
+@@ -1543,6 +1555,7 @@ void page_remove_rmap(struct page *page,
+ 				nr = 0;
+ 			}
+ 		}
++		break;
+ 	}
+ 
+ 	if (nr_pmdmapped) {
+@@ -1564,7 +1577,7 @@ void page_remove_rmap(struct page *page,
+ 		 * is still mapped.
+ 		 */
+ 		if (folio_test_large(folio) && folio_test_anon(folio))
+-			if (!compound || nr < nr_pmdmapped)
++			if (level == RMAP_LEVEL_PTE || nr < nr_pmdmapped)
+ 				deferred_split_folio(folio);
+ 	}
+ 
+@@ -1579,6 +1592,43 @@ void page_remove_rmap(struct page *page,
+ 	munlock_vma_folio(folio, vma);
+ }
+ 
++/**
++ * folio_remove_rmap_ptes - remove PTE mappings from a page range of a folio
++ * @folio:	The folio to remove the mappings from
++ * @page:	The first page to remove
++ * @nr_pages:	The number of pages that will be removed from the mapping
++ * @vma:	The vm area from which the mappings are removed
++ *
++ * The page range of the folio is defined by [page, page + nr_pages)
++ *
++ * The caller needs to hold the page table lock.
++ */
++void folio_remove_rmap_ptes(struct folio *folio, struct page *page,
++		int nr_pages, struct vm_area_struct *vma)
++{
++	__folio_remove_rmap(folio, page, nr_pages, vma, RMAP_LEVEL_PTE);
++}
++
++/**
++ * folio_remove_rmap_pmd - remove a PMD mapping from a page range of a folio
++ * @folio:	The folio to remove the mapping from
++ * @page:	The first page to remove
++ * @vma:	The vm area from which the mapping is removed
++ *
++ * The page range of the folio is defined by [page, page + HPAGE_PMD_NR)
++ *
++ * The caller needs to hold the page table lock.
++ */
++void folio_remove_rmap_pmd(struct folio *folio, struct page *page,
++		struct vm_area_struct *vma)
++{
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	__folio_remove_rmap(folio, page, HPAGE_PMD_NR, vma, RMAP_LEVEL_PMD);
++#else
++	WARN_ON_ONCE(true);
++#endif
++}
++
+ /*
+  * @arg: enum ttu_flags will be passed to this argument
+  */
+_
