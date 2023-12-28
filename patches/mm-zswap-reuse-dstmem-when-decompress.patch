@@ -1,0 +1,161 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zswap: reuse dstmem when decompress
+Date: Thu, 28 Dec 2023 09:45:42 +0000
+
+Patch series "mm/zswap: dstmem reuse optimizations and cleanups", v5.
+
+The problem this series tries to optimize is that zswap_load() and
+zswap_writeback_entry() have to malloc a temporary memory to support
+!zpool_can_sleep_mapped().  We can avoid it by reusing the percpu
+crypto_acomp_ctx->dstmem, which is also used by zswap_store() and
+protected by the same percpu crypto_acomp_ctx->mutex.
+
+
+This patch (of 5):
+
+In the !zpool_can_sleep_mapped() case such as zsmalloc, we need to first
+copy the entry->handle memory to a temporary memory, which is allocated
+using kmalloc.
+
+Obviously we can reuse the per-compressor dstmem to avoid allocating every
+time, since it's percpu-compressor and protected in percpu mutex.
+
+Link: https://lkml.kernel.org/r/20231213-zswap-dstmem-v5-0-9382162bbf05@bytedance.com
+Link: https://lkml.kernel.org/r/20231213-zswap-dstmem-v5-1-9382162bbf05@bytedance.com
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
+Acked-by: Chris Li <chrisl@kernel.org> (Google)
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Dan Streetman <ddstreet@ieee.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Seth Jennings <sjenning@redhat.com>
+Cc: Vitaly Wool <vitaly.wool@konsulko.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   44 ++++++++++++--------------------------------
+ 1 file changed, 12 insertions(+), 32 deletions(-)
+
+--- a/mm/zswap.c~mm-zswap-reuse-dstmem-when-decompress
++++ a/mm/zswap.c
+@@ -1417,19 +1417,13 @@ static int zswap_writeback_entry(struct
+ 	struct crypto_acomp_ctx *acomp_ctx;
+ 	struct zpool *pool = zswap_find_zpool(entry);
+ 	bool page_was_allocated;
+-	u8 *src, *tmp = NULL;
++	u8 *src;
+ 	unsigned int dlen;
+ 	int ret;
+ 	struct writeback_control wbc = {
+ 		.sync_mode = WB_SYNC_NONE,
+ 	};
+ 
+-	if (!zpool_can_sleep_mapped(pool)) {
+-		tmp = kmalloc(PAGE_SIZE, GFP_KERNEL);
+-		if (!tmp)
+-			return -ENOMEM;
+-	}
+-
+ 	/* try to allocate swap cache page */
+ 	mpol = get_task_policy(current);
+ 	page = __read_swap_cache_async(swpentry, GFP_KERNEL, mpol,
+@@ -1465,15 +1459,15 @@ static int zswap_writeback_entry(struct
+ 	/* decompress */
+ 	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+ 	dlen = PAGE_SIZE;
++	mutex_lock(acomp_ctx->mutex);
+ 
+ 	src = zpool_map_handle(pool, entry->handle, ZPOOL_MM_RO);
+ 	if (!zpool_can_sleep_mapped(pool)) {
+-		memcpy(tmp, src, entry->length);
+-		src = tmp;
++		memcpy(acomp_ctx->dstmem, src, entry->length);
++		src = acomp_ctx->dstmem;
+ 		zpool_unmap_handle(pool, entry->handle);
+ 	}
+ 
+-	mutex_lock(acomp_ctx->mutex);
+ 	sg_init_one(&input, src, entry->length);
+ 	sg_init_table(&output, 1);
+ 	sg_set_page(&output, page, PAGE_SIZE, 0);
+@@ -1482,9 +1476,7 @@ static int zswap_writeback_entry(struct
+ 	dlen = acomp_ctx->req->dlen;
+ 	mutex_unlock(acomp_ctx->mutex);
+ 
+-	if (!zpool_can_sleep_mapped(pool))
+-		kfree(tmp);
+-	else
++	if (zpool_can_sleep_mapped(pool))
+ 		zpool_unmap_handle(pool, entry->handle);
+ 
+ 	BUG_ON(ret);
+@@ -1503,9 +1495,6 @@ static int zswap_writeback_entry(struct
+ 	return ret;
+ 
+ fail:
+-	if (!zpool_can_sleep_mapped(pool))
+-		kfree(tmp);
+-
+ 	/*
+ 	 * If we get here because the page is already in swapcache, a
+ 	 * load may be happening concurrently. It is safe and okay to
+@@ -1767,7 +1756,7 @@ bool zswap_load(struct folio *folio)
+ 	struct zswap_entry *entry;
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
+-	u8 *src, *dst, *tmp;
++	u8 *src, *dst;
+ 	struct zpool *zpool;
+ 	unsigned int dlen;
+ 	bool ret;
+@@ -1792,26 +1781,19 @@ bool zswap_load(struct folio *folio)
+ 	}
+ 
+ 	zpool = zswap_find_zpool(entry);
+-	if (!zpool_can_sleep_mapped(zpool)) {
+-		tmp = kmalloc(entry->length, GFP_KERNEL);
+-		if (!tmp) {
+-			ret = false;
+-			goto freeentry;
+-		}
+-	}
+ 
+ 	/* decompress */
+ 	dlen = PAGE_SIZE;
+-	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
++	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
++	mutex_lock(acomp_ctx->mutex);
+ 
++	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
+ 	if (!zpool_can_sleep_mapped(zpool)) {
+-		memcpy(tmp, src, entry->length);
+-		src = tmp;
++		memcpy(acomp_ctx->dstmem, src, entry->length);
++		src = acomp_ctx->dstmem;
+ 		zpool_unmap_handle(zpool, entry->handle);
+ 	}
+ 
+-	acomp_ctx = raw_cpu_ptr(entry->pool->acomp_ctx);
+-	mutex_lock(acomp_ctx->mutex);
+ 	sg_init_one(&input, src, entry->length);
+ 	sg_init_table(&output, 1);
+ 	sg_set_page(&output, page, PAGE_SIZE, 0);
+@@ -1822,15 +1804,13 @@ bool zswap_load(struct folio *folio)
+ 
+ 	if (zpool_can_sleep_mapped(zpool))
+ 		zpool_unmap_handle(zpool, entry->handle);
+-	else
+-		kfree(tmp);
+ 
+ 	ret = true;
+ stats:
+ 	count_vm_event(ZSWPIN);
+ 	if (entry->objcg)
+ 		count_objcg_event(entry->objcg, ZSWPIN);
+-freeentry:
++
+ 	spin_lock(&tree->lock);
+ 	if (ret && zswap_exclusive_loads_enabled) {
+ 		zswap_invalidate_entry(tree, entry);
+_
