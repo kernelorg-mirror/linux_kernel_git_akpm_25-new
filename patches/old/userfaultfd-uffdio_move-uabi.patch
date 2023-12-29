@@ -1,29 +1,27 @@
 From: Andrea Arcangeli <aarcange@redhat.com>
 Subject: userfaultfd: UFFDIO_MOVE uABI
-Date: Tue, 21 Nov 2023 09:16:35 -0800
+Date: Wed, 6 Dec 2023 02:36:56 -0800
 
 Implement the uABI of UFFDIO_MOVE ioctl.
-
 UFFDIO_COPY performs ~20% better than UFFDIO_MOVE when the application
-needs pages to be allocated [1].  However, with UFFDIO_MOVE, if pages are
+needs pages to be allocated [1]. However, with UFFDIO_MOVE, if pages are
 available (in userspace) for recycling, as is usually the case in heap
 compaction algorithms, then we can avoid the page allocation and memcpy
-(done by UFFDIO_COPY).  Also, since the pages are recycled in the
+(done by UFFDIO_COPY). Also, since the pages are recycled in the
 userspace, we avoid the need to release (via madvise) the pages back to
 the kernel [2].
 
 We see over 40% reduction (on a Google pixel 6 device) in the compacting
-thread’s completion time by using UFFDIO_MOVE vs.  UFFDIO_COPY.  This
-was measured using a benchmark that emulates a heap compaction
-implementation using userfaultfd (to allow concurrent accesses by
-application threads).  More details of the usecase are explained in [2]. 
-Furthermore, UFFDIO_MOVE enables moving swapped-out pages without touching
-them within the same vma.  Today, it can only be done by mremap, however
-it forces splitting the vma.
+thread's completion time by using UFFDIO_MOVE vs.  UFFDIO_COPY.  This was
+measured using a benchmark that emulates a heap compaction implementation
+using userfaultfd (to allow concurrent accesses by application threads). 
+More details of the usecase are explained in [2].  Furthermore,
+UFFDIO_MOVE enables moving swapped-out pages without touching them within
+the same vma.  Today, it can only be done by mremap, however it forces
+splitting the vma.
 
 [1] https://lore.kernel.org/all/1425575884-2574-1-git-send-email-aarcange@redhat.com/
 [2] https://lore.kernel.org/linux-mm/CA+EESO4uO84SSnBhArH4HvLNhaUQ5nZKNKXqxRCyjniNVjp0Aw@mail.gmail.com/
-
 
 Update for the ioctl_userfaultfd(2)  manpage:
 
@@ -112,7 +110,7 @@ Update for the ioctl_userfaultfd(2)  manpage:
               The target process has exited at the time of a UFFDIO_MOVE
               operation.
 
-Link: https://lkml.kernel.org/r/20231121171643.3719880-3-surenb@google.com
+Link: https://lkml.kernel.org/r/20231206103702.3873743-3-surenb@google.com
 Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Cc: Al Viro <viro@zeniv.linux.org.uk>
@@ -130,21 +128,22 @@ Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mike Rapoport (IBM) <rppt@kernel.org>
 Cc: Nicolas Geoffray <ngeoffray@google.com>
 Cc: Peter Xu <peterx@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Shuah Khan <shuah@kernel.org>
 Cc: ZhangPeng <zhangpeng362@huawei.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/admin-guide/mm/userfaultfd.rst |    3 
- fs/userfaultfd.c                             |   72 ++
+ fs/userfaultfd.c                             |   72 +
  include/linux/rmap.h                         |    5 
  include/linux/userfaultfd_k.h                |   11 
  include/uapi/linux/userfaultfd.h             |   29 
  mm/huge_memory.c                             |  122 +++
  mm/khugepaged.c                              |    3 
  mm/rmap.c                                    |    6 
- mm/userfaultfd.c                             |  599 +++++++++++++++++
- 9 files changed, 849 insertions(+), 1 deletion(-)
+ mm/userfaultfd.c                             |  614 +++++++++++++++++
+ 9 files changed, 864 insertions(+), 1 deletion(-)
 
 --- a/Documentation/admin-guide/mm/userfaultfd.rst~userfaultfd-uffdio_move-uabi
 +++ a/Documentation/admin-guide/mm/userfaultfd.rst
@@ -362,7 +361,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
 --- a/mm/huge_memory.c~userfaultfd-uffdio_move-uabi
 +++ a/mm/huge_memory.c
-@@ -1964,6 +1964,128 @@ unlock:
+@@ -2141,6 +2141,128 @@ unlock:
  	return ret;
  }
  
@@ -493,7 +492,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
 --- a/mm/khugepaged.c~userfaultfd-uffdio_move-uabi
 +++ a/mm/khugepaged.c
-@@ -1139,6 +1139,9 @@ static int collapse_huge_page(struct mm_
+@@ -1140,6 +1140,9 @@ static int collapse_huge_page(struct mm_
  	 * Prevent all access to pagetables with the exception of
  	 * gup_fast later handled by the ptep_clear_flush and the VM
  	 * handled by the anon_vma lock + PG_lock.
@@ -520,7 +519,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 --- a/mm/userfaultfd.c~userfaultfd-uffdio_move-uabi
 +++ a/mm/userfaultfd.c
-@@ -842,3 +842,602 @@ out_unlock:
+@@ -842,3 +842,617 @@ out_unlock:
  	mmap_read_unlock(dst_mm);
  	return err;
  }
@@ -732,8 +731,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			}
 +
 +			folio = vm_normal_folio(src_vma, src_addr, orig_src_pte);
-+			if (!folio || folio_test_large(folio) ||
-+			    !PageAnonExclusive(&folio->page)) {
++			if (!folio || !PageAnonExclusive(&folio->page)) {
 +				spin_unlock(src_ptl);
 +				err = -EBUSY;
 +				goto out;
@@ -757,6 +755,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				err = -EBUSY;
 +				goto out;
 +			}
++		}
++
++		/* at this point we have src_folio locked */
++		if (folio_test_large(src_folio)) {
++			err = split_folio(src_folio);
++			if (err)
++				goto out;
 +		}
 +
 +		if (!src_anon_vma) {
@@ -1064,8 +1069,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			/* Check if we can move the pmd without splitting it. */
 +			if (move_splits_huge_pmd(dst_addr, src_addr, src_start + len) ||
 +			    !pmd_none(dst_pmdval)) {
++				struct folio *folio = pfn_folio(pmd_pfn(*src_pmd));
++
++				if (!folio || !PageAnonExclusive(&folio->page)) {
++					spin_unlock(ptl);
++					err = -EBUSY;
++					break;
++				}
++
 +				spin_unlock(ptl);
 +				split_huge_pmd(src_vma, src_pmd, src_addr);
++				/* The folio will be split by move_pages_pte() */
 +				continue;
 +			}
 +

@@ -1,46 +1,36 @@
 From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
 Subject: buffer: return bool from grow_dev_folio()
-Date: Mon, 16 Oct 2023 21:10:48 +0100
+Date: Thu, 9 Nov 2023 21:06:02 +0000
 
-Patch series "Finish the create_empty_buffers() transition", v2.
+Patch series "More buffer_head cleanups", v2.
 
-Pankaj recently added folio_create_empty_buffers() as the folio equivalent
-to create_empty_buffers().  This patch set finishes the conversion by
-first converting all remaining filesystems to call
-folio_create_empty_buffers(), then renaming it back to
-create_empty_buffers().  I took the opportunity to make a few
-simplifications like making folio_create_empty_buffers() return the head
-buffer and extracting get_nth_bh() from nilfs2.
-
-A few of the patches in this series aren't directly related to
-create_empty_buffers(), but I saw them while I was working on this and
-thought they'd be easy enough to add to this series.  Compile-tested only,
-other than ext4.
+The first patch is a left-over from last cycle.  The rest fix "obvious"
+block size > PAGE_SIZE problems.  I haven't tested with a large block size
+setup (but I have done an ext4 xfstests run).
 
 
-This patch (of 27):
+This patch (of 7):
 
 Rename grow_dev_page() to grow_dev_folio() and make it return a bool. 
 Document what that bool means; it's more subtle than it first appears. 
 Also rename the 'failed' label to 'unlock' beacuse it's not exactly
 'failed'.  It just hasn't succeeded.
 
-Link: https://lkml.kernel.org/r/20231016201114.1928083-1-willy@infradead.org
-Link: https://lkml.kernel.org/r/20231016201114.1928083-2-willy@infradead.org
+Link: https://lkml.kernel.org/r/20231109210608.2252323-2-willy@infradead.org
 Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Hannes Reinecke <hare@suse.de>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
 Cc: Pankaj Raghav <p.raghav@samsung.com>
-Cc: Andreas Gruenbacher <agruenba@redhat.com>
 Cc: Ryusuke Konishi <konishi.ryusuke@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/buffer.c |   39 ++++++++++++++++++++++-----------------
- 1 file changed, 22 insertions(+), 17 deletions(-)
+ fs/buffer.c |   50 +++++++++++++++++++++++++-------------------------
+ 1 file changed, 25 insertions(+), 25 deletions(-)
 
 --- a/fs/buffer.c~buffer-return-bool-from-grow_dev_folio
 +++ a/fs/buffer.c
-@@ -1024,24 +1024,26 @@ static sector_t folio_init_buffers(struc
+@@ -1024,40 +1024,43 @@ static sector_t folio_init_buffers(struc
  }
  
  /*
@@ -54,15 +44,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
 -static int
 -grow_dev_page(struct block_device *bdev, sector_t block,
+-	      pgoff_t index, int size, int sizebits, gfp_t gfp)
 +static bool grow_dev_folio(struct block_device *bdev, sector_t block,
- 	      pgoff_t index, int size, int sizebits, gfp_t gfp)
++		pgoff_t index, unsigned size, int sizebits, gfp_t gfp)
  {
  	struct inode *inode = bdev->bd_inode;
  	struct folio *folio;
  	struct buffer_head *bh;
- 	sector_t end_block;
+-	sector_t end_block;
 -	int ret = 0;
-+	bool ret;
++	sector_t end_block = 0;
  
  	folio = __filemap_get_folio(inode->i_mapping, index,
  			FGP_LOCK | FGP_ACCESSED | FGP_CREAT, gfp);
@@ -72,20 +63,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	bh = folio_buffers(folio);
  	if (bh) {
-@@ -1050,14 +1052,17 @@ grow_dev_page(struct block_device *bdev,
+ 		if (bh->b_size == size) {
+ 			end_block = folio_init_buffers(folio, bdev,
  					(sector_t)index << sizebits, size);
- 			goto done;
+-			goto done;
++			goto unlock;
  		}
 +
 +		/* Caller should retry if this call fails */
-+		ret = true;
++		end_block = ~0ULL;
  		if (!try_to_free_buffers(folio))
 -			goto failed;
 +			goto unlock;
  	}
  
 -	ret = -ENOMEM;
-+	ret = false;
  	bh = folio_alloc_buffers(folio, size, gfp | __GFP_ACCOUNT);
  	if (!bh)
 -		goto failed;
@@ -93,33 +85,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Link the folio to the buffers and initialise them.  Take the
-@@ -1070,19 +1075,19 @@ grow_dev_page(struct block_device *bdev,
+@@ -1069,20 +1072,19 @@ grow_dev_page(struct block_device *bdev,
+ 	end_block = folio_init_buffers(folio, bdev,
  			(sector_t)index << sizebits, size);
  	spin_unlock(&inode->i_mapping->private_lock);
- done:
+-done:
 -	ret = (block < end_block) ? 1 : -ENXIO;
 -failed:
-+	ret = block < end_block;
 +unlock:
  	folio_unlock(folio);
  	folio_put(folio);
- 	return ret;
+-	return ret;
++	return block < end_block;
  }
  
  /*
 - * Create buffers for the specified block device block's page.  If
 - * that page was dirty, the buffers are set dirty also.
 + * Create buffers for the specified block device block's folio.  If
-+ * that folio was dirty, the buffers are set dirty also.
++ * that folio was dirty, the buffers are set dirty also.  Returns false
++ * if we've hit a permanent error.
   */
 -static int
 -grow_buffers(struct block_device *bdev, sector_t block, int size, gfp_t gfp)
 +static bool grow_buffers(struct block_device *bdev, sector_t block,
-+		int size, gfp_t gfp)
++		unsigned size, gfp_t gfp)
  {
  	pgoff_t index;
  	int sizebits;
-@@ -1099,11 +1104,11 @@ grow_buffers(struct block_device *bdev,
+@@ -1099,11 +1101,11 @@ grow_buffers(struct block_device *bdev,
  			"device %pg\n",
  			__func__, (unsigned long long)block,
  			bdev);
@@ -129,9 +123,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -	/* Create a page with the proper size buffers.. */
 -	return grow_dev_page(bdev, block, index, size, sizebits, gfp);
-+	/* Create a folio with the proper size buffers.. */
++	/* Create a folio with the proper size buffers */
 +	return grow_dev_folio(bdev, block, index, size, sizebits, gfp);
  }
  
  static struct buffer_head *
+@@ -1124,14 +1126,12 @@ __getblk_slow(struct block_device *bdev,
+ 
+ 	for (;;) {
+ 		struct buffer_head *bh;
+-		int ret;
+ 
+ 		bh = __find_get_block(bdev, block, size);
+ 		if (bh)
+ 			return bh;
+ 
+-		ret = grow_buffers(bdev, block, size, gfp);
+-		if (ret < 0)
++		if (!grow_buffers(bdev, block, size, gfp))
+ 			return NULL;
+ 	}
+ }
 _
