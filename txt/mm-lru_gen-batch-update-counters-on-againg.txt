@@ -1,0 +1,80 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm, lru_gen: batch update counters on aging
+Date: Fri, 12 Jan 2024 02:33:19 +0800
+
+Patch series "mm, lru_gen: batch update pages when aging", v2.
+
+From: Kairui Song <kasong@tencent.com>
+Currently when MGLRU ages, it moves the pages one by one and updates mm
+counter page by page, which is correct but the overhead can be optimized
+by batching these operations.
+
+In previous series I only test with memtier which didn't show a good
+enough improment.  Acutally in-mem fio benifits the most from patch 3:
+
+Ramdisk fio test in a 4G memcg on a EPYC 7K62 with:
+
+  fio -name=mglru --numjobs=16 --directory=/mnt --size=960m \
+    --buffered=1 --ioengine=io_uring --iodepth=128 \
+    --iodepth_batch_submit=32 --iodepth_batch_complete=32 \
+    --rw=randread --random_distribution=zipf:0.5 --norandommap \
+    --time_based --ramp_time=1m --runtime=5m --group_reporting
+
+Before this series:
+bw (  MiB/s): min= 7644, max= 9293, per=100.00%, avg=8777.77, stdev=16.59, samples=9568
+iops        : min=1956954, max=2379053, avg=2247108.51, stdev=4247.22, samples=9568
+
+After this series (+7.5%):
+bw (  MiB/s): min= 8462, max= 9902, per=100.00%, avg=9444.77, stdev=16.43, samples=9568
+iops        : min=2166433, max=2535135, avg=2417858.23, stdev=4205.15, samples=9568
+
+However it's highly related to the actual timing and use case.
+
+Besides, batch moving also has a good effect on LRU ordering.  Currently
+when MGLRU ages, it walks the LRU backward, and the protected pages are
+moved to the tail of newer gen one by one, which reverses the order of
+pages in LRU.  Moving them in batches can help keep their order, only in a
+small scope though due to the scan limit of MAX_LRU_BATCH pages.
+
+I noticed a higher performance gain if there are a lot of pages getting
+protected, but hard to reproduce, so instead I tested using a simpler
+benchmark, memtier, also for a more generic result.  The main overhead
+here is not aging but the result is also looking good:
+
+Average result of 18 test runs:
+
+Before:           44017.78 Ops/sec
+After patch 1-3:  44890.50 Ops/sec (+1.8%)
+
+
+This patch (of 3):
+
+When lru_gen is aging, it will update mm counters page by page, which
+causes a higher overhead if age happens frequently or there are a lot of
+pages in one generation getting moved.  Optimize this by doing the counter
+update in batch.
+
+Although most __mod_*_state has its own caches the overhead is still
+observable.
+
+Tested in a 4G memcg on a EPYC 7K62 with:
+
+  memcached -u nobody -m 16384 -s /tmp/memcached.socket \
+    -a 0766 -t 16 -B binary &
+
+  memtier_benchmark -S /tmp/memcached.socket \
+    -P memcache_binary -n allkeys \
+    --key-minimum=1 --key-maximum=16000000 -d 1024 \
+    --ratio=1:0 --key-pattern=P:P -c 2 -t 16 --pipeline 8 -x 6
+
+Average result of 18 test runs:
+
+Before: 44017.78 Ops/sec
+After:  44687.08 Ops/sec (+1.5%)
+
+Link: https://lkml.kernel.org/r/20240111183321.19984-1-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20240111183321.19984-2-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Yu Zhao <yuzhao@google.com>
