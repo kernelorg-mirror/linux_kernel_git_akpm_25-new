@@ -1,0 +1,190 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: tools/mm: add thpmaps script to dump THP usage info
+Date: Tue, 16 Jan 2024 14:12:35 +0000
+
+With the proliferation of large folios for file-backed memory, and more
+recently the introduction of multi-size THP for anonymous memory, it is
+becoming useful to be able to see exactly how large folios are mapped into
+processes.  For some architectures (e.g.  arm64), if most memory is mapped
+using contpte-sized and -aligned blocks, TLB usage can be optimized so
+it's useful to see where these requirements are and are not being met.
+
+thpmaps is a Python utility that reads /proc/<pid>/smaps,
+/proc/<pid>/pagemap and /proc/kpageflags to print information about how
+transparent huge pages (both file and anon) are mapped to a specified
+process or cgroup.  It aims to help users debug and optimize their
+workloads.  In future we may wish to introduce stats directly into the
+kernel (e.g.  smaps or similar), but for now this provides a short term
+solution without the need to introduce any new ABI.
+
+Run with help option for a full listing of the arguments:
+
+    # ./thpmaps --help
+
+--8<--
+usage: thpmaps [-h] [--pid pid | --cgroup path] [--rollup]
+               [--cont size[KMG]] [--inc-smaps] [--inc-empty]
+               [--periodic sleep_ms]
+
+Prints information about how transparent huge pages are mapped, either
+system-wide, or for a specified process or cgroup.
+
+When run with --pid, the user explicitly specifies the set of pids to
+scan.  e.g.  "--pid 10 [--pid 134 ...]".  When run with --cgroup, the user
+passes either a v1 or v2 cgroup and all pids that belong to the cgroup
+subtree are scanned.  When run with neither --pid nor --cgroup, the full
+set of pids on the system is gathered from /proc and scanned as if the
+user had provided "--pid 1 --pid 2 ...".
+
+A default set of statistics is always generated for THP mappings. 
+However, it is also possible to generate additional statistics for
+"contiguous block mappings" where the block size is user-defined.
+
+Statistics are maintained independently for anonymous and file-backed
+(pagecache) memory and are shown both in kB and as a percentage of either
+total anonymous or total file-backed memory as appropriate.
+
+THP Statistics
+--------------
+
+Statistics are always generated for fully- and contiguously-mapped THPs
+whose mapping address is aligned to their size, for each <size> supported
+by the system.  Separate counters describe THPs mapped by PTE vs those
+mapped by PMD.  (Although note a THP can only be mapped by PMD if it is
+PMD-sized):
+
+- anon-thp-pte-aligned-<size>kB
+- file-thp-pte-aligned-<size>kB
+- anon-thp-pmd-aligned-<size>kB
+- file-thp-pmd-aligned-<size>kB
+
+Similarly, statistics are always generated for fully- and contiguously-
+mapped THPs whose mapping address is *not* aligned to their size, for each
+<size> supported by the system.  Due to the unaligned mapping, it is
+impossible to map by PMD, so there are only PTE counters for this case:
+
+- anon-thp-pte-unaligned-<size>kB
+- file-thp-pte-unaligned-<size>kB
+
+Statistics are also always generated for mapped pages that belong to a THP
+but where the is THP is *not* fully- and contiguously- mapped.  These
+"partial" mappings are all counted in the same counter regardless of the
+size of the THP that is partially mapped:
+
+- anon-thp-pte-partial
+- file-thp-pte-partial
+
+Contiguous Block Statistics
+---------------------------
+
+An optional, additional set of statistics is generated for every
+contiguous block size specified with `--cont <size>`.  These statistics
+show how much memory is mapped in contiguous blocks of <size> and also
+aligned to <size>.  A given contiguous block must all belong to the same
+THP, but there is no requirement for it to be the *whole* THP.  Separate
+counters describe contiguous blocks mapped by PTE vs those mapped by PMD:
+
+- anon-cont-pte-aligned-<size>kB
+- file-cont-pte-aligned-<size>kB
+- anon-cont-pmd-aligned-<size>kB
+- file-cont-pmd-aligned-<size>kB
+
+As an example, if monitoring 64K contiguous blocks (--cont 64K), there are
+a number of sources that could provide such blocks: a fully- and
+contiguously-mapped 64K THP that is aligned to a 64K boundary would
+provide 1 block.  A fully- and contiguously-mapped 128K THP that is
+aligned to at least a 64K boundary would provide 2 blocks.  Or a 128K THP
+that maps its first 100K, but contiguously and starting at a 64K boundary
+would provide 1 block.  A fully- and contiguously-mapped 2M THP would
+provide 32 blocks.  There are many other possible permutations.
+
+options:
+  -h, --help           show this help message and exit
+  --pid pid            Process id of the target process. Maybe issued
+                       multiple times to scan multiple processes. --pid
+                       and --cgroup are mutually exclusive. If neither
+                       are provided, all processes are scanned to
+                       provide system-wide information.
+  --cgroup path        Path to the target cgroup in sysfs. Iterates
+                       over every pid in the cgroup and its children.
+                       --pid and --cgroup are mutually exclusive. If
+                       neither are provided, all processes are scanned
+                       to provide system-wide information.
+  --rollup             Sum the per-vma statistics to provide a summary
+                       over the whole system, process or cgroup.
+  --cont size[KMG]     Adds stats for memory that is mapped in
+                       contiguous blocks of <size> and also aligned to
+                       <size>. May be issued multiple times to track
+                       multiple sized blocks. Useful to infer e.g.
+                       arm64 contpte and hpa mappings. Size must be a
+                       power-of-2 number of pages.
+  --inc-smaps          Include all numerical, additive
+                       /proc/<pid>/smaps stats in the output.
+  --inc-empty          Show all statistics including those whose value
+                       is 0.
+  --periodic sleep_ms  Run in a loop, polling every sleep_ms
+                       milliseconds.
+
+Requires root privilege to access pagemap and kpageflags.
+--8<--
+
+Example command to summarise fully and partially mapped THPs and 64K
+contiguous blocks over all VMAs in all processes in the system
+(--inc-empty forces printing stats that are 0):
+
+    # ./thpmaps --cont 64K --rollup --inc-empty
+
+--8<--
+anon-thp-pmd-aligned-2048kB:      139264 kB ( 6%)
+file-thp-pmd-aligned-2048kB:           0 kB ( 0%)
+anon-thp-pte-aligned-16kB:             0 kB ( 0%)
+anon-thp-pte-aligned-32kB:             0 kB ( 0%)
+anon-thp-pte-aligned-64kB:         72256 kB ( 3%)
+anon-thp-pte-aligned-128kB:            0 kB ( 0%)
+anon-thp-pte-aligned-256kB:            0 kB ( 0%)
+anon-thp-pte-aligned-512kB:            0 kB ( 0%)
+anon-thp-pte-aligned-1024kB:           0 kB ( 0%)
+anon-thp-pte-aligned-2048kB:           0 kB ( 0%)
+anon-thp-pte-unaligned-16kB:           0 kB ( 0%)
+anon-thp-pte-unaligned-32kB:           0 kB ( 0%)
+anon-thp-pte-unaligned-64kB:           0 kB ( 0%)
+anon-thp-pte-unaligned-128kB:          0 kB ( 0%)
+anon-thp-pte-unaligned-256kB:          0 kB ( 0%)
+anon-thp-pte-unaligned-512kB:          0 kB ( 0%)
+anon-thp-pte-unaligned-1024kB:         0 kB ( 0%)
+anon-thp-pte-unaligned-2048kB:         0 kB ( 0%)
+anon-thp-pte-partial:              63232 kB ( 3%)
+file-thp-pte-aligned-16kB:        809024 kB (47%)
+file-thp-pte-aligned-32kB:         43168 kB ( 3%)
+file-thp-pte-aligned-64kB:         98496 kB ( 6%)
+file-thp-pte-aligned-128kB:        17536 kB ( 1%)
+file-thp-pte-aligned-256kB:            0 kB ( 0%)
+file-thp-pte-aligned-512kB:            0 kB ( 0%)
+file-thp-pte-aligned-1024kB:           0 kB ( 0%)
+file-thp-pte-aligned-2048kB:           0 kB ( 0%)
+file-thp-pte-unaligned-16kB:       21712 kB ( 1%)
+file-thp-pte-unaligned-32kB:         704 kB ( 0%)
+file-thp-pte-unaligned-64kB:         896 kB ( 0%)
+file-thp-pte-unaligned-128kB:      44928 kB ( 3%)
+file-thp-pte-unaligned-256kB:          0 kB ( 0%)
+file-thp-pte-unaligned-512kB:          0 kB ( 0%)
+file-thp-pte-unaligned-1024kB:         0 kB ( 0%)
+file-thp-pte-unaligned-2048kB:         0 kB ( 0%)
+file-thp-pte-partial:               9252 kB ( 1%)
+anon-cont-pmd-aligned-64kB:       139264 kB ( 6%)
+file-cont-pmd-aligned-64kB:            0 kB ( 0%)
+anon-cont-pte-aligned-64kB:       100672 kB ( 4%)
+file-cont-pte-aligned-64kB:       161856 kB ( 9%)
+--8<--
+
+Link: https://lkml.kernel.org/r/20240116141235.960842-1-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Tested-by: Barry Song <v-songbaohua@oppo.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: William Kucharski <william.kucharski@oracle.com>
+Cc: Zenghui Yu <yuzenghui@huawei.com>
+Cc: Zi Yan <ziy@nvidia.com>
