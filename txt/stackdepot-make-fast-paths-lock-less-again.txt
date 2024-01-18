@@ -1,0 +1,58 @@
+From: Marco Elver <elver@google.com>
+Subject: stackdepot: make fast paths lock-less again
+Date: Thu, 18 Jan 2024 12:01:30 +0100
+
+With the introduction of the pool_rwlock (reader-writer lock), several
+fast paths end up taking the pool_rwlock as readers.  Furthermore,
+stack_depot_put() unconditionally takes the pool_rwlock as a writer.
+
+Despite allowing readers to make forward-progress concurrently,
+reader-writer locks have inherent cache contention issues, which does not
+scale well on systems with large CPU counts.
+
+Rework the synchronization story of stack depot to again avoid taking any
+locks in the fast paths.  This is done by relying on RCU-protected list
+traversal, and the NMI-safe subset of RCU to delay reuse of freed stack
+records.  See code comments for more details.
+
+Along with the performance issues, this also fixes incorrect nesting of
+rwlock within a raw_spinlock, given that stack depot should still be
+usable from anywhere:
+
+ | [ BUG: Invalid wait context ]
+ | -----------------------------
+ | swapper/0/1 is trying to lock:
+ | ffffffff89869be8 (pool_rwlock){..--}-{3:3}, at: stack_depot_save_flags
+ | other info that might help us debug this:
+ | context-{5:5}
+ | 2 locks held by swapper/0/1:
+ |  #0: ffffffff89632440 (rcu_read_lock){....}-{1:3}, at: __queue_work
+ |  #1: ffff888100092018 (&pool->lock){-.-.}-{2:2}, at: __queue_work  <-- raw_spin_lock
+
+Stack depot usage stats are similar to the previous version after a KASAN
+kernel boot:
+
+ $ cat /sys/kernel/debug/stackdepot/stats
+ pools: 838
+ allocations: 29865
+ frees: 6604
+ in_use: 23261
+ freelist_size: 1879
+
+The number of pools is the same as previously.  The freelist size is
+minimally larger, but this may also be due to variance across system
+boots.  This shows that even though we do not eagerly wait for the next
+RCU grace period (such as with synchronize_rcu() or call_rcu()) after
+freeing a stack record - requiring depot_pop_free() to "poll" if an entry
+may be used - new allocations are very likely to happen in later RCU grace
+periods.
+
+Link: https://lkml.kernel.org/r/20240118110216.2539519-2-elver@google.com
+Fixes: 108be8def46e ("lib/stackdepot: allow users to evict stack traces")
+Reported-by: Andi Kleen <ak@linux.intel.com>
+Signed-off-by: Marco Elver <elver@google.com>
+Reviewed-by: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
