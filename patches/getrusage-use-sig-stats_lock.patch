@@ -1,0 +1,98 @@
+From: Oleg Nesterov <oleg@redhat.com>
+Subject: getrusage: use sig->stats_lock
+Date: Fri, 19 Jan 2024 15:15:29 +0100
+
+Rather than lock_task_sighand(), sig->stats_lock was specifically designed
+for this type of use.  This way getrusage runs lockless in the likely
+case.
+
+TODO:
+	- Change do_task_stat() to use sig->stats_lock too, then we can
+	  remove spin_lock_irq(siglock) in wait_task_zombie().
+
+	- Turn sig->stats_lock into seqcount_rwlock_t, this way the
+	  readers in the slow mode won't exclude each other. See
+	  https://lore.kernel.org/all/20230913154907.GA26210@redhat.com/
+
+	- stats_lock has to disable irqs because ->siglock can be taken
+	  in irq context, it would be very nice to change __exit_signal()
+	  to avoid the siglock->stats_lock dependency.
+
+Link: https://lkml.kernel.org/r/20240119141529.GB23739@redhat.com
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Tested-by: Dylan Hatch <dylanbhatch@google.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Cc: Florent Revest <revest@chromium.org>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Helge Deller <deller@gmx.de>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Joey Gouly <joey.gouly@arm.com>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Mike Christie <michael.christie@oracle.com>
+Cc: Ondrej Mosnacek <omosnace@redhat.com>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Stefan Roesch <shr@devkernel.io>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vincent Whitchurch <Vincent.Whitchurch@axis.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/sys.c |   16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+--- a/kernel/sys.c~getrusage-use-sig-stats_lock
++++ a/kernel/sys.c
+@@ -1788,7 +1788,9 @@ void getrusage(struct task_struct *p, in
+ 	unsigned long maxrss;
+ 	struct mm_struct *mm;
+ 	struct signal_struct *sig = p->signal;
++	unsigned int seq = 0;
+ 
++retry:
+ 	memset(r, 0, sizeof(*r));
+ 	utime = stime = 0;
+ 	maxrss = 0;
+@@ -1800,8 +1802,7 @@ void getrusage(struct task_struct *p, in
+ 		goto out_thread;
+ 	}
+ 
+-	if (!lock_task_sighand(p, &flags))
+-		return;
++	flags = read_seqbegin_or_lock_irqsave(&sig->stats_lock, &seq);
+ 
+ 	switch (who) {
+ 	case RUSAGE_BOTH:
+@@ -1829,14 +1830,23 @@ void getrusage(struct task_struct *p, in
+ 		r->ru_oublock += sig->oublock;
+ 		if (maxrss < sig->maxrss)
+ 			maxrss = sig->maxrss;
++
++		rcu_read_lock();
+ 		__for_each_thread(sig, t)
+ 			accumulate_thread_rusage(t, r);
++		rcu_read_unlock();
++
+ 		break;
+ 
+ 	default:
+ 		BUG();
+ 	}
+-	unlock_task_sighand(p, &flags);
++
++	if (need_seqretry(&sig->stats_lock, seq)) {
++		seq = 1;
++		goto retry;
++	}
++	done_seqretry_irqrestore(&sig->stats_lock, seq, flags);
+ 
+ 	if (who == RUSAGE_CHILDREN)
+ 		goto out_children;
+_
