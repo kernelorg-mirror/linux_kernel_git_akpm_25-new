@@ -1,0 +1,185 @@
+From: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Subject: nilfs2: localize highmem mapping for checkpoint finalization within cpfile
+Date: Mon, 22 Jan 2024 23:01:59 +0900
+
+Move the checkpoint finalization routine to the cpfile side, and make the
+page mapping local and temporary.  And use kmap_local instead of kmap to
+access the checkpoint entry page when finalizing a checkpoint.
+
+In this conversion, some of the information on the checkpoint entry being
+rewritten is passed through the arguments of the newly added method
+nilfs_cpfile_finalize_checkpoint().
+
+Link: https://lkml.kernel.org/r/20240122140202.6950-13-konishi.ryusuke@gmail.com
+Signed-off-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/nilfs2/cpfile.c  |   74 ++++++++++++++++++++++++++++++++++++++++++
+ fs/nilfs2/cpfile.h  |    3 +
+ fs/nilfs2/segment.c |   51 ++--------------------------
+ 3 files changed, 82 insertions(+), 46 deletions(-)
+
+--- a/fs/nilfs2/cpfile.c~nilfs2-localize-highmem-mapping-for-checkpoint-finalization-within-cpfile
++++ a/fs/nilfs2/cpfile.c
+@@ -364,6 +364,80 @@ void nilfs_cpfile_put_checkpoint(struct
+ }
+ 
+ /**
++ * nilfs_cpfile_finalize_checkpoint - fill in a checkpoint entry in cpfile
++ * @cpfile: checkpoint file inode
++ * @cno:    checkpoint number
++ * @root:   nilfs root object
++ * @blkinc: number of blocks added by this checkpoint
++ * @ctime:  checkpoint creation time
++ * @minor:  minor checkpoint flag
++ *
++ * This function completes the checkpoint entry numbered by @cno in the
++ * cpfile with the data given by the arguments @root, @blkinc, @ctime, and
++ * @minor.
++ *
++ * Return: 0 on success, or the following negative error code on failure.
++ * * %-ENOMEM	- Insufficient memory available.
++ * * %-EIO	- I/O error (including metadata corruption).
++ */
++int nilfs_cpfile_finalize_checkpoint(struct inode *cpfile, __u64 cno,
++				     struct nilfs_root *root, __u64 blkinc,
++				     time64_t ctime, bool minor)
++{
++	struct buffer_head *cp_bh;
++	struct nilfs_checkpoint *cp;
++	void *kaddr;
++	int ret;
++
++	if (WARN_ON_ONCE(cno < 1))
++		return -EIO;
++
++	down_write(&NILFS_MDT(cpfile)->mi_sem);
++	ret = nilfs_cpfile_get_checkpoint_block(cpfile, cno, 0, &cp_bh);
++	if (unlikely(ret < 0)) {
++		if (ret == -ENOENT)
++			goto error;
++		goto out_sem;
++	}
++
++	kaddr = kmap_local_page(cp_bh->b_page);
++	cp = nilfs_cpfile_block_get_checkpoint(cpfile, cno, cp_bh, kaddr);
++	if (unlikely(nilfs_checkpoint_invalid(cp))) {
++		kunmap_local(kaddr);
++		brelse(cp_bh);
++		goto error;
++	}
++
++	cp->cp_snapshot_list.ssl_next = 0;
++	cp->cp_snapshot_list.ssl_prev = 0;
++	cp->cp_inodes_count = cpu_to_le64(atomic64_read(&root->inodes_count));
++	cp->cp_blocks_count = cpu_to_le64(atomic64_read(&root->blocks_count));
++	cp->cp_nblk_inc = cpu_to_le64(blkinc);
++	cp->cp_create = cpu_to_le64(ctime);
++	cp->cp_cno = cpu_to_le64(cno);
++
++	if (minor)
++		nilfs_checkpoint_set_minor(cp);
++	else
++		nilfs_checkpoint_clear_minor(cp);
++
++	nilfs_write_inode_common(root->ifile, &cp->cp_ifile_inode);
++	nilfs_bmap_write(NILFS_I(root->ifile)->i_bmap, &cp->cp_ifile_inode);
++
++	kunmap_local(kaddr);
++	brelse(cp_bh);
++out_sem:
++	up_write(&NILFS_MDT(cpfile)->mi_sem);
++	return ret;
++
++error:
++	nilfs_error(cpfile->i_sb,
++		    "checkpoint finalization failed due to metadata corruption.");
++	ret = -EIO;
++	goto out_sem;
++}
++
++/**
+  * nilfs_cpfile_delete_checkpoints - delete checkpoints
+  * @cpfile: inode of checkpoint file
+  * @start: start checkpoint number
+--- a/fs/nilfs2/cpfile.h~nilfs2-localize-highmem-mapping-for-checkpoint-finalization-within-cpfile
++++ a/fs/nilfs2/cpfile.h
+@@ -21,6 +21,9 @@ int nilfs_cpfile_get_checkpoint(struct i
+ 				struct buffer_head **);
+ int nilfs_cpfile_create_checkpoint(struct inode *cpfile, __u64 cno);
+ void nilfs_cpfile_put_checkpoint(struct inode *, __u64, struct buffer_head *);
++int nilfs_cpfile_finalize_checkpoint(struct inode *cpfile, __u64 cno,
++				     struct nilfs_root *root, __u64 blkinc,
++				     time64_t ctime, bool minor);
+ int nilfs_cpfile_delete_checkpoints(struct inode *, __u64, __u64);
+ int nilfs_cpfile_delete_checkpoint(struct inode *, __u64);
+ int nilfs_cpfile_change_cpmode(struct inode *, __u64, int);
+--- a/fs/nilfs2/segment.c~nilfs2-localize-highmem-mapping-for-checkpoint-finalization-within-cpfile
++++ a/fs/nilfs2/segment.c
+@@ -880,51 +880,6 @@ static void nilfs_segctor_clear_metadata
+ 	nilfs_mdt_clear_dirty(nilfs->ns_dat);
+ }
+ 
+-static int nilfs_segctor_fill_in_checkpoint(struct nilfs_sc_info *sci)
+-{
+-	struct the_nilfs *nilfs = sci->sc_super->s_fs_info;
+-	struct buffer_head *bh_cp;
+-	struct nilfs_checkpoint *raw_cp;
+-	struct inode *ifile;
+-	int err;
+-
+-	err = nilfs_cpfile_get_checkpoint(nilfs->ns_cpfile, nilfs->ns_cno, 0,
+-					  &raw_cp, &bh_cp);
+-	if (unlikely(err)) {
+-		if (err == -EINVAL || err == -ENOENT) {
+-			nilfs_error(sci->sc_super,
+-				    "checkpoint finalization failed due to metadata corruption.");
+-			err = -EIO;
+-		}
+-		goto failed_ibh;
+-	}
+-	raw_cp->cp_snapshot_list.ssl_next = 0;
+-	raw_cp->cp_snapshot_list.ssl_prev = 0;
+-	raw_cp->cp_inodes_count =
+-		cpu_to_le64(atomic64_read(&sci->sc_root->inodes_count));
+-	raw_cp->cp_blocks_count =
+-		cpu_to_le64(atomic64_read(&sci->sc_root->blocks_count));
+-	raw_cp->cp_nblk_inc =
+-		cpu_to_le64(sci->sc_nblk_inc + sci->sc_nblk_this_inc);
+-	raw_cp->cp_create = cpu_to_le64(sci->sc_seg_ctime);
+-	raw_cp->cp_cno = cpu_to_le64(nilfs->ns_cno);
+-
+-	if (test_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags))
+-		nilfs_checkpoint_clear_minor(raw_cp);
+-	else
+-		nilfs_checkpoint_set_minor(raw_cp);
+-
+-	ifile = sci->sc_root->ifile;
+-	nilfs_write_inode_common(ifile, &raw_cp->cp_ifile_inode);
+-	nilfs_bmap_write(NILFS_I(ifile)->i_bmap, &raw_cp->cp_ifile_inode);
+-
+-	nilfs_cpfile_put_checkpoint(nilfs->ns_cpfile, nilfs->ns_cno, bh_cp);
+-	return 0;
+-
+- failed_ibh:
+-	return err;
+-}
+-
+ static void nilfs_fill_in_file_bmap(struct inode *ifile,
+ 				    struct nilfs_inode_info *ii)
+ 
+@@ -2103,7 +2058,11 @@ static int nilfs_segctor_do_construct(st
+ 
+ 		if (mode == SC_LSEG_SR &&
+ 		    nilfs_sc_cstage_get(sci) >= NILFS_ST_CPFILE) {
+-			err = nilfs_segctor_fill_in_checkpoint(sci);
++			err = nilfs_cpfile_finalize_checkpoint(
++				nilfs->ns_cpfile, nilfs->ns_cno, sci->sc_root,
++				sci->sc_nblk_inc + sci->sc_nblk_this_inc,
++				sci->sc_seg_ctime,
++				!test_bit(NILFS_SC_HAVE_DELTA, &sci->sc_flags));
+ 			if (unlikely(err))
+ 				goto failed_to_write;
+ 
+_
