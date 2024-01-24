@@ -1,0 +1,168 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: make vm_area_struct anon_name field RCU-safe
+Date: Tue, 23 Jan 2024 15:10:12 -0800
+
+For lockless /proc/pid/maps reading we have to ensure all the fields used
+when generating the output are RCU-safe.  The only pointer fields in
+vm_area_struct which are used to generate that file's output are vm_file
+and anon_name.  vm_file is RCU-safe but anon_name is not.  Make anon_name
+RCU-safe as well.
+
+Link: https://lkml.kernel.org/r/20240123231014.3801041-1-surenb@google.com
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Andrei Vagin <avagin@google.com>
+Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Ben Wolsieffer <ben.wolsieffer@hefring.com>
+Cc: Casey Schaufler <casey@schaufler-ca.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Dave Chinner <dchinner@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Muhammad Usama Anjum <usama.anjum@collabora.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: T.J. Alumbaugh <talumbau@google.com>
+Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xingui Yang <yangxingui@huawei.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm_inline.h |   10 +++++++++-
+ include/linux/mm_types.h  |    3 ++-
+ mm/madvise.c              |   30 ++++++++++++++++++++++++++----
+ 3 files changed, 37 insertions(+), 6 deletions(-)
+
+--- a/include/linux/mm_inline.h~mm-make-vm_area_struct-anon_name-field-rcu-safe
++++ a/include/linux/mm_inline.h
+@@ -389,7 +389,7 @@ static inline void dup_anon_vma_name(str
+ 	struct anon_vma_name *anon_name = anon_vma_name(orig_vma);
+ 
+ 	if (anon_name)
+-		new_vma->anon_name = anon_vma_name_reuse(anon_name);
++		rcu_assign_pointer(new_vma->anon_name, anon_vma_name_reuse(anon_name));
+ }
+ 
+ static inline void free_anon_vma_name(struct vm_area_struct *vma)
+@@ -411,6 +411,8 @@ static inline bool anon_vma_name_eq(stru
+ 		!strcmp(anon_name1->name, anon_name2->name);
+ }
+ 
++struct anon_vma_name *anon_vma_name_get_rcu(struct vm_area_struct *vma);
++
+ #else /* CONFIG_ANON_VMA_NAME */
+ static inline void anon_vma_name_get(struct anon_vma_name *anon_name) {}
+ static inline void anon_vma_name_put(struct anon_vma_name *anon_name) {}
+@@ -424,6 +426,12 @@ static inline bool anon_vma_name_eq(stru
+ 	return true;
+ }
+ 
++static inline
++struct anon_vma_name *anon_vma_name_get_rcu(struct vm_area_struct *vma)
++{
++	return NULL;
++}
++
+ #endif  /* CONFIG_ANON_VMA_NAME */
+ 
+ static inline void init_tlb_flush_pending(struct mm_struct *mm)
+--- a/include/linux/mm_types.h~mm-make-vm_area_struct-anon_name-field-rcu-safe
++++ a/include/linux/mm_types.h
+@@ -545,6 +545,7 @@ struct vm_userfaultfd_ctx {};
+ 
+ struct anon_vma_name {
+ 	struct kref kref;
++	struct rcu_head rcu;
+ 	/* The name needs to be at the end because it is dynamically sized. */
+ 	char name[];
+ };
+@@ -699,7 +700,7 @@ struct vm_area_struct {
+ 	 * terminated string containing the name given to the vma, or NULL if
+ 	 * unnamed. Serialized by mmap_lock. Use anon_vma_name to access.
+ 	 */
+-	struct anon_vma_name *anon_name;
++	struct anon_vma_name __rcu *anon_name;
+ #endif
+ #ifdef CONFIG_SWAP
+ 	atomic_long_t swap_readahead_info;
+--- a/mm/madvise.c~mm-make-vm_area_struct-anon_name-field-rcu-safe
++++ a/mm/madvise.c
+@@ -88,14 +88,15 @@ void anon_vma_name_free(struct kref *kre
+ {
+ 	struct anon_vma_name *anon_name =
+ 			container_of(kref, struct anon_vma_name, kref);
+-	kfree(anon_name);
++	kfree_rcu(anon_name, rcu);
+ }
+ 
+ struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma)
+ {
+ 	mmap_assert_locked(vma->vm_mm);
+ 
+-	return vma->anon_name;
++	return rcu_dereference_protected(vma->anon_name,
++		rwsem_is_locked(&vma->vm_mm->mmap_lock));
+ }
+ 
+ /* mmap_lock should be write-locked */
+@@ -105,7 +106,7 @@ static int replace_anon_vma_name(struct
+ 	struct anon_vma_name *orig_name = anon_vma_name(vma);
+ 
+ 	if (!anon_name) {
+-		vma->anon_name = NULL;
++		rcu_assign_pointer(vma->anon_name, NULL);
+ 		anon_vma_name_put(orig_name);
+ 		return 0;
+ 	}
+@@ -113,11 +114,32 @@ static int replace_anon_vma_name(struct
+ 	if (anon_vma_name_eq(orig_name, anon_name))
+ 		return 0;
+ 
+-	vma->anon_name = anon_vma_name_reuse(anon_name);
++	rcu_assign_pointer(vma->anon_name, anon_vma_name_reuse(anon_name));
+ 	anon_vma_name_put(orig_name);
+ 
+ 	return 0;
+ }
++
++/*
++ * Returned anon_vma_name is stable due to elevated refcount but not guaranteed
++ * to be assigned to the original VMA after the call.
++ */
++struct anon_vma_name *anon_vma_name_get_rcu(struct vm_area_struct *vma)
++{
++	struct anon_vma_name __rcu *anon_name;
++
++	WARN_ON_ONCE(!rcu_read_lock_held());
++
++	anon_name = rcu_dereference(vma->anon_name);
++	if (!anon_name)
++		return NULL;
++
++	if (unlikely(!kref_get_unless_zero(&anon_name->kref)))
++		return NULL;
++
++	return anon_name;
++}
++
+ #else /* CONFIG_ANON_VMA_NAME */
+ static int replace_anon_vma_name(struct vm_area_struct *vma,
+ 				 struct anon_vma_name *anon_name)
+_
