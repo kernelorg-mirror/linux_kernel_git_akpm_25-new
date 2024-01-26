@@ -34,6 +34,8 @@ allocation attempt, with little hope of restoring balance.
 To fix this, skip synchronous memory.high enforcement on dying tasks
 altogether again. Update memory.high path documentation while at it.
 
+[hannes@cmpxchg.org: also handle tasks are being killed during the reclaim]
+  Link: https://lkml.kernel.org/r/20240111192807.GA424308@cmpxchg.org
 Link: https://lkml.kernel.org/r/20240111132902.389862-1-hannes@cmpxchg.org
 Fixes: c9afe31ec443 ("memcg: synchronously enforce memory.high for large overcharges")
 Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
@@ -47,8 +49,8 @@ Cc: Muchun Song <muchun.song@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memcontrol.c |   24 +++++++++++++++++++++---
- 1 file changed, 21 insertions(+), 3 deletions(-)
+ mm/memcontrol.c |   29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
 
 --- a/mm/memcontrol.c~mm-memcontrol-dont-throttle-dying-tasks-on-memoryhigh
 +++ a/mm/memcontrol.c
@@ -59,12 +61,30 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * Scheduled by try_charge() to be executed from the userland return path
 - * and reclaims memory over the high limit.
 + * Reclaims memory over the high limit. Called directly from
-+ * try_charge() when possible, but also scheduled to be called from
-+ * the userland return path where reclaim is always able to block.
++ * try_charge() (context permitting), as well as from the userland
++ * return path where reclaim is always able to block.
   */
  void mem_cgroup_handle_over_high(gfp_t gfp_mask)
  {
-@@ -2693,6 +2694,9 @@ retry_reclaim:
+@@ -2644,6 +2645,17 @@ void mem_cgroup_handle_over_high(gfp_t g
+ 
+ retry_reclaim:
+ 	/*
++	 * Bail if the task is already exiting. Unlike memory.max,
++	 * memory.high enforcement isn't as strict, and there is no
++	 * OOM killer involved, which means the excess could already
++	 * be much bigger (and still growing) than it could for
++	 * memory.max; the dying task could get stuck in fruitless
++	 * reclaim for a long time, which isn't desirable.
++	 */
++	if (task_is_dying())
++		goto out;
++
++	/*
+ 	 * The allocating task should reclaim at least the batch size, but for
+ 	 * subsequent retries we only want to do what's necessary to prevent oom
+ 	 * or breaching resource isolation.
+@@ -2693,6 +2705,9 @@ retry_reclaim:
  	}
  
  	/*
@@ -74,28 +94,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * If we exit early, we're guaranteed to die (since
  	 * schedule_timeout_killable sets TASK_KILLABLE). This means we don't
  	 * need to account for any ill-begotten jiffies to pay them off later.
-@@ -2887,8 +2891,22 @@ done_restock:
+@@ -2887,11 +2902,17 @@ done_restock:
  		}
  	} while ((memcg = parent_mem_cgroup(memcg)));
  
 +	/*
-+	 * Reclaim is scheduled for the userland return path already,
-+	 * but also attempt synchronous reclaim to avoid excessive
-+	 * overrun while the task is still inside the kernel. If this
-+	 * is successful, the return path will see it when it rechecks
-+	 * the overage, and simply bail out.
-+	 *
-+	 * Skip if the task is already dying, though. Unlike
-+	 * memory.max, memory.high enforcement isn't as strict, and
-+	 * there is no OOM killer involved, which means the excess
-+	 * could already be much bigger (and still growing) than it
-+	 * could for memory.max; the dying task could get stuck in
-+	 * fruitless reclaim for a long time, which isn't desirable.
++	 * Reclaim is set up above to be called from the userland
++	 * return path. But also attempt synchronous reclaim to avoid
++	 * excessive overrun while the task is still inside the
++	 * kernel. If this is successful, the return path will see it
++	 * when it rechecks the overage and simply bail out.
 +	 */
  	if (current->memcg_nr_pages_over_high > MEMCG_CHARGE_BATCH &&
--	    !(current->flags & PF_MEMALLOC) &&
-+	    !(current->flags & PF_MEMALLOC) && !task_is_dying() &&
- 	    gfpflags_allow_blocking(gfp_mask)) {
+ 	    !(current->flags & PF_MEMALLOC) &&
+-	    gfpflags_allow_blocking(gfp_mask)) {
++	    gfpflags_allow_blocking(gfp_mask))
  		mem_cgroup_handle_over_high(gfp_mask);
- 	}
+-	}
+ 	return 0;
+ }
+ 
 _
