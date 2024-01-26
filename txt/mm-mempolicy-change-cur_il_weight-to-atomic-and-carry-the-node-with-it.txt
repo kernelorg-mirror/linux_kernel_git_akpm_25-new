@@ -1,0 +1,78 @@
+From: Gregory Price <gourry.memverge@gmail.com>
+Subject: mm/mempolicy: change cur_il_weight to atomic and carry the node with it
+Date: Thu, 25 Jan 2024 13:43:45 -0500
+
+In the prior patch, we carry only the current weight for a weighted
+interleave round with us across calls through the allocator path.
+
+node = next_node_in(current->il_prev, pol->nodemask)
+pol->cur_il_weight <--- this weight applies to the above node
+
+This separation of data can cause a race condition.
+
+If a cgroup-initiated task migration or mems_allowed change occurs
+from outside the context of the task, this can cause the weight to
+become stale, meaning we may end using that weight to allocate
+memory on the wrong node.
+
+Example:
+  1) task A sets (cur_il_weight = 8) and (current->il_prev) to
+     node0. node1 is the next set bit in pol->nodemask
+  2) rebind event occurs, removing node1 from the nodemask.
+     node2 is now the next set bit in pol->nodemask
+     cur_il_weight is now stale.
+  3) allocation occurs, next_node_in(il_prev, nodes) returns
+     node2. cur_il_weight is now applied to the wrong node.
+
+The upper level allocator logic must still enforce mems_allowed,
+so this isn't dangerous, but it is innaccurate.
+
+Just clearing the weight is insufficient, as it creates two more
+race conditions.  The root of the issue is the separation of weight
+and node data between nodemask and cur_il_weight.
+
+To solve this, update cur_il_weight to be an atomic_t, and place the
+node that the weight applies to in the upper bits of the field:
+
+atomic_t cur_il_weight
+	node bits 32:8
+	weight bits 7:0
+
+Now retrieving or clearing the active interleave node and weight
+is a single atomic operation, and we are not dependent on the
+potentially changing state of (pol->nodemask) to determine what
+node the weight applies to.
+
+Two special observations:
+- if the weight is non-zero, cur_il_weight must *always* have a
+  valid node number, e.g. it cannot be NUMA_NO_NODE (-1).
+  This is because we steal the top byte for the weight.
+
+- MAX_NUMNODES is presently limited to 1024 or less on every
+  architecture. This would permanently limit MAX_NUMNODES to
+  an absolute maximum of (1 << 24) to avoid overflows.
+
+Per some reading and discussion, it appears that max nodes is
+limited to 1024 so that zone type still fits in page flags, so
+this method seemed preferable compared to the alternatives of
+trying to make all or part of mempolicy RCU protected (which
+may not be possible, since it is often referenced during code
+chunks which call operations that may sleep).
+
+Link: https://lkml.kernel.org/r/20240125184345.47074-5-gregory.price@memverge.com
+Signed-off-by: Gregory Price <gregory.price@memverge.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Frank van der Linden <fvdl@google.com>
+Cc: Hasan Al Maruf <Hasan.Maruf@amd.com>
+Cc: Honggyu Kim <honggyu.kim@sk.com>
+Cc: Huang Ying <ying.huang@intel.com>
+Cc: Hyeongtak Ji <hyeongtak.ji@sk.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ravi Jonnalagadda <ravis.opensrc@micron.com>
+Cc: Srinivasulu Thanneeru <sthanneeru.opensrc@micron.com>

@@ -1,0 +1,54 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: mm: memcg: optimize parent iteration in memcg_rstat_updated()
+Date: Wed, 24 Jan 2024 10:00:22 +0000
+
+In memcg_rstat_updated(), we iterate the memcg being updated and its
+parents to update memcg->vmstats_percpu->stats_updates in the fast path
+(i.e. no atomic updates). According to my math, this is 3 memory loads
+(and potentially 3 cache misses) per memcg:
+- Load the address of memcg->vmstats_percpu.
+- Load vmstats_percpu->stats_updates (based on some percpu calculation).
+- Load the address of the parent memcg.
+
+Avoid most of the cache misses by caching a pointer from each struct
+memcg_vmstats_percpu to its parent on the corresponding CPU. In this
+case, for the first memcg we have 2 memory loads (same as above):
+- Load the address of memcg->vmstats_percpu.
+- Load vmstats_percpu->stats_updates (based on some percpu calculation).
+
+Then for each additional memcg, we need a single load to get the
+parent's stats_updates directly. This reduces the number of loads from
+O(3N) to O(2+N) -- where N is the number of memcgs we need to iterate.
+
+Additionally, stash a pointer to memcg->vmstats in each struct
+memcg_vmstats_percpu such that we can access the atomic counter that all
+CPUs fold into, memcg->vmstats->stats_updates.
+memcg_should_flush_stats() is changed to memcg_vmstats_needs_flush() to
+accept a struct memcg_vmstats pointer accordingly.
+
+In struct memcg_vmstats_percpu, make sure both pointers together with
+stats_updates live on the same cacheline. Finally, update
+mem_cgroup_alloc() to take in a parent pointer and initialize the new
+cache pointers on each CPU. The percpu loop in mem_cgroup_alloc() may
+look concerning, but there are multiple similar loops in the cgroup
+creation path (e.g. cgroup_rstat_init()), most of which are hidden
+within alloc_percpu().
+
+According to Oliver's testing [1], this fixes multiple 30-38%
+regressions in vm-scalability, will-it-scale-tlb_flush2, and
+will-it-scale-fallocate1. This comes at a cost of 2 more pointers per
+CPU (<2KB on a machine with 128 CPUs).
+
+[1] https://lore.kernel.org/lkml/ZbDJsfsZt2ITyo61@xsang-OptiPlex-9020/
+
+Link: https://lkml.kernel.org/r/20240124100023.660032-1-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Fixes: 8d59d2214c23 ("mm: memcg: make stats flushing threshold per-memcg")
+Tested-by: kernel test robot <oliver.sang@intel.com>
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202401221624.cb53a8ca-oliver.sang@intel.com
+Acked-by: Shakeel Butt <shakeelb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
