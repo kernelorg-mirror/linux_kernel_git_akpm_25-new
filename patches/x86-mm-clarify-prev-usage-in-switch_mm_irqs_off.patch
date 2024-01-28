@@ -1,0 +1,128 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: x86/mm: clarify "prev" usage in switch_mm_irqs_off()
+Date: Fri, 26 Jan 2024 08:06:44 +0000
+
+In the x86 implementation of switch_mm_irqs_off(), we do not use the
+"prev" argument passed in by the caller, we use exclusively use
+"real_prev", which is cpu_tlbstate.loaded_mm.  This is not obvious at the
+first sight.
+
+Furthermore, a comment describes a condition that happens when called with
+prev == next, but this should not affect the function in any way since
+prev is unused.  Apparently, the comment is intended to clarify why we
+don't rely on prev == next to decide whether we need to update CR3, but
+again, it is not obvious.  The comment also references the fact that
+leave_mm() calls with prev == NULL and tsk == NULL, but this also
+shouldn't matter because prev is unused and tsk is only used in one
+function which has a NULL check.
+
+Clarify things by renaming (prev -> unused) and (real_prev -> prev), also
+move and rewrite the comment as an explanation for why we don't rely on
+"prev" supplied by the caller in x86 code and use our own.  Hopefully this
+makes reading the code easier.
+
+Link: https://lkml.kernel.org/r/20240126080644.1714297-2-yosryahmed@google.com
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov (AMD) <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/mm/tlb.c |   35 ++++++++++++++++-------------------
+ 1 file changed, 16 insertions(+), 19 deletions(-)
+
+--- a/arch/x86/mm/tlb.c~x86-mm-clarify-prev-usage-in-switch_mm_irqs_off
++++ a/arch/x86/mm/tlb.c
+@@ -492,10 +492,16 @@ void cr4_update_pce(void *ignored)
+ static inline void cr4_update_pce_mm(struct mm_struct *mm) { }
+ #endif
+ 
+-void switch_mm_irqs_off(struct mm_struct *prev, struct mm_struct *next,
++/*
++ * The "prev" argument passed by the caller does not always match CR3. For
++ * example, the scheduler passes in active_mm when switching from lazy TLB mode
++ * to normal mode, but switch_mm_irqs_off() can be called from x86 code without
++ * updating active_mm. Use cpu_tlbstate.loaded_mm instead.
++ */
++void switch_mm_irqs_off(struct mm_struct *unused, struct mm_struct *next,
+ 			struct task_struct *tsk)
+ {
+-	struct mm_struct *real_prev = this_cpu_read(cpu_tlbstate.loaded_mm);
++	struct mm_struct *prev = this_cpu_read(cpu_tlbstate.loaded_mm);
+ 	u16 prev_asid = this_cpu_read(cpu_tlbstate.loaded_mm_asid);
+ 	unsigned long new_lam = mm_lam_cr3_mask(next);
+ 	bool was_lazy = this_cpu_read(cpu_tlbstate_shared.is_lazy);
+@@ -504,15 +510,6 @@ void switch_mm_irqs_off(struct mm_struct
+ 	bool need_flush;
+ 	u16 new_asid;
+ 
+-	/*
+-	 * NB: The scheduler will call us with prev == next when switching
+-	 * from lazy TLB mode to normal mode if active_mm isn't changing.
+-	 * When this happens, we don't assume that CR3 (and hence
+-	 * cpu_tlbstate.loaded_mm) matches next.
+-	 *
+-	 * NB: leave_mm() calls us with prev == NULL and tsk == NULL.
+-	 */
+-
+ 	/* We don't want flush_tlb_func() to run concurrently with us. */
+ 	if (IS_ENABLED(CONFIG_PROVE_LOCKING))
+ 		WARN_ON_ONCE(!irqs_disabled());
+@@ -527,7 +524,7 @@ void switch_mm_irqs_off(struct mm_struct
+ 	 * isn't free.
+ 	 */
+ #ifdef CONFIG_DEBUG_VM
+-	if (WARN_ON_ONCE(__read_cr3() != build_cr3(real_prev->pgd, prev_asid,
++	if (WARN_ON_ONCE(__read_cr3() != build_cr3(prev->pgd, prev_asid,
+ 						   tlbstate_lam_cr3_mask()))) {
+ 		/*
+ 		 * If we were to BUG here, we'd be very likely to kill
+@@ -559,7 +556,7 @@ void switch_mm_irqs_off(struct mm_struct
+ 	 * provides that full memory barrier and core serializing
+ 	 * instruction.
+ 	 */
+-	if (real_prev == next) {
++	if (prev == next) {
+ 		/* Not actually switching mm's */
+ 		VM_WARN_ON(this_cpu_read(cpu_tlbstate.ctxs[prev_asid].ctx_id) !=
+ 			   next->context.ctx_id);
+@@ -574,7 +571,7 @@ void switch_mm_irqs_off(struct mm_struct
+ 		 * mm_cpumask. The TLB shootdown code can figure out from
+ 		 * cpu_tlbstate_shared.is_lazy whether or not to send an IPI.
+ 		 */
+-		if (WARN_ON_ONCE(real_prev != &init_mm &&
++		if (WARN_ON_ONCE(prev != &init_mm &&
+ 				 !cpumask_test_cpu(cpu, mm_cpumask(next))))
+ 			cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+@@ -616,10 +613,10 @@ void switch_mm_irqs_off(struct mm_struct
+ 		 * Skip kernel threads; we never send init_mm TLB flushing IPIs,
+ 		 * but the bitmap manipulation can cause cache line contention.
+ 		 */
+-		if (real_prev != &init_mm) {
++		if (prev != &init_mm) {
+ 			VM_WARN_ON_ONCE(!cpumask_test_cpu(cpu,
+-						mm_cpumask(real_prev)));
+-			cpumask_clear_cpu(cpu, mm_cpumask(real_prev));
++						mm_cpumask(prev)));
++			cpumask_clear_cpu(cpu, mm_cpumask(prev));
+ 		}
+ 
+ 		/*
+@@ -656,9 +653,9 @@ void switch_mm_irqs_off(struct mm_struct
+ 	this_cpu_write(cpu_tlbstate.loaded_mm, next);
+ 	this_cpu_write(cpu_tlbstate.loaded_mm_asid, new_asid);
+ 
+-	if (next != real_prev) {
++	if (next != prev) {
+ 		cr4_update_pce_mm(next);
+-		switch_ldt(real_prev, next);
++		switch_ldt(prev, next);
+ 	}
+ }
+ 
+_
