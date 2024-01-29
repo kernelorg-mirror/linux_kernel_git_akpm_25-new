@@ -1,0 +1,49 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zswap: fix race between lru writeback and swapoff
+Date: Sun, 28 Jan 2024 13:28:50 +0000
+
+LRU writeback has race problem with swapoff, as spotted by Yosry [1]:
+
+CPU1			CPU2
+shrink_memcg_cb		swap_off
+  list_lru_isolate	  zswap_invalidate
+			  zswap_swapoff
+			    kfree(tree)
+  // UAF
+  spin_lock(&tree->lock)
+
+The problem is that the entry in lru list can't protect the tree from
+being swapoff and freed, and the entry also can be invalidated and freed
+concurrently after we unlock the lru lock.
+
+We can fix it by moving the swap cache allocation ahead before referencing
+the tree, then check invalidate race with tree lock, only after that we
+can safely deref the entry.  Note we couldn't deref entry or tree anymore
+after we unlock the folio, since we depend on this to hold on swapoff.
+
+So this patch moves all tree and entry usage to zswap_writeback_entry(),
+we only use the copied swpentry on the stack to allocate swap cache and if
+returned with folio locked we can reference the tree safely.  Then we can
+check invalidate race with tree lock, the following things is much the
+same like zswap_load().
+
+Since we can't deref the entry after zswap_writeback_entry(), we can't use
+zswap_lru_putback() anymore, instead we rotate the entry in the beginning.
+And it will be unlinked and freed when invalidated if writeback success.
+
+Another change is we don't update the memcg nr_zswap_protected in the
+-ENOMEM and -EEXIST cases anymore.  -EEXIST case means we raced with
+swapin or concurrent shrinker action, since swapin already have memcg
+nr_zswap_protected updated, don't need double counts here.  For concurrent
+shrinker, the folio will be writeback and freed anyway.  -ENOMEM case is
+extremely rare and doesn't happen spuriously either, so don't bother
+distinguishing this case.
+
+[1] https://lore.kernel.org/all/CAJD7tkasHsRnT_75-TXsEe58V9_OW6m3g6CF7Kmsvz8CKRG_EA@mail.gmail.com/
+
+Link: https://lkml.kernel.org/r/20240126-zswap-writeback-race-v2-2-b10479847099@bytedance.com
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chris Li <chriscli@google.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>
