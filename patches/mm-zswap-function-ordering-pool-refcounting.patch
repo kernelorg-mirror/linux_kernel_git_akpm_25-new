@@ -1,0 +1,143 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: zswap: function ordering: pool refcounting
+Date: Mon, 29 Jan 2024 20:36:47 -0500
+
+Move pool refcounting functions into the pool section. First the
+destroy functions, then the get and put which uses them.
+
+__zswap_pool_empty() has an upward reference to the global
+zswap_pools, to sanity check it's not the currently active pool that's
+being freed. That gets the forward decl for zswap_pool_cuyrrent().
+
+This puts the get and put function above all callers, so kill the
+forward decls as well.
+
+Link: https://lkml.kernel.org/r/20240130014208.565554-12-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Chengming Zhou <zhouchengming@bytedance.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   94 +++++++++++++++++++++++++--------------------------
+ 1 file changed, 47 insertions(+), 47 deletions(-)
+
+--- a/mm/zswap.c~mm-zswap-function-ordering-pool-refcounting
++++ a/mm/zswap.c
+@@ -278,8 +278,6 @@ static inline struct zswap_tree *swap_zs
+ 
+ static int zswap_writeback_entry(struct zswap_entry *entry,
+ 				 swp_entry_t swpentry);
+-static int zswap_pool_get(struct zswap_pool *pool);
+-static void zswap_pool_put(struct zswap_pool *pool);
+ 
+ static bool zswap_is_full(void)
+ {
+@@ -472,6 +470,53 @@ static void zswap_pool_destroy(struct zs
+ 	kfree(pool);
+ }
+ 
++static void __zswap_pool_release(struct work_struct *work)
++{
++	struct zswap_pool *pool = container_of(work, typeof(*pool),
++						release_work);
++
++	synchronize_rcu();
++
++	/* nobody should have been able to get a kref... */
++	WARN_ON(kref_get_unless_zero(&pool->kref));
++
++	/* pool is now off zswap_pools list and has no references. */
++	zswap_pool_destroy(pool);
++}
++
++static struct zswap_pool *zswap_pool_current(void);
++
++static void __zswap_pool_empty(struct kref *kref)
++{
++	struct zswap_pool *pool;
++
++	pool = container_of(kref, typeof(*pool), kref);
++
++	spin_lock(&zswap_pools_lock);
++
++	WARN_ON(pool == zswap_pool_current());
++
++	list_del_rcu(&pool->list);
++
++	INIT_WORK(&pool->release_work, __zswap_pool_release);
++	schedule_work(&pool->release_work);
++
++	spin_unlock(&zswap_pools_lock);
++}
++
++static int __must_check zswap_pool_get(struct zswap_pool *pool)
++{
++	if (!pool)
++		return 0;
++
++	return kref_get_unless_zero(&pool->kref);
++}
++
++static void zswap_pool_put(struct zswap_pool *pool)
++{
++	kref_put(&pool->kref, __zswap_pool_empty);
++}
++
+ /* should be called under RCU */
+ #ifdef CONFIG_MEMCG
+ static inline struct mem_cgroup *mem_cgroup_from_entry(struct zswap_entry *entry)
+@@ -1122,51 +1167,6 @@ resched:
+ 	zswap_pool_put(pool);
+ }
+ 
+-static int __must_check zswap_pool_get(struct zswap_pool *pool)
+-{
+-	if (!pool)
+-		return 0;
+-
+-	return kref_get_unless_zero(&pool->kref);
+-}
+-
+-static void __zswap_pool_release(struct work_struct *work)
+-{
+-	struct zswap_pool *pool = container_of(work, typeof(*pool),
+-						release_work);
+-
+-	synchronize_rcu();
+-
+-	/* nobody should have been able to get a kref... */
+-	WARN_ON(kref_get_unless_zero(&pool->kref));
+-
+-	/* pool is now off zswap_pools list and has no references. */
+-	zswap_pool_destroy(pool);
+-}
+-
+-static void __zswap_pool_empty(struct kref *kref)
+-{
+-	struct zswap_pool *pool;
+-
+-	pool = container_of(kref, typeof(*pool), kref);
+-
+-	spin_lock(&zswap_pools_lock);
+-
+-	WARN_ON(pool == zswap_pool_current());
+-
+-	list_del_rcu(&pool->list);
+-
+-	INIT_WORK(&pool->release_work, __zswap_pool_release);
+-	schedule_work(&pool->release_work);
+-
+-	spin_unlock(&zswap_pools_lock);
+-}
+-
+-static void zswap_pool_put(struct zswap_pool *pool)
+-{
+-	kref_put(&pool->kref, __zswap_pool_empty);
+-}
+-
+ /*********************************
+ * param callbacks
+ **********************************/
+_
