@@ -1,0 +1,90 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/swap: fix race condition in direct swapin path
+Date: Mon, 5 Feb 2024 19:09:59 +0800
+
+In the direct swapin path, when two or more threads swapin the same entry
+at the same time, they get different pages (A, B) because swap cache is
+skipped.  Before one thread (T0) finishes the swapin and installs page (A)
+to the PTE, another thread (T1) could finish swapin of page (B), swap_free
+the entry, then modify and swap-out the page again, using the same entry. 
+It break the pte_same check because PTE value is unchanged, causing ABA
+problem.  Then thread (T0) will then install the stalled page (A) into the
+PTE so new data in page (B) is lost, one possible callstack is like this:
+
+CPU0                                CPU1
+----                                ----
+do_swap_page()                      do_swap_page() with same entry
+<direct swapin path>                <direct swapin path>
+<alloc page A>                      <alloc page B>
+swap_readpage() <- read to page A   swap_readpage() <- read to page B
+<slow on later locks or interrupt>  <finished swapin first>
+...                                 set_pte_at()
+                                    swap_free() <- Now the entry is freed.
+                                    <write to page B, now page A stalled>
+                                    <swap out page B using same swap entry>
+pte_same() <- Check pass, PTE seems
+              unchanged, but page A
+              is stalled!
+swap_free() <- page B content lost!
+set_pte_at() <- staled page A installed!
+
+To fix this, reuse swapcache_prepare which will pin the swap entry using
+the cache flag, and allow only one thread to pin it.  Release the pin
+after PT unlocked.  Racers will simply busy wait since it's a rare and
+very short event.
+
+Other methods like increasing the swap count don't seem to be a good idea
+after some tests, that will cause racers to fall back to the cached swapin
+path, two swapin path being used at the same time leads to a much more
+complex scenario.
+
+Reproducer:
+
+This race issue can be triggered easily using a well constructed
+reproducer and patched brd (with a delay in read path) [1]:
+
+With latest 6.8 mainline, race caused data loss can be observed easily:
+$ gcc -g -lpthread test-thread-swap-race.c && ./a.out
+  Polulating 32MB of memory region...
+  Keep swapping out...
+  Starting round 0...
+  Spawning 65536 workers...
+  32746 workers spawned, wait for done...
+  Round 0: Error on 0x5aa00, expected 32746, got 32743, 3 data loss!
+  Round 0: Error on 0x395200, expected 32746, got 32743, 3 data loss!
+  Round 0: Error on 0x3fd000, expected 32746, got 32737, 9 data loss!
+  Round 0 Failed, 15 data loss!
+
+This reproducer spawns multiple threads sharing the same memory region
+using a small swap device.  Every two threads updates mapped pages one by
+one in opposite direction trying to create a race, with one dedicated
+thread keep swapping out the data out using madvise.
+
+The reproducer created a reproduce rate of about once every 5 minutes,
+so the race should be totally possible in production.
+
+After this patch, I ran the reproducer for over a few hundred rounds
+and no data loss observed.
+
+Performance overhead is minimal, microbenchmark swapin 10G from 32G
+zram:
+
+Before:     10934698 us
+After:      11157121 us
+Non-direct: 13155355 us (Dropping SWP_SYNCHRONOUS_IO flag)
+
+Link: https://lkml.kernel.org/r/20240205110959.4021-1-ryncsn@gmail.com
+Fixes: 0bcac06f27d7 ("mm, swap: skip swapcache for swapin of synchronous device")
+Link: https://github.com/ryncsn/emm-test-project/tree/master/swap-stress-race [1]
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Barry Song <21cnbao@gmail.com>

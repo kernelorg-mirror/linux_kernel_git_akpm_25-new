@@ -1,0 +1,99 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zswap: invalidate zswap entry when swap entry free
+Date: Sun, 04 Feb 2024 03:06:00 +0000
+
+During testing I found there are some times the zswap_writeback_entry()
+return -ENOMEM, which is not we expected:
+
+bpftrace -e 'kr:zswap_writeback_entry {@[(int32)retval]=count()}'
+@[-12]: 1563
+@[0]: 277221
+
+The reason is that __read_swap_cache_async() return NULL because
+swapcache_prepare() failed.  The reason is that we won't invalidate zswap
+entry when swap entry freed to the per-cpu pool, these zswap entries are
+still on the zswap tree and lru list.
+
+This patch moves the invalidation ahead to when swap entry freed to the
+per-cpu pool, since there is no any benefit to leave trashy zswap entry on
+the tree and lru list.
+
+With this patch:
+bpftrace -e 'kr:zswap_writeback_entry {@[(int32)retval]=count()}'
+@[0]: 259744
+
+Note: large folio can't have zswap entry for now, so don't bother
+to add zswap entry invalidation in the large folio swap free path.
+
+Link: https://lkml.kernel.org/r/20240201-b4-zswap-invalidate-entry-v2-2-99d4084260a0@bytedance.com
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Yosry Ahmed <yosryahmed@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/zswap.h |    4 ++--
+ mm/swap_slots.c       |    3 +++
+ mm/swapfile.c         |    1 -
+ mm/zswap.c            |    5 +++--
+ 4 files changed, 8 insertions(+), 5 deletions(-)
+
+--- a/include/linux/zswap.h~mm-zswap-invalidate-zswap-entry-when-swap-entry-free
++++ a/include/linux/zswap.h
+@@ -29,7 +29,7 @@ struct zswap_lruvec_state {
+ 
+ bool zswap_store(struct folio *folio);
+ bool zswap_load(struct folio *folio);
+-void zswap_invalidate(int type, pgoff_t offset);
++void zswap_invalidate(swp_entry_t swp);
+ int zswap_swapon(int type, unsigned long nr_pages);
+ void zswap_swapoff(int type);
+ void zswap_memcg_offline_cleanup(struct mem_cgroup *memcg);
+@@ -50,7 +50,7 @@ static inline bool zswap_load(struct fol
+ 	return false;
+ }
+ 
+-static inline void zswap_invalidate(int type, pgoff_t offset) {}
++static inline void zswap_invalidate(swp_entry_t swp) {}
+ static inline int zswap_swapon(int type, unsigned long nr_pages)
+ {
+ 	return 0;
+--- a/mm/swapfile.c~mm-zswap-invalidate-zswap-entry-when-swap-entry-free
++++ a/mm/swapfile.c
+@@ -744,7 +744,6 @@ static void swap_range_free(struct swap_
+ 		swap_slot_free_notify = NULL;
+ 	while (offset <= end) {
+ 		arch_swap_invalidate_page(si->type, offset);
+-		zswap_invalidate(si->type, offset);
+ 		if (swap_slot_free_notify)
+ 			swap_slot_free_notify(si->bdev, offset);
+ 		offset++;
+--- a/mm/swap_slots.c~mm-zswap-invalidate-zswap-entry-when-swap-entry-free
++++ a/mm/swap_slots.c
+@@ -273,6 +273,9 @@ void free_swap_slot(swp_entry_t entry)
+ {
+ 	struct swap_slots_cache *cache;
+ 
++	/* Large folio swap slot is not covered. */
++	zswap_invalidate(entry);
++
+ 	cache = raw_cpu_ptr(&swp_slots);
+ 	if (likely(use_swap_slot_cache && cache->slots_ret)) {
+ 		spin_lock_irq(&cache->free_lock);
+--- a/mm/zswap.c~mm-zswap-invalidate-zswap-entry-when-swap-entry-free
++++ a/mm/zswap.c
+@@ -1738,9 +1738,10 @@ bool zswap_load(struct folio *folio)
+ 	return true;
+ }
+ 
+-void zswap_invalidate(int type, pgoff_t offset)
++void zswap_invalidate(swp_entry_t swp)
+ {
+-	struct zswap_tree *tree = swap_zswap_tree(swp_entry(type, offset));
++	pgoff_t offset = swp_offset(swp);
++	struct zswap_tree *tree = swap_zswap_tree(swp);
+ 	struct zswap_entry *entry;
+ 
+ 	spin_lock(&tree->lock);
+_

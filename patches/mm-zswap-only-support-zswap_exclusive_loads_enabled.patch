@@ -1,0 +1,126 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zswap: only support zswap_exclusive_loads_enabled
+Date: Sun, 04 Feb 2024 03:06:03 +0000
+
+The !zswap_exclusive_loads_enabled mode will leave compressed copy in
+the zswap tree and lru list after the folio swapin.
+
+There are some disadvantages in this mode:
+1. It's a waste of memory since there are two copies of data, one is
+   folio, the other one is compressed data in zswap. And it's unlikely
+   the compressed data is useful in the near future.
+
+2. If that folio is dirtied, the compressed data must be not useful,
+   but we don't know and don't invalidate the trashy memory in zswap.
+
+3. It's not reclaimable from zswap shrinker since zswap_writeback_entry()
+   will always return -EEXIST and terminate the shrinking process.
+
+On the other hand, the only downside of zswap_exclusive_loads_enabled
+is a little more cpu usage/latency when compression, and the same if
+the folio is removed from swapcache or dirtied.
+
+More explanation by Johannes on why we should consider exclusive load
+as the default for zswap:
+
+  Caching "swapout work" is helpful when the system is thrashing. Then
+  recently swapped in pages might get swapped out again very soon. It
+  certainly makes sense with conventional swap, because keeping a clean
+  copy on the disk saves IO work and doesn't cost any additional memory.
+
+  But with zswap, it's different. It saves some compression work on a
+  thrashing page. But the act of keeping compressed memory contributes
+  to a higher rate of thrashing. And that can cause IO in other places
+  like zswap writeback and file memory.
+
+And the A/B test results of the kernel build in tmpfs with limited memory
+can support this theory:
+
+			!exclusive	exclusive
+real                       63.80         63.01
+user                       1063.83       1061.32
+sys                        290.31        266.15
+
+workingset_refault_anon    2383084.40    1976397.40
+workingset_refault_file    44134.00      45689.40
+workingset_activate_anon   837878.00     728441.20
+workingset_activate_file   4710.00       4085.20
+workingset_restore_anon    732622.60     639428.40
+workingset_restore_file    1007.00       926.80
+workingset_nodereclaim     0.00          0.00
+pgscan                     14343003.40   12409570.20
+pgscan_kswapd              0.00          0.00
+pgscan_direct              14343003.40   12409570.20
+pgscan_khugepaged          0.00          0.00
+
+Link: https://lkml.kernel.org/r/20240201-b4-zswap-invalidate-entry-v2-5-99d4084260a0@bytedance.com
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Acked-by: Yosry Ahmed <yosryahmed@google.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/Kconfig |   16 ----------------
+ mm/zswap.c |   14 +++-----------
+ 2 files changed, 3 insertions(+), 27 deletions(-)
+
+--- a/mm/Kconfig~mm-zswap-only-support-zswap_exclusive_loads_enabled
++++ a/mm/Kconfig
+@@ -45,22 +45,6 @@ config ZSWAP_DEFAULT_ON
+ 	  The selection made here can be overridden by using the kernel
+ 	  command line 'zswap.enabled=' option.
+ 
+-config ZSWAP_EXCLUSIVE_LOADS_DEFAULT_ON
+-	bool "Invalidate zswap entries when pages are loaded"
+-	depends on ZSWAP
+-	help
+-	  If selected, exclusive loads for zswap will be enabled at boot,
+-	  otherwise it will be disabled.
+-
+-	  If exclusive loads are enabled, when a page is loaded from zswap,
+-	  the zswap entry is invalidated at once, as opposed to leaving it
+-	  in zswap until the swap entry is freed.
+-
+-	  This avoids having two copies of the same page in memory
+-	  (compressed and uncompressed) after faulting in a page from zswap.
+-	  The cost is that if the page was never dirtied and needs to be
+-	  swapped out again, it will be re-compressed.
+-
+ config ZSWAP_SHRINKER_DEFAULT_ON
+ 	bool "Shrink the zswap pool on memory pressure"
+ 	depends on ZSWAP
+--- a/mm/zswap.c~mm-zswap-only-support-zswap_exclusive_loads_enabled
++++ a/mm/zswap.c
+@@ -139,10 +139,6 @@ static bool zswap_non_same_filled_pages_
+ module_param_named(non_same_filled_pages_enabled, zswap_non_same_filled_pages_enabled,
+ 		   bool, 0644);
+ 
+-static bool zswap_exclusive_loads_enabled = IS_ENABLED(
+-		CONFIG_ZSWAP_EXCLUSIVE_LOADS_DEFAULT_ON);
+-module_param_named(exclusive_loads, zswap_exclusive_loads_enabled, bool, 0644);
+-
+ /* Number of zpools in zswap_pool (empirically determined for scalability) */
+ #define ZSWAP_NR_ZPOOLS 32
+ 
+@@ -1722,16 +1718,12 @@ bool zswap_load(struct folio *folio)
+ 		count_objcg_event(entry->objcg, ZSWPIN);
+ 
+ 	spin_lock(&tree->lock);
+-	if (zswap_exclusive_loads_enabled) {
+-		zswap_invalidate_entry(tree, entry);
+-		folio_mark_dirty(folio);
+-	} else if (entry->length) {
+-		zswap_lru_del(&entry->pool->list_lru, entry);
+-		zswap_lru_add(&entry->pool->list_lru, entry);
+-	}
++	zswap_invalidate_entry(tree, entry);
+ 	zswap_entry_put(entry);
+ 	spin_unlock(&tree->lock);
+ 
++	folio_mark_dirty(folio);
++
+ 	return true;
+ }
+ 
+_

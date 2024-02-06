@@ -1,0 +1,132 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zswap: add more comments in shrink_memcg_cb()
+Date: Sun, 04 Feb 2024 03:05:59 +0000
+
+Patch series "mm/zswap: optimize zswap lru list", v2.
+
+This series is motivated when observe the zswap lru list shrinking, noted
+there are some unexpected cases in zswap_writeback_entry().
+
+bpftrace -e 'kr:zswap_writeback_entry {@[(int32)retval]=count()}'
+
+There are some -ENOMEM because when the swap entry is freed to per-cpu
+swap pool, it doesn't invalidate/drop zswap entry.  Then the shrinker
+encounter these trashy zswap entries, it can't be reclaimed and return
+-ENOMEM.
+
+So move the invalidation ahead to when swap entry freed to the per-cpu
+swap pool, since there is no any benefit to leave trashy zswap entries on
+the zswap tree and lru list.
+
+Another case is -EEXIST, which is seen more in the case of
+!zswap_exclusive_loads_enabled, in which case the swapin folio will leave
+compressed copy on the tree and lru list.  And it can't be reclaimed until
+the folio is removed from swapcache.
+
+Changing to zswap_exclusive_loads_enabled mode will invalidate when folio
+swapin, which has its own drawback if that folio is still clean in
+swapcache and swapout again, we need to compress it again.  Please see the
+commit for details on why we choose exclusive load as the default for
+zswap.
+
+Another optimization for -EEXIST is that we add LRU_STOP to support
+terminating the shrinking process to avoid evicting warmer region.
+
+Testing using kernel build in tmpfs, one 50GB swapfile and
+zswap shrinker_enabled, with memory.max set to 2GB.
+
+                mm-unstable   zswap-optimize
+real               63.90s       63.25s
+user             1064.05s     1063.40s
+sys               292.32s      270.94s
+
+The main optimization is in sys cpu, about 7% improvement.
+
+
+This patch (of 6):
+
+Add more comments in shrink_memcg_cb() to describe the deref dance which
+is implemented to fix race problem between lru writeback and swapoff, and
+the reason why we rotate the entry at the beginning.
+
+Also fix the stale comments in zswap_writeback_entry(), and add more
+comments to state that we only deref the tree after we get the swapcache
+reference.
+
+Link: https://lkml.kernel.org/r/20240201-b4-zswap-invalidate-entry-v2-0-99d4084260a0@bytedance.com
+Link: https://lkml.kernel.org/r/20240201-b4-zswap-invalidate-entry-v2-1-99d4084260a0@bytedance.com
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Suggested-by: Yosry Ahmed <yosryahmed@google.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Yosry Ahmed <yosryahmed@google.com>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   43 ++++++++++++++++++++++++++-----------------
+ 1 file changed, 26 insertions(+), 17 deletions(-)
+
+--- a/mm/zswap.c~mm-zswap-add-more-comments-in-shrink_memcg_cb
++++ a/mm/zswap.c
+@@ -1207,10 +1207,12 @@ static int zswap_writeback_entry(struct
+ 
+ 	/*
+ 	 * folio is locked, and the swapcache is now secured against
+-	 * concurrent swapping to and from the slot. Verify that the
+-	 * swap entry hasn't been invalidated and recycled behind our
+-	 * backs (our zswap_entry reference doesn't prevent that), to
+-	 * avoid overwriting a new swap folio with old compressed data.
++	 * concurrent swapping to and from the slot, and concurrent
++	 * swapoff so we can safely dereference the zswap tree here.
++	 * Verify that the swap entry hasn't been invalidated and recycled
++	 * behind our backs, to avoid overwriting a new swap folio with
++	 * old compressed data. Only when this is successful can the entry
++	 * be dereferenced.
+ 	 */
+ 	tree = swap_zswap_tree(swpentry);
+ 	spin_lock(&tree->lock);
+@@ -1263,22 +1265,29 @@ static enum lru_status shrink_memcg_cb(s
+ 	int writeback_result;
+ 
+ 	/*
+-	 * Rotate the entry to the tail before unlocking the LRU,
+-	 * so that in case of an invalidation race concurrent
+-	 * reclaimers don't waste their time on it.
++	 * As soon as we drop the LRU lock, the entry can be freed by
++	 * a concurrent invalidation. This means the following:
+ 	 *
+-	 * If writeback succeeds, or failure is due to the entry
+-	 * being invalidated by the swap subsystem, the invalidation
+-	 * will unlink and free it.
++	 * 1. We extract the swp_entry_t to the stack, allowing
++	 *    zswap_writeback_entry() to pin the swap entry and
++	 *    then validate the zwap entry against that swap entry's
++	 *    tree using pointer value comparison. Only when that
++	 *    is successful can the entry be dereferenced.
+ 	 *
+-	 * Temporary failures, where the same entry should be tried
+-	 * again immediately, almost never happen for this shrinker.
+-	 * We don't do any trylocking; -ENOMEM comes closest,
+-	 * but that's extremely rare and doesn't happen spuriously
+-	 * either. Don't bother distinguishing this case.
++	 * 2. Usually, objects are taken off the LRU for reclaim. In
++	 *    this case this isn't possible, because if reclaim fails
++	 *    for whatever reason, we have no means of knowing if the
++	 *    entry is alive to put it back on the LRU.
+ 	 *
+-	 * But since they do exist in theory, the entry cannot just
+-	 * be unlinked, or we could leak it. Hence, rotate.
++	 *    So rotate it before dropping the lock. If the entry is
++	 *    written back or invalidated, the free path will unlink
++	 *    it. For failures, rotation is the right thing as well.
++	 *
++	 *    Temporary failures, where the same entry should be tried
++	 *    again immediately, almost never happen for this shrinker.
++	 *    We don't do any trylocking; -ENOMEM comes closest,
++	 *    but that's extremely rare and doesn't happen spuriously
++	 *    either. Don't bother distinguishing this case.
+ 	 */
+ 	list_move_tail(item, &l->list);
+ 
+_
