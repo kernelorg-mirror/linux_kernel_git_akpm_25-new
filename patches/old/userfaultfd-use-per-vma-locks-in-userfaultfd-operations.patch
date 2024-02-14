@@ -1,6 +1,6 @@
 From: Lokesh Gidra <lokeshgidra@google.com>
 Subject: userfaultfd: use per-vma locks in userfaultfd operations
-Date: Thu, 8 Feb 2024 13:22:04 -0800
+Date: Mon, 12 Feb 2024 16:19:20 -0800
 
 All userfaultfd operations, except write-protect, opportunistically use
 per-vma locks to lock vmas.  On failure, attempt again inside mmap_lock
@@ -9,7 +9,7 @@ critical section.
 Write-protect operation requires mmap_lock as it iterates over multiple
 vmas.
 
-Link: https://lkml.kernel.org/r/20240208212204.2043140-4-lokeshgidra@google.com
+Link: https://lkml.kernel.org/r/20240213001920.3551772-4-lokeshgidra@google.com
 Signed-off-by: Lokesh Gidra <lokeshgidra@google.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
@@ -29,8 +29,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  fs/userfaultfd.c              |   13 -
  include/linux/userfaultfd_k.h |    5 
- mm/userfaultfd.c              |  356 ++++++++++++++++++++++++--------
- 3 files changed, 275 insertions(+), 99 deletions(-)
+ mm/userfaultfd.c              |  394 +++++++++++++++++++++++++-------
+ 3 files changed, 313 insertions(+), 99 deletions(-)
 
 --- a/fs/userfaultfd.c~userfaultfd-use-per-vma-locks-in-userfaultfd-operations
 +++ a/fs/userfaultfd.c
@@ -70,16 +70,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			struct vm_area_struct *src_vma,
 --- a/mm/userfaultfd.c~userfaultfd-use-per-vma-locks-in-userfaultfd-operations
 +++ a/mm/userfaultfd.c
-@@ -19,20 +19,12 @@
- #include <asm/tlb.h>
+@@ -20,19 +20,11 @@
  #include "internal.h"
  
--static __always_inline
+ static __always_inline
 -struct vm_area_struct *find_dst_vma(struct mm_struct *dst_mm,
 -				    unsigned long dst_start,
 -				    unsigned long len)
-+static bool validate_dst_vma(struct vm_area_struct *dst_vma,
-+			     unsigned long dst_end)
++bool validate_dst_vma(struct vm_area_struct *dst_vma, unsigned long dst_end)
  {
 -	/*
 -	 * Make sure that the dst range is both valid and fully within a
@@ -96,7 +94,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Check the vma is registered in uffd, this is required to
-@@ -40,10 +32,124 @@ struct vm_area_struct *find_dst_vma(stru
+@@ -40,11 +32,119 @@ struct vm_area_struct *find_dst_vma(stru
  	 * time.
  	 */
  	if (!dst_vma->vm_userfaultfd_ctx.ctx)
@@ -106,22 +104,37 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return true;
 +}
 +
++static __always_inline
++struct vm_area_struct *find_vma_and_prepare_anon(struct mm_struct *mm,
++						 unsigned long addr)
++{
++	struct vm_area_struct *vma;
++
++	mmap_assert_locked(mm);
++	vma = vma_lookup(mm, addr);
++	if (!vma)
++		vma = ERR_PTR(-ENOENT);
++	else if (!(vma->vm_flags & VM_SHARED) && anon_vma_prepare(vma))
++		vma = ERR_PTR(-ENOMEM);
+ 
+-	return dst_vma;
++	return vma;
+ }
+ 
 +#ifdef CONFIG_PER_VMA_LOCK
 +/*
 + * lock_vma() - Lookup and lock vma corresponding to @address.
 + * @mm: mm to search vma in.
 + * @address: address that the vma should contain.
-+ * @prepare_anon: If true, then prepare the vma (if private) with anon_vma.
 + *
 + * Should be called without holding mmap_lock. vma should be unlocked after use
 + * with unlock_vma().
 + *
-+ * Return: A locked vma containing @address, NULL if no vma is found, or
++ * Return: A locked vma containing @address, -ENOENT if no vma is found, or
 + * -ENOMEM if anon_vma couldn't be allocated.
 + */
 +static struct vm_area_struct *lock_vma(struct mm_struct *mm,
-+				       unsigned long address,
-+				       bool prepare_anon)
++				       unsigned long address)
 +{
 +	struct vm_area_struct *vma;
 +
@@ -132,29 +145,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * anonymous mappings. But we need to ensure it is assigned in
 +		 * private file-backed vmas as well.
 +		 */
-+		if (prepare_anon && !(vma->vm_flags & VM_SHARED) &&
-+		    !vma->anon_vma)
++		if (!(vma->vm_flags & VM_SHARED) && !vma->anon_vma)
 +			vma_end_read(vma);
 +		else
 +			return vma;
 +	}
 +
 +	mmap_read_lock(mm);
-+	vma = vma_lookup(mm, address);
-+	if (vma) {
-+		if (prepare_anon && !(vma->vm_flags & VM_SHARED) &&
-+		    anon_vma_prepare(vma)) {
-+			vma = ERR_PTR(-ENOMEM);
-+		} else {
-+			/*
-+			 * We cannot use vma_start_read() as it may fail due to
-+			 * false locked (see comment in vma_start_read()). We
-+			 * can avoid that by directly locking vm_lock under
-+			 * mmap_lock, which guarantees that nobody can lock the
-+			 * vma for write (vma_start_write()) under us.
-+			 */
-+			down_read(&vma->vm_lock->lock);
-+		}
++	vma = find_vma_and_prepare_anon(mm, address);
++	if (!IS_ERR(vma)) {
++		/*
++		 * We cannot use vma_start_read() as it may fail due to
++		 * false locked (see comment in vma_start_read()). We
++		 * can avoid that by directly locking vm_lock under
++		 * mmap_lock, which guarantees that nobody can lock the
++		 * vma for write (vma_start_write()) under us.
++		 */
++		down_read(&vma->vm_lock->lock);
 +	}
 +
 +	mmap_read_unlock(mm);
@@ -172,20 +179,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct vm_area_struct *dst_vma;
 +
-+	/* Ensure anon_vma is assigned for private vmas */
-+	dst_vma = lock_vma(dst_mm, dst_start, true);
-+
-+	if (!dst_vma)
-+		return ERR_PTR(-ENOENT);
-+
-+	if (PTR_ERR(dst_vma) == -ENOMEM)
++	dst_vma = lock_vma(dst_mm, dst_start);
++	if (IS_ERR(dst_vma) || validate_dst_vma(dst_vma, dst_start + len))
 +		return dst_vma;
 +
-+	if (!validate_dst_vma(dst_vma, dst_start + len))
-+		goto out_unlock;
- 
- 	return dst_vma;
-+out_unlock:
 +	unlock_vma(dst_vma);
 +	return ERR_PTR(-ENOENT);
 +}
@@ -197,32 +194,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +						       unsigned long len)
 +{
 +	struct vm_area_struct *dst_vma;
-+	int err = -ENOENT;
++	int err;
 +
 +	mmap_read_lock(dst_mm);
-+	dst_vma = vma_lookup(dst_mm, dst_start);
-+	if (!dst_vma)
-+		goto out_unlock;
-+
-+	/* Ensure anon_vma is assigned for private vmas */
-+	if (!(dst_vma->vm_flags & VM_SHARED) && anon_vma_prepare(dst_vma)) {
-+		err = -ENOMEM;
++	dst_vma = find_vma_and_prepare_anon(dst_mm, dst_start);
++	if (IS_ERR(dst_vma)) {
++		err = PTR_ERR(dst_vma);
 +		goto out_unlock;
 +	}
 +
-+	if (!validate_dst_vma(dst_vma, dst_start + len))
-+		goto out_unlock;
++	if (validate_dst_vma(dst_vma, dst_start + len))
++		return dst_vma;
 +
-+	return dst_vma;
++	err = -ENOENT;
 +out_unlock:
 +	mmap_read_unlock(dst_mm);
 +	return ERR_PTR(err);
- }
++}
 +#endif
- 
++
  /* Check if dst_addr is outside of file's size. Must be called with ptl held. */
  static bool mfill_file_over_size(struct vm_area_struct *dst_vma,
-@@ -350,7 +456,8 @@ static pmd_t *mm_alloc_pmd(struct mm_str
+ 				 unsigned long dst_addr)
+@@ -350,7 +450,8 @@ static pmd_t *mm_alloc_pmd(struct mm_str
  #ifdef CONFIG_HUGETLB_PAGE
  /*
   * mfill_atomic processing for HUGETLB vmas.  Note that this routine is
@@ -232,7 +226,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  static __always_inline ssize_t mfill_atomic_hugetlb(
  					      struct userfaultfd_ctx *ctx,
-@@ -361,7 +468,6 @@ static __always_inline ssize_t mfill_ato
+@@ -361,7 +462,6 @@ static __always_inline ssize_t mfill_ato
  					      uffd_flags_t flags)
  {
  	struct mm_struct *dst_mm = dst_vma->vm_mm;
@@ -240,7 +234,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	ssize_t err;
  	pte_t *dst_pte;
  	unsigned long src_addr, dst_addr;
-@@ -380,7 +486,11 @@ static __always_inline ssize_t mfill_ato
+@@ -380,7 +480,11 @@ static __always_inline ssize_t mfill_ato
  	 */
  	if (uffd_flags_mode_is(flags, MFILL_ATOMIC_ZEROPAGE)) {
  		up_read(&ctx->map_changing_lock);
@@ -252,7 +246,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return -EINVAL;
  	}
  
-@@ -403,24 +513,32 @@ retry:
+@@ -403,24 +507,32 @@ retry:
  	 * retry, dst_vma will be set to NULL and we must lookup again.
  	 */
  	if (!dst_vma) {
@@ -276,11 +270,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		err = -EINVAL;
  		if (vma_hpagesize != vma_kernel_pagesize(dst_vma))
 -			goto out_unlock;
-+			goto out_unlock_vma;
- 
+-
 -		vm_shared = dst_vma->vm_flags & VM_SHARED;
 -	}
--
++			goto out_unlock_vma;
+ 
 -	/*
 -	 * If not shared, ensure the dst_vma has a anon_vma.
 -	 */
@@ -298,7 +292,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto out_unlock;
  	}
  
-@@ -465,7 +583,11 @@ retry:
+@@ -465,7 +577,11 @@ retry:
  
  		if (unlikely(err == -ENOENT)) {
  			up_read(&ctx->map_changing_lock);
@@ -310,7 +304,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			BUG_ON(!folio);
  
  			err = copy_folio_from_user(folio,
-@@ -474,17 +596,6 @@ retry:
+@@ -474,17 +590,6 @@ retry:
  				err = -EFAULT;
  				goto out;
  			}
@@ -328,7 +322,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  			dst_vma = NULL;
  			goto retry;
-@@ -505,7 +616,12 @@ retry:
+@@ -505,7 +610,12 @@ retry:
  
  out_unlock:
  	up_read(&ctx->map_changing_lock);
@@ -341,7 +335,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  out:
  	if (folio)
  		folio_put(folio);
-@@ -597,7 +713,19 @@ static __always_inline ssize_t mfill_ato
+@@ -597,7 +707,19 @@ static __always_inline ssize_t mfill_ato
  	copied = 0;
  	folio = NULL;
  retry:
@@ -362,7 +356,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * If memory mappings are changing because of non-cooperative
-@@ -609,15 +737,6 @@ retry:
+@@ -609,15 +731,6 @@ retry:
  	if (atomic_read(&ctx->mmap_changing))
  		goto out_unlock;
  
@@ -378,7 +372,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	err = -EINVAL;
  	/*
  	 * shmem_zero_setup is invoked in mmap for MAP_ANONYMOUS|MAP_SHARED but
-@@ -647,16 +766,6 @@ retry:
+@@ -647,16 +760,6 @@ retry:
  	    uffd_flags_mode_is(flags, MFILL_ATOMIC_CONTINUE))
  		goto out_unlock;
  
@@ -395,7 +389,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	while (src_addr < src_start + len) {
  		pmd_t dst_pmdval;
  
-@@ -699,7 +808,11 @@ retry:
+@@ -699,7 +802,11 @@ retry:
  			void *kaddr;
  
  			up_read(&ctx->map_changing_lock);
@@ -407,7 +401,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			BUG_ON(!folio);
  
  			kaddr = kmap_local_folio(folio, 0);
-@@ -730,7 +843,11 @@ retry:
+@@ -730,7 +837,11 @@ retry:
  
  out_unlock:
  	up_read(&ctx->map_changing_lock);
@@ -419,7 +413,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  out:
  	if (folio)
  		folio_put(folio);
-@@ -1267,16 +1384,67 @@ static int validate_move_areas(struct us
+@@ -1267,27 +1378,119 @@ static int validate_move_areas(struct us
  	if (!vma_is_anonymous(src_vma) || !vma_is_anonymous(dst_vma))
  		return -EINVAL;
  
@@ -432,78 +426,123 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		return -ENOMEM;
 +	return 0;
 +}
-+
-+#ifdef CONFIG_PER_VMA_LOCK
-+static int find_and_lock_vmas(struct mm_struct *mm,
-+			      unsigned long dst_start,
-+			      unsigned long src_start,
-+			      struct vm_area_struct **dst_vmap,
-+			      struct vm_area_struct **src_vmap)
-+{
-+	int err;
-+
-+	/* There is no need to prepare anon_vma for src_vma */
-+	*src_vmap = lock_vma(mm, src_start, false);
-+	if (!*src_vmap)
-+		return -ENOENT;
-+
-+	/* Ensure anon_vma is assigned for anonymous vma */
-+	*dst_vmap = lock_vma(mm, dst_start, true);
-+	err = -ENOENT;
-+	if (!*dst_vmap)
-+		goto out_unlock;
-+
-+	err = -ENOMEM;
-+	if (PTR_ERR(*dst_vmap) == -ENOMEM)
-+		goto out_unlock;
  
- 	return 0;
-+out_unlock:
-+	unlock_vma(*src_vmap);
-+	return err;
- }
-+#else
-+static int lock_mm_and_find_vmas(struct mm_struct *mm,
-+				 unsigned long dst_start,
-+				 unsigned long src_start,
-+				 struct vm_area_struct **dst_vmap,
-+				 struct vm_area_struct **src_vmap)
++static __always_inline
++long find_vmas_mm_locked(struct mm_struct *mm,
++			 unsigned long dst_start,
++			 unsigned long src_start,
++			 struct vm_area_struct **dst_vmap,
++			 struct vm_area_struct **src_vmap)
 +{
-+	int err = -ENOENT;
++	struct vm_area_struct *vma;
++
++	mmap_assert_locked(mm);
++	vma = find_vma_and_prepare_anon(mm, dst_start);
++	if (IS_ERR(vma))
++		return PTR_ERR(vma);
++
++	*dst_vmap = vma;
++	/* Skip finding src_vma if src_start is in dst_vma */
++	if (src_start >= vma->vm_start && src_start < vma->vm_end)
++		goto out_success;
++
++	vma = vma_lookup(mm, src_start);
++	if (!vma)
++		return -ENOENT;
++out_success:
++	*src_vmap = vma;
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_PER_VMA_LOCK
++static long find_and_lock_vmas(struct mm_struct *mm,
++			       unsigned long dst_start,
++			       unsigned long src_start,
++			       struct vm_area_struct **dst_vmap,
++			       struct vm_area_struct **src_vmap)
++{
++	struct vm_area_struct *vma;
++	long err;
++
++	vma = lock_vma(mm, dst_start);
++	if (IS_ERR(vma))
++		return PTR_ERR(vma);
++
++	*dst_vmap = vma;
++	/*
++	 * Skip finding src_vma if src_start is in dst_vma. This also ensures
++	 * that we don't lock the same vma twice.
++	 */
++	if (src_start >= vma->vm_start && src_start < vma->vm_end) {
++		*src_vmap = vma;
++		return 0;
++	}
++
++	/*
++	 * Using lock_vma() to get src_vma can lead to following deadlock:
++	 *
++	 * Thread1				Thread2
++	 * -------				-------
++	 * vma_start_read(dst_vma)
++	 *					mmap_write_lock(mm)
++	 *					vma_start_write(src_vma)
++	 * vma_start_read(src_vma)
++	 * mmap_read_lock(mm)
++	 *					vma_start_write(dst_vma)
++	 */
++	*src_vmap = lock_vma_under_rcu(mm, src_start);
++	if (likely(*src_vmap))
++		return 0;
++
++	/* Undo any locking and retry in mmap_lock critical section */
++	vma_end_read(*dst_vmap);
++
 +	mmap_read_lock(mm);
-+
-+	*src_vmap = vma_lookup(mm, src_start);
-+	if (!*src_vmap)
-+		goto out_unlock;
-+
-+	*dst_vmap = vma_lookup(mm, dst_start);
-+	if (!*dst_vmap)
-+		goto out_unlock;
-+
-+	/* Ensure anon_vma is assigned */
-+	err = -ENOMEM;
-+	if (vma_is_anonymous(*dst_vmap) && anon_vma_prepare(*dst_vmap))
-+		goto out_unlock;
-+
-+	return 0;
-+out_unlock:
++	err = find_vmas_mm_locked(mm, dst_start, src_start, dst_vmap, src_vmap);
++	if (!err) {
++		/*
++		 * See comment in lock_vma() as to why not using
++		 * vma_start_read() here.
++		 */
++		down_read(&(*dst_vmap)->vm_lock->lock);
++		if (*dst_vmap != *src_vmap)
++			down_read(&(*src_vmap)->vm_lock->lock);
++	}
 +	mmap_read_unlock(mm);
 +	return err;
 +}
++#else
++static long lock_mm_and_find_vmas(struct mm_struct *mm,
++				  unsigned long dst_start,
++				  unsigned long src_start,
++				  struct vm_area_struct **dst_vmap,
++				  struct vm_area_struct **src_vmap)
++{
++	long err;
++
++	mmap_read_lock(mm);
++	err = find_vmas_mm_locked(mm, dst_start, src_start, dst_vmap, src_vmap);
++	if (err)
++		mmap_read_unlock(mm);
++	return err;
++}
 +#endif
- 
++
  /**
   * move_pages - move arbitrary anonymous pages of an existing vma
-@@ -1287,8 +1455,6 @@ static int validate_move_areas(struct us
+  * @ctx: pointer to the userfaultfd context
+- * @mm: the address space to move pages
+  * @dst_start: start of the destination virtual memory range
+  * @src_start: start of the source virtual memory range
   * @len: length of the virtual memory range
   * @mode: flags from uffdio_move.mode
   *
 - * Must be called with mmap_lock held for read.
-- *
++ * It will either use the mmap_lock in read mode or per-vma locks
+  *
   * move_pages() remaps arbitrary anonymous pages atomically in zero
   * copy. It only works on non shared anonymous pages because those can
-  * be relocated without generating non linear anon_vmas in the rmap
-@@ -1355,10 +1521,10 @@ static int validate_move_areas(struct us
+@@ -1355,10 +1558,10 @@ static int validate_move_areas(struct us
   * could be obtained. This is the only additional complexity added to
   * the rmap code to provide this anonymous page remapping functionality.
   */
@@ -517,7 +556,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct vm_area_struct *src_vma, *dst_vma;
  	unsigned long src_addr, dst_addr;
  	pmd_t *src_pmd, *dst_pmd;
-@@ -1376,28 +1542,40 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1376,28 +1579,40 @@ ssize_t move_pages(struct userfaultfd_ct
  	    WARN_ON_ONCE(dst_start + len <= dst_start))
  		goto out;
  
@@ -532,11 +571,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		goto out;
 +
 +	/* Re-check after taking map_changing_lock */
++	err = -EAGAIN;
 +	down_read(&ctx->map_changing_lock);
-+	if (likely(atomic_read(&ctx->mmap_changing))) {
-+		err = -EAGAIN;
++	if (likely(atomic_read(&ctx->mmap_changing)))
 +		goto out_unlock;
-+	}
  	/*
  	 * Make sure the vma is not shared, that the src and dst remap
  	 * ranges are both valid and fully within a single existing
@@ -548,6 +586,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (src_start < src_vma->vm_start ||
 -	    src_start + len > src_vma->vm_end)
 -		goto out;
++	err = -EINVAL;
 +	if (src_vma->vm_flags & VM_SHARED)
 +		goto out_unlock;
 +	if (src_start + len > src_vma->vm_end)
@@ -571,15 +610,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (src_addr = src_start, dst_addr = dst_start;
  	     src_addr < src_start + len;) {
-@@ -1514,6 +1692,14 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1514,6 +1729,15 @@ ssize_t move_pages(struct userfaultfd_ct
  		moved += step_size;
  	}
  
 +out_unlock:
 +	up_read(&ctx->map_changing_lock);
 +#ifdef CONFIG_PER_VMA_LOCK
-+	unlock_vma(dst_vma);
 +	unlock_vma(src_vma);
++	if (src_vma != dst_vma)
++		unlock_vma(dst_vma);
 +#else
 +	mmap_read_unlock(mm);
 +#endif
