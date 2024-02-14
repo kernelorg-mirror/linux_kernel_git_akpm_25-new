@@ -1,0 +1,137 @@
+From: Oscar Salvador <osalvador@suse.de>
+Subject: lib/stackdepot: fix first entry having a 0-handle
+Date: Wed, 14 Feb 2024 18:01:51 +0100
+
+Patch series "page_owner: print stacks and their outstanding allocations", v9.
+
+page_owner is a great debug functionality tool that lets us know about all
+pages that have been allocated/freed and their specific stacktrace.  This
+comes very handy when debugging memory leaks, since with some scripting we
+can see the outstanding allocations, which might point to a memory leak.
+
+In my experience, that is one of the most useful cases, but it can get
+really tedious to screen through all pages and try to reconstruct the
+stack <-> allocated/freed relationship, becoming most of the time a
+daunting and slow process when we have tons of allocation/free operations.
+
+This patchset aims to ease that by adding a new functionality into
+page_owner.  This functionality creates a new directory called
+'page_owner_stacks' under 'sys/kernel//debug' with a read-only file called
+'show_stacks', which prints out all the stacks followed by their
+outstanding number of allocations (being that the times the stacktrace has
+allocated but not freed yet).  This gives us a clear and a quick overview
+of stacks <-> allocated/free.
+
+We take advantage of the new refcount_f field that stack_record struct
+gained, and increment/decrement the stack refcount on every
+__set_page_owner() (alloc operation) and __reset_page_owner (free
+operation) call.
+
+Unfortunately, we cannot use the new stackdepot api STACK_DEPOT_FLAG_GET
+because it does not fulfill page_owner needs, meaning we would have to
+special case things, at which point makes more sense for page_owner to do
+its own {dec,inc}rementing of the stacks.  E.g: Using
+STACK_DEPOT_FLAG_PUT, once the refcount reaches 0, such stack gets
+evicted, so page_owner would lose information.
+
+This patchset also creates a new file called 'set_threshold' within
+'page_owner_stacks' directory, and by writing a value to it, the stacks
+which refcount is below such value will be filtered out.
+
+A PoC can be found below:
+
+ # cat /sys/kernel/debug/page_owner_stacks/show_stacks > page_owner_full_stacks.txt
+ # head -40 page_owner_full_stacks.txt 
+  prep_new_page+0xa9/0x120
+  get_page_from_freelist+0x801/0x2210
+  __alloc_pages+0x18b/0x350
+  alloc_pages_mpol+0x91/0x1f0
+  folio_alloc+0x14/0x50
+  filemap_alloc_folio+0xb2/0x100
+  page_cache_ra_unbounded+0x96/0x180
+  filemap_get_pages+0xfd/0x590
+  filemap_read+0xcc/0x330
+  blkdev_read_iter+0xb8/0x150
+  vfs_read+0x285/0x320
+  ksys_read+0xa5/0xe0
+  do_syscall_64+0x80/0x160
+  entry_SYSCALL_64_after_hwframe+0x6e/0x76
+ stack_count: 521
+
+
+
+  prep_new_page+0xa9/0x120
+  get_page_from_freelist+0x801/0x2210
+  __alloc_pages+0x18b/0x350
+  alloc_pages_mpol+0x91/0x1f0
+  folio_alloc+0x14/0x50
+  filemap_alloc_folio+0xb2/0x100
+  __filemap_get_folio+0x14a/0x490
+  ext4_write_begin+0xbd/0x4b0 [ext4]
+  generic_perform_write+0xc1/0x1e0
+  ext4_buffered_write_iter+0x68/0xe0 [ext4]
+  ext4_file_write_iter+0x70/0x740 [ext4]
+  vfs_write+0x33d/0x420
+  ksys_write+0xa5/0xe0
+  do_syscall_64+0x80/0x160
+  entry_SYSCALL_64_after_hwframe+0x6e/0x76
+ stack_count: 4609
+...
+...
+
+ # echo 5000 > /sys/kernel/debug/page_owner_stacks/set_threshold 
+ # cat /sys/kernel/debug/page_owner_stacks/show_stacks > page_owner_full_stacks_5000.txt
+ # head -40 page_owner_full_stacks_5000.txt 
+  prep_new_page+0xa9/0x120
+  get_page_from_freelist+0x801/0x2210
+  __alloc_pages+0x18b/0x350
+  alloc_pages_mpol+0x91/0x1f0
+  folio_alloc+0x14/0x50
+  filemap_alloc_folio+0xb2/0x100
+  __filemap_get_folio+0x14a/0x490
+  ext4_write_begin+0xbd/0x4b0 [ext4]
+  generic_perform_write+0xc1/0x1e0
+  ext4_buffered_write_iter+0x68/0xe0 [ext4]
+  ext4_file_write_iter+0x70/0x740 [ext4]
+  vfs_write+0x33d/0x420
+  ksys_pwrite64+0x75/0x90
+  do_syscall_64+0x80/0x160
+  entry_SYSCALL_64_after_hwframe+0x6e/0x76
+ stack_count: 6781
+
+
+
+  prep_new_page+0xa9/0x120
+  get_page_from_freelist+0x801/0x2210
+  __alloc_pages+0x18b/0x350
+  pcpu_populate_chunk+0xec/0x350
+  pcpu_balance_workfn+0x2d1/0x4a0
+  process_scheduled_works+0x84/0x380
+  worker_thread+0x12a/0x2a0
+  kthread+0xe3/0x110
+  ret_from_fork+0x30/0x50
+  ret_from_fork_asm+0x1b/0x30
+ stack_count: 8641
+
+
+This patch (of 7):
+
+The very first entry of stack_record gets a handle of 0, but this is wrong
+because stackdepot treats a 0-handle as a non-valid one.  E.g: See the
+check in stack_depot_fetch()
+
+Fix this by adding and offset of 1.
+
+This bug has been lurking since the very beginning of stackdepot, but no
+one really cared as it seems.  Because of that I am not adding a Fixes
+tag.
+
+Link: https://lkml.kernel.org/r/20240214170157.17530-1-osalvador@suse.de
+Link: https://lkml.kernel.org/r/20240214170157.17530-2-osalvador@suse.de
+Co-developed-by: Marco Elver <elver@google.com>
+Signed-off-by: Marco Elver <elver@google.com>
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
