@@ -1,0 +1,212 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: mm: clarify the spec for set_ptes()
+Date: Thu, 15 Feb 2024 10:31:48 +0000
+
+Patch series "Transparent Contiguous PTEs for User Mappings", v6.
+
+This is a series to opportunistically and transparently use contpte
+mappings (set the contiguous bit in ptes) for user memory when those
+mappings meet the requirements.  The change benefits arm64, but there is
+some (very) minor refactoring for x86 to enable its integration with
+core-mm.
+
+It is part of a wider effort to improve performance by allocating and
+mapping variable-sized blocks of memory (folios).  One aim is for the 4K
+kernel to approach the performance of the 16K kernel, but without breaking
+compatibility and without the associated increase in memory.  Another aim
+is to benefit the 16K and 64K kernels by enabling 2M THP, since this is
+the contpte size for those kernels.  We have good performance data that
+demonstrates both aims are being met (see below).
+
+Of course this is only one half of the change.  We require the mapped
+physical memory to be the correct size and alignment for this to actually
+be useful (i.e.  64K for 4K pages, or 2M for 16K/64K pages).  Fortunately
+folios are solving this problem for us.  Filesystems that support it (XFS,
+AFS, EROFS, tmpfs, ...) will allocate large folios up to the PMD size
+today, and more filesystems are coming.  And for anonymous memory,
+"multi-size THP" is now upstream.
+
+
+Patch Layout
+============
+
+In this version, I've split the patches to better show each optimization:
+
+  - 1-2:    mm prep: misc code and docs cleanups
+  - 3-6:    mm,arm64,x86 prep: Add pte_advance_pfn() and make pte_next_pfn() a
+            generic wrapper around it
+  - 7-11:   arm64 prep: Refactor ptep helpers into new layer
+  - 12:     functional contpte implementation
+  - 23-18:  various optimizations on top of the contpte implementation
+
+
+Testing
+=======
+
+I've tested this series on both Ampere Altra (bare metal) and Apple M2 (VM):
+  - mm selftests (inc new tests written for multi-size THP); no regressions
+  - Speedometer Java script benchmark in Chromium web browser; no issues
+  - Kernel compilation; no issues
+  - Various tests under high memory pressure with swap enabled; no issues
+
+
+Performance
+===========
+
+High Level Use Cases
+~~~~~~~~~~~~~~~~~~~~
+
+First some high level use cases (kernel compilation and speedometer JavaScript
+benchmarks). These are running on Ampere Altra (I've seen similar improvements
+on Android/Pixel 6).
+
+baseline:                  mm-unstable (mTHP switched off)
+mTHP:                      + enable 16K, 32K, 64K mTHP sizes "always"
+mTHP + contpte:            + this series
+mTHP + contpte + exefolio: + patch at [6], which series supports
+
+Kernel Compilation with -j8 (negative is faster):
+
+| kernel                    | real-time | kern-time | user-time |
+|---------------------------|-----------|-----------|-----------|
+| baseline                  |      0.0% |      0.0% |      0.0% |
+| mTHP                      |     -5.0% |    -39.1% |     -0.7% |
+| mTHP + contpte            |     -6.0% |    -41.4% |     -1.5% |
+| mTHP + contpte + exefolio |     -7.8% |    -43.1% |     -3.4% |
+
+Kernel Compilation with -j80 (negative is faster):
+
+| kernel                    | real-time | kern-time | user-time |
+|---------------------------|-----------|-----------|-----------|
+| baseline                  |      0.0% |      0.0% |      0.0% |
+| mTHP                      |     -5.0% |    -36.6% |     -0.6% |
+| mTHP + contpte            |     -6.1% |    -38.2% |     -1.6% |
+| mTHP + contpte + exefolio |     -7.4% |    -39.2% |     -3.2% |
+
+Speedometer (positive is faster):
+
+| kernel                    | runs_per_min |
+|:--------------------------|--------------|
+| baseline                  |         0.0% |
+| mTHP                      |         1.5% |
+| mTHP + contpte            |         3.2% |
+| mTHP + contpte + exefolio |         4.5% |
+
+
+Micro Benchmarks
+~~~~~~~~~~~~~~~~
+
+The following microbenchmarks are intended to demonstrate the performance of
+fork() and munmap() do not regress. I'm showing results for order-0 (4K)
+mappings, and for order-9 (2M) PTE-mapped THP. Thanks to David for sharing his
+benchmarks.
+
+baseline:                  mm-unstable + batch zap [7] series
+contpte-basic:             + patches 0-19; functional contpte implementation
+contpte-batch:             + patches 20-23; implement new batched APIs
+contpte-inline:            + patch 24; __always_inline to help compiler
+contpte-fold:              + patch 25; fold contpte mapping when sensible
+
+Primary platform is Ampere Altra bare metal. I'm also showing results for M2 VM
+(on top of MacOS) for reference, although experience suggests this might not be
+the most reliable for performance numbers of this sort:
+
+| FORK           |         order-0        |         order-9        |
+| Ampere Altra   |------------------------|------------------------|
+| (pte-map)      |       mean |     stdev |       mean |     stdev |
+|----------------|------------|-----------|------------|-----------|
+| baseline       |       0.0% |      2.7% |       0.0% |      0.2% |
+| contpte-basic  |       6.3% |      1.4% |    1948.7% |      0.2% |
+| contpte-batch  |       7.6% |      2.0% |      -1.9% |      0.4% |
+| contpte-inline |       3.6% |      1.5% |      -1.0% |      0.2% |
+| contpte-fold   |       4.6% |      2.1% |      -1.8% |      0.2% |
+
+| MUNMAP         |         order-0        |         order-9        |
+| Ampere Altra   |------------------------|------------------------|
+| (pte-map)      |       mean |     stdev |       mean |     stdev |
+|----------------|------------|-----------|------------|-----------|
+| baseline       |       0.0% |      0.5% |       0.0% |      0.3% |
+| contpte-basic  |       1.8% |      0.3% |    1104.8% |      0.1% |
+| contpte-batch  |      -0.3% |      0.4% |       2.7% |      0.1% |
+| contpte-inline |      -0.1% |      0.6% |       0.9% |      0.1% |
+| contpte-fold   |       0.1% |      0.6% |       0.8% |      0.1% |
+
+| FORK           |         order-0        |         order-9        |
+| Apple M2 VM    |------------------------|------------------------|
+| (pte-map)      |       mean |     stdev |       mean |     stdev |
+|----------------|------------|-----------|------------|-----------|
+| baseline       |       0.0% |      1.4% |       0.0% |      0.8% |
+| contpte-basic  |       6.8% |      1.2% |     469.4% |      1.4% |
+| contpte-batch  |      -7.7% |      2.0% |      -8.9% |      0.7% |
+| contpte-inline |      -6.0% |      2.1% |      -6.0% |      2.0% |
+| contpte-fold   |       5.9% |      1.4% |      -6.4% |      1.4% |
+
+| MUNMAP         |         order-0        |         order-9        |
+| Apple M2 VM    |------------------------|------------------------|
+| (pte-map)      |       mean |     stdev |       mean |     stdev |
+|----------------|------------|-----------|------------|-----------|
+| baseline       |       0.0% |      0.6% |       0.0% |      0.4% |
+| contpte-basic  |       1.6% |      0.6% |     233.6% |      0.7% |
+| contpte-batch  |       1.9% |      0.3% |      -3.9% |      0.4% |
+| contpte-inline |       2.2% |      0.8% |      -1.6% |      0.9% |
+| contpte-fold   |       1.5% |      0.7% |      -1.7% |      0.7% |
+
+Misc
+~~~~
+
+John Hubbard at Nvidia has indicated dramatic 10x performance improvements
+for some workloads at [8], when using 64K base page kernel.
+
+[1] https://lore.kernel.org/linux-arm-kernel/20230622144210.2623299-1-ryan.roberts@arm.com/
+[2] https://lore.kernel.org/linux-arm-kernel/20231115163018.1303287-1-ryan.roberts@arm.com/
+[3] https://lore.kernel.org/linux-arm-kernel/20231204105440.61448-1-ryan.roberts@arm.com/
+[4] https://lore.kernel.org/lkml/20231218105100.172635-1-ryan.roberts@arm.com/
+[5] https://lore.kernel.org/linux-mm/633af0a7-0823-424f-b6ef-374d99483f05@arm.com/
+[6] https://lore.kernel.org/lkml/08c16f7d-f3b3-4f22-9acc-da943f647dc3@arm.com/
+[7] https://lore.kernel.org/linux-mm/20240214204435.167852-1-david@redhat.com/
+[8] https://lore.kernel.org/linux-mm/c507308d-bdd4-5f9e-d4ff-e96e4520be85@nvidia.com/
+[9] https://gitlab.arm.com/linux-arm/linux-rr/-/tree/features/granule_perf/contpte-lkml_v6
+
+
+
+
+This patch (of 18):
+
+set_ptes() spec implies that it can only be used to set a present pte
+because it interprets the PFN field to increment it.  However,
+set_pte_at() has been implemented on top of set_ptes() since set_ptes()
+was introduced, and set_pte_at() allows setting a pte to a not-present
+state.  So clarify the spec to state that when nr==1, new state of pte may
+be present or not present.  When nr>1, new state of all ptes must be
+present.
+
+While we are at it, tighten the spec to set requirements around the
+initial state of ptes; when nr==1 it may be either present or not-present.
+But when nr>1 all ptes must initially be not-present.  All set_ptes()
+callsites already conform to this requirement.  Stating it explicitly is
+useful because it allows for a simplification to the upcoming arm64
+contpte implementation.
+
+Link: https://lkml.kernel.org/r/20240215103205.2607016-1-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20240215103205.2607016-2-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Borislav Petkov (AMD) <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
