@@ -81,6 +81,8 @@ Before:     10934698 us
 After:      11157121 us
 Cached:     13155355 us (Dropping SWP_SYNCHRONOUS_IO flag)
 
+[kasong@tencent.com: v4]
+  Link: https://lkml.kernel.org/r/20240219082040.7495-1-ryncsn@gmail.com
 Link: https://lkml.kernel.org/r/20240206182559.32264-1-ryncsn@gmail.com
 Fixes: 0bcac06f27d7 ("mm, swap: skip swapcache for swapin of synchronous device")
 Reported-by: "Huang, Ying" <ying.huang@intel.com>
@@ -105,10 +107,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/swap.h |    5 +++++
- mm/memory.c          |   15 +++++++++++++++
+ mm/memory.c          |   20 ++++++++++++++++++++
  mm/swap.h            |    5 +++++
  mm/swapfile.c        |   13 +++++++++++++
- 4 files changed, 38 insertions(+)
+ 4 files changed, 43 insertions(+)
 
 --- a/include/linux/swap.h~mm-swap-fix-race-when-skipping-swapcache
 +++ a/include/linux/swap.h
@@ -126,7 +128,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/mm/memory.c~mm-swap-fix-race-when-skipping-swapcache
 +++ a/mm/memory.c
-@@ -3867,6 +3867,16 @@ vm_fault_t do_swap_page(struct vm_fault
+@@ -3799,6 +3799,7 @@ vm_fault_t do_swap_page(struct vm_fault
+ 	struct page *page;
+ 	struct swap_info_struct *si = NULL;
+ 	rmap_t rmap_flags = RMAP_NONE;
++	bool need_clear_cache = false;
+ 	bool exclusive = false;
+ 	swp_entry_t entry;
+ 	pte_t pte;
+@@ -3867,6 +3868,20 @@ vm_fault_t do_swap_page(struct vm_fault
  	if (!folio) {
  		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
  		    __swap_count(entry) == 1) {
@@ -137,31 +147,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			 * reusing the same entry. It's undetectable as
 +			 * pte_same() returns true due to entry reuse.
 +			 */
-+			if (swapcache_prepare(entry))
++			if (swapcache_prepare(entry)) {
++				/* Relax a bit to prevent rapid repeated page faults */
++				schedule_timeout_uninterruptible(1);
 +				goto out;
++			}
++			need_clear_cache = true;
 +
  			/* skip swapcache */
  			folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
  						vma, vmf->address, false);
-@@ -4116,6 +4126,9 @@ vm_fault_t do_swap_page(struct vm_fault
- unlock:
+@@ -4117,6 +4132,9 @@ unlock:
  	if (vmf->pte)
  		pte_unmap_unlock(vmf->pte, vmf->ptl);
-+	/* Clear the swap cache pin for direct swapin after PTL unlock */
-+	if (folio && !swapcache)
-+		swapcache_clear(si, entry);
  out:
++	/* Clear the swap cache pin for direct swapin after PTL unlock */
++	if (need_clear_cache)
++		swapcache_clear(si, entry);
  	if (si)
  		put_swap_device(si);
-@@ -4124,6 +4137,8 @@ out_nomap:
- 	if (vmf->pte)
- 		pte_unmap_unlock(vmf->pte, vmf->ptl);
- out_page:
-+	if (!swapcache)
+ 	return ret;
+@@ -4131,6 +4149,8 @@ out_release:
+ 		folio_unlock(swapcache);
+ 		folio_put(swapcache);
+ 	}
++	if (need_clear_cache)
 +		swapcache_clear(si, entry);
- 	folio_unlock(folio);
- out_release:
- 	folio_put(folio);
+ 	if (si)
+ 		put_swap_device(si);
+ 	return ret;
 --- a/mm/swapfile.c~mm-swap-fix-race-when-skipping-swapcache
 +++ a/mm/swapfile.c
 @@ -3365,6 +3365,19 @@ int swapcache_prepare(swp_entry_t entry)
