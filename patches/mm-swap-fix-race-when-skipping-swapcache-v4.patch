@@ -1,0 +1,94 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm-swap-fix-race-when-skipping-swapcache-v4
+Date: Mon, 19 Feb 2024 16:20:40 +0800
+
+Add a schedule() if raced to prevent repeated page faults wasting CPU and
+add noise to perf statistics.
+
+Use a bool to state the special case instead of reusing existing variables
+fixing error handling [Minchan Kim].
+
+Use schedule_timeout_uninterruptible(1) for now instead of schedule() to
+prevent the busy faulting task holds CPU and livelocks [Huang, Ying].
+
+Link: https://lkml.kernel.org/r/20240219082040.7495-1-ryncsn@gmail.com
+Fixes: 0bcac06f27d7 ("mm, swap: skip swapcache for swapin of synchronous device")
+Link: https://github.com/ryncsn/emm-test-project/tree/master/swap-stress-race [1]
+Reported-by: "Huang, Ying" <ying.huang@intel.com>
+Closes: https://lore.kernel.org/lkml/87bk92gqpx.fsf_-_@yhuang6-desk2.ccr.corp.intel.com/
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Chris Li <chrisl@kernel.org>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: SeongJae Park <sj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   15 ++++++++++-----
+ 1 file changed, 10 insertions(+), 5 deletions(-)
+
+--- a/mm/memory.c~mm-swap-fix-race-when-skipping-swapcache-v4
++++ a/mm/memory.c
+@@ -3799,6 +3799,7 @@ vm_fault_t do_swap_page(struct vm_fault
+ 	struct page *page;
+ 	struct swap_info_struct *si = NULL;
+ 	rmap_t rmap_flags = RMAP_NONE;
++	bool need_clear_cache = false;
+ 	bool exclusive = false;
+ 	swp_entry_t entry;
+ 	pte_t pte;
+@@ -3874,8 +3875,12 @@ vm_fault_t do_swap_page(struct vm_fault
+ 			 * reusing the same entry. It's undetectable as
+ 			 * pte_same() returns true due to entry reuse.
+ 			 */
+-			if (swapcache_prepare(entry))
++			if (swapcache_prepare(entry)) {
++				/* Relax a bit to prevent rapid repeated page faults */
++				schedule_timeout_uninterruptible(1);
+ 				goto out;
++			}
++			need_clear_cache = true;
+ 
+ 			/* skip swapcache */
+ 			folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0,
+@@ -4126,10 +4131,10 @@ vm_fault_t do_swap_page(struct vm_fault
+ unlock:
+ 	if (vmf->pte)
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
++out:
+ 	/* Clear the swap cache pin for direct swapin after PTL unlock */
+-	if (folio && !swapcache)
++	if (need_clear_cache)
+ 		swapcache_clear(si, entry);
+-out:
+ 	if (si)
+ 		put_swap_device(si);
+ 	return ret;
+@@ -4137,8 +4142,6 @@ out_nomap:
+ 	if (vmf->pte)
+ 		pte_unmap_unlock(vmf->pte, vmf->ptl);
+ out_page:
+-	if (!swapcache)
+-		swapcache_clear(si, entry);
+ 	folio_unlock(folio);
+ out_release:
+ 	folio_put(folio);
+@@ -4146,6 +4149,8 @@ out_release:
+ 		folio_unlock(swapcache);
+ 		folio_put(swapcache);
+ 	}
++	if (need_clear_cache)
++		swapcache_clear(si, entry);
+ 	if (si)
+ 		put_swap_device(si);
+ 	return ret;
+_
