@@ -1,0 +1,135 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: writeback: simplify the loops in write_cache_pages()
+Date: Thu, 15 Feb 2024 07:36:44 +0100
+
+Collapse the two nested loops into one.  This is needed as a step towards
+turning this into an iterator.
+
+Note that this drops the "index <= end" check in the previous outer loop
+and just relies on filemap_get_folios_tag() to return 0 entries when index
+> end.  This actually has a subtle implication when end == -1 because then
+the returned index will be -1 as well and thus if there is page present on
+index -1, we could be looping indefinitely.  But as the comment in
+filemap_get_folios_tag documents this as already broken anyway we should
+not worry about it here either.  The fix for that would probably a change
+to the filemap_get_folios_tag() calling convention.
+
+[hch@lst.de: update the commit log per Jan]
+Link: https://lkml.kernel.org/r/20240215063649.2164017-10-hch@lst.de
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Acked-by: Dave Chinner <dchinner@redhat.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Howells <dhowells@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page-writeback.c |   83 ++++++++++++++++++++----------------------
+ 1 file changed, 40 insertions(+), 43 deletions(-)
+
+--- a/mm/page-writeback.c~writeback-simplify-the-loops-in-write_cache_pages
++++ a/mm/page-writeback.c
+@@ -2454,6 +2454,7 @@ int write_cache_pages(struct address_spa
+ 	int error;
+ 	struct folio *folio;
+ 	pgoff_t end;		/* Inclusive */
++	int i = 0;
+ 
+ 	if (wbc->range_cyclic) {
+ 		wbc->index = mapping->writeback_index; /* prev offset */
+@@ -2467,53 +2468,49 @@ int write_cache_pages(struct address_spa
+ 
+ 	folio_batch_init(&wbc->fbatch);
+ 
+-	while (wbc->index <= end) {
+-		int i;
+-
+-		writeback_get_batch(mapping, wbc);
+-
++	for (;;) {
++		if (i == wbc->fbatch.nr) {
++			writeback_get_batch(mapping, wbc);
++			i = 0;
++		}
+ 		if (wbc->fbatch.nr == 0)
+ 			break;
+ 
+-		for (i = 0; i < wbc->fbatch.nr; i++) {
+-			folio = wbc->fbatch.folios[i];
++		folio = wbc->fbatch.folios[i++];
++
++		folio_lock(folio);
++		if (!folio_prepare_writeback(mapping, wbc, folio)) {
++			folio_unlock(folio);
++			continue;
++		}
++
++		trace_wbc_writepage(wbc, inode_to_bdi(mapping->host));
++
++		error = writepage(folio, wbc, data);
++		wbc->nr_to_write -= folio_nr_pages(folio);
++
++		if (error == AOP_WRITEPAGE_ACTIVATE) {
++			folio_unlock(folio);
++			error = 0;
++		}
+ 
+-			folio_lock(folio);
+-			if (!folio_prepare_writeback(mapping, wbc, folio)) {
+-				folio_unlock(folio);
+-				continue;
+-			}
+-
+-			trace_wbc_writepage(wbc, inode_to_bdi(mapping->host));
+-
+-			error = writepage(folio, wbc, data);
+-			wbc->nr_to_write -= folio_nr_pages(folio);
+-
+-			if (error == AOP_WRITEPAGE_ACTIVATE) {
+-				folio_unlock(folio);
+-				error = 0;
+-			}
+-
+-			/*
+-			 * For integrity writeback we have to keep going until
+-			 * we have written all the folios we tagged for
+-			 * writeback above, even if we run past wbc->nr_to_write
+-			 * or encounter errors.
+-			 * We stash away the first error we encounter in
+-			 * wbc->saved_err so that it can be retrieved when we're
+-			 * done.  This is because the file system may still have
+-			 * state to clear for each folio.
+-			 *
+-			 * For background writeback we exit as soon as we run
+-			 * past wbc->nr_to_write or encounter the first error.
+-			 */
+-			if (wbc->sync_mode == WB_SYNC_ALL) {
+-				if (error && !ret)
+-					ret = error;
+-			} else {
+-				if (error || wbc->nr_to_write <= 0)
+-					goto done;
+-			}
++		/*
++		 * For integrity writeback we have to keep going until we have
++		 * written all the folios we tagged for writeback above, even if
++		 * we run past wbc->nr_to_write or encounter errors.
++		 * We stash away the first error we encounter in wbc->saved_err
++		 * so that it can be retrieved when we're done.  This is because
++		 * the file system may still have state to clear for each folio.
++		 *
++		 * For background writeback we exit as soon as we run past
++		 * wbc->nr_to_write or encounter the first error.
++		 */
++		if (wbc->sync_mode == WB_SYNC_ALL) {
++			if (error && !ret)
++				ret = error;
++		} else {
++			if (error || wbc->nr_to_write <= 0)
++				goto done;
+ 		}
+ 	}
+ 
+_
