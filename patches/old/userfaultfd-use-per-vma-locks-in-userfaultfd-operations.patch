@@ -1,6 +1,6 @@
 From: Lokesh Gidra <lokeshgidra@google.com>
 Subject: userfaultfd: use per-vma locks in userfaultfd operations
-Date: Tue, 13 Feb 2024 13:57:41 -0800
+Date: Thu, 15 Feb 2024 10:27:56 -0800
 
 All userfaultfd operations, except write-protect, opportunistically use
 per-vma locks to lock vmas.  On failure, attempt again inside mmap_lock
@@ -9,7 +9,7 @@ critical section.
 Write-protect operation requires mmap_lock as it iterates over multiple
 vmas.
 
-Link: https://lkml.kernel.org/r/20240213215741.3816570-4-lokeshgidra@google.com
+Link: https://lkml.kernel.org/r/20240215182756.3448972-5-lokeshgidra@google.com
 Signed-off-by: Lokesh Gidra <lokeshgidra@google.com>
 Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
@@ -22,6 +22,7 @@ Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Mike Rapoport (IBM) <rppt@kernel.org>
 Cc: Nicolas Geoffray <ngeoffray@google.com>
 Cc: Peter Xu <peterx@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Tim Murray <timmurray@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -29,8 +30,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  fs/userfaultfd.c              |   13 -
  include/linux/userfaultfd_k.h |    5 
+ mm/huge_memory.c              |    5 
  mm/userfaultfd.c              |  382 ++++++++++++++++++++++++--------
- 3 files changed, 297 insertions(+), 103 deletions(-)
+ 4 files changed, 300 insertions(+), 105 deletions(-)
 
 --- a/fs/userfaultfd.c~userfaultfd-use-per-vma-locks-in-userfaultfd-operations
 +++ a/fs/userfaultfd.c
@@ -68,6 +70,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int move_pages_huge_pmd(struct mm_struct *mm, pmd_t *dst_pmd, pmd_t *src_pmd, pmd_t dst_pmdval,
  			struct vm_area_struct *dst_vma,
  			struct vm_area_struct *src_vma,
+--- a/mm/huge_memory.c~userfaultfd-use-per-vma-locks-in-userfaultfd-operations
++++ a/mm/huge_memory.c
+@@ -2158,7 +2158,7 @@ unlock:
+ 
+ #ifdef CONFIG_USERFAULTFD
+ /*
+- * The PT lock for src_pmd and the mmap_lock for reading are held by
++ * The PT lock for src_pmd and dst_vma/src_vma (for reading) are locked by
+  * the caller, but it must return after releasing the page_table_lock.
+  * Just move the page from src_pmd to dst_pmd if possible.
+  * Return zero if succeeded in moving the page, -EAGAIN if it needs to be
+@@ -2181,7 +2181,8 @@ int move_pages_huge_pmd(struct mm_struct
+ 	src_ptl = pmd_lockptr(mm, src_pmd);
+ 
+ 	lockdep_assert_held(src_ptl);
+-	mmap_assert_locked(mm);
++	vma_assert_locked(src_vma);
++	vma_assert_locked(dst_vma);
+ 
+ 	/* Sanity checks before the operation */
+ 	if (WARN_ON_ONCE(!pmd_none(dst_pmdval)) || WARN_ON_ONCE(src_addr & ~HPAGE_PMD_MASK) ||
 --- a/mm/userfaultfd.c~userfaultfd-use-per-vma-locks-in-userfaultfd-operations
 +++ a/mm/userfaultfd.c
 @@ -20,19 +20,11 @@
