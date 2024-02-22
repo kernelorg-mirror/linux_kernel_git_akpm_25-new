@@ -1,9 +1,9 @@
 From: Rakie Kim <rakie.kim@sk.com>
 Subject: mm/mempolicy: implement the sysfs-based weighted_interleave interface
-Date: Tue, 30 Jan 2024 13:20:44 -0500
+Date: Fri, 2 Feb 2024 12:02:35 -0500
 
 Patch series "mm/mempolicy: weighted interleave mempolicy and sysfs
-extension", v4.
+extension", v5.
 
 Weighted interleave is a new interleave policy intended to make use of
 heterogeneous memory environments appearing with CXL.
@@ -73,7 +73,7 @@ beneficial when applied globally, but is always beneficial when applied to
 bandwidth-driving memory regions.
 
 
-There are 3 patches in this set:
+There are 4 patches in this set:
 1) Implement system-global interleave weights as sysfs extension
    in mm/mempolicy.c.  These weights are RCU protected, and a
    default weight set is provided (all weights are 1 by default).
@@ -87,6 +87,9 @@ There are 3 patches in this set:
 
 3) MPOL_WEIGHTED_INTERLEAVE extension for set_mempolicy/mbind
 
+4) Protect interleave logic (weighted and normal) with the
+   mems_allowed seq cookie.  If the nodemask changes while
+   accessing it during a rebind, just retry the access.
 
 Included below are some performance and LTP test information,
 and a sample numactl branch which can be used for testing.
@@ -103,14 +106,11 @@ existing mempolicy & mbind tests: pass
 mempolicy & mbind + weighted interleave (global weights): pass
 
 = version history
-v4:
-- style fixes, code deduplication, simplifications, comments
-- moved mempolicy->il_weight to task_struct->il_weight
-- changed logic to simply move forward on il_weight=0 rather than
-  treat il_weight=0 as a special value
-- detect when il_prev is no longer in the nodemask and move forward
-- missed weighted interleave check in alloc_pages_mpol()
-- uninitialized value of nr_allocated in bulk allocator
+v5:
+- style fixes
+- mems_allowed cookie protection to detect rebind issues,
+  prevents spurious allocation failures and/or mis-allocations
+- sparse warning fixes related to __rcu on local variables
 
 =====================================================================
 Performance tests - MLC
@@ -221,10 +221,10 @@ LTP Tests: https://github.com/gmprice/ltp/tree/mempolicy2
 = Existing tests
 set_mempolicy, get_mempolicy, mbind
 
-MPOL_WEIGHTED_INTERLEAVE added manually to test basic functionality
-but did not adjust tests for weighting.  Basically the weights were
-set to 1, which is the default, and it should behave the same as
-MPOL_INTERLEAVE if logic is correct.
+MPOL_WEIGHTED_INTERLEAVE added manually to test basic functionality but
+did not adjust tests for weighting.  Basically the weights were set to 1,
+which is the default, and it should behave the same as MPOL_INTERLEAVE if
+logic is correct.
 
 == set_mempolicy01 : passed   18, failed   0
 == set_mempolicy02 : passed   10, failed   0
@@ -285,10 +285,8 @@ int main (void)
         return 0;
 }
 
-=====================================================================
 
-
-This patch (of 3):
+This patch (of 4):
 
 This patch provides a way to set interleave weight information under sysfs
 at /sys/kernel/mm/mempolicy/weighted_interleave/nodeN
@@ -312,9 +310,9 @@ Each file above can be explained as follows.
 If a node value is set to `0`, the system-default value will be used.
 As of this patch, the system-default for all nodes is always 1.
 
-Link: https://lkml.kernel.org/r/20240130182046.74278-1-gregory.price@memverge.com
-Link: https://lkml.kernel.org/r/20240130182046.74278-2-gregory.price@memverge.com
-Suggested-by: Huang Ying <ying.huang@intel.com>
+Link: https://lkml.kernel.org/r/20240202170238.90004-1-gregory.price@memverge.com
+Link: https://lkml.kernel.org/r/20240202170238.90004-2-gregory.price@memverge.com
+Suggested-by: "Huang, Ying" <ying.huang@intel.com>
 Signed-off-by: Rakie Kim <rakie.kim@sk.com>
 Signed-off-by: Honggyu Kim <honggyu.kim@sk.com>
 Co-developed-by: Gregory Price <gregory.price@memverge.com>
@@ -322,16 +320,12 @@ Signed-off-by: Gregory Price <gregory.price@memverge.com>
 Co-developed-by: Hyeongtak Ji <hyeongtak.ji@sk.com>
 Signed-off-by: Hyeongtak Ji <hyeongtak.ji@sk.com>
 Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
-Cc: Andi Kleen <ak@linux.intel.com>
 Cc: Dan Williams <dan.j.williams@intel.com>
-Cc: Frank van der Linden <fvdl@google.com>
 Cc: Gregory Price <gourry.memverge@gmail.com>
 Cc: Hasan Al Maruf <Hasan.Maruf@amd.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Michal Hocko <mhocko@suse.com>
 Cc: Srinivasulu Thanneeru <sthanneeru.opensrc@micron.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
@@ -395,7 +389,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static u8 get_il_weight(int node)
 +{
-+	u8 __rcu *table;
++	u8 *table;
 +	u8 weight;
 +
 +	rcu_read_lock();
@@ -437,8 +431,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			  const char *buf, size_t count)
 +{
 +	struct iw_node_attr *node_attr;
-+	u8 __rcu *new;
-+	u8 __rcu *old;
++	u8 *new;
++	u8 *old;
 +	u8 weight = 0;
 +
 +	node_attr = container_of(attr, struct iw_node_attr, kobj_attr);
@@ -553,7 +547,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static void mempolicy_kobj_release(struct kobject *kobj)
 +{
-+	u8 __rcu *old;
++	u8 *old;
 +
 +	mutex_lock(&iw_table_lock);
 +	old = rcu_dereference_protected(iw_table,

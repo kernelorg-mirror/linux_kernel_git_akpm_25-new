@@ -1,16 +1,28 @@
 From: David Hildenbrand <david@redhat.com>
 Subject: mm/memory: ignore dirty/accessed/soft-dirty bits in folio_pte_batch()
-Date: Mon, 22 Jan 2024 20:41:59 +0100
+Date: Mon, 29 Jan 2024 13:46:48 +0100
 
-Let's ignore these bits: they are irrelevant for fork, and will likely be
-irrelevant for upcoming users such as page unmapping.
+Let's always ignore the accessed/young bit: we'll always mark the PTE as
+old in our child process during fork, and upcoming users will similarly
+not care.
 
-Link: https://lkml.kernel.org/r/20240122194200.381241-11-david@redhat.com
+Ignore the dirty bit only if we don't want to duplicate the dirty bit into
+the child process during fork.  Maybe, we could just set all PTEs in the
+child dirty if any PTE is dirty.  For now, let's keep the behavior
+unchanged, this can be optimized later if required.
+
+Ignore the soft-dirty bit only if the bit doesn't have any meaning in the
+src vma, and similarly won't have any in the copied dst vma.
+
+For now, we won't bother with the uffd-wp bit.
+
+Link: https://lkml.kernel.org/r/20240129124649.189745-15-david@redhat.com
 Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Albert Ou <aou@eecs.berkeley.edu>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Alexandre Ghiti <alexghiti@rivosinc.com>
-Cc: "Aneesh Kumar K.V (IBM)" <aneesh.kumar@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
@@ -18,56 +30,94 @@ Cc: David S. Miller <davem@davemloft.net>
 Cc: Dinh Nguyen <dinguyen@kernel.org>
 Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
 Cc: Heiko Carstens <hca@linux.ibm.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
-Cc: "Naveen N. Rao" <naveen.n.rao@linux.ibm.com>
+Cc: Naveen N. Rao <naveen.n.rao@linux.ibm.com>
 Cc: Nicholas Piggin <npiggin@gmail.com>
 Cc: Palmer Dabbelt <palmer@dabbelt.com>
 Cc: Paul Walmsley <paul.walmsley@sifive.com>
-Cc: Russell King <linux@armlinux.org.uk>
-Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Russell King (Oracle) <linux@armlinux.org.uk>
 Cc: Sven Schnelle <svens@linux.ibm.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Will Deacon <will@kernel.org>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memory.c |   10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
+ mm/memory.c |   36 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
 
 --- a/mm/memory.c~mm-memory-ignore-dirty-accessed-soft-dirty-bits-in-folio_pte_batch
 +++ a/mm/memory.c
-@@ -953,24 +953,30 @@ static __always_inline void __copy_prese
+@@ -953,24 +953,44 @@ static __always_inline void __copy_prese
  	set_ptes(dst_vma->vm_mm, addr, dst_pte, pte, nr);
  }
  
-+static inline pte_t __pte_batch_clear_ignored(pte_t pte)
++/* Flags for folio_pte_batch(). */
++typedef int __bitwise fpb_t;
++
++/* Compare PTEs after pte_mkclean(), ignoring the dirty bit. */
++#define FPB_IGNORE_DIRTY		((__force fpb_t)BIT(0))
++
++/* Compare PTEs after pte_clear_soft_dirty(), ignoring the soft-dirty bit. */
++#define FPB_IGNORE_SOFT_DIRTY		((__force fpb_t)BIT(1))
++
++static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
 +{
-+	return pte_clear_soft_dirty(pte_mkclean(pte_mkold(pte)));
++	if (flags & FPB_IGNORE_DIRTY)
++		pte = pte_mkclean(pte);
++	if (likely(flags & FPB_IGNORE_SOFT_DIRTY))
++		pte = pte_clear_soft_dirty(pte);
++	return pte_mkold(pte);
 +}
 +
  /*
   * Detect a PTE batch: consecutive (present) PTEs that map consecutive
   * pages of the same folio.
   *
-  * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN.
-+ * the accessed bit, dirty bit and soft-dirty bit.
+- * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN.
++ * All PTEs inside a PTE batch have the same PTE bits set, excluding the PFN,
++ * the accessed bit, dirty bit (with FPB_IGNORE_DIRTY) and soft-dirty bit
++ * (with FPB_IGNORE_SOFT_DIRTY).
   */
  static inline int folio_pte_batch(struct folio *folio, unsigned long addr,
- 		pte_t *start_ptep, pte_t pte, int max_nr)
+-		pte_t *start_ptep, pte_t pte, int max_nr)
++		pte_t *start_ptep, pte_t pte, int max_nr, fpb_t flags)
  {
  	unsigned long folio_end_pfn = folio_pfn(folio) + folio_nr_pages(folio);
  	const pte_t *end_ptep = start_ptep + max_nr;
 -	pte_t expected_pte = pte_next_pfn(pte);
-+	pte_t expected_pte = __pte_batch_clear_ignored(pte_next_pfn(pte));
++	pte_t expected_pte = __pte_batch_clear_ignored(pte_next_pfn(pte), flags);
  	pte_t *ptep = start_ptep + 1;
  
  	VM_WARN_ON_FOLIO(!pte_present(pte), folio);
  
  	while (ptep != end_ptep) {
 -		pte = ptep_get(ptep);
-+		pte = __pte_batch_clear_ignored(ptep_get(ptep));
++		pte = __pte_batch_clear_ignored(ptep_get(ptep), flags);
  
  		if (!pte_same(pte, expected_pte))
  			break;
+@@ -1004,6 +1024,7 @@ copy_present_ptes(struct vm_area_struct
+ {
+ 	struct page *page;
+ 	struct folio *folio;
++	fpb_t flags = 0;
+ 	int err, nr;
+ 
+ 	page = vm_normal_page(src_vma, addr, pte);
+@@ -1018,7 +1039,12 @@ copy_present_ptes(struct vm_area_struct
+ 	 * by keeping the batching logic separate.
+ 	 */
+ 	if (unlikely(!*prealloc && folio_test_large(folio) && max_nr != 1)) {
+-		nr = folio_pte_batch(folio, addr, src_pte, pte, max_nr);
++		if (src_vma->vm_flags & VM_SHARED)
++			flags |= FPB_IGNORE_DIRTY;
++		if (!vma_soft_dirty_enabled(src_vma))
++			flags |= FPB_IGNORE_SOFT_DIRTY;
++
++		nr = folio_pte_batch(folio, addr, src_pte, pte, max_nr, flags);
+ 		folio_ref_add(folio, nr);
+ 		if (folio_test_anon(folio)) {
+ 			if (unlikely(folio_try_dup_anon_rmap_ptes(folio, page,
 _
