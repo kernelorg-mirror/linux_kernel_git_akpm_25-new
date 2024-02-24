@@ -1,6 +1,6 @@
 From: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
 Subject: mm: vmalloc: remove global purge_vmap_area_root rb-tree
-Date: Tue, 29 Aug 2023 10:11:38 +0200
+Date: Tue, 2 Jan 2024 19:46:28 +0100
 
 Similar to busy VA, lazily-freed area is stored to a node it belongs to. 
 Such approach does not require any global locking primitive, instead an
@@ -9,12 +9,13 @@ access becomes scalable what mitigates a contention.
 This patch removes a global purge-lock, global purge-tree and global purge
 list.
 
-Link: https://lkml.kernel.org/r/20230829081142.3619-6-urezki@gmail.com
+Link: https://lkml.kernel.org/r/20240102184633.748113-7-urezki@gmail.com
 Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
-Cc: Baoquan He <bhe@redhat.com>
+Reviewed-by: Baoquan He <bhe@redhat.com>
 Cc: Christoph Hellwig <hch@lst.de>
 Cc: Dave Chinner <david@fromorbit.com>
 Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Kazuhito Hagio <k-hagio-ab@nec.com>
 Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Lorenzo Stoakes <lstoakes@gmail.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
@@ -28,8 +29,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/mm/vmalloc.c~mm-vmalloc-remove-global-purge_vmap_area_root-rb-tree
 +++ a/mm/vmalloc.c
-@@ -733,10 +733,6 @@ static DEFINE_SPINLOCK(free_vmap_area_lo
- LIST_HEAD(vmap_area_list);
+@@ -731,10 +731,6 @@ EXPORT_SYMBOL(vmalloc_to_pfn);
+ static DEFINE_SPINLOCK(free_vmap_area_lock);
  static bool vmap_initialized __read_mostly;
  
 -static struct rb_root purge_vmap_area_root = RB_ROOT;
@@ -39,8 +40,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * This kmem_cache is used for vmap_area objects. Instead of
   * allocating from slab we reuse an object from this cache to
-@@ -784,6 +780,12 @@ struct rb_list {
- struct vmap_node {
+@@ -782,6 +778,12 @@ struct rb_list {
+ static struct vmap_node {
  	/* Bookkeeping data of this node. */
  	struct rb_list busy;
 +	struct rb_list lazy;
@@ -49,10 +50,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * Ready-to-free areas.
 +	 */
 +	struct list_head purge_list;
- };
+ } single;
  
- static struct vmap_node *nodes, snode;
-@@ -1768,40 +1770,22 @@ static DEFINE_MUTEX(vmap_purge_lock);
+ static struct vmap_node *vmap_nodes = &single;
+@@ -1766,40 +1768,22 @@ static DEFINE_MUTEX(vmap_purge_lock);
  
  /* for per-CPU blocks */
  static void purge_fragmented_blocks_allcpus(void);
@@ -100,7 +101,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		unsigned long nr = (va->va_end - va->va_start) >> PAGE_SHIFT;
  		unsigned long orig_start = va->va_start;
  		unsigned long orig_end = va->va_end;
-@@ -1823,13 +1807,55 @@ static bool __purge_vmap_area_lazy(unsig
+@@ -1821,13 +1805,55 @@ static bool __purge_vmap_area_lazy(unsig
  
  		atomic_long_sub(nr, &vmap_lazy_nr);
  		num_purged_areas++;
@@ -126,8 +127,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	lockdep_assert_held(&vmap_purge_lock);
 +	purge_nodes = CPU_MASK_NONE;
 +
-+	for (i = 0; i < nr_nodes; i++) {
-+		vn = &nodes[i];
++	for (i = 0; i < nr_vmap_nodes; i++) {
++		vn = &vmap_nodes[i];
 +
 +		INIT_LIST_HEAD(&vn->purge_list);
 +
@@ -160,7 +161,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	trace_purge_vmap_area_lazy(start, end, num_purged_areas);
  	return num_purged_areas > 0;
  }
-@@ -1848,16 +1874,9 @@ static void reclaim_and_purge_vmap_areas
+@@ -1846,16 +1872,9 @@ static void reclaim_and_purge_vmap_areas
  
  static void drain_vmap_area_work(struct work_struct *work)
  {
@@ -180,7 +181,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -1867,6 +1886,7 @@ static void drain_vmap_area_work(struct
+@@ -1865,6 +1884,7 @@ static void drain_vmap_area_work(struct
   */
  static void free_vmap_area_noflush(struct vmap_area *va)
  {
@@ -188,7 +189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned long nr_lazy_max = lazy_max_pages();
  	unsigned long va_start = va->va_start;
  	unsigned long nr_lazy;
-@@ -1880,10 +1900,9 @@ static void free_vmap_area_noflush(struc
+@@ -1878,10 +1898,9 @@ static void free_vmap_area_noflush(struc
  	/*
  	 * Merge or place it to the purge tree/list.
  	 */
@@ -202,7 +203,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	trace_free_vmap_area_noflush(va_start, nr_lazy, nr_lazy_max);
  
-@@ -4412,15 +4431,21 @@ static void show_numa_info(struct seq_fi
+@@ -4411,15 +4430,21 @@ static void show_numa_info(struct seq_fi
  
  static void show_purge_info(struct seq_file *m)
  {
@@ -215,8 +216,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		seq_printf(m, "0x%pK-0x%pK %7ld unpurged vm_area\n",
 -			(void *)va->va_start, (void *)va->va_end,
 -			va->va_end - va->va_start);
-+	for (i = 0; i < nr_nodes; i++) {
-+		vn = &nodes[i];
++	for (i = 0; i < nr_vmap_nodes; i++) {
++		vn = &vmap_nodes[i];
 +
 +		spin_lock(&vn->lazy.lock);
 +		list_for_each_entry(va, &vn->lazy.head, list) {
@@ -230,7 +231,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int s_show(struct seq_file *m, void *p)
-@@ -4567,6 +4592,10 @@ static void vmap_init_nodes(void)
+@@ -4558,6 +4583,10 @@ static void vmap_init_nodes(void)
  		vn->busy.root = RB_ROOT;
  		INIT_LIST_HEAD(&vn->busy.head);
  		spin_lock_init(&vn->busy.lock);

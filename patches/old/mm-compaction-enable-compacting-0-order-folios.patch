@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
-Subject: mm/compaction: enable compacting >0 order folios
-Date: Fri, 16 Feb 2024 12:04:30 -0500
+Subject: mm/compaction: enable compacting >0 order folios.
+Date: Tue, 20 Feb 2024 13:32:18 -0500
 
 migrate_pages() supports >0 order folio migration and during compaction,
 even if compaction_alloc() cannot provide >0 order free pages,
@@ -8,7 +8,7 @@ migrate_pages() can split the source page and try to migrate the base
 pages from the split.  It can be a baseline and start point for adding
 support for compacting >0 order folios.
 
-Link: https://lkml.kernel.org/r/20240216170432.1268753-3-zi.yan@sent.com
+Link: https://lkml.kernel.org/r/20240220183220.1451315-3-zi.yan@sent.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Suggested-by: Huang Ying <ying.huang@intel.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -30,34 +30,68 @@ Cc: Yin Fengwei <fengwei.yin@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/compaction.c |   66 ++++++++++++++++++++++++++++++++++++----------
- 1 file changed, 52 insertions(+), 14 deletions(-)
+ mm/compaction.c |  101 ++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 76 insertions(+), 25 deletions(-)
 
 --- a/mm/compaction.c~mm-compaction-enable-compacting-0-order-folios
 +++ a/mm/compaction.c
-@@ -816,6 +816,21 @@ static bool too_many_isolated(struct com
- 	return too_many;
+@@ -40,9 +40,22 @@ static inline void count_compact_events(
+ {
+ 	count_vm_events(item, delta);
+ }
++
++/*
++ * order == -1 is expected when compacting proactively via
++ * 1. /proc/sys/vm/compact_memory
++ * 2. /sys/devices/system/node/nodex/compact
++ * 3. /proc/sys/vm/compaction_proactiveness
++ */
++static inline bool is_via_compact_memory(int order)
++{
++	return order == -1;
++}
++
+ #else
+ #define count_compact_event(item) do { } while (0)
+ #define count_compact_events(item, delta) do { } while (0)
++static inline bool is_via_compact_memory(int order) { return false; }
+ #endif
+ 
+ #if defined CONFIG_COMPACTION || defined CONFIG_CMA
+@@ -817,6 +830,32 @@ static bool too_many_isolated(struct com
  }
  
-+/*
-+ * 1. if the page order is larger than or equal to target_order (i.e.,
-+ * cc->order and when it is not -1 for global compaction), skip it since
-+ * target_order already indicates no free page with larger than target_order
-+ * exists and later migrating it will most likely fail;
+ /**
++ * skip_isolation_on_order() - determine when to skip folio isolation based on
++ *			       folio order and compaction target order
++ * @order:		to-be-isolated folio order
++ * @target_order:	compaction target order
 + *
-+ * 2. compacting > pageblock_order pages does not improve memory fragmentation,
-+ * skip them;
++ * This avoids unnecessary folio isolations during compaction.
 + */
 +static bool skip_isolation_on_order(int order, int target_order)
 +{
-+	return (target_order != -1 && order >= target_order) ||
-+		order >= pageblock_order;
++	/*
++	 * Unless we are performing global compaction (i.e.,
++	 * is_via_compact_memory), skip any folios that are larger than the
++	 * target order: we wouldn't be here if we'd have a free folio with
++	 * the desired target_order, so migrating this folio would likely fail
++	 * later.
++	 */
++	if (!is_via_compact_memory(target_order) && order >= target_order)
++		return true;
++	/*
++	 * We limit memory compaction to pageblocks and won't try
++	 * creating free blocks of memory that are larger than that.
++	 */
++	return order >= pageblock_order;
 +}
 +
- /**
++/**
   * isolate_migratepages_block() - isolate all migrate-able pages within
   *				  a single pageblock
-@@ -947,7 +962,22 @@ isolate_migratepages_block(struct compac
+  * @cc:		Compaction control structure.
+@@ -947,7 +986,22 @@ isolate_migratepages_block(struct compac
  			valid_page = page;
  		}
  
@@ -81,7 +115,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (locked) {
  				unlock_page_lruvec_irqrestore(locked, flags);
  				locked = NULL;
-@@ -1008,21 +1038,24 @@ isolate_migratepages_block(struct compac
+@@ -1008,21 +1062,24 @@ isolate_migratepages_block(struct compac
  		}
  
  		/*
@@ -116,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  
  		/*
-@@ -1165,10 +1198,11 @@ isolate_migratepages_block(struct compac
+@@ -1165,10 +1222,11 @@ isolate_migratepages_block(struct compac
  			}
  
  			/*
@@ -131,15 +165,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				low_pfn += folio_nr_pages(folio) - 1;
  				nr_scanned += folio_nr_pages(folio) - 1;
  				folio_set_lru(folio);
-@@ -1788,6 +1822,10 @@ static struct folio *compaction_alloc(st
+@@ -1788,6 +1846,10 @@ static struct folio *compaction_alloc(st
  	struct compact_control *cc = (struct compact_control *)data;
  	struct folio *dst;
  
 +	/* this makes migrate_pages() split the source page and retry */
-+	if (folio_test_large(src) > 0)
++	if (folio_test_large(src))
 +		return NULL;
 +
  	if (list_empty(&cc->freepages)) {
  		isolate_freepages(cc);
  
+@@ -2091,17 +2153,6 @@ static isolate_migrate_t isolate_migrate
+ }
+ 
+ /*
+- * order == -1 is expected when compacting proactively via
+- * 1. /proc/sys/vm/compact_memory
+- * 2. /sys/devices/system/node/nodex/compact
+- * 3. /proc/sys/vm/compaction_proactiveness
+- */
+-static inline bool is_via_compact_memory(int order)
+-{
+-	return order == -1;
+-}
+-
+-/*
+  * Determine whether kswapd is (or recently was!) running on this node.
+  *
+  * pgdat_kswapd_lock() pins pgdat->kswapd, so a concurrent kswapd_stop() can't
 _

@@ -1,0 +1,67 @@
+From: Byungchul Park <byungchul@sk.com>
+Subject: mm, vmscan: do not turn on cache_trim_mode if it doesn't work
+Date: Fri, 23 Feb 2024 14:44:07 +0900
+
+With cache_trim_mode on, reclaim logic doesn't bother reclaiming anon
+pages.  However, it should be more careful to turn on the mode because
+it's going to prevent anon pages from being reclaimed even if there are a
+huge number of anon pages that are cold and should be reclaimed.  Even
+worse, that leads kswapd_failures to reach MAX_RECLAIM_RETRIES and
+stopping kswapd from functioning until direct reclaim eventually works to
+resume kswapd.
+
+So do not turn on cache_trim_mode if the mode doesn't work, especially
+while the sytem is struggling against reclaim.
+
+The problematic behavior can be reproduced by:
+
+   CONFIG_NUMA_BALANCING enabled
+   sysctl_numa_balancing_mode set to NUMA_BALANCING_MEMORY_TIERING
+   numa node0 (8GB local memory, 16 CPUs)
+   numa node1 (8GB slow tier memory, no CPUs)
+
+   Sequence:
+
+   1) echo 3 > /proc/sys/vm/drop_caches
+   2) To emulate the system with full of cold memory in local DRAM, run
+      the following dummy program and never touch the region:
+
+         mmap(0, 8 * 1024 * 1024 * 1024, PROT_READ | PROT_WRITE,
+	      MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE, -1, 0);
+
+   3) Run any memory intensive work e.g. XSBench.
+   4) Check if numa balancing is working e.i. promotion/demotion.
+   5) Iterate 1) ~ 4) until numa balancing stops.
+
+With this, you could see that promotion/demotion are not working because
+kswapd has stopped due to ->kswapd_failures >= MAX_RECLAIM_RETRIES.
+
+Interesting vmstat delta's differences between before and after are like:
+
+   +-----------------------+-------------------------------+
+   | interesting vmstat	   | before	   | after	   |
+   +-----------------------+-------------------------------+
+   | nr_inactive_anon	   | 321935	   | 1636737	   |
+   | nr_active_anon	   | 1780700	   | 465913	   |
+   | nr_inactive_file	   | 30425	   | 35711	   |
+   | nr_active_file	   | 14961	   | 8698	   |
+   | pgpromote_success	   | 356	   | 1267785	   |
+   | pgpromote_candidate   | 21953245	   | 1745631	   |
+   | pgactivate		   | 1844523	   | 3309867	   |
+   | pgdeactivate	   | 50634	   | 1545041	   |
+   | pgfault		   | 31100294	   | 6411036	   |
+   | pgdemote_kswapd	   | 30856	   | 2267467	   |
+   | pgscan_kswapd	   | 1861981	   | 7729231	   |
+   | pgscan_anon	   | 1822930	   | 7667544	   |
+   | pgscan_file	   | 39051	   | 61687	   |
+   | pgsteal_anon	   | 386	   | 2227217	   |
+   | pgsteal_file	   | 30470	   | 40250	   |
+   | pageoutrun		   | 30		   | 457	   |
+   | numa_hint_faults	   | 27418279	   | 2752289	   |
+   | numa_pages_migrated   | 356	   | 1267785 	   |
+   +-----------------------+-------------------------------+
+
+Link: https://lkml.kernel.org/r/20240223054407.14829-1-byungchul@sk.com
+Signed-off-by: Byungchul Park <byungchul@sk.com>
+Acked-by: "Huang, Ying" <ying.huang@intel.com>
+Cc: Yu Zhao <yuzhao@google.com>
