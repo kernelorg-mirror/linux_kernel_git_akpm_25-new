@@ -1,0 +1,72 @@
+From: Chengming Zhou <zhouchengming@bytedance.com>
+Subject: mm/zsmalloc: don't hold locks of all pages when free_zspage()
+Date: Tue, 27 Feb 2024 03:02:54 +0000
+
+Patch series "mm/zsmalloc: simplify synchronization between
+zs_page_migrate() and free_zspage()".
+
+free_zspage() has to hold locks of all pages, since zs_page_migrate() path
+rely on this page lock to protect the race between zs_free() and it, so it
+can safely get zspage from page->private.
+
+But this way is not good and simple enough:
+
+1. Since zs_free() couldn't be sleepable, it can only trylock pages,
+   or has to kick_deferred_free() to defer that to a work.
+
+2. Even in the worker context, async_free_zspage() can't simply
+   lock all pages in lock_zspage(), it's still trylock because of
+   the race between zs_free() and zs_page_migrate(). Please see
+   the commit 2505a981114d ("zsmalloc: fix races between asynchronous
+   zspage free and page migration") for details.
+
+Actually, all free_zspage() needs is to get zspage from page safely, we
+can use RCU to achieve it easily.  Then free_zspage() don't need to hold
+locks of all pages, so don't need the deferred free mechanism at all. 
+This patchset implements it and remove all of deferred free related code.
+
+
+This patch (of 2):
+
+free_zspage() has to hold locks of all pages, since zs_page_migrate() path
+rely on this page lock to protect the race between zs_free() and it, so it
+can safely get zspage from page->private.
+
+But this way is not good and simple enough:
+
+1. Since zs_free() couldn't be sleepable, it can only trylock pages,
+   or has to kick_deferred_free() to defer that to a work.
+
+2. Even in the worker context, async_free_zspage() can't simply
+   lock all pages in lock_zspage(), it's still trylock because of
+   the race between zs_free() and zs_page_migrate(). Please see
+   the commit 2505a981114d ("zsmalloc: fix races between asynchronous
+   zspage free and page migration") for details.
+
+Actually, all free_zspage() needs is to get zspage from page safely, we
+can use RCU to achieve it easily.  Then free_zspage() don't need to hold
+locks of all pages, so don't need the deferred free mechanism at all.
+
+The updated zs_page_migrate() now has two more cases to consider:
+
+1. get_zspage_lockless() return NULL: it means free_zspage() has used
+   reset_page() on this page and its reference of page.
+
+2. get_zspage_lockless() return zspage but it's not on pool list:
+   it means zspage has been removed from list and in process of free.
+
+I'm not sure what value should be returned in these cases?  -EINVAL or
+-EAGAIN or other value?  If the migration caller can find that page has no
+extra referenced and can just free it, I think we should return -EAGAIN to
+let the migration caller retry this page later to free it.  Now I choose
+to use -EINVAL to skip migration of this page, it seems not a big deal to
+fail migration of some pages?
+
+Link: https://lkml.kernel.org/r/20240226-zsmalloc-zspage-rcu-v1-0-456b0ef1a89d@bytedance.com
+Link: https://lkml.kernel.org/r/20240226-zsmalloc-zspage-rcu-v1-1-456b0ef1a89d@bytedance.com
+Signed-off-by: Chengming Zhou <zhouchengming@bytedance.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Yosry Ahmed <yosryahmed@google.com>
