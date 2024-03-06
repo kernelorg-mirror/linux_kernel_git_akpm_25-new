@@ -1,6 +1,6 @@
 From: Ryan Roberts <ryan.roberts@arm.com>
 Subject: mm: swap: fix race between free_swap_and_cache() and swapoff()
-Date: Tue, 5 Mar 2024 15:13:49 +0000
+Date: Wed, 6 Mar 2024 14:03:56 +0000
 
 There was previously a theoretical window where swapoff() could run and
 teardown a swap_info_struct while a call to free_swap_and_cache() was
@@ -14,9 +14,10 @@ possible (see link below).
 
 Fix it by using get_swap_device()/put_swap_device(), which will stall
 swapoff().  There was an extra check in _swap_info_get() to confirm that
-the swap entry was valid.  This wasn't present in get_swap_device() so
-I've added it.  I couldn't find any existing get_swap_device() call sites
-where this extra check would cause any false alarms.
+the swap entry was not free.  This isn't present in get_swap_device()
+because it doesn't make sense in general due to the race between getting
+the reference and swapoff.  So I've added an equivalent check directly in
+free_swap_and_cache().
 
 Details of how to provoke one possible issue (thanks to David Hildenbrand
 for deriving this):
@@ -58,7 +59,7 @@ but before process1 finished its call to swap_page_trans_huge_swapped()?
 
 --8<-----
 
-Link: https://lkml.kernel.org/r/20240305151349.3781428-1-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20240306140356.3974886-1-ryan.roberts@arm.com
 Fixes: 7c00bafee87c ("mm/swap: free swap slots in batch")
 Closes: https://lore.kernel.org/linux-mm/65a66eb9-41f8-4790-8db2-0c70ea15979f@redhat.com/
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
@@ -68,45 +69,35 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/swapfile.c |   14 +++++++++++---
- 1 file changed, 11 insertions(+), 3 deletions(-)
+ mm/swapfile.c |   13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
 
 --- a/mm/swapfile.c~mm-swap-fix-race-between-free_swap_and_cache-and-swapoff
 +++ a/mm/swapfile.c
-@@ -1281,7 +1281,9 @@ struct swap_info_struct *get_swap_device
- 	smp_rmb();
- 	offset = swp_offset(entry);
- 	if (offset >= si->max)
--		goto put_out;
-+		goto bad_offset;
-+	if (data_race(!si->swap_map[swp_offset(entry)]))
-+		goto bad_free;
- 
- 	return si;
- bad_nofile:
-@@ -1289,9 +1291,14 @@ bad_nofile:
- out:
- 	return NULL;
- put_out:
--	pr_err("%s: %s%08lx\n", __func__, Bad_offset, entry.val);
- 	percpu_ref_put(&si->users);
- 	return NULL;
-+bad_offset:
-+	pr_err("%s: %s%08lx\n", __func__, Bad_offset, entry.val);
-+	goto put_out;
-+bad_free:
-+	pr_err("%s: %s%08lx\n", __func__, Unused_offset, entry.val);
-+	goto put_out;
- }
- 
- static unsigned char __swap_entry_free(struct swap_info_struct *p,
-@@ -1609,13 +1616,14 @@ int free_swap_and_cache(swp_entry_t entr
+@@ -1232,6 +1232,11 @@ static unsigned char __swap_entry_free_l
+  * with get_swap_device() and put_swap_device(), unless the swap
+  * functions call get/put_swap_device() by themselves.
+  *
++ * Note that when only holding the PTL, swapoff might succeed immediately
++ * after freeing a swap entry. Therefore, immediately after
++ * __swap_entry_free(), the swap info might become stale and should not
++ * be touched without a prior get_swap_device().
++ *
+  * Check whether swap entry is valid in the swap device.  If so,
+  * return pointer to swap_info_struct, and keep the swap entry valid
+  * via preventing the swap device from being swapoff, until
+@@ -1609,13 +1614,19 @@ int free_swap_and_cache(swp_entry_t entr
  	if (non_swap_entry(entry))
  		return 1;
  
 -	p = _swap_info_get(entry);
 +	p = get_swap_device(entry);
  	if (p) {
++		if (WARN_ON(data_race(!p->swap_map[swp_offset(entry)]))) {
++			put_swap_device(p);
++			return 0;
++		}
++
  		count = __swap_entry_free(p, entry);
  		if (count == SWAP_HAS_CACHE &&
  		    !swap_page_trans_huge_swapped(p, entry))
