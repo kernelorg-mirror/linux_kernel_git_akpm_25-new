@@ -1,0 +1,91 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/madvise: make MADV_POPULATE_(READ|WRITE) handle VM_FAULT_RETRY properly
+Date: Thu, 14 Mar 2024 17:12:59 +0100
+
+Patch series "mm/madvise: make MADV_POPULATE_(READ|WRITE) handle
+VM_FAULT_RETRY properly". 
+
+Derrick reports that in some cases where pread() would fail with -EIO and
+mmap()+access would generate a SIGBUS signal, MADV_POPULATE_READ /
+MADV_POPULATE_WRITE will keep retrying forever and not fail with -EFAULT.
+
+It all boils down to missing VM_FAULT_RETRY handling.  Let's try to handle
+that in a better way, similar to how ordinary GUP handles it.
+
+Details in patch #1.  In short, move special MADV_POPULATE_(READ|WRITE)
+VMA handling into __get_user_pages(), and make faultin_page_range() call
+__get_user_pages_locked(), which handles VM_FAULT_RETRY.  Further, avoid
+the now-useless madvise VMA walk, because __get_user_pages() will perform
+the VMA lookup either way.
+
+I briefly played with handling the FOLL_MADV_POPULATE checks in
+__get_user_pages() a bit differently, integrating them with existing
+handling, but it ended up looking worse.  So I decided to keep it simple.
+
+Likely, we need better selftests, but the reproducer from Darrick might be
+a bit hard to convert into a simple selftest.
+
+Note that using mlock() in Darricks reproducer results in a similar
+endless retry.  Likely, that is not what we want, and we should handle
+VM_FAULT_RETRY in populate_vma_page_range() / __mm_populate() as well. 
+However, similarly using __get_user_pages_locked() might be more
+complicated, because of the advanced VMA handling in
+populate_vma_page_range().
+
+Further, most populate_vma_page_range() callers simply ignore the return
+values, so it's unclear in which cases we expect to just silently fail, or
+where we'd want to retry+fail or endlessly retry instead.
+
+
+This patch (of 2): 
+
+Darrick reports that in some cases where pread() would fail with -EIO and
+mmap()+access would generate a SIGBUS signal, MADV_POPULATE_READ /
+MADV_POPULATE_WRITE will keep retrying forever and not fail with -EFAULT.
+
+While the madvise() call can be interrupted by a signal, this is not the
+desired behavior.  MADV_POPULATE_READ / MADV_POPULATE_WRITE should behave
+like page faults in that case: fail and not retry forever.
+
+A reproducer can be found at [1].
+
+The reason is that __get_user_pages(), as called by
+faultin_vma_page_range(), will not handle VM_FAULT_RETRY in a proper way:
+it will simply return 0 when VM_FAULT_RETRY happened, making
+madvise_populate()->faultin_vma_page_range() retry again and again, never
+setting FOLL_TRIED->FAULT_FLAG_TRIED for __get_user_pages().
+
+__get_user_pages_locked() does what we want, but duplicating that logic in
+faultin_vma_page_range() feels wrong.
+
+So let's use __get_user_pages_locked() instead, that will detect
+VM_FAULT_RETRY and set FOLL_TRIED when retrying, making the fault handler
+return VM_FAULT_SIGBUS (VM_FAULT_ERROR) at some point, propagating -EFAULT
+from faultin_page() to __get_user_pages(), all the way to
+madvise_populate().
+
+But, there is an issue: __get_user_pages_locked() will end up re-taking
+the MM lock and then __get_user_pages() will do another VMA lookup.  In
+the meantime, the VMA layout could have changed and we'd fail with
+different error codes than we'd want to.
+
+As __get_user_pages() will currently do a new VMA lookup either way, let
+it do the VMA handling in a different way, controlled by a new
+FOLL_MADV_POPULATE flag, effectively moving these checks from
+madvise_populate() + faultin_page_range() in there.
+
+With this change, Darricks reproducer properly fails with -EFAULT, as
+documented for MADV_POPULATE_READ / MADV_POPULATE_WRITE.
+
+[1] https://lore.kernel.org/all/20240313171936.GN1927156@frogsfrogsfrogs/
+
+Link: https://lkml.kernel.org/r/20240314161300.382526-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20240314161300.382526-2-david@redhat.com
+Fixes: 4ca9b3859dac ("mm/madvise: introduce MADV_POPULATE_(READ|WRITE) to prefault page tables")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reported-by: Darrick J. Wong <djwong@kernel.org>
+Closes: https://lore.kernel.org/all/20240311223815.GW1927156@frogsfrogsfrogs/
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
