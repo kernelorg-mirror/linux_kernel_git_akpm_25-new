@@ -1,0 +1,56 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: zswap: optimize zswap pool size tracking
+Date: Tue, 12 Mar 2024 11:34:11 -0400
+
+Profiling the munmap() of a zswapped memory region shows 60% of the total
+cycles currently going into updating the zswap_pool_total_size.
+
+There are three consumers of this counter:
+- store, to enforce the globally configured pool limit
+- meminfo & debugfs, to report the size to the user
+- shrink, to determine the batch size for each cycle
+
+Instead of aggregating everytime an entry enters or exits the zswap
+pool, aggregate the value from the zpools on-demand:
+
+- Stores aggregate the counter anyway upon success. Aggregating to
+  check the limit instead is the same amount of work.
+
+- Meminfo & debugfs might benefit somewhat from a pre-aggregated
+  counter, but aren't exactly hotpaths.
+
+- Shrinking can aggregate once for every cycle instead of doing it for
+  every freed entry. As the shrinker might work on tens or hundreds of
+  objects per scan cycle, this is a large reduction in aggregations.
+
+The paths that benefit dramatically are swapin, swapoff, and unmaps. 
+There could be millions of pages being processed until somebody asks for
+the pool size again.  This eliminates the pool size updates from those
+paths entirely.
+
+Top profile entries for a 24G range munmap(), before:
+
+    38.54%  zswap-unmap  [kernel.kallsyms]  [k] zs_zpool_total_size
+    12.51%  zswap-unmap  [kernel.kallsyms]  [k] zpool_get_total_size
+     9.10%  zswap-unmap  [kernel.kallsyms]  [k] zswap_update_total_size
+     2.95%  zswap-unmap  [kernel.kallsyms]  [k] obj_cgroup_uncharge_zswap
+     2.88%  zswap-unmap  [kernel.kallsyms]  [k] __slab_free
+     2.86%  zswap-unmap  [kernel.kallsyms]  [k] xas_store
+
+and after:
+
+     7.70%  zswap-unmap  [kernel.kallsyms]  [k] __slab_free
+     7.16%  zswap-unmap  [kernel.kallsyms]  [k] obj_cgroup_uncharge_zswap
+     6.74%  zswap-unmap  [kernel.kallsyms]  [k] xas_store
+
+It was also briefly considered to move to a single atomic in zswap
+that is updated by the backends, since zswap only cares about the sum
+of all pools anyway. However, zram directly needs per-pool information
+out of zsmalloc. To keep the backend from having to update two atomics
+every time, I opted for the lazy aggregation instead for now.
+
+Link: https://lkml.kernel.org/r/20240312153901.3441-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Yosry Ahmed <yosryahmed@google.com>
+Reviewed-by: Chengming Zhou <chengming.zhou@linux.dev>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
