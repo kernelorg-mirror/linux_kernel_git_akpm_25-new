@@ -1,0 +1,95 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: page_alloc: optimize free_unref_folios()
+Date: Wed, 20 Mar 2024 14:02:07 -0400
+
+Move direct freeing of isolated pages to the lock-breaking block in the
+second loop.  This saves an unnecessary migratetype reassessment.
+
+Minor comment and local variable scoping cleanups.
+
+Link: https://lkml.kernel.org/r/20240320180429.678181-3-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Suggested-by: Vlastimil Babka <vbabka@suse.cz>
+Tested-by: "Huang, Ying" <ying.huang@intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page_alloc.c |   32 +++++++++++++++++++++++---------
+ 1 file changed, 23 insertions(+), 9 deletions(-)
+
+--- a/mm/page_alloc.c~mm-page_alloc-optimize-free_unref_folios
++++ a/mm/page_alloc.c
+@@ -2493,7 +2493,7 @@ void free_unref_folios(struct folio_batc
+ 	unsigned long __maybe_unused UP_flags;
+ 	struct per_cpu_pages *pcp = NULL;
+ 	struct zone *locked_zone = NULL;
+-	int i, j, migratetype;
++	int i, j;
+ 
+ 	/* Prepare folios for freeing */
+ 	for (i = 0, j = 0; i < folios->nr; i++) {
+@@ -2505,14 +2505,15 @@ void free_unref_folios(struct folio_batc
+ 			folio_undo_large_rmappable(folio);
+ 		if (!free_pages_prepare(&folio->page, order))
+ 			continue;
+-
+ 		/*
+-		 * Free isolated folios and orders not handled on the PCP
+-		 * directly to the allocator, see comment in free_unref_page.
++		 * Free orders not handled on the PCP directly to the
++		 * allocator.
+ 		 */
+-		migratetype = get_pfnblock_migratetype(&folio->page, pfn);
+-		if (!pcp_allowed_order(order) ||
+-		    is_migrate_isolate(migratetype)) {
++		if (!pcp_allowed_order(order)) {
++			int migratetype;
++
++			migratetype = get_pfnblock_migratetype(&folio->page,
++							       pfn);
+ 			free_one_page(folio_zone(folio), &folio->page, pfn,
+ 					order, migratetype, FPI_NONE);
+ 			continue;
+@@ -2529,15 +2530,29 @@ void free_unref_folios(struct folio_batc
+ 		struct zone *zone = folio_zone(folio);
+ 		unsigned long pfn = folio_pfn(folio);
+ 		unsigned int order = (unsigned long)folio->private;
++		int migratetype;
+ 
+ 		folio->private = NULL;
+ 		migratetype = get_pfnblock_migratetype(&folio->page, pfn);
+ 
+ 		/* Different zone requires a different pcp lock */
+-		if (zone != locked_zone) {
++		if (zone != locked_zone ||
++		    is_migrate_isolate(migratetype)) {
+ 			if (pcp) {
+ 				pcp_spin_unlock(pcp);
+ 				pcp_trylock_finish(UP_flags);
++				locked_zone = NULL;
++				pcp = NULL;
++			}
++
++			/*
++			 * Free isolated pages directly to the
++			 * allocator, see comment in free_unref_page.
++			 */
++			if (is_migrate_isolate(migratetype)) {
++				free_one_page(zone, &folio->page, pfn,
++					      order, migratetype, FPI_NONE);
++				continue;
+ 			}
+ 
+ 			/*
+@@ -2550,7 +2565,6 @@ void free_unref_folios(struct folio_batc
+ 				pcp_trylock_finish(UP_flags);
+ 				free_one_page(zone, &folio->page, pfn,
+ 					      order, migratetype, FPI_NONE);
+-				locked_zone = NULL;
+ 				continue;
+ 			}
+ 			locked_zone = zone;
+_

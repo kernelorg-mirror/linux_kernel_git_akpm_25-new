@@ -1,0 +1,98 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: fix non-compound multi-order memory accounting in __free_pages
+Date: Thu, 21 Mar 2024 09:36:42 -0700
+
+When a non-compound multi-order page is freed, it is possible that a
+speculative reference keeps the page pinned.  In this case we free all
+pages except for the first page, which will be freed later by the last
+put_page().  However the page passed to put_page() is indistinguishable
+from an order-0 page, so it cannot do the accounting, just as it cannot
+free the subsequent pages.  Do the accounting here, where we free the
+pages.
+
+Link: https://lkml.kernel.org/r/20240321163705.3067592-21-surenb@google.com
+Reported-by: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+Cc: Alex Gaynor <alex.gaynor@gmail.com>
+Cc: Alice Ryhl <aliceryhl@google.com>
+Cc: Andreas Hindborg <a.hindborg@samsung.com>
+Cc: Benno Lossin <benno.lossin@proton.me>
+Cc: "Björn Roy Baron" <bjorn3_gh@protonmail.com>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Gary Guo <gary@garyguo.net>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Wedson Almeida Filho <wedsonaf@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/pgalloc_tag.h |   24 ++++++++++++++++++++++++
+ mm/page_alloc.c             |    5 ++++-
+ 2 files changed, 28 insertions(+), 1 deletion(-)
+
+--- a/include/linux/pgalloc_tag.h~mm-fix-non-compound-multi-order-memory-accounting-in-__free_pages
++++ a/include/linux/pgalloc_tag.h
+@@ -96,12 +96,36 @@ out:
+ 	page_ext_put(page_ext);
+ }
+ 
++static inline struct alloc_tag *pgalloc_tag_get(struct page *page)
++{
++	struct alloc_tag *tag = NULL;
++
++	if (mem_alloc_profiling_enabled()) {
++		union codetag_ref *ref = get_page_tag_ref(page);
++
++		alloc_tag_sub_check(ref);
++		if (ref && ref->ct)
++			tag = ct_to_alloc_tag(ref->ct);
++		put_page_tag_ref(ref);
++	}
++
++	return tag;
++}
++
++static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr)
++{
++	if (mem_alloc_profiling_enabled() && tag)
++		this_cpu_sub(tag->counters->bytes, PAGE_SIZE * nr);
++}
++
+ #else /* CONFIG_MEM_ALLOC_PROFILING */
+ 
+ static inline void pgalloc_tag_add(struct page *page, struct task_struct *task,
+ 				   unsigned int nr) {}
+ static inline void pgalloc_tag_sub(struct page *page, unsigned int nr) {}
+ static inline void pgalloc_tag_split(struct page *page, unsigned int nr) {}
++static inline struct alloc_tag *pgalloc_tag_get(struct page *page) { return NULL; }
++static inline void pgalloc_tag_sub_pages(struct alloc_tag *tag, unsigned int nr) {}
+ 
+ #endif /* CONFIG_MEM_ALLOC_PROFILING */
+ 
+--- a/mm/page_alloc.c~mm-fix-non-compound-multi-order-memory-accounting-in-__free_pages
++++ a/mm/page_alloc.c
+@@ -4664,12 +4664,15 @@ void __free_pages(struct page *page, uns
+ {
+ 	/* get PageHead before we drop reference */
+ 	int head = PageHead(page);
++	struct alloc_tag *tag = pgalloc_tag_get(page);
+ 
+ 	if (put_page_testzero(page))
+ 		free_the_page(page, order);
+-	else if (!head)
++	else if (!head) {
++		pgalloc_tag_sub_pages(tag, (1 << order) - 1);
+ 		while (order-- > 0)
+ 			free_the_page(page + (1 << order), order);
++	}
+ }
+ EXPORT_SYMBOL(__free_pages);
+ 
+_

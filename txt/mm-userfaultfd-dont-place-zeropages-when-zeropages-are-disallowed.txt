@@ -1,0 +1,84 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/userfaultfd: don't place zeropages when zeropages are disallowed
+Date: Thu, 21 Mar 2024 22:59:53 +0100
+
+Patch series "s390/mm: shared zeropage + KVM fix and optimization".
+
+This series fixes one issue with uffd + shared zeropages on s390x and
+optimizes "ordinary" KVM guests to make use of shared zeropages again.
+
+userfaultfd could currently end up mapping shared zeropages into processes
+that forbid shared zeropages.  This only apples to s390x, relevant for
+handling PV guests and guests that use storage kets correctly.  Fix it by
+placing a zeroed folio instead of the shared zeropage during
+UFFDIO_ZEROPAGE instead.
+
+I stumbled over this issue while looking into a customer scenario that
+is using:
+
+(1) Memory ballooning for dynamic resizing. Start a VM with, say, 100 GiB
+    and inflate the balloon during boot to 60 GiB. The VM has ~40 GiB
+    available and additional memory can be "fake hotplugged" to the VM
+    later on demand by deflating the balloon. Actual memory overcommit is
+    not desired, so physical memory would only be moved between VMs.
+
+(2) Live migration of VMs between sites to evacuate servers in case of
+    emergency.
+
+Without the shared zeropage, during (2), the VM would suddenly consume 100
+GiB on the migration source and destination.  On the migration source,
+where we don't excpect memory overcommit, we could easilt end up crashing
+the VM during migration.
+
+Independent of that, memory handed back to the hypervisor using "free page
+reporting" would end up consuming actual memory after the migration on the
+destination, not getting freed up until reused+freed again.
+
+While there might be ways to optimize parts of this in QEMU, we really
+should just support the shared zeropage again for ordinary VMs.
+
+We only expect legcy guests to make use of storage keys, so let's handle
+zeropages again when enabling storage keys or when enabling PV.  To not
+break userfaultfd like we did in the past, don't zap the shared zeropages,
+but instead trigger unsharing faults, just like we do for unsharing KSM
+pages in break_ksm().
+
+Unsharing faults will simply replace the shared zeropage by a zeroed
+anonymous folio.  We can already trigger the same fault path using GUP,
+when trying to long-term pin a shared zeropage, but also when unmerging a
+KSM-placed zeropages, so this is nothing new.
+
+
+This patch (of 2):
+
+s390x must disable shared zeropages for processes running VMs, because the
+VMs could end up making use of "storage keys" or protected virtualization,
+which are incompatible with shared zeropages.
+
+Yet, with userfaultfd it is possible to insert shared zeropages into such
+processes.  Let's fallback to simply allocating a fresh zeroed anonymous
+folio and insert that instead.
+
+mm_forbids_zeropage() was introduced in commit 593befa6ab74 ("mm:
+introduce mm_forbids_zeropage function"), briefly before userfaultfd went
+upstream.
+
+Note that we don't want to fail the UFFDIO_ZEROPAGE request like we do for
+hugetlb, it would be rather unexpected.  Further, we also cannot really
+indicated "not supported" to user space ahead of time: it could be that
+the MM disallows zeropages after userfaultfd was already registered.
+
+Link: https://lkml.kernel.org/r/20240321215954.177730-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20240321215954.177730-2-david@redhat.com
+Fixes: c1a4de99fada ("userfaultfd: mcopy_atomic|mfill_zeropage: UFFDIO_COPY|UFFDIO_ZEROPAGE preparation")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Peter Xu <peterx@redhat.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Janosch Frank <frankja@linux.ibm.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>

@@ -1,0 +1,154 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: free up PG_slab
+Date: Thu, 21 Mar 2024 14:24:45 +0000
+
+Reclaim the Slab page flag by using a spare bit in PageType.  We are
+perennially short of page flags for various purposes, and now that the
+original SLAB allocator has been retired, SLUB does not use the
+mapcount/page_type field.  This lets us remove a number of special cases
+for ignoring mapcount on Slab pages.
+
+Link: https://lkml.kernel.org/r/20240321142448.1645400-8-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/page-flags.h     |   21 +++++++++++++++++----
+ include/trace/events/mmflags.h |    2 +-
+ mm/memory-failure.c            |    9 ---------
+ mm/slab.h                      |    2 +-
+ 4 files changed, 19 insertions(+), 15 deletions(-)
+
+--- a/include/linux/page-flags.h~mm-free-up-pg_slab
++++ a/include/linux/page-flags.h
+@@ -109,7 +109,6 @@ enum pageflags {
+ 	PG_active,
+ 	PG_workingset,
+ 	PG_error,
+-	PG_slab,
+ 	PG_owner_priv_1,	/* Owner use. If pagecache, fs may use*/
+ 	PG_arch_1,
+ 	PG_reserved,
+@@ -524,7 +523,6 @@ PAGEFLAG(Active, active, PF_HEAD) __CLEA
+ 	TESTCLEARFLAG(Active, active, PF_HEAD)
+ PAGEFLAG(Workingset, workingset, PF_HEAD)
+ 	TESTCLEARFLAG(Workingset, workingset, PF_HEAD)
+-__PAGEFLAG(Slab, slab, PF_NO_TAIL)
+ PAGEFLAG(Checked, checked, PF_NO_COMPOUND)	   /* Used by some filesystems */
+ 
+ /* Xen */
+@@ -931,7 +929,7 @@ PAGEFLAG_FALSE(HasHWPoisoned, has_hwpois
+ #endif
+ 
+ /*
+- * For pages that are never mapped to userspace (and aren't PageSlab),
++ * For pages that are never mapped to userspace,
+  * page_type may be used.  Because it is initialised to -1, we invert the
+  * sense of the bit, so __SetPageFoo *clears* the bit used for PageFoo, and
+  * __ClearPageFoo *sets* the bit used for PageFoo.  We reserve a few high and
+@@ -947,6 +945,7 @@ PAGEFLAG_FALSE(HasHWPoisoned, has_hwpois
+ #define PG_table	0x00000200
+ #define PG_guard	0x00000400
+ #define PG_hugetlb	0x00000800
++#define PG_slab		0x00001000
+ 
+ #define PageType(page, flag)						\
+ 	((page->page_type & (PAGE_TYPE_BASE | flag)) == PAGE_TYPE_BASE)
+@@ -1041,6 +1040,20 @@ PAGE_TYPE_OPS(Table, table, pgtable)
+  */
+ PAGE_TYPE_OPS(Guard, guard, guard)
+ 
++FOLIO_TYPE_OPS(slab, slab)
++
++/**
++ * PageSlab - Determine if the page belongs to the slab allocator
++ * @page: The page to test.
++ *
++ * Context: Any context.
++ * Return: True for slab pages, false for any other kind of page.
++ */
++static inline bool PageSlab(const struct page *page)
++{
++	return folio_test_slab(page_folio(page));
++}
++
+ #ifdef CONFIG_HUGETLB_PAGE
+ FOLIO_TYPE_OPS(hugetlb, hugetlb)
+ #else
+@@ -1121,7 +1134,7 @@ static __always_inline void __ClearPageA
+ 	(1UL << PG_lru		| 1UL << PG_locked	|	\
+ 	 1UL << PG_private	| 1UL << PG_private_2	|	\
+ 	 1UL << PG_writeback	| 1UL << PG_reserved	|	\
+-	 1UL << PG_slab		| 1UL << PG_active 	|	\
++	 1UL << PG_active 	|				\
+ 	 1UL << PG_unevictable	| __PG_MLOCKED | LRU_GEN_MASK)
+ 
+ /*
+--- a/include/trace/events/mmflags.h~mm-free-up-pg_slab
++++ a/include/trace/events/mmflags.h
+@@ -107,7 +107,6 @@
+ 	DEF_PAGEFLAG_NAME(lru),						\
+ 	DEF_PAGEFLAG_NAME(active),					\
+ 	DEF_PAGEFLAG_NAME(workingset),					\
+-	DEF_PAGEFLAG_NAME(slab),					\
+ 	DEF_PAGEFLAG_NAME(owner_priv_1),				\
+ 	DEF_PAGEFLAG_NAME(arch_1),					\
+ 	DEF_PAGEFLAG_NAME(reserved),					\
+@@ -135,6 +134,7 @@ IF_HAVE_PG_ARCH_X(arch_3)
+ #define DEF_PAGETYPE_NAME(_name) { PG_##_name, __stringify(_name) }
+ 
+ #define __def_pagetype_names						\
++	DEF_PAGETYPE_NAME(slab),					\
+ 	DEF_PAGETYPE_NAME(hugetlb),					\
+ 	DEF_PAGETYPE_NAME(offline),					\
+ 	DEF_PAGETYPE_NAME(guard),					\
+--- a/mm/memory-failure.c~mm-free-up-pg_slab
++++ a/mm/memory-failure.c
+@@ -1239,7 +1239,6 @@ static int me_huge_page(struct page_stat
+ #define mlock		(1UL << PG_mlocked)
+ #define lru		(1UL << PG_lru)
+ #define head		(1UL << PG_head)
+-#define slab		(1UL << PG_slab)
+ #define reserved	(1UL << PG_reserved)
+ 
+ static struct page_state error_states[] = {
+@@ -1249,13 +1248,6 @@ static struct page_state error_states[]
+ 	 * PG_buddy pages only make a small fraction of all free pages.
+ 	 */
+ 
+-	/*
+-	 * Could in theory check if slab page is free or if we can drop
+-	 * currently unused objects without touching them. But just
+-	 * treat it as standard kernel for now.
+-	 */
+-	{ slab,		slab,		MF_MSG_SLAB,	me_kernel },
+-
+ 	{ head,		head,		MF_MSG_HUGE,		me_huge_page },
+ 
+ 	{ sc|dirty,	sc|dirty,	MF_MSG_DIRTY_SWAPCACHE,	me_swapcache_dirty },
+@@ -1282,7 +1274,6 @@ static struct page_state error_states[]
+ #undef mlock
+ #undef lru
+ #undef head
+-#undef slab
+ #undef reserved
+ 
+ static void update_per_node_mf_stats(unsigned long pfn,
+--- a/mm/slab.h~mm-free-up-pg_slab
++++ a/mm/slab.h
+@@ -84,8 +84,8 @@ struct slab {
+ 		};
+ 		struct rcu_head rcu_head;
+ 	};
+-	unsigned int __unused;
+ 
++	unsigned int __page_type;
+ 	atomic_t __page_refcount;
+ #ifdef CONFIG_SLAB_OBJ_EXT
+ 	unsigned long obj_exts;
+_

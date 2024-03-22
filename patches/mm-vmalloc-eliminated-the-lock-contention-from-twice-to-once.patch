@@ -1,0 +1,153 @@
+From: rulinhuang <rulin.huang@intel.com>
+Subject: mm/vmalloc: eliminated the lock contention from twice to once
+Date: Wed, 6 Mar 2024 21:14:40 -0500
+
+When allocating a new memory area where the mapping address range is
+known, it is observed that the vmap_node->busy.lock is acquired twice.
+
+The first acquisition occurs in the alloc_vmap_area() function when
+inserting the vm area into the vm mapping red-black tree.  The second
+acquisition occurs in the setup_vmalloc_vm() function when updating the
+properties of the vm, such as flags and address, etc.
+
+Combine these two operations together in alloc_vmap_area(), which improves
+scalability when the vmap_node->busy.lock is contended.  By doing so, the
+need to acquire the lock twice can also be eliminated to once.
+
+With the above change, tested on intel sapphire rapids platform(224 vcpu),
+a 4% performance improvement is gained on
+stress-ng/pthread(https://github.com/ColinIanKing/stress-ng), which is the
+stress test of thread creations.
+
+Link: https://lkml.kernel.org/r/20240307021440.64967-1-rulin.huang@intel.com
+Co-developed-by: "Chen, Tim C" <tim.c.chen@intel.com>
+Signed-off-by: "Chen, Tim C" <tim.c.chen@intel.com>
+Co-developed-by: "King, Colin" <colin.king@intel.com>
+Signed-off-by: "King, Colin" <colin.king@intel.com>
+Signed-off-by: rulinhuang <rulin.huang@intel.com>
+Reviewed-by: Baoquan He <bhe@redhat.com>
+Reviewed-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Wangyang Guo <wangyang.guo@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmalloc.c |   50 +++++++++++++++++++++----------------------------
+ 1 file changed, 22 insertions(+), 28 deletions(-)
+
+--- a/mm/vmalloc.c~mm-vmalloc-eliminated-the-lock-contention-from-twice-to-once
++++ a/mm/vmalloc.c
+@@ -1913,15 +1913,26 @@ node_alloc(unsigned long size, unsigned
+ 	return va;
+ }
+ 
++static inline void setup_vmalloc_vm(struct vm_struct *vm,
++	struct vmap_area *va, unsigned long flags, const void *caller)
++{
++	vm->flags = flags;
++	vm->addr = (void *)va->va_start;
++	vm->size = va->va_end - va->va_start;
++	vm->caller = caller;
++	va->vm = vm;
++}
++
+ /*
+  * Allocate a region of KVA of the specified size and alignment, within the
+- * vstart and vend.
++ * vstart and vend. If vm is passed in, the two will also be bound.
+  */
+ static struct vmap_area *alloc_vmap_area(unsigned long size,
+ 				unsigned long align,
+ 				unsigned long vstart, unsigned long vend,
+ 				int node, gfp_t gfp_mask,
+-				unsigned long va_flags)
++				unsigned long va_flags, struct vm_struct *vm,
++				unsigned long flags, const void *caller)
+ {
+ 	struct vmap_node *vn;
+ 	struct vmap_area *va;
+@@ -1984,6 +1995,9 @@ retry:
+ 	va->vm = NULL;
+ 	va->flags = (va_flags | vn_id);
+ 
++	if (vm)
++		setup_vmalloc_vm(vm, va, flags, caller);
++
+ 	vn = addr_to_node(va->va_start);
+ 
+ 	spin_lock(&vn->busy.lock);
+@@ -2558,7 +2572,8 @@ static void *new_vmap_block(unsigned int
+ 	va = alloc_vmap_area(VMAP_BLOCK_SIZE, VMAP_BLOCK_SIZE,
+ 					VMALLOC_START, VMALLOC_END,
+ 					node, gfp_mask,
+-					VMAP_RAM|VMAP_BLOCK);
++					VMAP_RAM|VMAP_BLOCK, NULL,
++					0, NULL);
+ 	if (IS_ERR(va)) {
+ 		kfree(vb);
+ 		return ERR_CAST(va);
+@@ -2915,7 +2930,8 @@ void *vm_map_ram(struct page **pages, un
+ 		struct vmap_area *va;
+ 		va = alloc_vmap_area(size, PAGE_SIZE,
+ 				VMALLOC_START, VMALLOC_END,
+-				node, GFP_KERNEL, VMAP_RAM);
++				node, GFP_KERNEL, VMAP_RAM,
++				NULL, 0, NULL);
+ 		if (IS_ERR(va))
+ 			return NULL;
+ 
+@@ -3018,26 +3034,6 @@ void __init vm_area_register_early(struc
+ 	kasan_populate_early_vm_area_shadow(vm->addr, vm->size);
+ }
+ 
+-static inline void setup_vmalloc_vm_locked(struct vm_struct *vm,
+-	struct vmap_area *va, unsigned long flags, const void *caller)
+-{
+-	vm->flags = flags;
+-	vm->addr = (void *)va->va_start;
+-	vm->size = va->va_end - va->va_start;
+-	vm->caller = caller;
+-	va->vm = vm;
+-}
+-
+-static void setup_vmalloc_vm(struct vm_struct *vm, struct vmap_area *va,
+-			      unsigned long flags, const void *caller)
+-{
+-	struct vmap_node *vn = addr_to_node(va->va_start);
+-
+-	spin_lock(&vn->busy.lock);
+-	setup_vmalloc_vm_locked(vm, va, flags, caller);
+-	spin_unlock(&vn->busy.lock);
+-}
+-
+ static void clear_vm_uninitialized_flag(struct vm_struct *vm)
+ {
+ 	/*
+@@ -3074,14 +3070,12 @@ static struct vm_struct *__get_vm_area_n
+ 	if (!(flags & VM_NO_GUARD))
+ 		size += PAGE_SIZE;
+ 
+-	va = alloc_vmap_area(size, align, start, end, node, gfp_mask, 0);
++	va = alloc_vmap_area(size, align, start, end, node, gfp_mask, 0, area, flags, caller);
+ 	if (IS_ERR(va)) {
+ 		kfree(area);
+ 		return NULL;
+ 	}
+ 
+-	setup_vmalloc_vm(area, va, flags, caller);
+-
+ 	/*
+ 	 * Mark pages for non-VM_ALLOC mappings as accessible. Do it now as a
+ 	 * best-effort approach, as they can be mapped outside of vmalloc code.
+@@ -4656,7 +4650,7 @@ retry:
+ 
+ 		spin_lock(&vn->busy.lock);
+ 		insert_vmap_area(vas[area], &vn->busy.root, &vn->busy.head);
+-		setup_vmalloc_vm_locked(vms[area], vas[area], VM_ALLOC,
++		setup_vmalloc_vm(vms[area], vas[area], VM_ALLOC,
+ 				 pcpu_get_vm_areas);
+ 		spin_unlock(&vn->busy.lock);
+ 	}
+_
