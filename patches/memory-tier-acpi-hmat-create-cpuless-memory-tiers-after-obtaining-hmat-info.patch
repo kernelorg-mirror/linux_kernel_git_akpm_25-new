@@ -1,0 +1,253 @@
+From: "Ho-Ren (Jack) Chuang" <horenchuang@bytedance.com>
+Subject: memory tier: acpi/hmat: create CPUless memory tiers after obtaining HMAT info
+Date: Fri, 1 Mar 2024 08:22:45 +0000
+
+The memory tiering component in the kernel is functionally useless for
+CPUless memory/non-DRAM devices like CXL1.1 type3 memory because the nodes
+are lumped together in the DRAM tier. 
+https://lore.kernel.org/linux-mm/PH0PR08MB7955E9F08CCB64F23963B5C3A860A@PH0PR08MB7955.namprd08.prod.outlook.com/T/
+
+This patchset automatically resolves the issues.  It delays the
+initialization of memory tiers for CPUless NUMA nodes until they obtain
+HMAT information at boot time, eliminating the need for user intervention.
+If no HMAT specified, it falls back to using `default_dram_type`.
+
+Example usecase:
+We have CXL memory on the host, and we create VMs with a new system memory
+device backed by host CXL memory. We inject CXL memory performance attributes
+through QEMU, and the guest now sees memory nodes with performance attributes
+in HMAT. With this change, we enable the guest kernel to construct
+the correct memory tiering for the memory nodes.
+
+* Introduce `mt_init_with_hmat()`
+
+  We defer memory tier initialization for those CPUless NUMA nodes until
+  acquiring HMAT info.  `mt_init_with_hmat()` is introduced to post-create
+  CPUless memory tiers after obtaining HMAT info.  It iterates through
+  each CPUless memory node, creating memory tiers if necessary.  Finally,
+  it calculates demotion tables again at the end.
+
+* Introduce `hmat_find_alloc_memory_type()` Find or allocate a memory
+  type in the `hmat_memory_types` list.
+
+* Make `set_node_memory_tier()` more generic This function can also be
+  used for setting other memory types for a node.  To do so, a new
+  argument is added to specify a memory type.
+
+* Handle cases where there is no HMAT when creating memory tiers If no
+  HMAT is specified, it falls back to using `default_dram_type`.
+
+* Change adist calculation code to use another new lock, mt_perf_lock. 
+  Iterating through CPUlist nodes requires holding the `memory_tier_lock`.
+  However, `mt_calc_adistance()` will end up trying to acquire the same
+  lock, leading to a potential deadlock.  Therefore, we propose
+  introducing a standalone `mt_perf_lock` to protect `default_dram_perf`. 
+  This approach not only avoids deadlock but also prevents holding a large
+  lock simultaneously.
+
+Link: https://lkml.kernel.org/r/20240301082248.3456086-2-horenchuang@bytedance.com
+Signed-off-by: Ho-Ren (Jack) Chuang <horenchuang@bytedance.com>
+Signed-off-by: Hao Xiang <hao.xiang@bytedance.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Gregory Price <gourry.memverge@gmail.com>
+Cc: Huang, Ying <ying.huang@intel.com>
+Cc: Jonathan Cameron <jonathan.cameron@huawei.com>
+Cc: Len Brown <lenb@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rafael J. Wysocki <rafael@kernel.org>
+Cc: Ravi Jonnalagadda <ravis.opensrc@micron.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/acpi/numa/hmat.c     |    3 +
+ include/linux/memory-tiers.h |    6 ++
+ mm/memory-tiers.c            |   76 +++++++++++++++++++++++++++++----
+ 3 files changed, 77 insertions(+), 8 deletions(-)
+
+--- a/drivers/acpi/numa/hmat.c~memory-tier-acpi-hmat-create-cpuless-memory-tiers-after-obtaining-hmat-info
++++ a/drivers/acpi/numa/hmat.c
+@@ -1083,6 +1083,9 @@ static __init int hmat_init(void)
+ 	if (!hmat_set_default_dram_perf())
+ 		register_mt_adistance_algorithm(&hmat_adist_nb);
+ 
++	/* Post-create CPUless memory tiers after getting HMAT info */
++	mt_init_with_hmat();
++
+ 	return 0;
+ out_put:
+ 	hmat_free_structures();
+--- a/include/linux/memory-tiers.h~memory-tier-acpi-hmat-create-cpuless-memory-tiers-after-obtaining-hmat-info
++++ a/include/linux/memory-tiers.h
+@@ -48,6 +48,7 @@ int mt_calc_adistance(int node, int *adi
+ int mt_set_default_dram_perf(int nid, struct access_coordinate *perf,
+ 			     const char *source);
+ int mt_perf_to_adistance(struct access_coordinate *perf, int *adist);
++void mt_init_with_hmat(void);
+ #ifdef CONFIG_MIGRATION
+ int next_demotion_node(int node);
+ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
+@@ -136,5 +137,10 @@ static inline int mt_perf_to_adistance(s
+ {
+ 	return -EIO;
+ }
++
++static inline void mt_init_with_hmat(void)
++{
++
++}
+ #endif	/* CONFIG_NUMA */
+ #endif  /* _LINUX_MEMORY_TIERS_H */
+--- a/mm/memory-tiers.c~memory-tier-acpi-hmat-create-cpuless-memory-tiers-after-obtaining-hmat-info
++++ a/mm/memory-tiers.c
+@@ -35,7 +35,9 @@ struct node_memory_type_map {
+ };
+ 
+ static DEFINE_MUTEX(memory_tier_lock);
++static DEFINE_MUTEX(mt_perf_lock);
+ static LIST_HEAD(memory_tiers);
++static LIST_HEAD(hmat_memory_types);
+ static struct node_memory_type_map node_memory_types[MAX_NUMNODES];
+ struct memory_dev_type *default_dram_type;
+ 
+@@ -502,7 +504,7 @@ static inline void __init_node_memory_ty
+ 	}
+ }
+ 
+-static struct memory_tier *set_node_memory_tier(int node)
++static struct memory_tier *set_node_memory_tier(int node, struct memory_dev_type *new_memtype)
+ {
+ 	struct memory_tier *memtier;
+ 	struct memory_dev_type *memtype;
+@@ -514,7 +516,7 @@ static struct memory_tier *set_node_memo
+ 	if (!node_state(node, N_MEMORY))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	__init_node_memory_type(node, default_dram_type);
++	__init_node_memory_type(node, new_memtype);
+ 
+ 	memtype = node_memory_types[node].memtype;
+ 	node_set(node, memtype->nodes);
+@@ -623,6 +625,56 @@ void clear_node_memory_type(int node, st
+ }
+ EXPORT_SYMBOL_GPL(clear_node_memory_type);
+ 
++static struct memory_dev_type *hmat_find_alloc_memory_type(int adist)
++{
++	bool found = false;
++	struct memory_dev_type *mtype;
++
++	list_for_each_entry(mtype, &hmat_memory_types, list) {
++		if (mtype->adistance == adist) {
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		mtype = alloc_memory_type(adist);
++		if (!IS_ERR(mtype))
++			list_add(&mtype->list, &hmat_memory_types);
++	}
++	return mtype;
++}
++
++static void mt_create_with_hmat(int node)
++{
++	struct memory_dev_type *mtype = NULL;
++	int adist = MEMTIER_ADISTANCE_DRAM;
++
++	mt_calc_adistance(node, &adist);
++	if (adist != MEMTIER_ADISTANCE_DRAM) {
++		mtype = hmat_find_alloc_memory_type(adist);
++		if (IS_ERR(mtype))
++			pr_err("%s() failed to allocate a tier\n", __func__);
++	} else {
++		mtype = default_dram_type;
++	}
++
++	set_node_memory_tier(node, mtype);
++}
++
++void mt_init_with_hmat(void)
++{
++	int nid;
++
++	mutex_lock(&memory_tier_lock);
++	for_each_node_state(nid, N_MEMORY)
++		if (!node_state(nid, N_CPU))
++			mt_create_with_hmat(nid);
++
++	establish_demotion_targets();
++	mutex_unlock(&memory_tier_lock);
++}
++EXPORT_SYMBOL_GPL(mt_init_with_hmat);
++
+ static void dump_hmem_attrs(struct access_coordinate *coord, const char *prefix)
+ {
+ 	pr_info(
+@@ -636,7 +688,7 @@ int mt_set_default_dram_perf(int nid, st
+ {
+ 	int rc = 0;
+ 
+-	mutex_lock(&memory_tier_lock);
++	mutex_lock(&mt_perf_lock);
+ 	if (default_dram_perf_error) {
+ 		rc = -EIO;
+ 		goto out;
+@@ -684,7 +736,7 @@ int mt_set_default_dram_perf(int nid, st
+ 	}
+ 
+ out:
+-	mutex_unlock(&memory_tier_lock);
++	mutex_unlock(&mt_perf_lock);
+ 	return rc;
+ }
+ 
+@@ -700,7 +752,7 @@ int mt_perf_to_adistance(struct access_c
+ 	    perf->read_bandwidth + perf->write_bandwidth == 0)
+ 		return -EINVAL;
+ 
+-	mutex_lock(&memory_tier_lock);
++	mutex_lock(&mt_perf_lock);
+ 	/*
+ 	 * The abstract distance of a memory node is in direct proportion to
+ 	 * its memory latency (read + write) and inversely proportional to its
+@@ -713,7 +765,7 @@ int mt_perf_to_adistance(struct access_c
+ 		(default_dram_perf.read_latency + default_dram_perf.write_latency) *
+ 		(default_dram_perf.read_bandwidth + default_dram_perf.write_bandwidth) /
+ 		(perf->read_bandwidth + perf->write_bandwidth);
+-	mutex_unlock(&memory_tier_lock);
++	mutex_unlock(&mt_perf_lock);
+ 
+ 	return 0;
+ }
+@@ -797,7 +849,7 @@ static int __meminit memtier_hotplug_cal
+ 		break;
+ 	case MEM_ONLINE:
+ 		mutex_lock(&memory_tier_lock);
+-		memtier = set_node_memory_tier(arg->status_change_nid);
++		memtier = set_node_memory_tier(arg->status_change_nid, default_dram_type);
+ 		if (!IS_ERR(memtier))
+ 			establish_demotion_targets();
+ 		mutex_unlock(&memory_tier_lock);
+@@ -836,7 +888,15 @@ static int __init memory_tier_init(void)
+ 	 * types assigned.
+ 	 */
+ 	for_each_node_state(node, N_MEMORY) {
+-		memtier = set_node_memory_tier(node);
++		if (!node_state(node, N_CPU))
++			/*
++			 * Defer memory tier initialization on CPUless numa nodes.
++			 * These will be initialized when HMAT information is
++			 * available.
++			 */
++			continue;
++
++		memtier = set_node_memory_tier(node, default_dram_type);
+ 		if (IS_ERR(memtier))
+ 			/*
+ 			 * Continue with memtiers we are able to setup
+_

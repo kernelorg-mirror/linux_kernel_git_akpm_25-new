@@ -1,0 +1,204 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: convert folio_estimated_sharers() to folio_likely_mapped_shared()
+Date: Tue, 27 Feb 2024 21:15:48 +0100
+
+Callers of folio_estimated_sharers() only care about "mapped shared vs. 
+mapped exclusively", not the exact estimate of sharers.  Let's consolidate
+and unify the condition users are checking.  While at it clarify the
+semantics and extend the discussion on the fuzziness.
+
+Use the "likely mapped shared" terminology to better express what the
+(adjusted) function actually checks.
+
+Whether a partially-mappable folio is more likely to not be partially
+mapped than partially mapped is debatable.  In the future, we might be
+able to improve our estimate for partially-mappable folios, though.
+
+Note that we will now consistently detect "mapped shared" only if the
+first subpage is actually mapped multiple times.  When the first subpage
+is not mapped, we will consistently detect it as "mapped exclusively". 
+This change should currently only affect the usage in
+madvise_free_pte_range() and queue_folios_pte_range() for large folios: if
+the first page was already unmapped, we would have skipped the folio.
+
+Link: https://lkml.kernel.org/r/20240227201548.857831-1-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com>
+Acked-by: Barry Song <v-songbaohua@oppo.com>
+Reviewed-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h |   46 +++++++++++++++++++++++++++++++++----------
+ mm/huge_memory.c   |    2 -
+ mm/madvise.c       |    6 ++---
+ mm/memory.c        |    2 -
+ mm/mempolicy.c     |   14 +++++--------
+ mm/migrate.c       |    8 +++----
+ 6 files changed, 51 insertions(+), 27 deletions(-)
+
+--- a/include/linux/mm.h~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/include/linux/mm.h
+@@ -2165,21 +2165,47 @@ static inline size_t folio_size(struct f
+ }
+ 
+ /**
+- * folio_estimated_sharers - Estimate the number of sharers of a folio.
++ * folio_likely_mapped_shared - Estimate if the folio is mapped into the page
++ *				tables of more than one MM
+  * @folio: The folio.
+  *
+- * folio_estimated_sharers() aims to serve as a function to efficiently
+- * estimate the number of processes sharing a folio. This is done by
+- * looking at the precise mapcount of the first subpage in the folio, and
+- * assuming the other subpages are the same. This may not be true for large
+- * folios. If you want exact mapcounts for exact calculations, look at
+- * page_mapcount() or folio_total_mapcount().
++ * This function checks if the folio is currently mapped into more than one
++ * MM ("mapped shared"), or if the folio is only mapped into a single MM
++ * ("mapped exclusively").
+  *
+- * Return: The estimated number of processes sharing a folio.
++ * As precise information is not easily available for all folios, this function
++ * estimates the number of MMs ("sharers") that are currently mapping a folio
++ * using the number of times the first page of the folio is currently mapped
++ * into page tables.
++ *
++ * For small anonymous folios (except KSM folios) and anonymous hugetlb folios,
++ * the return value will be exactly correct, because they can only be mapped
++ * at most once into an MM, and they cannot be partially mapped.
++ *
++ * For other folios, the result can be fuzzy:
++ * (a) For partially-mappable large folios (THP), the return value can wrongly
++ *     indicate "mapped exclusively" (false negative) when the folio is
++ *     only partially mapped into at least one MM.
++ * (b) For pagecache folios (including hugetlb), the return value can wrongly
++ *     indicate "mapped shared" (false positive) when two VMAs in the same MM
++ *     cover the same file range.
++ * (c) For (small) KSM folios, the return value can wrongly indicate "mapped
++ *     shared" (false negative), when the folio is mapped multiple times into
++ *     the same MM.
++ *
++ * Further, this function only considers current page table mappings that
++ * are tracked using the folio mapcount(s). It does not consider:
++ * (1) If the folio might get mapped in the (near) future (e.g., swapcache,
++ *     pagecache, temporary unmapping for migration).
++ * (2) If the folio is mapped differently (VM_PFNMAP).
++ * (3) If hugetlb page table sharing applies. Callers might want to check
++ *     hugetlb_pmd_shared().
++ *
++ * Return: Whether the folio is estimated to be mapped into more than one MM.
+  */
+-static inline int folio_estimated_sharers(struct folio *folio)
++static inline bool folio_likely_mapped_shared(struct folio *folio)
+ {
+-	return page_mapcount(folio_page(folio, 0));
++	return page_mapcount(folio_page(folio, 0)) > 1;
+ }
+ 
+ #ifndef HAVE_ARCH_MAKE_PAGE_ACCESSIBLE
+--- a/mm/huge_memory.c~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/mm/huge_memory.c
+@@ -1696,7 +1696,7 @@ bool madvise_free_huge_pmd(struct mmu_ga
+ 	 * If other processes are mapping this folio, we couldn't discard
+ 	 * the folio unless they all do MADV_FREE so let's skip the folio.
+ 	 */
+-	if (folio_estimated_sharers(folio) != 1)
++	if (folio_likely_mapped_shared(folio))
+ 		goto out;
+ 
+ 	if (!folio_trylock(folio))
+--- a/mm/madvise.c~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/mm/madvise.c
+@@ -366,7 +366,7 @@ static int madvise_cold_or_pageout_pte_r
+ 		folio = pfn_folio(pmd_pfn(orig_pmd));
+ 
+ 		/* Do not interfere with other mappings of this folio */
+-		if (folio_estimated_sharers(folio) != 1)
++		if (folio_likely_mapped_shared(folio))
+ 			goto huge_unlock;
+ 
+ 		if (pageout_anon_only_filter && !folio_test_anon(folio))
+@@ -453,7 +453,7 @@ restart:
+ 		if (folio_test_large(folio)) {
+ 			int err;
+ 
+-			if (folio_estimated_sharers(folio) > 1)
++			if (folio_likely_mapped_shared(folio))
+ 				break;
+ 			if (pageout_anon_only_filter && !folio_test_anon(folio))
+ 				break;
+@@ -677,7 +677,7 @@ static int madvise_free_pte_range(pmd_t
+ 		if (folio_test_large(folio)) {
+ 			int err;
+ 
+-			if (folio_estimated_sharers(folio) != 1)
++			if (folio_likely_mapped_shared(folio))
+ 				break;
+ 			if (!folio_trylock(folio))
+ 				break;
+--- a/mm/memory.c~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/mm/memory.c
+@@ -5112,7 +5112,7 @@ static vm_fault_t do_numa_page(struct vm
+ 	 * Flag if the folio is shared between multiple address spaces. This
+ 	 * is later used when determining whether to group tasks together
+ 	 */
+-	if (folio_estimated_sharers(folio) > 1 && (vma->vm_flags & VM_SHARED))
++	if (folio_likely_mapped_shared(folio) && (vma->vm_flags & VM_SHARED))
+ 		flags |= TNF_SHARED;
+ 
+ 	nid = folio_nid(folio);
+--- a/mm/mempolicy.c~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/mm/mempolicy.c
+@@ -642,12 +642,11 @@ static int queue_folios_hugetlb(pte_t *p
+ 	 * Unless MPOL_MF_MOVE_ALL, we try to avoid migrating a shared folio.
+ 	 * Choosing not to migrate a shared folio is not counted as a failure.
+ 	 *
+-	 * To check if the folio is shared, ideally we want to make sure
+-	 * every page is mapped to the same process. Doing that is very
+-	 * expensive, so check the estimated sharers of the folio instead.
++	 * See folio_likely_mapped_shared() on possible imprecision when we
++	 * cannot easily detect if a folio is shared.
+ 	 */
+ 	if ((flags & MPOL_MF_MOVE_ALL) ||
+-	    (folio_estimated_sharers(folio) == 1 && !hugetlb_pmd_shared(pte)))
++	    (!folio_likely_mapped_shared(folio) && !hugetlb_pmd_shared(pte)))
+ 		if (!isolate_hugetlb(folio, qp->pagelist))
+ 			qp->nr_failed++;
+ unlock:
+@@ -1032,11 +1031,10 @@ static bool migrate_folio_add(struct fol
+ 	 * Unless MPOL_MF_MOVE_ALL, we try to avoid migrating a shared folio.
+ 	 * Choosing not to migrate a shared folio is not counted as a failure.
+ 	 *
+-	 * To check if the folio is shared, ideally we want to make sure
+-	 * every page is mapped to the same process. Doing that is very
+-	 * expensive, so check the estimated sharers of the folio instead.
++	 * See folio_likely_mapped_shared() on possible imprecision when we
++	 * cannot easily detect if a folio is shared.
+ 	 */
+-	if ((flags & MPOL_MF_MOVE_ALL) || folio_estimated_sharers(folio) == 1) {
++	if ((flags & MPOL_MF_MOVE_ALL) || !folio_likely_mapped_shared(folio)) {
+ 		if (folio_isolate_lru(folio)) {
+ 			list_add_tail(&folio->lru, foliolist);
+ 			node_stat_mod_folio(folio,
+--- a/mm/migrate.c~mm-convert-folio_estimated_sharers-to-folio_likely_mapped_shared
++++ a/mm/migrate.c
+@@ -2593,11 +2593,11 @@ int migrate_misplaced_folio(struct folio
+ 	/*
+ 	 * Don't migrate file folios that are mapped in multiple processes
+ 	 * with execute permissions as they are probably shared libraries.
+-	 * To check if the folio is shared, ideally we want to make sure
+-	 * every page is mapped to the same process. Doing that is very
+-	 * expensive, so check the estimated mapcount of the folio instead.
++	 *
++	 * See folio_likely_mapped_shared() on possible imprecision when we
++	 * cannot easily detect if a folio is shared.
+ 	 */
+-	if (folio_estimated_sharers(folio) != 1 && folio_is_file_lru(folio) &&
++	if (folio_likely_mapped_shared(folio) && folio_is_file_lru(folio) &&
+ 	    (vma->vm_flags & VM_EXEC))
+ 		goto out;
+ 
+_
