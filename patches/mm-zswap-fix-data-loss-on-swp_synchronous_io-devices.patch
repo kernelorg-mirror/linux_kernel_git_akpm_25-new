@@ -1,0 +1,80 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: zswap: fix data loss on SWP_SYNCHRONOUS_IO devices
+Date: Sun, 24 Mar 2024 17:04:47 -0400
+
+Zhongkun He reports data corruption when combining zswap with zram.
+
+The issue is the exclusive loads we're doing in zswap. They assume
+that all reads are going into the swapcache, which can assume
+authoritative ownership of the data and so the zswap copy can go.
+
+However, zram files are marked SWP_SYNCHRONOUS_IO, and faults will try to
+bypass the swapcache.  This results in an optimistic read of the swap data
+into a page that will be dismissed if the fault fails due to races.  In
+this case, zswap mustn't drop its authoritative copy.
+
+Link: https://lore.kernel.org/all/CACSyD1N+dUvsu8=zV9P691B9bVq33erwOXNTmEaUbi9DrDeJzw@mail.gmail.com/
+Fixes: b9c91c43412f ("mm: zswap: support exclusive loads")
+Link: https://lkml.kernel.org/r/20240324210447.956973-1-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: Zhongkun He <hezhongkun.hzk@bytedance.com>
+Tested-by: Zhongkun He <hezhongkun.hzk@bytedance.com>
+Acked-by: Yosry Ahmed <yosryahmed@google.com>
+Acked-by: Barry Song <baohua@kernel.org>
+Reviewed-by: Chengming Zhou <chengming.zhou@linux.dev>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: <stable@vger.kernel.org>	[6.5+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   23 +++++++++++++++++++----
+ 1 file changed, 19 insertions(+), 4 deletions(-)
+
+--- a/mm/zswap.c~mm-zswap-fix-data-loss-on-swp_synchronous_io-devices
++++ a/mm/zswap.c
+@@ -1636,6 +1636,7 @@ bool zswap_load(struct folio *folio)
+ 	swp_entry_t swp = folio->swap;
+ 	pgoff_t offset = swp_offset(swp);
+ 	struct page *page = &folio->page;
++	bool swapcache = folio_test_swapcache(folio);
+ 	struct zswap_tree *tree = swap_zswap_tree(swp);
+ 	struct zswap_entry *entry;
+ 	u8 *dst;
+@@ -1648,7 +1649,20 @@ bool zswap_load(struct folio *folio)
+ 		spin_unlock(&tree->lock);
+ 		return false;
+ 	}
+-	zswap_rb_erase(&tree->rbroot, entry);
++	/*
++	 * When reading into the swapcache, invalidate our entry. The
++	 * swapcache can be the authoritative owner of the page and
++	 * its mappings, and the pressure that results from having two
++	 * in-memory copies outweighs any benefits of caching the
++	 * compression work.
++	 *
++	 * (Most swapins go through the swapcache. The notable
++	 * exception is the singleton fault on SWP_SYNCHRONOUS_IO
++	 * files, which reads into a private page and may free it if
++	 * the fault fails. We remain the primary owner of the entry.)
++	 */
++	if (swapcache)
++		zswap_rb_erase(&tree->rbroot, entry);
+ 	spin_unlock(&tree->lock);
+ 
+ 	if (entry->length)
+@@ -1663,9 +1677,10 @@ bool zswap_load(struct folio *folio)
+ 	if (entry->objcg)
+ 		count_objcg_event(entry->objcg, ZSWPIN);
+ 
+-	zswap_entry_free(entry);
+-
+-	folio_mark_dirty(folio);
++	if (swapcache) {
++		zswap_entry_free(entry);
++		folio_mark_dirty(folio);
++	}
+ 
+ 	return true;
+ }
+_
