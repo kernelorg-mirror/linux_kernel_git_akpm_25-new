@@ -1,0 +1,85 @@
+From: Kemeng Shi <shikemeng@huaweicloud.com>
+Subject: writeback: protect race between bdi release and bdi_debug_stats_show
+Date: Wed, 27 Mar 2024 23:57:46 +0800
+
+There is a race between bdi release and bdi_debug_stats_show:
+/* get debug info */		/* bdi release */
+bdi_debug_stats_show
+  bdi = m->private;
+  wb = &bdi->wb;
+				bdi_unregister
+				bdi_put
+				  release_bdi
+				    kfree(bdi)
+  /* use after free */
+  spin_lock(&wb->list_lock);
+
+Search bdi on bdi_list under rcu lock in bdi_debug_stats_show to ensure
+the bdi is not freed to fix the issue.
+
+Link: https://lkml.kernel.org/r/20240327155751.3536-2-shikemeng@huaweicloud.com
+Signed-off-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/backing-dev.c |   33 +++++++++++++++++++++++++++++++--
+ 1 file changed, 31 insertions(+), 2 deletions(-)
+
+--- a/mm/backing-dev.c~writeback-protect-race-between-bdi-release-and-bdi_debug_stats_show
++++ a/mm/backing-dev.c
+@@ -46,16 +46,44 @@ static void bdi_debug_init(void)
+ 	bdi_debug_root = debugfs_create_dir("bdi", NULL);
+ }
+ 
+-static int bdi_debug_stats_show(struct seq_file *m, void *v)
++static struct backing_dev_info *lookup_bdi(struct seq_file *m)
+ {
++	const struct file *file = m->file;
+ 	struct backing_dev_info *bdi = m->private;
+-	struct bdi_writeback *wb = &bdi->wb;
++	struct backing_dev_info *exist;
++
++	list_for_each_entry_rcu(exist, &bdi_list, bdi_list) {
++		if (exist != bdi)
++			continue;
++
++		if (exist->debug_dir == file->f_path.dentry->d_parent)
++			return bdi;
++		else
++			return NULL;
++	}
++
++	return NULL;
++}
++
++
++static int bdi_debug_stats_show(struct seq_file *m, void *v)
++{
++	struct backing_dev_info *bdi;
++	struct bdi_writeback *wb;
+ 	unsigned long background_thresh;
+ 	unsigned long dirty_thresh;
+ 	unsigned long wb_thresh;
+ 	unsigned long nr_dirty, nr_io, nr_more_io, nr_dirty_time;
+ 	struct inode *inode;
+ 
++	rcu_read_lock();
++	bdi = lookup_bdi(m);
++	if (!bdi) {
++		rcu_read_unlock();
++		return -EEXIST;
++	}
++
++	wb = &bdi->wb;
+ 	nr_dirty = nr_io = nr_more_io = nr_dirty_time = 0;
+ 	spin_lock(&wb->list_lock);
+ 	list_for_each_entry(inode, &wb->b_dirty, i_io_list)
+@@ -101,6 +129,7 @@ static int bdi_debug_stats_show(struct s
+ 		   nr_dirty_time,
+ 		   !list_empty(&bdi->bdi_list), bdi->wb.state);
+ 
++	rcu_read_unlock();
+ 	return 0;
+ }
+ DEFINE_SHOW_ATTRIBUTE(bdi_debug_stats);
+_
