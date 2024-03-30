@@ -1,0 +1,111 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: add max_pages param to recompression
+Date: Fri, 29 Mar 2024 18:39:41 +0900
+
+Introduce "max_pages" param to recompress device attribute which sets an
+upper limit on the number of entries (pages) zram attempts to recompress
+(in this particular recompression call).  S/W recompression can be quite
+expensive so limiting the number of pages recompress touches can be quite
+helpful.
+
+Link: https://lkml.kernel.org/r/20240329094050.2815699-1-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/blockdev/zram.rst |    5 ++
+ drivers/block/zram/zram_drv.c               |   31 ++++++++++++++++--
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+--- a/Documentation/admin-guide/blockdev/zram.rst~zram-add-max_pages-param-to-recompression
++++ a/Documentation/admin-guide/blockdev/zram.rst
+@@ -466,6 +466,11 @@ of equal or greater size:::
+ 	#recompress idle pages larger than 2000 bytes
+ 	echo "type=idle threshold=2000" > /sys/block/zramX/recompress
+ 
++It is also possible to limit the number of pages zram re-compression will
++attempt to recompress:::
++
++	echo "type=huge_idle max_pages=42" > /sys/block/zramX/recompress
++
+ Recompression of idle pages requires memory tracking.
+ 
+ During re-compression for every page, that matches re-compression criteria,
+--- a/drivers/block/zram/zram_drv.c~zram-add-max_pages-param-to-recompression
++++ a/drivers/block/zram/zram_drv.c
+@@ -1568,7 +1568,8 @@ static int zram_bvec_write(struct zram *
+  * Corresponding ZRAM slot should be locked.
+  */
+ static int zram_recompress(struct zram *zram, u32 index, struct page *page,
+-			   u32 threshold, u32 prio, u32 prio_max)
++			   u64 *num_recomp_pages, u32 threshold, u32 prio,
++			   u32 prio_max)
+ {
+ 	struct zcomp_strm *zstrm = NULL;
+ 	unsigned long handle_old;
+@@ -1645,6 +1646,15 @@ static int zram_recompress(struct zram *
+ 	if (!zstrm)
+ 		return 0;
+ 
++	/*
++	 * Decrement the limit (if set) on pages we can recompress, even
++	 * when current recompression was unsuccessful or did not compress
++	 * the page below the threshold, because we still spent resources
++	 * on it.
++	 */
++	if (*num_recomp_pages)
++		*num_recomp_pages -= 1;
++
+ 	if (class_index_new >= class_index_old) {
+ 		/*
+ 		 * Secondary algorithms failed to re-compress the page
+@@ -1710,6 +1720,7 @@ static ssize_t recompress_store(struct d
+ 	struct zram *zram = dev_to_zram(dev);
+ 	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
+ 	char *args, *param, *val, *algo = NULL;
++	u64 num_recomp_pages = ULLONG_MAX;
+ 	u32 mode = 0, threshold = 0;
+ 	unsigned long index;
+ 	struct page *page;
+@@ -1732,6 +1743,17 @@ static ssize_t recompress_store(struct d
+ 			continue;
+ 		}
+ 
++		if (!strcmp(param, "max_pages")) {
++			/*
++			 * Limit the number of entries (pages) we attempt to
++			 * recompress.
++			 */
++			ret = kstrtoull(val, 10, &num_recomp_pages);
++			if (ret)
++				return ret;
++			continue;
++		}
++
+ 		if (!strcmp(param, "threshold")) {
+ 			/*
+ 			 * We will re-compress only idle objects equal or
+@@ -1788,6 +1810,9 @@ static ssize_t recompress_store(struct d
+ 	for (index = 0; index < nr_pages; index++) {
+ 		int err = 0;
+ 
++		if (!num_recomp_pages)
++			break;
++
+ 		zram_slot_lock(zram, index);
+ 
+ 		if (!zram_allocated(zram, index))
+@@ -1807,8 +1832,8 @@ static ssize_t recompress_store(struct d
+ 		    zram_test_flag(zram, index, ZRAM_INCOMPRESSIBLE))
+ 			goto next;
+ 
+-		err = zram_recompress(zram, index, page, threshold,
+-				      prio, prio_max);
++		err = zram_recompress(zram, index, page, &num_recomp_pages,
++				      threshold, prio, prio_max);
+ next:
+ 		zram_slot_unlock(zram, index);
+ 		if (err) {
+_
