@@ -1,0 +1,101 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: x86: mm: accelerate pagefault when badaccess
+Date: Wed, 3 Apr 2024 16:38:05 +0800
+
+The access_error() of vma is already checked under per-VMA lock, if it is
+a bad access, directly handle error, no need to retry with mmap_lock
+again.  In order to release the correct lock, pass the mm_struct into
+bad_area_access_error().  If mm is NULL, release vma lock, or release
+mmap_lock.  Since the page faut is handled under per-VMA lock, count it as
+a vma lock event with VMA_LOCK_SUCCESS.
+
+Link: https://lkml.kernel.org/r/20240403083805.1818160-8-wangkefeng.wang@huawei.com
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Albert Ou <aou@eecs.berkeley.edu>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/mm/fault.c |   23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+--- a/arch/x86/mm/fault.c~x86-mm-accelerate-pagefault-when-badaccess
++++ a/arch/x86/mm/fault.c
+@@ -866,14 +866,17 @@ bad_area_nosemaphore(struct pt_regs *reg
+ 
+ static void
+ __bad_area(struct pt_regs *regs, unsigned long error_code,
+-	   unsigned long address, u32 pkey, int si_code)
++	   unsigned long address, struct mm_struct *mm,
++	   struct vm_area_struct *vma, u32 pkey, int si_code)
+ {
+-	struct mm_struct *mm = current->mm;
+ 	/*
+ 	 * Something tried to access memory that isn't in our memory map..
+ 	 * Fix it, but check if it's kernel or user first..
+ 	 */
+-	mmap_read_unlock(mm);
++	if (mm)
++		mmap_read_unlock(mm);
++	else
++		vma_end_read(vma);
+ 
+ 	__bad_area_nosemaphore(regs, error_code, address, pkey, si_code);
+ }
+@@ -897,7 +900,8 @@ static inline bool bad_area_access_from_
+ 
+ static noinline void
+ bad_area_access_error(struct pt_regs *regs, unsigned long error_code,
+-		      unsigned long address, struct vm_area_struct *vma)
++		      unsigned long address, struct mm_struct *mm,
++		      struct vm_area_struct *vma)
+ {
+ 	/*
+ 	 * This OSPKE check is not strictly necessary at runtime.
+@@ -927,9 +931,9 @@ bad_area_access_error(struct pt_regs *re
+ 		 */
+ 		u32 pkey = vma_pkey(vma);
+ 
+-		__bad_area(regs, error_code, address, pkey, SEGV_PKUERR);
++		__bad_area(regs, error_code, address, mm, vma, pkey, SEGV_PKUERR);
+ 	} else {
+-		__bad_area(regs, error_code, address, 0, SEGV_ACCERR);
++		__bad_area(regs, error_code, address, mm, vma, 0, SEGV_ACCERR);
+ 	}
+ }
+ 
+@@ -1357,8 +1361,9 @@ void do_user_addr_fault(struct pt_regs *
+ 		goto lock_mmap;
+ 
+ 	if (unlikely(access_error(error_code, vma))) {
+-		vma_end_read(vma);
+-		goto lock_mmap;
++		bad_area_access_error(regs, error_code, address, NULL, vma);
++		count_vm_vma_lock_event(VMA_LOCK_SUCCESS);
++		return;
+ 	}
+ 	fault = handle_mm_fault(vma, address, flags | FAULT_FLAG_VMA_LOCK, regs);
+ 	if (!(fault & (VM_FAULT_RETRY | VM_FAULT_COMPLETED)))
+@@ -1394,7 +1399,7 @@ retry:
+ 	 * we can handle it..
+ 	 */
+ 	if (unlikely(access_error(error_code, vma))) {
+-		bad_area_access_error(regs, error_code, address, vma);
++		bad_area_access_error(regs, error_code, address, mm, vma);
+ 		return;
+ 	}
+ 
+_
