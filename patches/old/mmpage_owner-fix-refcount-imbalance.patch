@@ -1,6 +1,6 @@
 From: Oscar Salvador <osalvador@suse.de>
 Subject: mm,page_owner: fix refcount imbalance
-Date: Tue, 19 Mar 2024 19:32:11 +0100
+Date: Tue, 26 Mar 2024 07:30:35 +0100
 
 Current code does not contemplate scenarios were an allocation and free
 operation on the same pages do not handle it in the same amount at once.
@@ -16,24 +16,23 @@ imbalance.
 
 Fix this by recording the number of base pages in the refcount field.
 
-Link: https://lkml.kernel.org/r/20240319183212.17156-2-osalvador@suse.de
+Link: https://lkml.kernel.org/r/20240326063036.6242-3-osalvador@suse.de
 Fixes: 217b2119b9e2 ("mm,page_owner: implement the tracking of the stacks count")
 Signed-off-by: Oscar Salvador <osalvador@suse.de>
 Reported-by: syzbot+41bbfdb8d41003d12c0f@syzkaller.appspotmail.com
 Closes: https://lore.kernel.org/linux-mm/00000000000090e8ff0613eda0e5@google.com
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Tested-by: Alexandre Ghiti <alexghiti@rivosinc.com>
 Cc: Alexander Potapenko <glider@google.com>
 Cc: Andrey Konovalov <andreyknvl@gmail.com>
 Cc: Marco Elver <elver@google.com>
 Cc: Michal Hocko <mhocko@suse.com>
-Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Matthew Wilcox <willy@infradead.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/mm/page_owner.rst |   73 +++++++++++++++---------------
- mm/page_owner.c                 |   38 +++++++--------
- 2 files changed, 56 insertions(+), 55 deletions(-)
+ mm/page_owner.c                 |   34 ++++++++-----
+ 2 files changed, 58 insertions(+), 49 deletions(-)
 
 --- a/Documentation/mm/page_owner.rst~mmpage_owner-fix-refcount-imbalance
 +++ a/Documentation/mm/page_owner.rst
@@ -131,7 +130,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	cat /sys/kernel/debug/page_owner > page_owner_full.txt
 --- a/mm/page_owner.c~mmpage_owner-fix-refcount-imbalance
 +++ a/mm/page_owner.c
-@@ -196,9 +196,11 @@ static void add_stack_record_to_list(str
+@@ -196,7 +196,8 @@ static void add_stack_record_to_list(str
  	spin_unlock_irqrestore(&stack_list_lock, flags);
  }
  
@@ -140,24 +139,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				   int nr_base_pages)
  {
  	struct stack_record *stack_record = __stack_depot_get_stack_record(handle);
-+	int old = REFCOUNT_SATURATED;
  
- 	if (!stack_record)
- 		return;
-@@ -210,22 +212,18 @@ static void inc_stack_record_count(depot
- 	 * Since we do not use STACK_DEPOT_FLAG_GET API, let us
- 	 * set a refcount of 1 ourselves.
- 	 */
--	if (refcount_read(&stack_record->count) == REFCOUNT_SATURATED) {
--		int old = REFCOUNT_SATURATED;
--
--		if (atomic_try_cmpxchg_relaxed(&stack_record->count.refs, &old, 1))
--			/* Add the new stack_record to our list */
--			add_stack_record_to_list(stack_record, gfp_mask);
--	}
+@@ -217,15 +218,20 @@ static void inc_stack_record_count(depot
+ 			/* Add the new stack_record to our list */
+ 			add_stack_record_to_list(stack_record, gfp_mask);
+ 	}
 -	refcount_inc(&stack_record->count);
-+	if (atomic_try_cmpxchg_relaxed(&stack_record->count.refs, &old, 1))
-+		add_stack_record_to_list(stack_record, gfp_mask);
 +	refcount_add(nr_base_pages, &stack_record->count);
  }
  
@@ -167,13 +154,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct stack_record *stack_record = __stack_depot_get_stack_record(handle);
  
- 	if (stack_record)
+-	if (stack_record)
 -		refcount_dec(&stack_record->count);
-+		refcount_sub_and_test(nr_base_pages, &stack_record->count);
++	if (!stack_record)
++		return;
++
++	if (refcount_sub_and_test(nr_base_pages, &stack_record->count))
++		pr_warn("%s: refcount went to 0 for %u handle\n", __func__,
++			handle);
  }
  
- void __reset_page_owner(struct page *page, unsigned short order)
-@@ -263,7 +261,7 @@ void __reset_page_owner(struct page *pag
+ static inline void __update_page_owner_handle(struct page_ext *page_ext,
+@@ -306,7 +312,7 @@ void __reset_page_owner(struct page *pag
  		 * the machinery is not ready yet, we cannot decrement
  		 * their refcount either.
  		 */
@@ -181,17 +173,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		dec_stack_record_count(alloc_handle, 1 << order);
  }
  
- static inline void __set_page_owner_handle(struct page_ext *page_ext,
-@@ -305,7 +303,7 @@ noinline void __set_page_owner(struct pa
- 		return;
- 	__set_page_owner_handle(page_ext, handle, order, gfp_mask);
+ noinline void __set_page_owner(struct page *page, unsigned short order,
+@@ -325,7 +331,7 @@ noinline void __set_page_owner(struct pa
+ 				   current->pid, current->tgid, ts_nsec,
+ 				   current->comm);
  	page_ext_put(page_ext);
 -	inc_stack_record_count(handle, gfp_mask);
 +	inc_stack_record_count(handle, gfp_mask, 1 << order);
  }
  
  void __set_page_owner_migrate_reason(struct page *page, int reason)
-@@ -861,11 +859,11 @@ static void *stack_next(struct seq_file
+@@ -872,11 +878,11 @@ static void *stack_next(struct seq_file
  	return stack;
  }
  
@@ -205,7 +197,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct stack *stack = v;
  	unsigned long *entries;
  	unsigned long nr_entries;
-@@ -876,14 +874,14 @@ static int stack_print(struct seq_file *
+@@ -887,14 +893,14 @@ static int stack_print(struct seq_file *
  
  	nr_entries = stack_record->size;
  	entries = stack_record->entries;
@@ -223,7 +215,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return 0;
  }
-@@ -913,13 +911,13 @@ static const struct file_operations page
+@@ -924,13 +930,13 @@ static const struct file_operations page
  
  static int page_owner_threshold_get(void *data, u64 *val)
  {
