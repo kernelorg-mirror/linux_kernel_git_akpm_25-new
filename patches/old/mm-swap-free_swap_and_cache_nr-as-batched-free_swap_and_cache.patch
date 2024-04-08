@@ -1,6 +1,6 @@
 From: Ryan Roberts <ryan.roberts@arm.com>
 Subject: mm: swap: free_swap_and_cache_nr() as batched free_swap_and_cache()
-Date: Wed, 27 Mar 2024 14:45:33 +0000
+Date: Wed, 3 Apr 2024 12:40:28 +0100
 
 Now that we no longer have a convenient flag in the cluster to determine
 if a folio is large, free_swap_and_cache() will take a reference and lock
@@ -25,7 +25,7 @@ wasn't exactly guaranteed.  We will still get the warning with most of the
 information from get_swap_device().  With the batch version, we wouldn't
 know which pte was bad anyway so could print the wrong one.
 
-Link: https://lkml.kernel.org/r/20240327144537.4165578-3-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20240403114032.1162100-3-ryan.roberts@arm.com
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Barry Song <21cnbao@gmail.com>
 Cc: Barry Song <v-songbaohua@oppo.com>
@@ -42,13 +42,13 @@ Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/pgtable.h |   28 +++++++++++++
- include/linux/swap.h    |   12 ++++-
- mm/internal.h           |   48 +++++++++++++++++++++++
+ include/linux/pgtable.h |   28 ++++++++++++
+ include/linux/swap.h    |   12 +++--
+ mm/internal.h           |   48 +++++++++++++++++++++
  mm/madvise.c            |   12 +++--
- mm/memory.c             |   13 +++---
- mm/swapfile.c           |   78 +++++++++++++++++++++++++++-----------
- 6 files changed, 157 insertions(+), 34 deletions(-)
+ mm/memory.c             |   13 +++--
+ mm/swapfile.c           |   86 +++++++++++++++++++++++++++++---------
+ 6 files changed, 167 insertions(+), 32 deletions(-)
 
 --- a/include/linux/pgtable.h~mm-swap-free_swap_and_cache_nr-as-batched-free_swap_and_cache
 +++ a/include/linux/pgtable.h
@@ -223,7 +223,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
 --- a/mm/memory.c~mm-swap-free_swap_and_cache_nr-as-batched-free_swap_and_cache
 +++ a/mm/memory.c
-@@ -1631,12 +1631,13 @@ static unsigned long zap_pte_range(struc
+@@ -1637,12 +1637,13 @@ static unsigned long zap_pte_range(struc
  				folio_remove_rmap_pte(folio, page, vma);
  			folio_put(folio);
  		} else if (!non_swap_entry(entry)) {
@@ -241,7 +241,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		} else if (is_migration_entry(entry)) {
  			folio = pfn_swap_entry_folio(entry);
  			if (!should_zap_folio(details, folio))
-@@ -1659,8 +1660,8 @@ static unsigned long zap_pte_range(struc
+@@ -1665,8 +1666,8 @@ static unsigned long zap_pte_range(struc
  			pr_alert("unrecognized swap entry 0x%lx\n", entry.val);
  			WARN_ON_ONCE(1);
  		}
@@ -284,7 +284,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto checks;
  		goto scan; /* check next one */
  	}
-@@ -1572,32 +1577,63 @@ bool folio_free_swap(struct folio *folio
+@@ -1572,32 +1577,75 @@ bool folio_free_swap(struct folio *folio
  	return true;
  }
  
@@ -296,14 +296,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +void free_swap_and_cache_nr(swp_entry_t entry, int nr)
  {
 -	struct swap_info_struct *p;
--	unsigned char count;
 +	unsigned long end = swp_offset(entry) + nr;
 +	unsigned int type = swp_type(entry);
 +	struct swap_info_struct *si;
++	bool any_only_cache = false;
 +	unsigned long offset;
+ 	unsigned char count;
  
  	if (non_swap_entry(entry))
 -		return 1;
++		return;
++
++	si = get_swap_device(entry);
++	if (!si)
 +		return;
  
 -	p = get_swap_device(entry);
@@ -311,14 +316,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (WARN_ON(data_race(!p->swap_map[swp_offset(entry)]))) {
 -			put_swap_device(p);
 -			return 0;
--		}
-+	si = get_swap_device(entry);
-+	if (!si)
-+		return;
- 
--		count = __swap_entry_free(p, entry);
--		if (count == SWAP_HAS_CACHE)
--			__try_to_reclaim_swap(p, swp_offset(entry),
 +	if (WARN_ON(end > si->max))
 +		goto out;
 +
@@ -326,9 +323,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * First free all entries in the range.
 +	 */
 +	for (offset = swp_offset(entry); offset < end; offset++) {
-+		if (!WARN_ON(data_race(!si->swap_map[offset])))
-+			__swap_entry_free(si, swp_entry(type, offset));
++		if (!WARN_ON(data_race(!si->swap_map[offset]))) {
++			count = __swap_entry_free(si, swp_entry(type, offset));
++			if (count == SWAP_HAS_CACHE)
++				any_only_cache = true;
+ 		}
 +	}
+ 
+-		count = __swap_entry_free(p, entry);
+-		if (count == SWAP_HAS_CACHE)
+-			__try_to_reclaim_swap(p, swp_offset(entry),
++	/*
++	 * Short-circuit the below loop if none of the entries had their
++	 * reference drop to zero.
++	 */
++	if (!any_only_cache)
++		goto out;
 +
 +	/*
 +	 * Now go back over the range trying to reclaim the swap cache. This is
