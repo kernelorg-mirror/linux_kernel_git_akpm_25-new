@@ -1,0 +1,133 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: allow for detecting underflows with page_mapcount() again
+Date: Tue, 9 Apr 2024 21:22:44 +0200
+
+Patch series "mm: mapcount for large folios + page_mapcount() cleanups".
+
+This series tracks the mapcount of large folios in a single value, so it
+can be read efficiently and atomically, just like the mapcount of small
+folios.
+
+folio_mapcount() is then used in a couple more places, most notably to
+reduce false negatives in folio_likely_mapped_shared(), and many users of
+page_mapcount() are cleaned up (that's maybe why you got CCed on the full
+series, sorry sh+xtensa folks!  :) ).
+
+The remaining s390x user and one KSM user of page_mapcount() are getting
+removed separately on the list right now.  I have patches to handle the
+other KSM one, the khugepaged one and the kpagecount one; as they are not
+as "obvious", I will send them out separately in the future.  Once that is
+all in place, I'm planning on moving page_mapcount() into
+fs/proc/task_mmu.c, the remaining user for the time being (and we can
+discuss at LSF/MM details on that :) ).
+
+I proposed the mapcount for large folios (previously called total
+mapcount) originally in part of [1] and I later included it in [2] where
+it is a requirement.  In the meantime, I changed the patch a bit so I
+dropped all RB's.  During the discussion of [1], Peter Xu correctly raised
+that this additional tracking might affect the performance when PMD->PTE
+remapping THPs.  In the meantime.  I addressed that by batching RMAP
+operations during fork(), unmap/zap and when PMD->PTE remapping THPs.
+
+Running some of my micro-benchmarks [3] (fork,munmap,cow-byte,remap) on 1
+GiB of memory backed by folios with the same order, I observe the
+following on an Intel(R) Xeon(R) Silver 4210R CPU @ 2.40GHz tuned for
+reproducible results as much as possible:
+
+Standard deviation is mostly < 1%, except for order-9, where it's < 2% for
+fork() and munmap().
+
+(1) Small folios are not affected (< 1%) in all 4 microbenchmarks.
+(2) Order-4 folios are not affected (< 1%) in all 4 microbenchmarks. A bit
+    weird comapred to the other orders ...
+(3) PMD->PTE remapping of order-9 THPs is not affected (< 1%)
+(4) COW-byte (COWing a single page by writing a single byte) is not
+    affected for any order (< 1 %). The page copy_fault overhead dominates
+    everything.
+(5) fork() is mostly not affected (< 1%), except order-2, where we have
+    a slowdown of ~4%. Already for order-3 folios, we're down to a slowdown
+    of < 1%.
+(6) munmap() sees a slowdown by < 3% for some orders (order-5,
+    order-6, order-9), but less for others (< 1% for order-4 and order-8,
+    < 2% for order-2, order-3, order-7).
+
+Especially the fork() and munmap() benchmark are sensitive to each added
+instruction and other system noise, so I suspect some of the change and
+observed weirdness (order-4) is due to code layout changes and other
+factors, but not really due to the added atomics.
+
+So in the common case where we can batch, the added atomics don't really
+make a big difference, especially in light of the recent improvements for
+large folios that we recently gained due to batching.  Surprisingly, for
+some cases where we cannot batch (e.g., COW), the added atomics don't seem
+to matter, because other overhead dominates.
+
+My fork and munmap micro-benchmarks don't cover cases where we cannot
+batch-process bigger parts of large folios.  As this is not the common
+case, I'm not worrying about that right now.
+
+Future work is batching RMAP operations during swapout and folio
+migration.
+
+[1] https://lore.kernel.org/all/20230809083256.699513-1-david@redhat.com/
+[2] https://lore.kernel.org/all/20231124132626.235350-1-david@redhat.com/
+[3] https://gitlab.com/davidhildenbrand/scratchspace/-/raw/main/pte-mapped-folio-benchmarks.c?ref_type=heads
+
+
+This patch (of 18):
+
+Commit 53277bcf126d ("mm: support page_mapcount() on page_has_type()
+pages") made it impossible to detect mapcount underflows by treating any
+negative raw mapcount value as a mapcount of 0.
+
+We perform such underflow checks in zap_present_folio_ptes() and
+zap_huge_pmd(), which would currently no longer trigger.
+
+Let's check against PAGE_MAPCOUNT_RESERVE instead by using
+page_type_has_type(), like page_has_type() would, so we can still catch
+some underflows.
+
+Link: https://lkml.kernel.org/r/20240409192301.907377-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20240409192301.907377-2-david@redhat.com
+Fixes: 53277bcf126d ("mm: support page_mapcount() on page_has_type() pages")
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: John Paul Adrian Glaubitz <glaubitz@physik.fu-berlin.de>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Naoya Horiguchi <naoya.horiguchi@nec.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Richard Chang <richardycc@google.com>
+Cc: Rich Felker <dalias@libc.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Yin Fengwei <fengwei.yin@intel.com>
+Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h |    5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+--- a/include/linux/mm.h~mm-allow-for-detecting-underflows-with-page_mapcount-again
++++ a/include/linux/mm.h
+@@ -1229,11 +1229,10 @@ static inline void page_mapcount_reset(s
+  */
+ static inline int page_mapcount(struct page *page)
+ {
+-	int mapcount = atomic_read(&page->_mapcount) + 1;
++	int mapcount = atomic_read(&page->_mapcount);
+ 
+ 	/* Handle page_has_type() pages */
+-	if (mapcount < 0)
+-		mapcount = 0;
++	mapcount = page_type_has_type(mapcount) ? 0 : mapcount + 1;
+ 	if (unlikely(PageCompound(page)))
+ 		mapcount += folio_entire_mapcount(page_folio(page));
+ 
+_
