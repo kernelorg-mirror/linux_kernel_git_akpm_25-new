@@ -1,0 +1,116 @@
+From: Peter Xu <peterx@redhat.com>
+Subject: mm: Always sanity check anon_vma first for per-vma locks
+Date: Wed, 10 Apr 2024 13:06:21 -0400
+
+anon_vma is a tricky object in the context of per-vma lock, because it's
+racy to modify it in that context and mmap lock is needed if it's not
+stable yet.
+
+So far there are three places that sanity checks anon_vma for that:
+
+  - lock_vma_under_rcu(): this is the major entrance of per-vma lock, where
+    we have taken care of anon memory v.s. potential anon_vma allocations.
+
+  - lock_vma(): even if it looks so generic as an API, it's only used in
+    userfaultfd context to leverage per-vma locks.  It does extra check
+    over MAP_PRIVATE file mappings for the same anon_vma issue.
+
+  - vmf_anon_prepare(): it works for private file mapping faults just like
+    what lock_vma() wanted to cover above.  One trivial difference is in
+    some extremely corner case, the fault handler will still allow per-vma
+    fault to happen, like a READ on a privately mapped file.
+
+The question is whether that's intended to make it as complicated.  Per my
+question in the thread, it is not intended, and Suren also seems to agree [1].
+
+So the trivial side effect of such patch is:
+
+  - We may do slightly better on the first WRITE of a private file mapping,
+  because we can retry earlier (in lock_vma_under_rcu(), rather than
+  vmf_anon_prepare() later).
+
+  - We may always use mmap lock for the initial READs on a private file
+  mappings, while before this patch it _can_ (only when no WRITE ever
+  happened... but it doesn't make much sense for a MAP_PRIVATE..) do the
+  read fault with per-vma lock.
+
+Then noted that right after any WRITE the anon_vma will be stablized, then
+there will be no difference.  And I believe that should be the majority
+cases too; I also did try to run a program, writting to MAP_PRIVATE file
+memory (that I pre-headed in the page cache) and I can hardly measure a
+difference in performance.
+
+Let's simply ignore all those trivial corner cases and unify the anon_vma
+check from three places into one.  I also didn't check the rest users of
+lock_vma_under_rcu(), where in a !fault context it could even fix something
+that used to race with private file mappings but I didn't check further.
+
+I still left a WARN_ON_ONCE() in vmf_anon_prepare() to double check we're
+all good.
+
+[1] https://lore.kernel.org/r/CAJuCfpGj5xk-NxSwW6Mt8NGZcV9N__8zVPMGXDPAYKMcN9=Oig@mail.gmail.com
+
+Link: https://lkml.kernel.org/r/20240410170621.2011171-1-peterx@redhat.com
+Signed-off-by: Peter Xu <peterx@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c      |   10 ++++------
+ mm/userfaultfd.c |   13 ++-----------
+ 2 files changed, 6 insertions(+), 17 deletions(-)
+
+--- a/mm/memory.c~mm-always-sanity-check-anon_vma-first-for-per-vma-locks
++++ a/mm/memory.c
+@@ -3219,10 +3219,8 @@ vm_fault_t vmf_anon_prepare(struct vm_fa
+ 
+ 	if (likely(vma->anon_vma))
+ 		return 0;
+-	if (vmf->flags & FAULT_FLAG_VMA_LOCK) {
+-		vma_end_read(vma);
+-		return VM_FAULT_RETRY;
+-	}
++	/* We shouldn't try a per-vma fault at all if anon_vma isn't solid */
++	WARN_ON_ONCE(vmf->flags & FAULT_FLAG_VMA_LOCK);
+ 	if (__anon_vma_prepare(vma))
+ 		return VM_FAULT_OOM;
+ 	return 0;
+@@ -5826,9 +5824,9 @@ retry:
+ 	 * find_mergeable_anon_vma uses adjacent vmas which are not locked.
+ 	 * This check must happen after vma_start_read(); otherwise, a
+ 	 * concurrent mremap() with MREMAP_DONTUNMAP could dissociate the VMA
+-	 * from its anon_vma.
++	 * from its anon_vma.  This applies to both anon or private file maps.
+ 	 */
+-	if (unlikely(vma_is_anonymous(vma) && !vma->anon_vma))
++	if (unlikely(!(vma->vm_flags & VM_SHARED) && !vma->anon_vma))
+ 		goto inval_end_read;
+ 
+ 	/* Check since vm_start/vm_end might change before we lock the VMA */
+--- a/mm/userfaultfd.c~mm-always-sanity-check-anon_vma-first-for-per-vma-locks
++++ a/mm/userfaultfd.c
+@@ -72,17 +72,8 @@ static struct vm_area_struct *lock_vma(s
+ 	struct vm_area_struct *vma;
+ 
+ 	vma = lock_vma_under_rcu(mm, address);
+-	if (vma) {
+-		/*
+-		 * lock_vma_under_rcu() only checks anon_vma for private
+-		 * anonymous mappings. But we need to ensure it is assigned in
+-		 * private file-backed vmas as well.
+-		 */
+-		if (!(vma->vm_flags & VM_SHARED) && unlikely(!vma->anon_vma))
+-			vma_end_read(vma);
+-		else
+-			return vma;
+-	}
++	if (vma)
++		return vma;
+ 
+ 	mmap_read_lock(mm);
+ 	vma = find_vma_and_prepare_anon(mm, address);
+_
