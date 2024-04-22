@@ -1,0 +1,85 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: mm: memory: check userfaultfd_wp() in vmf_orig_pte_uffd_wp()
+Date: Mon, 22 Apr 2024 11:00:39 +0800
+
+Add userfaultfd_wp() check in vmf_orig_pte_uffd_wp() to avoid the
+unnecessary FAULT_FLAG_ORIG_PTE_VALID check/pte_marker_entry_uffd_wp() in
+most pagefault, note, the function vmf_orig_pte_uffd_wp() is not inlined
+in the two kernel versions, the difference is shown below,
+
+perf date,
+
+  perf report -i perf.data.before | grep vmf
+     0.17%     0.13%  lat_pagefault  [kernel.kallsyms]      [k] vmf_orig_pte_uffd_wp.part.0.isra.0
+  perf report -i perf.data.after  | grep vmf
+
+lat_pagefault -W 5 -N 5 /tmp/XXX
+  latency              before        after        diff
+  average(8 tests)     0.262675      0.2600375   -0.0026375
+
+Although it's a small, but the uffd_wp is a new feature than previous
+kernel, when the vma is not registered with UFFD_WP, let's avoid to
+execute the new logical, also adding __always_inline attribute to
+vmf_orig_pte_uffd_wp(), which make set_pte_range() only check VM_UFFD_WP
+flags without the function call.  In addition, directly call the
+vmf_orig_pte_uffd_wp() in do_anonymous_page() and set_pte_range() to save
+an uffd_wp variable.
+
+Link: https://lkml.kernel.org/r/20240422030039.3293568-1-wangkefeng.wang@huawei.com
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Peter Xu <peterx@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+--- a/mm/memory.c~mm-memory-check-userfaultfd_wp-in-vmf_orig_pte_uffd_wp
++++ a/mm/memory.c
+@@ -112,8 +112,10 @@ static bool vmf_pte_changed(struct vm_fa
+  * Return true if the original pte was a uffd-wp pte marker (so the pte was
+  * wr-protected).
+  */
+-static bool vmf_orig_pte_uffd_wp(struct vm_fault *vmf)
++static __always_inline bool vmf_orig_pte_uffd_wp(struct vm_fault *vmf)
+ {
++	if (!userfaultfd_wp(vmf->vma))
++		return false;
+ 	if (!(vmf->flags & FAULT_FLAG_ORIG_PTE_VALID))
+ 		return false;
+ 
+@@ -4393,7 +4395,6 @@ fallback:
+  */
+ static vm_fault_t do_anonymous_page(struct vm_fault *vmf)
+ {
+-	bool uffd_wp = vmf_orig_pte_uffd_wp(vmf);
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	unsigned long addr = vmf->address;
+ 	struct folio *folio;
+@@ -4493,7 +4494,7 @@ static vm_fault_t do_anonymous_page(stru
+ 	folio_add_new_anon_rmap(folio, vma, addr);
+ 	folio_add_lru_vma(folio, vma);
+ setpte:
+-	if (uffd_wp)
++	if (vmf_orig_pte_uffd_wp(vmf))
+ 		entry = pte_mkuffd_wp(entry);
+ 	set_ptes(vma->vm_mm, addr, vmf->pte, entry, nr_pages);
+ 
+@@ -4668,7 +4669,6 @@ void set_pte_range(struct vm_fault *vmf,
+ 		struct page *page, unsigned int nr, unsigned long addr)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+-	bool uffd_wp = vmf_orig_pte_uffd_wp(vmf);
+ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
+ 	bool prefault = in_range(vmf->address, addr, nr * PAGE_SIZE);
+ 	pte_t entry;
+@@ -4683,7 +4683,7 @@ void set_pte_range(struct vm_fault *vmf,
+ 
+ 	if (write)
+ 		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+-	if (unlikely(uffd_wp))
++	if (unlikely(vmf_orig_pte_uffd_wp(vmf)))
+ 		entry = pte_mkuffd_wp(entry);
+ 	/* copy-on-write page */
+ 	if (write && !(vma->vm_flags & VM_SHARED)) {
+_
