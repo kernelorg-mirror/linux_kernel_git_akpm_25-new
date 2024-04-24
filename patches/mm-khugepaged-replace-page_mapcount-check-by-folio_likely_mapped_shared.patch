@@ -1,0 +1,217 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/khugepaged: replace page_mapcount() check by folio_likely_mapped_shared()
+Date: Wed, 24 Apr 2024 14:26:30 +0200
+
+We want to limit the use of page_mapcount() to places where absolutely
+required, to prepare for kernel configs where we won't keep track of
+per-page mapcounts in large folios.
+
+khugepaged is one of the remaining "more challenging" page_mapcount()
+users, but we might be able to move away from page_mapcount() without
+resulting in a significant behavior change that would warrant
+special-casing based on kernel configs.
+
+In 2020, we first added support to khugepaged for collapsing COW-shared
+pages via commit 9445689f3b61 ("khugepaged: allow to collapse a page
+shared across fork"), followed by support for collapsing PTE-mapped THP in
+commit 5503fbf2b0b8 ("khugepaged: allow to collapse PTE-mapped compound
+pages") and limiting the memory waste via the "page_count() > 1" check in
+commit 71a2c112a0f6 ("khugepaged: introduce 'max_ptes_shared' tunable").
+
+As a default, khugepaged will allow up to half of the PTEs to map shared
+pages: where page_mapcount() > 1.  MADV_COLLAPSE ignores the khugepaged
+setting.
+
+khugepaged does currently not care about swapcache page references, and
+does not check under folio lock: so in some corner cases the "shared vs. 
+exclusive" detection might be a bit off, making us detect "exclusive" when
+it's actually "shared".
+
+Most of our anonymous folios in the system are usually exclusive.  We
+frequently see sharing of anonymous folios for a short period of time,
+after which our short-lived suprocesses either quit or exec().
+
+There are some famous examples, though, where child processes exist for a
+long time, and where memory is COW-shared with a lot of processes
+(webservers, webbrowsers, sshd, ...) and COW-sharing is crucial for
+reducing the memory footprint.  We don't want to suddenly change the
+behavior to result in a significant increase in memory waste.
+
+Interestingly, khugepaged will only collapse an anonymous THP if at least
+one PTE is writable.  After fork(), that means that something (usually a
+page fault) populated at least a single exclusive anonymous THP in that
+PMD range.
+
+So ...  what happens when we switch to "is this folio mapped shared"
+instead of "is this page mapped shared" by using
+folio_likely_mapped_shared()?
+
+For "not-COW-shared" folios, small folios and for THPs (large folios) that
+are completely mapped into at least one process, switching to
+folio_likely_mapped_shared() will not result in a change.
+
+We'll only see a change for COW-shared PTE-mapped THPs that are partially
+mapped into all involved processes.
+
+There are two cases to consider:
+
+(A) folio_likely_mapped_shared() returns "false" for a PTE-mapped THP
+
+  If the folio is detected as exclusive, and it actually is exclusive,
+  there is no change: page_mapcount() == 1. This is the common case
+  without fork() or with short-lived child processes.
+
+  folio_likely_mapped_shared() might currently still detect a folio as
+  exclusive although it is shared (false negatives): if the first page is
+  not mapped multiple times and if the average per-page mapcount is smaller
+  than 1, implying that (1) the folio is partially mapped and (2) if we are
+  responsible for many mapcounts by mapping many pages others can't
+  ("mostly exclusive") (3) if we are not responsible for many mapcounts by
+  mapping little pages ("mostly shared") it won't make a big impact on the
+  end result.
+
+  So while we might now detect a page as "exclusive" although it isn't,
+  it's not expected to make a big difference in common cases.
+
+(B) folio_likely_mapped_shared() returns "true" for a PTE-mapped THP
+
+  folio_likely_mapped_shared() will never detect a large anonymous folio
+  as shared although it is exclusive: there are no false positives.
+
+  If we detect a THP as shared, at least one page of the THP is mapped by
+  another process. It could well be that some pages are actually exclusive.
+  For example, our child processes could have unmapped/COW'ed some pages
+  such that they would now be exclusive to out process, which we now
+  would treat as still-shared.
+
+  Examples:
+  (1) Parent maps all pages of a THP, child maps some pages. We detect
+      all pages in the parent as shared although some are actually
+      exclusive.
+  (2) Parent maps all but some page of a THP, child maps the remainder.
+      We detect all pages of the THP that the parent maps as shared
+      although they are all exclusive.
+
+  In (1) we wouldn't collapse a THP right now already: no PTE
+  is writable, because a write fault would have resulted in COW of a
+  single page and the parent would no longer map all pages of that THP.
+
+  For (2) we would have collapsed a THP in the parent so far, now we
+  wouldn't as long as the child process is still alive: unless the child
+  process unmaps the remaining THP pages or we decide to split that THP.
+
+  Possibly, the child COW'ed many pages, meaning that it's likely that
+  we can populate a THP for our child first, and then for our parent.
+
+  For (2), we are making really bad use of the THP in the first
+  place (not even mapped completely in at least one process). If the
+  THP would be completely partially mapped, it would be on the deferred
+  split queue where we would split it lazily later.
+
+  For short-running child processes, we don't particularly care. For
+  long-running processes, the expectation is that such scenarios are
+  rather rare: further, a THP might be best placed if most data in the
+  PMD range is actually written, implying that we'll have to COW more
+  pages first before khugepaged would collapse it.
+
+To summarize, in the common case, this change is not expected to matter
+much.  The more common application of khugepaged operates on exclusive
+pages, either before fork() or after a child quit.
+
+Can we improve (A)?  Yes, if we implement more precise tracking of "mapped
+shared" vs.  "mapped exclusively", we could get rid of the false negatives
+completely.
+
+Can we improve (B)?  We could count how many pages of a large folio we map
+inside the current page table and detect that we are responsible for most
+of the folio mapcount and conclude "as good as exclusive", which might
+help in some cases.  ...  but likely, some other mechanism should detect
+that the THP is not a good use in the scenario (not even mapped completely
+in a single process) and try splitting that folio lazily etc.
+
+We'll move the folio_test_anon() check before our "shared" check, so we
+might get more expressive results for SCAN_EXCEED_SHARED_PTE: this order
+of checks now matches the one in __collapse_huge_page_isolate().  Extend
+documentation.
+
+Link: https://lkml.kernel.org/r/20240424122630.495788-1-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Yang Shi <yang.shi@linux.alibaba.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/mm/transhuge.rst |    3 +-
+ mm/khugepaged.c                            |   22 ++++++++++++-------
+ 2 files changed, 17 insertions(+), 8 deletions(-)
+
+--- a/Documentation/admin-guide/mm/transhuge.rst~mm-khugepaged-replace-page_mapcount-check-by-folio_likely_mapped_shared
++++ a/Documentation/admin-guide/mm/transhuge.rst
+@@ -278,7 +278,8 @@ collapsed, resulting fewer pages being c
+ THPs, and lower memory access performance.
+ 
+ ``max_ptes_shared`` specifies how many pages can be shared across multiple
+-processes. Exceeding the number would block the collapse::
++processes. khugepaged might treat pages of THPs as shared if any page of
++that THP is shared. Exceeding the number would block the collapse::
+ 
+ 	/sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_shared
+ 
+--- a/mm/khugepaged.c~mm-khugepaged-replace-page_mapcount-check-by-folio_likely_mapped_shared
++++ a/mm/khugepaged.c
+@@ -583,7 +583,8 @@ static int __collapse_huge_page_isolate(
+ 		folio = page_folio(page);
+ 		VM_BUG_ON_FOLIO(!folio_test_anon(folio), folio);
+ 
+-		if (page_mapcount(page) > 1) {
++		/* See hpage_collapse_scan_pmd(). */
++		if (folio_likely_mapped_shared(folio)) {
+ 			++shared;
+ 			if (cc->is_khugepaged &&
+ 			    shared > khugepaged_max_ptes_shared) {
+@@ -1317,8 +1318,20 @@ static int hpage_collapse_scan_pmd(struc
+ 			result = SCAN_PAGE_NULL;
+ 			goto out_unmap;
+ 		}
++		folio = page_folio(page);
+ 
+-		if (page_mapcount(page) > 1) {
++		if (!folio_test_anon(folio)) {
++			result = SCAN_PAGE_ANON;
++			goto out_unmap;
++		}
++
++		/*
++		 * We treat a single page as shared if any part of the THP
++		 * is shared. "False negatives" from
++		 * folio_likely_mapped_shared() are not expected to matter
++		 * much in practice.
++		 */
++		if (folio_likely_mapped_shared(folio)) {
+ 			++shared;
+ 			if (cc->is_khugepaged &&
+ 			    shared > khugepaged_max_ptes_shared) {
+@@ -1328,7 +1341,6 @@ static int hpage_collapse_scan_pmd(struc
+ 			}
+ 		}
+ 
+-		folio = page_folio(page);
+ 		/*
+ 		 * Record which node the original page is from and save this
+ 		 * information to cc->node_load[].
+@@ -1349,10 +1361,6 @@ static int hpage_collapse_scan_pmd(struc
+ 			result = SCAN_PAGE_LOCK;
+ 			goto out_unmap;
+ 		}
+-		if (!folio_test_anon(folio)) {
+-			result = SCAN_PAGE_ANON;
+-			goto out_unmap;
+-		}
+ 
+ 		/*
+ 		 * Check if the page has any GUP (or other external) pins.
+_
