@@ -1,0 +1,87 @@
+From: Kemeng Shi <shikemeng@huaweicloud.com>
+Subject: mm: correct calculation of wb's bg_thresh in cgroup domain
+Date: Thu, 25 Apr 2024 21:17:22 +0800
+
+The wb_calc_thresh is supposed to calculate wb's share of bg_thresh in
+global domain.  To calculate wb's share of bg_thresh in cgroup domain,
+it's more reasonable to use __wb_calc_thresh in which way we calculate
+dirty_thresh in cgroup domain in balance_dirty_pages().
+
+Consider following domain hierarchy:
+                global domain (> 20G)
+                /                 \
+        cgroup domain1(10G)     cgroup domain2(10G)
+                |                 |
+bdi            wb1               wb2
+Assume wb1 and wb2 has the same bandwidth.
+We have global domain bg_thresh > 2G, cgroup domain bg_thresh 1G.
+Then we have:
+wb's thresh in global domain = 2G * (wb bandwidth) / (system bandwidth)
+= 2G * 1/2 = 1G
+wb's thresh in cgroup domain = 1G * (wb bandwidth) / (system bandwidth)
+= 1G * 1/2 = 0.5G
+At last, wb1 and wb2 will be limited at 0.5G, the system will be limited
+at 1G which is less than global domain bg_thresh 2G.
+
+Test as following:
+/* make it easier to observe the issue */
+echo 300000 > /proc/sys/vm/dirty_expire_centisecs
+echo 100 > /proc/sys/vm/dirty_writeback_centisecs
+
+/* run fio in wb1 */
+cd /sys/fs/cgroup
+echo "+memory +io" > cgroup.subtree_control
+mkdir group1
+cd group1
+echo 10G > memory.high
+echo 10G > memory.max
+echo $$ > cgroup.procs
+mkfs.ext4 -F /dev/vdb
+mount /dev/vdb /bdi1/
+fio -name test -filename=/bdi1/file -size=600M -ioengine=libaio -bs=4K \
+-iodepth=1 -rw=write -direct=0 --time_based -runtime=600 -invalidate=0
+
+/* run fio in wb2 with a new shell */
+cd /sys/fs/cgroup
+mkdir group2
+cd group2
+echo 10G > memory.high
+echo 10G > memory.max
+echo $$ > cgroup.procs
+mkfs.ext4 -F /dev/vdc
+mount /dev/vdc /bdi2/
+fio -name test -filename=/bdi2/file -size=600M -ioengine=libaio -bs=4K \
+-iodepth=1 -rw=write -direct=0 --time_based -runtime=600 -invalidate=0
+
+Before fix, the wrttien pages of wb1 and wb2 reported from
+toos/writeback/wb_monitor.py keep growing. After fix, rare written pages
+are accumulated.
+There is no obvious change in fio result.
+
+Link: https://lkml.kernel.org/r/20240425131724.36778-3-shikemeng@huaweicloud.com
+Fixes: 74d369443325 ("writeback: Fix performance regression in wb_over_bg_thresh()")
+Signed-off-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Howard Cochran <hcochran@kernelspring.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miklos Szeredi <mszeredi@redhat.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page-writeback.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/mm/page-writeback.c~mm-correct-calculation-of-wbs-bg_thresh-in-cgroup-domain
++++ a/mm/page-writeback.c
+@@ -2137,7 +2137,7 @@ bool wb_over_bg_thresh(struct bdi_writeb
+ 		if (mdtc->dirty > mdtc->bg_thresh)
+ 			return true;
+ 
+-		thresh = wb_calc_thresh(mdtc->wb, mdtc->bg_thresh);
++		thresh = __wb_calc_thresh(mdtc, mdtc->bg_thresh);
+ 		if (thresh < 2 * wb_stat_error())
+ 			reclaimable = wb_stat_sum(wb, WB_RECLAIMABLE);
+ 		else
+_

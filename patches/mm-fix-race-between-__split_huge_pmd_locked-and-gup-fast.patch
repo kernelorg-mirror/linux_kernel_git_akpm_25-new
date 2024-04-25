@@ -1,0 +1,82 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: mm: fix race between __split_huge_pmd_locked() and GUP-fast
+Date: Thu, 25 Apr 2024 18:07:04 +0100
+
+__split_huge_pmd_locked() can be called for a present THP, devmap or
+(non-present) migration entry.  It calls pmdp_invalidate() unconditionally
+on the pmdp and only determines if it is present or not based on the
+returned old pmd.  This is a problem for the migration entry case because
+pmd_mkinvalid(), called by pmdp_invalidate() must only be called for a
+present pmd.
+
+On arm64 at least, pmd_mkinvalid() will mark the pmd such that any future
+call to pmd_present() will return true.  And therefore any lockless
+pgtable walker could see the migration entry pmd in this state and start
+interpretting the fields as if it were present, leading to BadThings (TM).
+GUP-fast appears to be one such lockless pgtable walker.  I suspect the
+same is possible on other architectures.
+
+Fix this by only calling pmdp_invalidate() for a present pmd.  And for
+good measure let's add a warning to the generic implementation of
+pmdp_invalidate().  I've manually reviewed all other
+pmdp_invalidate[_ad]() call sites and believe all others to be conformant.
+
+This is a theoretical bug found during code review. I don't have any
+test case to trigger it in practice.
+
+Link: https://lkml.kernel.org/r/20240425170704.3379492-1-ryan.roberts@arm.com
+Fixes: 84c3fc4e9c56 ("mm: thp: check pmd migration entry in common path")
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Zi Yan <zi.yan@cs.rutgers.edu>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c     |    5 +++--
+ mm/pgtable-generic.c |    2 ++
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+--- a/mm/huge_memory.c~mm-fix-race-between-__split_huge_pmd_locked-and-gup-fast
++++ a/mm/huge_memory.c
+@@ -2533,12 +2533,12 @@ static void __split_huge_pmd_locked(stru
+ 	 * for this pmd), then we flush the SMP TLB and finally we write the
+ 	 * non-huge version of the pmd entry with pmd_populate.
+ 	 */
+-	old_pmd = pmdp_invalidate(vma, haddr, pmd);
+ 
+-	pmd_migration = is_pmd_migration_entry(old_pmd);
++	pmd_migration = is_pmd_migration_entry(*pmd);
+ 	if (unlikely(pmd_migration)) {
+ 		swp_entry_t entry;
+ 
++		old_pmd = *pmd;
+ 		entry = pmd_to_swp_entry(old_pmd);
+ 		page = pfn_swap_entry_to_page(entry);
+ 		write = is_writable_migration_entry(entry);
+@@ -2549,6 +2549,7 @@ static void __split_huge_pmd_locked(stru
+ 		soft_dirty = pmd_swp_soft_dirty(old_pmd);
+ 		uffd_wp = pmd_swp_uffd_wp(old_pmd);
+ 	} else {
++		old_pmd = pmdp_invalidate(vma, haddr, pmd);
+ 		page = pmd_page(old_pmd);
+ 		folio = page_folio(page);
+ 		if (pmd_dirty(old_pmd)) {
+--- a/mm/pgtable-generic.c~mm-fix-race-between-__split_huge_pmd_locked-and-gup-fast
++++ a/mm/pgtable-generic.c
+@@ -198,6 +198,7 @@ pgtable_t pgtable_trans_huge_withdraw(st
+ pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
+ 		     pmd_t *pmdp)
+ {
++	VM_WARN_ON(!pmd_present(*pmdp));
+ 	pmd_t old = pmdp_establish(vma, address, pmdp, pmd_mkinvalid(*pmdp));
+ 	flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+ 	return old;
+@@ -208,6 +209,7 @@ pmd_t pmdp_invalidate(struct vm_area_str
+ pmd_t pmdp_invalidate_ad(struct vm_area_struct *vma, unsigned long address,
+ 			 pmd_t *pmdp)
+ {
++	VM_WARN_ON(!pmd_present(*pmdp));
+ 	return pmdp_invalidate(vma, address, pmdp);
+ }
+ #endif
+_
