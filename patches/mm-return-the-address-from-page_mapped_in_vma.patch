@@ -1,0 +1,137 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: return the address from page_mapped_in_vma()
+Date: Fri, 12 Apr 2024 20:35:00 +0100
+
+The only user of this function calls page_address_in_vma() immediately
+after page_mapped_in_vma() calculates it and uses it to return true/false.
+Return the address instead, allowing memory-failure to skip the call to
+page_address_in_vma().
+
+Link: https://lkml.kernel.org/r/20240412193510.2356957-4-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Jane Chu <jane.chu@oracle.com>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/rmap.h |    2 +-
+ mm/memory-failure.c  |   22 +++++++++++++---------
+ mm/page_vma_mapped.c |   16 +++++++++-------
+ 3 files changed, 23 insertions(+), 17 deletions(-)
+
+--- a/include/linux/rmap.h~mm-return-the-address-from-page_mapped_in_vma
++++ a/include/linux/rmap.h
+@@ -732,7 +732,7 @@ int pfn_mkclean_range(unsigned long pfn,
+ 
+ void remove_migration_ptes(struct folio *src, struct folio *dst, bool locked);
+ 
+-int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
++unsigned long page_mapped_in_vma(struct page *page, struct vm_area_struct *vma);
+ 
+ /*
+  * rmap_walk_control: To control rmap traversing for specific needs
+--- a/mm/memory-failure.c~mm-return-the-address-from-page_mapped_in_vma
++++ a/mm/memory-failure.c
+@@ -473,10 +473,11 @@ static void __add_to_kill(struct task_st
+ }
+ 
+ static void add_to_kill_anon_file(struct task_struct *tsk, struct page *p,
+-				  struct vm_area_struct *vma,
+-				  struct list_head *to_kill)
++		struct vm_area_struct *vma, struct list_head *to_kill,
++		unsigned long addr)
+ {
+-	unsigned long addr = page_address_in_vma(p, vma);
++	if (addr == -EFAULT)
++		return;
+ 	__add_to_kill(tsk, p, vma, to_kill, addr);
+ }
+ 
+@@ -601,7 +602,6 @@ struct task_struct *task_early_kill(stru
+ static void collect_procs_anon(struct folio *folio, struct page *page,
+ 		struct list_head *to_kill, int force_early)
+ {
+-	struct vm_area_struct *vma;
+ 	struct task_struct *tsk;
+ 	struct anon_vma *av;
+ 	pgoff_t pgoff;
+@@ -613,8 +613,10 @@ static void collect_procs_anon(struct fo
+ 	pgoff = page_to_pgoff(page);
+ 	rcu_read_lock();
+ 	for_each_process(tsk) {
++		struct vm_area_struct *vma;
+ 		struct anon_vma_chain *vmac;
+ 		struct task_struct *t = task_early_kill(tsk, force_early);
++		unsigned long addr;
+ 
+ 		if (!t)
+ 			continue;
+@@ -623,9 +625,8 @@ static void collect_procs_anon(struct fo
+ 			vma = vmac->vma;
+ 			if (vma->vm_mm != t->mm)
+ 				continue;
+-			if (!page_mapped_in_vma(page, vma))
+-				continue;
+-			add_to_kill_anon_file(t, page, vma, to_kill);
++			addr = page_mapped_in_vma(page, vma);
++			add_to_kill_anon_file(t, page, vma, to_kill, addr);
+ 		}
+ 	}
+ 	rcu_read_unlock();
+@@ -648,6 +649,7 @@ static void collect_procs_file(struct fo
+ 	pgoff = page_to_pgoff(page);
+ 	for_each_process(tsk) {
+ 		struct task_struct *t = task_early_kill(tsk, force_early);
++		unsigned long addr;
+ 
+ 		if (!t)
+ 			continue;
+@@ -660,8 +662,10 @@ static void collect_procs_file(struct fo
+ 			 * Assume applications who requested early kill want
+ 			 * to be informed of all such data corruptions.
+ 			 */
+-			if (vma->vm_mm == t->mm)
+-				add_to_kill_anon_file(t, page, vma, to_kill);
++			if (vma->vm_mm != t->mm)
++				continue;
++			addr = page_address_in_vma(page, vma);
++			add_to_kill_anon_file(t, page, vma, to_kill, addr);
+ 		}
+ 	}
+ 	rcu_read_unlock();
+--- a/mm/page_vma_mapped.c~mm-return-the-address-from-page_mapped_in_vma
++++ a/mm/page_vma_mapped.c
+@@ -319,11 +319,12 @@ next_pte:
+  * @page: the page to test
+  * @vma: the VMA to test
+  *
+- * Returns 1 if the page is mapped into the page tables of the VMA, 0
+- * if the page is not mapped into the page tables of this VMA.  Only
+- * valid for normal file or anonymous VMAs.
++ * Return: The address the page is mapped at if the page is in the range
++ * covered by the VMA and present in the page table.  If the page is
++ * outside the VMA or not present, returns -EFAULT.
++ * Only valid for normal file or anonymous VMAs.
+  */
+-int page_mapped_in_vma(struct page *page, struct vm_area_struct *vma)
++unsigned long page_mapped_in_vma(struct page *page, struct vm_area_struct *vma)
+ {
+ 	struct folio *folio = page_folio(page);
+ 	pgoff_t pgoff = folio->index + folio_page_idx(folio, page);
+@@ -336,9 +337,10 @@ int page_mapped_in_vma(struct page *page
+ 
+ 	pvmw.address = vma_address(vma, pgoff, 1);
+ 	if (pvmw.address == -EFAULT)
+-		return 0;
++		goto out;
+ 	if (!page_vma_mapped_walk(&pvmw))
+-		return 0;
++		return -EFAULT;
+ 	page_vma_mapped_walk_done(&pvmw);
+-	return 1;
++out:
++	return pvmw.address;
+ }
+_
