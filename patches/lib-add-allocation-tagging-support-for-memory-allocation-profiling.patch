@@ -15,10 +15,19 @@ Memory allocation profiling can be enabled or disabled at runtime using
 CONFIG_MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT enables memory allocation
 profiling by default.
 
+[surenb@google.com: Documentation/filesystems/proc.rst: fix allocinfo title]
+  Link: https://lkml.kernel.org/r/20240326073813.727090-1-surenb@google.com
+[surenb@google.com: do limited memory accounting for modules with ARCH_NEEDS_WEAK_PER_CPU]
+  Link: https://lkml.kernel.org/r/20240402180933.1663992-2-surenb@google.com
+[klarasmodin@gmail.com: explicitly include irqflags.h in alloc_tag.h]
+  Link: https://lkml.kernel.org/r/20240407133252.173636-1-klarasmodin@gmail.com
+[surenb@google.com: fix alloc_tag_init() to prevent passing NULL to PTR_ERR()]
+  Link: https://lkml.kernel.org/r/20240417003349.2520094-1-surenb@google.com
 Link: https://lkml.kernel.org/r/20240321163705.3067592-14-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Co-developed-by: Kent Overstreet <kent.overstreet@linux.dev>
 Signed-off-by: Kent Overstreet <kent.overstreet@linux.dev>
+Signed-off-by: Klara Modin <klarasmodin@gmail.com>
 Tested-by: Kees Cook <keescook@chromium.org>
 Cc: Alexander Viro <viro@zeniv.linux.org.uk>
 Cc: Alex Gaynor <alex.gaynor@gmail.com>
@@ -41,15 +50,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  Documentation/admin-guide/sysctl/vm.rst |   16 ++
  Documentation/filesystems/proc.rst      |   29 ++++
- include/asm-generic/codetag.lds.h       |   14 ++
+ include/asm-generic/codetag.lds.h       |   14 +
  include/asm-generic/vmlinux.lds.h       |    3 
- include/linux/alloc_tag.h               |  145 +++++++++++++++++++++
+ include/linux/alloc_tag.h               |  156 ++++++++++++++++++++++
  include/linux/sched.h                   |   24 +++
  lib/Kconfig.debug                       |   25 +++
  lib/Makefile                            |    2 
- lib/alloc_tag.c                         |  149 ++++++++++++++++++++++
- scripts/module.lds.S                    |    7 +
- 10 files changed, 414 insertions(+)
+ lib/alloc_tag.c                         |  152 +++++++++++++++++++++
+ scripts/module.lds.S                    |    7 
+ 10 files changed, 428 insertions(+)
 
 --- a/Documentation/admin-guide/sysctl/vm.rst~lib-add-allocation-tagging-support-for-memory-allocation-profiling
 +++ a/Documentation/admin-guide/sysctl/vm.rst
@@ -98,7 +107,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  
 +allocinfo
-+~~~~~~~
++~~~~~~~~~
 +
 +Provides information about memory allocations at all locations in the code
 +base. Each allocation in the code is identified by its source file, line
@@ -166,7 +175,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	TRACE_PRINTKS()							\
 --- /dev/null
 +++ a/include/linux/alloc_tag.h
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,156 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * allocation tagging
@@ -181,6 +190,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#include <asm/percpu.h>
 +#include <linux/cpumask.h>
 +#include <linux/static_key.h>
++#include <linux/irqflags.h>
 +
 +struct alloc_tag_counters {
 +	u64 bytes;
@@ -208,9 +218,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +/*
 + * When percpu variables are required to be defined as weak, static percpu
 + * variables can't be used inside a function (see comments for DECLARE_PER_CPU_SECTION).
++ * Instead we will accound all module allocations to a single counter.
 + */
-+#error "Memory allocation profiling is incompatible with ARCH_NEEDS_WEAK_PER_CPU"
-+#endif
++DECLARE_PER_CPU(struct alloc_tag_counters, _shared_alloc_tag);
++
++#define DEFINE_ALLOC_TAG(_alloc_tag)						\
++	static struct alloc_tag _alloc_tag __used __aligned(8)			\
++	__section("alloc_tags") = {						\
++		.ct = CODE_TAG_INIT,						\
++		.counters = &_shared_alloc_tag };
++
++#else /* ARCH_NEEDS_WEAK_PER_CPU */
 +
 +#define DEFINE_ALLOC_TAG(_alloc_tag)						\
 +	static DEFINE_PER_CPU(struct alloc_tag_counters, _alloc_tag_cntr);	\
@@ -218,6 +236,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	__section("alloc_tags") = {						\
 +		.ct = CODE_TAG_INIT,						\
 +		.counters = &_alloc_tag_cntr };
++
++#endif /* ARCH_NEEDS_WEAK_PER_CPU */
 +
 +DECLARE_STATIC_KEY_MAYBE(CONFIG_MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT,
 +			mem_alloc_profiling_key);
@@ -359,7 +379,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
 --- /dev/null
 +++ a/lib/alloc_tag.c
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,152 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +#include <linux/alloc_tag.h>
 +#include <linux/fs.h>
@@ -370,6 +390,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#include <linux/seq_file.h>
 +
 +static struct codetag_type *alloc_tag_cttype;
++
++DEFINE_PER_CPU(struct alloc_tag_counters, _shared_alloc_tag);
++EXPORT_SYMBOL(_shared_alloc_tag);
 +
 +DEFINE_STATIC_KEY_MAYBE(CONFIG_MEM_ALLOC_PROFILING_ENABLED_BY_DEFAULT,
 +			mem_alloc_profiling_key);
@@ -500,7 +523,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	};
 +
 +	alloc_tag_cttype = codetag_register_type(&desc);
-+	if (IS_ERR_OR_NULL(alloc_tag_cttype))
++	if (IS_ERR(alloc_tag_cttype))
 +		return PTR_ERR(alloc_tag_cttype);
 +
 +	register_sysctl_init("vm", memory_allocation_profiling_sysctls);
