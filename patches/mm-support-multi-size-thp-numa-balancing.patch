@@ -74,6 +74,8 @@ numa02_SMT			numa02_SMT
 
 [1] https://lore.kernel.org/all/20231117100745.fnpijbk4xgmals3k@techsingularity.net/
 
+[baolin.wang@linux.alibaba.com: v3]
+  Link: https://lkml.kernel.org/r/c33a5c0b0a0323b1f8ed53772f50501f4b196e25.1712132950.git.baolin.wang@linux.alibaba.com
 Link: https://lkml.kernel.org/r/d28d276d599c26df7f38c9de8446f60e22dd1950.1711683069.git.baolin.wang@linux.alibaba.com
 Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
@@ -85,29 +87,45 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memory.c   |   57 +++++++++++++++++++++++++++++++++++++++++-------
+ mm/memory.c   |   62 ++++++++++++++++++++++++++++++++++++++----------
  mm/mprotect.c |    3 +-
- 2 files changed, 51 insertions(+), 9 deletions(-)
+ 2 files changed, 52 insertions(+), 13 deletions(-)
 
 --- a/mm/memory.c~mm-support-multi-size-thp-numa-balancing
 +++ a/mm/memory.c
-@@ -5077,16 +5077,56 @@ static void numa_rebuild_single_mapping(
- 	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
+@@ -5064,17 +5064,51 @@ int numa_migrate_prep(struct folio *foli
  }
  
+ static void numa_rebuild_single_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
++					unsigned long fault_addr, pte_t *fault_pte,
+ 					bool writable)
+ {
+ 	pte_t pte, old_pte;
+ 
+-	old_pte = ptep_modify_prot_start(vma, vmf->address, vmf->pte);
++	old_pte = ptep_modify_prot_start(vma, fault_addr, fault_pte);
+ 	pte = pte_modify(old_pte, vma->vm_page_prot);
+ 	pte = pte_mkyoung(pte);
+ 	if (writable)
+ 		pte = pte_mkwrite(pte, vma);
+-	ptep_modify_prot_commit(vma, vmf->address, vmf->pte, old_pte, pte);
+-	update_mmu_cache_range(vmf, vma, vmf->address, vmf->pte, 1);
++	ptep_modify_prot_commit(vma, fault_addr, fault_pte, old_pte, pte);
++	update_mmu_cache_range(vmf, vma, fault_addr, fault_pte, 1);
++}
++
 +static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
-+				       struct folio *folio, pte_t fault_pte, bool ignore_writable)
++				       struct folio *folio, pte_t fault_pte,
++				       bool ignore_writable, bool pte_write_upgrade)
 +{
 +	int nr = pte_pfn(fault_pte) - folio_pfn(folio);
 +	unsigned long start = max(vmf->address - nr * PAGE_SIZE, vma->vm_start);
 +	unsigned long end = min(vmf->address + (folio_nr_pages(folio) - nr) * PAGE_SIZE, vma->vm_end);
 +	pte_t *start_ptep = vmf->pte - (vmf->address - start) / PAGE_SIZE;
-+	bool pte_write_upgrade = vma_wants_manual_pte_write_upgrade(vma);
 +	unsigned long addr;
 +
 +	/* Restore all PTEs' mapping of the large folio */
 +	for (addr = start; addr != end; start_ptep++, addr += PAGE_SIZE) {
-+		pte_t pte, old_pte;
 +		pte_t ptent = ptep_get(start_ptep);
 +		bool writable = false;
 +
@@ -125,23 +143,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				writable = true;
 +		}
 +
-+		old_pte = ptep_modify_prot_start(vma, addr, start_ptep);
-+		pte = pte_modify(old_pte, vma->vm_page_prot);
-+		pte = pte_mkyoung(pte);
-+		if (writable)
-+			pte = pte_mkwrite(pte, vma);
-+		ptep_modify_prot_commit(vma, addr, start_ptep, old_pte, pte);
-+		update_mmu_cache_range(vmf, vma, addr, start_ptep, 1);
++		numa_rebuild_single_mapping(vmf, vma, addr, start_ptep, writable);
 +	}
-+}
-+
+ }
+ 
  static vm_fault_t do_numa_page(struct vm_fault *vmf)
- {
+@@ -5082,11 +5116,12 @@ static vm_fault_t do_numa_page(struct vm
  	struct vm_area_struct *vma = vmf->vma;
  	struct folio *folio = NULL;
  	int nid = NUMA_NO_NODE;
 -	bool writable = false;
 +	bool writable = false, ignore_writable = false;
++	bool pte_write_upgrade = vma_wants_manual_pte_write_upgrade(vma);
  	int last_cpupid;
  	int target_nid;
  	pte_t pte, old_pte;
@@ -150,7 +163,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * The pte cannot be used safely until we verify, while holding the page
-@@ -5116,10 +5156,6 @@ static vm_fault_t do_numa_page(struct vm
+@@ -5108,7 +5143,7 @@ static vm_fault_t do_numa_page(struct vm
+ 	 * is only valid while holding the PT lock.
+ 	 */
+ 	writable = pte_write(pte);
+-	if (!writable && vma_wants_manual_pte_write_upgrade(vma) &&
++	if (!writable && pte_write_upgrade &&
+ 	    can_change_pte_writable(vma, vmf->address, pte))
+ 		writable = true;
+ 
+@@ -5116,10 +5151,6 @@ static vm_fault_t do_numa_page(struct vm
  	if (!folio || folio_is_zone_device(folio))
  		goto out_map;
  
@@ -161,7 +183,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Avoid grouping on RO pages in general. RO pages shouldn't hurt as
  	 * much anyway since they can be in shared cache state. This misses
-@@ -5139,6 +5175,7 @@ static vm_fault_t do_numa_page(struct vm
+@@ -5139,6 +5170,7 @@ static vm_fault_t do_numa_page(struct vm
  		flags |= TNF_SHARED;
  
  	nid = folio_nid(folio);
@@ -169,7 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * For memory tiering mode, cpupid of slow memory page is used
  	 * to record page access time.  So use default value.
-@@ -5155,6 +5192,7 @@ static vm_fault_t do_numa_page(struct vm
+@@ -5155,6 +5187,7 @@ static vm_fault_t do_numa_page(struct vm
  	}
  	pte_unmap_unlock(vmf->pte, vmf->ptl);
  	writable = false;
@@ -177,7 +199,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Migrate to the requested node */
  	if (migrate_misplaced_folio(folio, vma, target_nid)) {
-@@ -5175,14 +5213,17 @@ static vm_fault_t do_numa_page(struct vm
+@@ -5175,14 +5208,19 @@ static vm_fault_t do_numa_page(struct vm
  
  out:
  	if (nid != NUMA_NO_NODE)
@@ -191,9 +213,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 */
 -	numa_rebuild_single_mapping(vmf, vma, writable);
 +	if (folio && folio_test_large(folio))
-+		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable);
++		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable,
++					   pte_write_upgrade);
 +	else
-+		numa_rebuild_single_mapping(vmf, vma, writable);
++		numa_rebuild_single_mapping(vmf, vma, vmf->address, vmf->pte,
++					    writable);
  	pte_unmap_unlock(vmf->pte, vmf->ptl);
  	goto out;
  }
