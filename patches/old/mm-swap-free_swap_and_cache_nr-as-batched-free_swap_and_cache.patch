@@ -1,6 +1,6 @@
 From: Ryan Roberts <ryan.roberts@arm.com>
 Subject: mm: swap: free_swap_and_cache_nr() as batched free_swap_and_cache()
-Date: Wed, 3 Apr 2024 12:40:28 +0100
+Date: Mon, 8 Apr 2024 19:39:41 +0100
 
 Now that we no longer have a convenient flag in the cluster to determine
 if a folio is large, free_swap_and_cache() will take a reference and lock
@@ -25,12 +25,14 @@ wasn't exactly guaranteed.  We will still get the warning with most of the
 information from get_swap_device().  With the batch version, we wouldn't
 know which pte was bad anyway so could print the wrong one.
 
-Link: https://lkml.kernel.org/r/20240403114032.1162100-3-ryan.roberts@arm.com
+[ryan.roberts@arm.com: fix a build warning on parisc]
+  Link: https://lkml.kernel.org/r/20240409111840.3173122-1-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20240408183946.2991168-3-ryan.roberts@arm.com
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Barry Song <21cnbao@gmail.com>
 Cc: Barry Song <v-songbaohua@oppo.com>
 Cc: Chris Li <chrisl@kernel.org>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: Gao Xiang <xiang@kernel.org>
 Cc: "Huang, Ying" <ying.huang@intel.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
@@ -42,23 +44,24 @@ Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/pgtable.h |   28 ++++++++++++
- include/linux/swap.h    |   12 +++--
- mm/internal.h           |   48 +++++++++++++++++++++
- mm/madvise.c            |   12 +++--
- mm/memory.c             |   13 +++--
- mm/swapfile.c           |   86 +++++++++++++++++++++++++++++---------
- 6 files changed, 167 insertions(+), 32 deletions(-)
+ include/linux/pgtable.h |   29 +++++++++++
+ include/linux/swap.h    |   12 +++-
+ mm/internal.h           |   64 +++++++++++++++++++++++++
+ mm/madvise.c            |   12 +++-
+ mm/memory.c             |   13 ++---
+ mm/swapfile.c           |   97 ++++++++++++++++++++++++++++++--------
+ 6 files changed, 196 insertions(+), 31 deletions(-)
 
 --- a/include/linux/pgtable.h~mm-swap-free_swap_and_cache_nr-as-batched-free_swap_and_cache
 +++ a/include/linux/pgtable.h
-@@ -708,6 +708,34 @@ static inline void pte_clear_not_present
+@@ -708,6 +708,35 @@ static inline void pte_clear_not_present
  }
  #endif
  
 +#ifndef clear_not_present_full_ptes
 +/**
-+ * clear_not_present_full_ptes - Clear consecutive not present PTEs.
++ * clear_not_present_full_ptes - Clear multiple not present PTEs which are
++ *				 consecutive in the pgtable.
 + * @mm: Address space the ptes represent.
 + * @addr: Address of the first pte.
 + * @ptep: Page table pointer for the first entry.
@@ -133,51 +136,67 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/tracepoint-defs.h>
  
  struct folio_batch;
-@@ -189,6 +191,52 @@ static inline int folio_pte_batch(struct
+@@ -189,6 +191,68 @@ static inline int folio_pte_batch(struct
  
  	return min(ptep - start_ptep, max_nr);
  }
 +
 +/**
++ * pte_next_swp_offset - Increment the swap entry offset field of a swap pte.
++ * @pte: The initial pte state; is_swap_pte(pte) must be true and
++ *	 non_swap_entry() must be false.
++ *
++ * Increments the swap offset, while maintaining all other fields, including
++ * swap type, and any swp pte bits. The resulting pte is returned.
++ */
++static inline pte_t pte_next_swp_offset(pte_t pte)
++{
++	swp_entry_t entry = pte_to_swp_entry(pte);
++	pte_t new = __swp_entry_to_pte(__swp_entry(swp_type(entry),
++						   (swp_offset(entry) + 1)));
++
++	if (pte_swp_soft_dirty(pte))
++		new = pte_swp_mksoft_dirty(new);
++	if (pte_swp_exclusive(pte))
++		new = pte_swp_mkexclusive(new);
++	if (pte_swp_uffd_wp(pte))
++		new = pte_swp_mkuffd_wp(new);
++
++	return new;
++}
++
++/**
 + * swap_pte_batch - detect a PTE batch for a set of contiguous swap entries
 + * @start_ptep: Page table pointer for the first entry.
 + * @max_nr: The maximum number of table entries to consider.
-+ * @entry: Swap entry recovered from the first table entry.
++ * @pte: Page table entry for the first entry.
 + *
 + * Detect a batch of contiguous swap entries: consecutive (non-present) PTEs
 + * containing swap entries all with consecutive offsets and targeting the same
-+ * swap type.
++ * swap type, all with matching swp pte bits.
 + *
 + * max_nr must be at least one and must be limited by the caller so scanning
 + * cannot exceed a single page table.
 + *
 + * Return: the number of table entries in the batch.
 + */
-+static inline int swap_pte_batch(pte_t *start_ptep, int max_nr,
-+				 swp_entry_t entry)
++static inline int swap_pte_batch(pte_t *start_ptep, int max_nr, pte_t pte)
 +{
++	pte_t expected_pte = pte_next_swp_offset(pte);
 +	const pte_t *end_ptep = start_ptep + max_nr;
-+	unsigned long expected_offset = swp_offset(entry) + 1;
-+	unsigned int expected_type = swp_type(entry);
 +	pte_t *ptep = start_ptep + 1;
 +
 +	VM_WARN_ON(max_nr < 1);
-+	VM_WARN_ON(non_swap_entry(entry));
++	VM_WARN_ON(!is_swap_pte(pte));
++	VM_WARN_ON(non_swap_entry(pte_to_swp_entry(pte)));
 +
 +	while (ptep < end_ptep) {
-+		pte_t pte = ptep_get(ptep);
++		pte = ptep_get(ptep);
 +
-+		if (pte_none(pte) || pte_present(pte))
++		if (!pte_same(pte, expected_pte))
 +			break;
 +
-+		entry = pte_to_swp_entry(pte);
-+
-+		if (non_swap_entry(entry) ||
-+		    swp_type(entry) != expected_type ||
-+		    swp_offset(entry) != expected_offset)
-+			break;
-+
-+		expected_offset++;
++		expected_pte = pte_next_swp_offset(expected_pte);
 +		ptep++;
 +	}
 +
@@ -214,7 +233,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -				free_swap_and_cache(entry);
 -				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
 +				max_nr = (end - addr) / PAGE_SIZE;
-+				nr = swap_pte_batch(pte, max_nr, entry);
++				nr = swap_pte_batch(pte, max_nr, ptent);
 +				nr_swap -= nr;
 +				free_swap_and_cache_nr(entry, nr);
 +				clear_not_present_full_ptes(mm, addr, pte, nr, tlb->fullmm);
@@ -229,7 +248,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		} else if (!non_swap_entry(entry)) {
 -			/* Genuine swap entry, hence a private anon page */
 +			max_nr = (end - addr) / PAGE_SIZE;
-+			nr = swap_pte_batch(pte, max_nr, entry);
++			nr = swap_pte_batch(pte, max_nr, ptent);
 +			/* Genuine swap entries, hence a private anon pages */
  			if (!should_zap_cows(details))
  				continue;
@@ -284,19 +303,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto checks;
  		goto scan; /* check next one */
  	}
-@@ -1572,32 +1577,75 @@ bool folio_free_swap(struct folio *folio
+@@ -1572,32 +1577,88 @@ bool folio_free_swap(struct folio *folio
  	return true;
  }
  
 -/*
 - * Free the swap entry like above, but also try to
 - * free the page cache entry if it is the last user.
-- */
++/**
++ * free_swap_and_cache_nr() - Release reference on range of swap entries and
++ *                            reclaim their cache if no more references remain.
++ * @entry: First entry of range.
++ * @nr: Number of entries in range.
++ *
++ * For each swap entry in the contiguous range, release a reference. If any swap
++ * entries become free, try to reclaim their underlying folios, if present. The
++ * offset range is defined by [entry.offset, entry.offset + nr).
+  */
 -int free_swap_and_cache(swp_entry_t entry)
 +void free_swap_and_cache_nr(swp_entry_t entry, int nr)
  {
 -	struct swap_info_struct *p;
-+	unsigned long end = swp_offset(entry) + nr;
++	const unsigned long start_offset = swp_offset(entry);
++	const unsigned long end_offset = start_offset + nr;
 +	unsigned int type = swp_type(entry);
 +	struct swap_info_struct *si;
 +	bool any_only_cache = false;
@@ -310,36 +339,38 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	si = get_swap_device(entry);
 +	if (!si)
 +		return;
++
++	if (WARN_ON(end_offset > si->max))
++		goto out;
  
 -	p = get_swap_device(entry);
 -	if (p) {
 -		if (WARN_ON(data_race(!p->swap_map[swp_offset(entry)]))) {
 -			put_swap_device(p);
 -			return 0;
-+	if (WARN_ON(end > si->max))
-+		goto out;
-+
 +	/*
 +	 * First free all entries in the range.
 +	 */
-+	for (offset = swp_offset(entry); offset < end; offset++) {
-+		if (!WARN_ON(data_race(!si->swap_map[offset]))) {
++	for (offset = start_offset; offset < end_offset; offset++) {
++		if (data_race(si->swap_map[offset])) {
 +			count = __swap_entry_free(si, swp_entry(type, offset));
 +			if (count == SWAP_HAS_CACHE)
 +				any_only_cache = true;
++		} else {
++			WARN_ON_ONCE(1);
  		}
 +	}
- 
--		count = __swap_entry_free(p, entry);
--		if (count == SWAP_HAS_CACHE)
--			__try_to_reclaim_swap(p, swp_offset(entry),
++
 +	/*
 +	 * Short-circuit the below loop if none of the entries had their
 +	 * reference drop to zero.
 +	 */
 +	if (!any_only_cache)
 +		goto out;
-+
+ 
+-		count = __swap_entry_free(p, entry);
+-		if (count == SWAP_HAS_CACHE)
+-			__try_to_reclaim_swap(p, swp_offset(entry),
 +	/*
 +	 * Now go back over the range trying to reclaim the swap cache. This is
 +	 * more efficient for large folios because we will only try to reclaim
@@ -349,7 +380,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * page but will only succeed once the swap slot for every subpage is
 +	 * zero.
 +	 */
-+	for (offset = swp_offset(entry); offset < end; offset += nr) {
++	for (offset = start_offset; offset < end_offset; offset += nr) {
 +		nr = 1;
 +		if (READ_ONCE(si->swap_map[offset]) == SWAP_HAS_CACHE) {
 +			/*

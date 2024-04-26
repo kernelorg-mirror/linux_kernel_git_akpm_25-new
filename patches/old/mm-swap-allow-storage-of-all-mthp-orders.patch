@@ -1,6 +1,6 @@
 From: Ryan Roberts <ryan.roberts@arm.com>
 Subject: mm: swap: allow storage of all mTHP orders
-Date: Wed, 3 Apr 2024 12:40:30 +0100
+Date: Mon, 8 Apr 2024 19:39:44 +0100
 
 Multi-size THP enables performance improvements by allocating large,
 pte-mapped folios for anonymous memory.  However I've observed that on an
@@ -44,7 +44,7 @@ This change only modifies swap to be able to accept any order mTHP.  It
 doesn't change the callers to elide doing the actual split.  That will be
 done in separate changes.
 
-Link: https://lkml.kernel.org/r/20240403114032.1162100-5-ryan.roberts@arm.com
+Link: https://lkml.kernel.org/r/20240408183946.2991168-6-ryan.roberts@arm.com
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
 Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
 Cc: Barry Song <21cnbao@gmail.com>
@@ -61,10 +61,9 @@ Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/swap.h |   10 +-
- mm/swap_slots.c      |    6 -
- mm/swapfile.c        |  175 ++++++++++++++++++++++-------------------
- 3 files changed, 109 insertions(+), 82 deletions(-)
+ include/linux/swap.h |    8 +-
+ mm/swapfile.c        |  162 +++++++++++++++++++++++------------------
+ 2 files changed, 98 insertions(+), 72 deletions(-)
 
 --- a/include/linux/swap.h~mm-swap-allow-storage-of-all-mthp-orders
 +++ a/include/linux/swap.h
@@ -89,36 +88,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  struct swap_cluster_list {
-@@ -468,7 +474,7 @@ swp_entry_t folio_alloc_swap(struct foli
- bool folio_free_swap(struct folio *folio);
- void put_swap_folio(struct folio *folio, swp_entry_t entry);
- extern swp_entry_t get_swap_page_of_type(int);
--extern int get_swap_pages(int n, swp_entry_t swp_entries[], int entry_size);
-+extern int get_swap_pages(int n, swp_entry_t swp_entries[], int order);
- extern int add_swap_count_continuation(swp_entry_t, gfp_t);
- extern void swap_shmem_alloc(swp_entry_t);
- extern int swap_duplicate(swp_entry_t);
 --- a/mm/swapfile.c~mm-swap-allow-storage-of-all-mthp-orders
 +++ a/mm/swapfile.c
-@@ -278,15 +278,15 @@ static void discard_swap_cluster(struct
- #ifdef CONFIG_THP_SWAP
- #define SWAPFILE_CLUSTER	HPAGE_PMD_NR
- 
--#define swap_entry_size(size)	(size)
-+#define swap_entry_order(order)	(order)
- #else
- #define SWAPFILE_CLUSTER	256
- 
- /*
-- * Define swap_entry_size() as constant to let compiler to optimize
-+ * Define swap_entry_order() as constant to let compiler to optimize
-  * out some code if !CONFIG_THP_SWAP
-  */
--#define swap_entry_size(size)	1
-+#define swap_entry_order(order)	0
- #endif
- #define LATENCY_LIMIT		256
- 
 @@ -551,10 +551,12 @@ static void free_cluster(struct swap_inf
  
  /*
@@ -400,18 +371,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void swap_free_cluster(struct swap_info_struct *si, unsigned long idx)
  {
  	unsigned long offset = idx * SWAPFILE_CLUSTER;
-@@ -1042,17 +1068,15 @@ static void swap_free_cluster(struct swa
- 	swap_range_free(si, offset, SWAPFILE_CLUSTER);
- }
- 
--int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_size)
-+int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_order)
- {
--	unsigned long size = swap_entry_size(entry_size);
-+	int order = swap_entry_order(entry_order);
-+	unsigned long size = 1 << order;
- 	struct swap_info_struct *si, *next;
- 	long avail_pgs;
+@@ -1051,9 +1077,6 @@ int get_swap_pages(int n_goal, swp_entry
  	int n_ret = 0;
  	int node;
  
@@ -421,7 +381,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	spin_lock(&swap_avail_lock);
  
  	avail_pgs = atomic_long_read(&nr_swap_pages) / size;
-@@ -1088,14 +1112,10 @@ start_over:
+@@ -1089,14 +1112,10 @@ start_over:
  			spin_unlock(&si->lock);
  			goto nextsi;
  		}
@@ -439,16 +399,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto check_out;
  		cond_resched();
  
-@@ -1349,7 +1369,7 @@ void put_swap_folio(struct folio *folio,
- 	unsigned char *map;
- 	unsigned int i, free_entries = 0;
- 	unsigned char val;
--	int size = swap_entry_size(folio_nr_pages(folio));
-+	int size = 1 << swap_entry_order(folio_order(folio));
- 
- 	si = _swap_info_get(entry);
- 	if (!si)
-@@ -1659,7 +1679,7 @@ swp_entry_t get_swap_page_of_type(int ty
+@@ -1673,7 +1692,7 @@ swp_entry_t get_swap_page_of_type(int ty
  
  	/* This is called for allocating swap entry, not cache */
  	spin_lock(&si->lock);
@@ -457,7 +408,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		atomic_long_dec(&nr_swap_pages);
  	spin_unlock(&si->lock);
  fail:
-@@ -3113,7 +3133,7 @@ SYSCALL_DEFINE2(swapon, const char __use
+@@ -3127,7 +3146,7 @@ SYSCALL_DEFINE2(swapon, const char __use
  		p->flags |= SWP_SYNCHRONOUS_IO;
  
  	if (p->bdev && bdev_nonrot(p->bdev)) {
@@ -466,7 +417,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		unsigned long ci, nr_cluster;
  
  		p->flags |= SWP_SOLIDSTATE;
-@@ -3151,7 +3171,8 @@ SYSCALL_DEFINE2(swapon, const char __use
+@@ -3165,7 +3184,8 @@ SYSCALL_DEFINE2(swapon, const char __use
  			struct percpu_cluster *cluster;
  
  			cluster = per_cpu_ptr(p->percpu_cluster, cpu);
@@ -476,33 +427,4 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  	} else {
  		atomic_inc(&nr_rotate_swap);
---- a/mm/swap_slots.c~mm-swap-allow-storage-of-all-mthp-orders
-+++ a/mm/swap_slots.c
-@@ -264,7 +264,7 @@ static int refill_swap_slots_cache(struc
- 	cache->cur = 0;
- 	if (swap_slot_cache_active)
- 		cache->nr = get_swap_pages(SWAP_SLOTS_CACHE_SIZE,
--					   cache->slots, 1);
-+					   cache->slots, 0);
- 
- 	return cache->nr;
- }
-@@ -311,7 +311,7 @@ swp_entry_t folio_alloc_swap(struct foli
- 
- 	if (folio_test_large(folio)) {
- 		if (IS_ENABLED(CONFIG_THP_SWAP))
--			get_swap_pages(1, &entry, folio_nr_pages(folio));
-+			get_swap_pages(1, &entry, folio_order(folio));
- 		goto out;
- 	}
- 
-@@ -343,7 +343,7 @@ repeat:
- 			goto out;
- 	}
- 
--	get_swap_pages(1, &entry, 1);
-+	get_swap_pages(1, &entry, 0);
- out:
- 	if (mem_cgroup_try_charge_swap(folio, entry)) {
- 		put_swap_folio(folio, entry);
 _

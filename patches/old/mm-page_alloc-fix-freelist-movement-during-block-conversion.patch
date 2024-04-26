@@ -1,6 +1,6 @@
 From: Johannes Weiner <hannes@cmpxchg.org>
 Subject: mm: page_alloc: fix freelist movement during block conversion
-Date: Mon, 11 Sep 2023 15:41:46 -0400
+Date: Wed, 20 Mar 2024 14:02:11 -0400
 
 Currently, page block type conversion during fallbacks, atomic
 reservations and isolation can strand various amounts of free pages on
@@ -22,20 +22,24 @@ Split the process into a proper transaction: check first if conversion
 will happen, then try to move the free pages, and only if that was
 successful convert the block to the new type.
 
-Link: https://lkml.kernel.org/r/20230911195023.247694-6-hannes@cmpxchg.org
+[baolin.wang@linux.alibaba.com: fix allocation failures with CONFIG_CMA]
+  Link: https://lkml.kernel.org/r/a97697e0-45b0-4f71-b087-fdc7a1d43c0e@linux.alibaba.com
+Link: https://lkml.kernel.org/r/20240320180429.678181-7-hannes@cmpxchg.org
 Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Tested-by: "Huang, Ying" <ying.huang@intel.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Tested-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
 Cc: Mel Gorman <mgorman@techsingularity.net>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/page-isolation.h |    3 
- mm/page_alloc.c                |  171 ++++++++++++++++++-------------
+ mm/page_alloc.c                |  174 ++++++++++++++++++-------------
  mm/page_isolation.c            |   22 ++-
- 3 files changed, 118 insertions(+), 78 deletions(-)
+ 3 files changed, 121 insertions(+), 78 deletions(-)
 
 --- a/include/linux/page-isolation.h~mm-page_alloc-fix-freelist-movement-during-block-conversion
 +++ a/include/linux/page-isolation.h
@@ -51,7 +55,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			     int migratetype, int flags, gfp_t gfp_flags);
 --- a/mm/page_alloc.c~mm-page_alloc-fix-freelist-movement-during-block-conversion
 +++ a/mm/page_alloc.c
-@@ -1592,9 +1592,8 @@ static inline struct page *__rmqueue_cma
+@@ -1601,9 +1601,8 @@ static inline struct page *__rmqueue_cma
   * Note that start_page and end_pages are not aligned on a pageblock
   * boundary. If alignment is required, use move_freepages_block()
   */
@@ -63,7 +67,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct page *page;
  	unsigned long pfn;
-@@ -1604,14 +1603,6 @@ static int move_freepages(struct zone *z
+@@ -1613,14 +1612,6 @@ static int move_freepages(struct zone *z
  	for (pfn = start_pfn; pfn <= end_pfn;) {
  		page = pfn_to_page(pfn);
  		if (!PageBuddy(page)) {
@@ -78,7 +82,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			pfn++;
  			continue;
  		}
-@@ -1629,26 +1620,62 @@ static int move_freepages(struct zone *z
+@@ -1638,17 +1629,16 @@ static int move_freepages(struct zone *z
  	return pages_moved;
  }
  
@@ -101,13 +105,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	start = pageblock_start_pfn(pfn);
 +	end = pageblock_end_pfn(pfn) - 1;
  
- 	/* Do not cross zone boundaries */
+ 	/*
+ 	 * The caller only has the lock for @zone, don't touch ranges
+@@ -1657,13 +1647,50 @@ int move_freepages_block(struct zone *zo
+ 	 * accompanied by other operations such as migratetype updates
+ 	 * which also should be locked.
+ 	 */
 -	if (!zone_spans_pfn(zone, start_pfn))
--		start_pfn = zone->zone_start_pfn;
+-		return 0;
 -	if (!zone_spans_pfn(zone, end_pfn))
 -		return 0;
 +	if (!zone_spans_pfn(zone, start))
-+		start = zone->zone_start_pfn;
++		return false;
 +	if (!zone_spans_pfn(zone, end))
 +		return false;
 +
@@ -155,7 +164,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void change_pageblock_range(struct page *pageblock_page,
-@@ -1733,33 +1760,36 @@ static inline bool boost_watermark(struc
+@@ -1748,33 +1775,37 @@ static inline bool boost_watermark(struc
  }
  
  /*
@@ -172,10 +181,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * future will be put on the correct free list. Otherwise, we isolate exactly
 + * the order we need from the fallback block and leave its migratetype alone.
   */
- static void steal_suitable_fallback(struct zone *zone, struct page *page,
+-static void steal_suitable_fallback(struct zone *zone, struct page *page,
 -		unsigned int alloc_flags, int start_type, bool whole_block)
-+				    int current_order, int order, int start_type,
-+				    unsigned int alloc_flags, bool whole_block)
++static struct page *
++steal_suitable_fallback(struct zone *zone, struct page *page,
++			int current_order, int order, int start_type,
++			unsigned int alloc_flags, bool whole_block)
  {
 -	unsigned int current_order = buddy_order(page);
  	int free_pages, movable_pages, alike_pages;
@@ -200,11 +211,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		change_pageblock_range(page, current_order, start_type);
 -		goto single_page;
 +		expand(zone, page, order, current_order, start_type);
-+		return;
++		return page;
  	}
  
  	/*
-@@ -1774,10 +1804,9 @@ static void steal_suitable_fallback(stru
+@@ -1789,10 +1820,9 @@ static void steal_suitable_fallback(stru
  	if (!whole_block)
  		goto single_page;
  
@@ -217,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto single_page;
  
  	/*
-@@ -1795,7 +1824,7 @@ static void steal_suitable_fallback(stru
+@@ -1810,7 +1840,7 @@ static void steal_suitable_fallback(stru
  		 * vice versa, be conservative since we can't distinguish the
  		 * exact migratetype of non-movable pages.
  		 */
@@ -226,7 +237,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			alike_pages = pageblock_nr_pages
  						- (free_pages + movable_pages);
  		else
-@@ -1806,13 +1835,15 @@ static void steal_suitable_fallback(stru
+@@ -1821,13 +1851,16 @@ static void steal_suitable_fallback(stru
  	 * compatible migratability as our allocation, claim the whole block.
  	 */
  	if (free_pages + alike_pages >= (1 << (pageblock_order-1)) ||
@@ -236,17 +247,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		set_pageblock_migratetype(page, start_type);
 -
 -	return;
-+		block_type = start_type;
++		return __rmqueue_smallest(zone, order, start_type);
 +	}
  
  single_page:
 -	move_to_free_list(page, zone, current_order, start_type);
 +	del_page_from_free_list(page, zone, current_order);
 +	expand(zone, page, order, current_order, block_type);
++	return page;
  }
  
  /*
-@@ -1876,9 +1907,10 @@ static void reserve_highatomic_pageblock
+@@ -1895,9 +1928,10 @@ static void reserve_highatomic_pageblock
  	mt = get_pageblock_migratetype(page);
  	/* Only reserve normal pageblocks (i.e., they can merge with others) */
  	if (migratetype_is_mergeable(mt)) {
@@ -260,7 +272,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  out_unlock:
-@@ -1903,7 +1935,7 @@ static bool unreserve_highatomic_pageblo
+@@ -1922,7 +1956,7 @@ static bool unreserve_highatomic_pageblo
  	struct zone *zone;
  	struct page *page;
  	int order;
@@ -269,7 +281,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for_each_zone_zonelist_nodemask(zone, z, zonelist, ac->highest_zoneidx,
  								ac->nodemask) {
-@@ -1952,10 +1984,14 @@ static bool unreserve_highatomic_pageblo
+@@ -1971,10 +2005,14 @@ static bool unreserve_highatomic_pageblo
  			 * of pageblocks that cannot be completely freed
  			 * may increase.
  			 */
@@ -287,7 +299,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				spin_unlock_irqrestore(&zone->lock, flags);
  				return ret;
  			}
-@@ -1976,7 +2012,7 @@ static bool unreserve_highatomic_pageblo
+@@ -1995,7 +2033,7 @@ static bool unreserve_highatomic_pageblo
   * deviation from the rest of this file, to make the for loop
   * condition simpler.
   */
@@ -296,7 +308,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  __rmqueue_fallback(struct zone *zone, int order, int start_migratetype,
  						unsigned int alloc_flags)
  {
-@@ -2023,7 +2059,7 @@ __rmqueue_fallback(struct zone *zone, in
+@@ -2042,7 +2080,7 @@ __rmqueue_fallback(struct zone *zone, in
  		goto do_steal;
  	}
  
@@ -304,16 +316,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return NULL;
  
  find_smallest:
- 	for (current_order = order; current_order <= MAX_ORDER;
-@@ -2044,14 +2080,14 @@ find_smallest:
+ 	for (current_order = order; current_order < NR_PAGE_ORDERS; current_order++) {
+@@ -2062,14 +2100,14 @@ find_smallest:
  do_steal:
  	page = get_page_from_free_area(area, fallback_mt);
  
 -	steal_suitable_fallback(zone, page, alloc_flags, start_migratetype,
 -								can_steal);
 +	/* take off list, maybe claim block, expand remainder */
-+	steal_suitable_fallback(zone, page, current_order, order,
-+				start_migratetype, alloc_flags, can_steal);
++	page = steal_suitable_fallback(zone, page, current_order, order,
++				       start_migratetype, alloc_flags, can_steal);
  
  	trace_mm_page_alloc_extfrag(page, order, current_order,
  		start_migratetype, fallback_mt);
@@ -323,8 +335,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return page;
  }
  
- #ifdef CONFIG_CMA
-@@ -2114,15 +2150,14 @@ __rmqueue(struct zone *zone, unsigned in
+ /*
+@@ -2096,15 +2134,15 @@ __rmqueue(struct zone *zone, unsigned in
  				return page;
  		}
  	}
@@ -334,17 +346,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (unlikely(!page)) {
  		if (alloc_flags & ALLOC_CMA)
  			page = __rmqueue_cma_fallback(zone, order);
--
+ 
 -		if (!page && __rmqueue_fallback(zone, order, migratetype,
 -								alloc_flags))
 -			goto retry;
-+		else
++		if (!page)
 +			page = __rmqueue_fallback(zone, order, migratetype,
 +						  alloc_flags);
  	}
  	return page;
  }
-@@ -2575,12 +2610,10 @@ int __isolate_free_page(struct page *pag
+@@ -2659,12 +2697,10 @@ int __isolate_free_page(struct page *pag
  			 * Only change normal pageblocks (i.e., they can merge
  			 * with others)
  			 */

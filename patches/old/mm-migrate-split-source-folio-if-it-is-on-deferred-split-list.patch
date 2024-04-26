@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/migrate: split source folio if it is on deferred split list
-Date: Tue, 19 Mar 2024 11:47:53 -0400
+Date: Fri, 22 Mar 2024 15:33:04 -0400
 
 If the source folio is on deferred split list, it is likely some subpages
 are not used.  Split it before migration to avoid migrating unused
@@ -15,162 +15,57 @@ consequence is present[1].
 
 [1]: https://lore.kernel.org/linux-mm/03CE3A00-917C-48CC-8E1C-6A98713C817C@nvidia.com/
 
-Link: https://lkml.kernel.org/r/20240319154753.253262-1-zi.yan@sent.com
+[zi.yan@sent.com: fix an error in migrate_misplaced_folio()]
+  Link: https://lkml.kernel.org/r/20240326150031.569387-1-zi.yan@sent.com
+Link: https://lkml.kernel.org/r/20240322193304.522496-1-zi.yan@sent.com
 Fixes: 616b8371539a ("mm: thp: enable thp migration in generic path")
 Signed-off-by: Zi Yan <ziy@nvidia.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Tested-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Huang, Ying <ying.huang@intel.com>
 Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
-Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
 Cc: Yang Shi <shy828301@gmail.com>
 Cc: Yin Fengwei <fengwei.yin@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |   22 ----------------
- mm/internal.h    |   23 +++++++++++++++++
- mm/migrate.c     |   60 ++++++++++++++++++++++++++++++++++++---------
- 3 files changed, 72 insertions(+), 33 deletions(-)
+ mm/migrate.c |   23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
 
---- a/mm/huge_memory.c~mm-migrate-split-source-folio-if-it-is-on-deferred-split-list
-+++ a/mm/huge_memory.c
-@@ -766,28 +766,6 @@ pmd_t maybe_pmd_mkwrite(pmd_t pmd, struc
- 	return pmd;
- }
- 
--#ifdef CONFIG_MEMCG
--static inline
--struct deferred_split *get_deferred_split_queue(struct folio *folio)
--{
--	struct mem_cgroup *memcg = folio_memcg(folio);
--	struct pglist_data *pgdat = NODE_DATA(folio_nid(folio));
--
--	if (memcg)
--		return &memcg->deferred_split_queue;
--	else
--		return &pgdat->deferred_split_queue;
--}
--#else
--static inline
--struct deferred_split *get_deferred_split_queue(struct folio *folio)
--{
--	struct pglist_data *pgdat = NODE_DATA(folio_nid(folio));
--
--	return &pgdat->deferred_split_queue;
--}
--#endif
--
- void folio_prep_large_rmappable(struct folio *folio)
- {
- 	if (!folio || !folio_test_large(folio))
---- a/mm/internal.h~mm-migrate-split-source-folio-if-it-is-on-deferred-split-list
-+++ a/mm/internal.h
-@@ -1106,6 +1106,29 @@ struct page *follow_trans_huge_pmd(struc
- 				   unsigned long addr, pmd_t *pmd,
- 				   unsigned int flags);
- 
-+#ifdef CONFIG_MEMCG
-+static inline
-+struct deferred_split *get_deferred_split_queue(struct folio *folio)
-+{
-+	struct mem_cgroup *memcg = folio_memcg(folio);
-+	struct pglist_data *pgdat = NODE_DATA(folio_nid(folio));
-+
-+	if (memcg)
-+		return &memcg->deferred_split_queue;
-+	else
-+		return &pgdat->deferred_split_queue;
-+}
-+#else
-+static inline
-+struct deferred_split *get_deferred_split_queue(struct folio *folio)
-+{
-+	struct pglist_data *pgdat = NODE_DATA(folio_nid(folio));
-+
-+	return &pgdat->deferred_split_queue;
-+}
-+#endif
-+
-+
- /*
-  * mm/mmap.c
-  */
 --- a/mm/migrate.c~mm-migrate-split-source-folio-if-it-is-on-deferred-split-list
 +++ a/mm/migrate.c
-@@ -1654,25 +1654,63 @@ static int migrate_pages_batch(struct li
+@@ -1653,6 +1653,29 @@ static int migrate_pages_batch(struct li
+ 			cond_resched();
  
  			/*
- 			 * Large folio migration might be unsupported or
--			 * the allocation might be failed so we should retry
--			 * on the same folio with the large folio split
-+			 * the folio is on deferred split list so we should
-+			 * retry on the same folio with the large folio split
- 			 * to normal folios.
- 			 *
- 			 * Split folios are put in split_folios, and
- 			 * we will migrate them after the rest of the
- 			 * list is processed.
- 			 */
--			if (!thp_migration_supported() && is_thp) {
--				nr_failed++;
--				stats->nr_thp_failed++;
--				if (!try_split_folio(folio, split_folios)) {
--					stats->nr_thp_split++;
--					stats->nr_split++;
-+			if (is_thp) {
-+				bool is_on_deferred_list = false;
-+
-+				/*
-+				 * Check without taking split_queue_lock to
-+				 * reduce locking overheads. The worst case is
-+				 * that if the folio is put on the deferred
-+				 * split list after the check, it will be
-+				 * migrated and not put back on the list.
-+				 * The migrated folio will not be split
-+				 * via shrinker during memory pressure.
-+				 */
-+				if (!data_race(list_empty(&folio->_deferred_list))) {
-+					struct deferred_split *ds_queue;
-+					unsigned long flags;
-+
-+					ds_queue =
-+						get_deferred_split_queue(folio);
-+					spin_lock_irqsave(&ds_queue->split_queue_lock,
-+							  flags);
-+					/*
-+					 * Only check if the folio is on
-+					 * deferred split list without removing
-+					 * it. Since the folio can be on
-+					 * deferred_split_scan() local list and
-+					 * removing it can cause the local list
-+					 * corruption. Folio split process
-+					 * below can handle it with the help of
-+					 * folio_ref_freeze().
-+					 */
-+					is_on_deferred_list =
-+						!list_empty(&folio->_deferred_list);
-+					spin_unlock_irqrestore(&ds_queue->split_queue_lock,
-+							       flags);
++			 * The rare folio on the deferred split list should
++			 * be split now. It should not count as a failure.
++			 * Only check it without removing it from the list.
++			 * Since the folio can be on deferred_split_scan()
++			 * local list and removing it can cause the local list
++			 * corruption. Folio split process below can handle it
++			 * with the help of folio_ref_freeze().
++			 *
++			 * nr_pages > 2 is needed to avoid checking order-1
++			 * page cache folios. They exist, in contrast to
++			 * non-existent order-1 anonymous folios, and do not
++			 * use _deferred_list.
++			 */
++			if (nr_pages > 2 &&
++			   !list_empty(&folio->_deferred_list)) {
++				if (try_split_folio(folio, split_folios) == 0) {
++					stats->nr_thp_split += is_thp;
++					stats->nr_split++;
++					continue;
 +				}
-+				if (!thp_migration_supported() ||
-+						is_on_deferred_list) {
-+					nr_failed++;
-+					stats->nr_thp_failed++;
-+					if (!try_split_folio(folio,
-+							     split_folios)) {
-+						stats->nr_thp_split++;
-+						stats->nr_split++;
-+						continue;
-+					}
-+					stats->nr_failed_pages += nr_pages;
-+					list_move_tail(&folio->lru, ret_folios);
- 					continue;
- 				}
--				stats->nr_failed_pages += nr_pages;
--				list_move_tail(&folio->lru, ret_folios);
--				continue;
- 			}
- 
- 			rc = migrate_folio_unmap(get_new_folio, put_new_folio,
++			}
++
++			/*
+ 			 * Large folio migration might be unsupported or
+ 			 * the allocation might be failed so we should retry
+ 			 * on the same folio with the large folio split
 _
