@@ -1,0 +1,120 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/damon/paddr: implement damon_folio_young()
+Date: Fri, 26 Apr 2024 12:52:40 -0700
+
+Patch series "mm/damon: add a DAMOS filter type for page granularity
+access recheck".
+
+DAMON provides its best-effort accuracy-overhead tradeoff under the
+user-defined ranges of acceptable level of the monitoring accuracy and
+overhead.  A recent discussion for tiered memory management support from
+DAMON[1] concluded that finding memory regions of specific access pattern
+with low overhead despite of low accuracy via DAMON first, and then double
+checking the access of the region again in a finer (e.g., page)
+granularity could be a useful strategy for some DAMOS schemes.
+
+Add a new type of DAMOS filter, namely 'young' for such a case.  It checks
+each page of DAMOS target region is accessed since the last check, and
+filters it out or in if 'matching' parameter is 'true' or 'false',
+respectively.
+
+Because this is a filter type that applied in page granularity, the
+support depends on DAMON operations set, similar to 'anon' and 'memcg'
+DAMOS filter types.  Implement the support on the DAMON operations set for
+the physical address space, 'paddr', since one of the expected usages[1]
+is based on the physical address space.
+
+[1] https://lore.kernel.org/r/20240227235121.153277-1-sj@kernel.org
+
+
+This patch (of 7):
+
+damon_pa_young() receives physical address, get the folio covering the
+address, and show if the folio is accessed since the last check.  A
+following commit will reuse the internal logic for checking access to a
+given folio.  To avoid duplication of the code, split the internal logic. 
+Also, change the rmap walker function's name from __damon_pa_young() to
+damon_folio_young_one(), following the change of the caller's name and the
+naming rule that more commonly used by other rmap walkers.
+
+Link: https://lkml.kernel.org/r/20240426195247.100306-1-sj@kernel.org
+Link: https://lkml.kernel.org/r/20240426195247.100306-2-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Tested-by: Honggyu Kim <honggyu.kim@sk.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/damon/paddr.c |   32 +++++++++++++++++++-------------
+ 1 file changed, 19 insertions(+), 13 deletions(-)
+
+--- a/mm/damon/paddr.c~mm-damon-paddr-implement-damon_folio_young
++++ a/mm/damon/paddr.c
+@@ -79,8 +79,8 @@ static void damon_pa_prepare_access_chec
+ 	}
+ }
+ 
+-static bool __damon_pa_young(struct folio *folio, struct vm_area_struct *vma,
+-		unsigned long addr, void *arg)
++static bool damon_folio_young_one(struct folio *folio,
++		struct vm_area_struct *vma, unsigned long addr, void *arg)
+ {
+ 	bool *accessed = arg;
+ 	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, addr, 0);
+@@ -111,38 +111,44 @@ static bool __damon_pa_young(struct foli
+ 	return *accessed == false;
+ }
+ 
+-static bool damon_pa_young(unsigned long paddr, unsigned long *folio_sz)
++static bool damon_folio_young(struct folio *folio)
+ {
+-	struct folio *folio = damon_get_folio(PHYS_PFN(paddr));
+ 	bool accessed = false;
+ 	struct rmap_walk_control rwc = {
+ 		.arg = &accessed,
+-		.rmap_one = __damon_pa_young,
++		.rmap_one = damon_folio_young_one,
+ 		.anon_lock = folio_lock_anon_vma_read,
+ 	};
+ 	bool need_lock;
+ 
+-	if (!folio)
+-		return false;
+-
+ 	if (!folio_mapped(folio) || !folio_raw_mapping(folio)) {
+ 		if (folio_test_idle(folio))
+-			accessed = false;
++			return false;
+ 		else
+-			accessed = true;
+-		goto out;
++			return true;
+ 	}
+ 
+ 	need_lock = !folio_test_anon(folio) || folio_test_ksm(folio);
+ 	if (need_lock && !folio_trylock(folio))
+-		goto out;
++		return false;
+ 
+ 	rmap_walk(folio, &rwc);
+ 
+ 	if (need_lock)
+ 		folio_unlock(folio);
+ 
+-out:
++	return accessed;
++}
++
++static bool damon_pa_young(unsigned long paddr, unsigned long *folio_sz)
++{
++	struct folio *folio = damon_get_folio(PHYS_PFN(paddr));
++	bool accessed;
++
++	if (!folio)
++		return false;
++
++	accessed = damon_folio_young(folio);
+ 	*folio_sz = folio_size(folio);
+ 	folio_put(folio);
+ 	return accessed;
+_
