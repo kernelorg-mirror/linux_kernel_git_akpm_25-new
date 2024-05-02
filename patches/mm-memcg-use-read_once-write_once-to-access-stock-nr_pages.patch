@@ -1,0 +1,133 @@
+From: Breno Leitao <leitao@debian.org>
+Subject: mm: memcg: use READ_ONCE()/WRITE_ONCE() to access stock->nr_pages
+Date: Wed, 1 May 2024 02:54:20 -0700
+
+A memcg pointer in the per-cpu stock can be accessed by drain_all_stock()
+and consume_stock() in parallel, causing a potential race.
+
+KCSAN shows this data-race clearly in the splat below:
+
+	BUG: KCSAN: data-race in drain_all_stock.part.0 / try_charge_memcg
+
+	write to 0xffff88903f8b0788 of 4 bytes by task 35901 on cpu 2:
+	try_charge_memcg (mm/memcontrol.c:2323 mm/memcontrol.c:2746)
+	__mem_cgroup_charge (mm/memcontrol.c:7287 mm/memcontrol.c:7301)
+	do_anonymous_page (mm/memory.c:1054 mm/memory.c:4375 mm/memory.c:4433)
+	__handle_mm_fault (mm/memory.c:3878 mm/memory.c:5300 mm/memory.c:5441)
+	handle_mm_fault (mm/memory.c:5606)
+	do_user_addr_fault (arch/x86/mm/fault.c:1363)
+	exc_page_fault (./arch/x86/include/asm/irqflags.h:37
+		        ./arch/x86/include/asm/irqflags.h:72
+			arch/x86/mm/fault.c:1513
+			arch/x86/mm/fault.c:1563)
+	asm_exc_page_fault (./arch/x86/include/asm/idtentry.h:623)
+
+	read to 0xffff88903f8b0788 of 4 bytes by task 287 on cpu 27:
+	drain_all_stock.part.0 (mm/memcontrol.c:2433)
+	mem_cgroup_css_offline (mm/memcontrol.c:5398 mm/memcontrol.c:5687)
+	css_killed_work_fn (kernel/cgroup/cgroup.c:5521 kernel/cgroup/cgroup.c:5794)
+	process_one_work (kernel/workqueue.c:3254)
+	worker_thread (kernel/workqueue.c:3329 kernel/workqueue.c:3416)
+	kthread (kernel/kthread.c:388)
+	ret_from_fork (arch/x86/kernel/process.c:147)
+	ret_from_fork_asm (arch/x86/entry/entry_64.S:257)
+
+	value changed: 0x00000014 -> 0x00000013
+
+This happens because drain_all_stock() is reading stock->nr_pages, while
+consume_stock() might be updating the same address, causing a potential
+data-race.
+
+Make the shared addresses bulletproof regarding to reads and writes,
+similarly to what stock->cached_objcg and stock->cached.
+Annotate all accesses to stock->nr_pages with READ_ONCE()/WRITE_ONCE().
+
+Link: https://lkml.kernel.org/r/20240501095420.679208-1-leitao@debian.org
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Reviewed-by: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol.c |   24 +++++++++++++++---------
+ 1 file changed, 15 insertions(+), 9 deletions(-)
+
+--- a/mm/memcontrol.c~mm-memcg-use-read_once-write_once-to-access-stock-nr_pages
++++ a/mm/memcontrol.c
+@@ -2468,6 +2468,7 @@ static void memcg_account_kmem(struct me
+ static bool consume_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+ {
+ 	struct memcg_stock_pcp *stock;
++	unsigned int stock_pages;
+ 	unsigned long flags;
+ 	bool ret = false;
+ 
+@@ -2477,8 +2478,9 @@ static bool consume_stock(struct mem_cgr
+ 	local_lock_irqsave(&memcg_stock.stock_lock, flags);
+ 
+ 	stock = this_cpu_ptr(&memcg_stock);
+-	if (memcg == READ_ONCE(stock->cached) && stock->nr_pages >= nr_pages) {
+-		stock->nr_pages -= nr_pages;
++	stock_pages = READ_ONCE(stock->nr_pages);
++	if (memcg == READ_ONCE(stock->cached) && stock_pages >= nr_pages) {
++		WRITE_ONCE(stock->nr_pages, stock_pages - nr_pages);
+ 		ret = true;
+ 	}
+ 
+@@ -2492,16 +2494,18 @@ static bool consume_stock(struct mem_cgr
+  */
+ static void drain_stock(struct memcg_stock_pcp *stock)
+ {
++	unsigned int stock_pages = READ_ONCE(stock->nr_pages);
+ 	struct mem_cgroup *old = READ_ONCE(stock->cached);
+ 
+ 	if (!old)
+ 		return;
+ 
+-	if (stock->nr_pages) {
+-		page_counter_uncharge(&old->memory, stock->nr_pages);
++	if (stock_pages) {
++		page_counter_uncharge(&old->memory, stock_pages);
+ 		if (do_memsw_account())
+-			page_counter_uncharge(&old->memsw, stock->nr_pages);
+-		stock->nr_pages = 0;
++			page_counter_uncharge(&old->memsw, stock_pages);
++
++		WRITE_ONCE(stock->nr_pages, 0);
+ 	}
+ 
+ 	css_put(&old->css);
+@@ -2537,6 +2541,7 @@ static void drain_local_stock(struct wor
+ static void __refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
+ {
+ 	struct memcg_stock_pcp *stock;
++	unsigned int stock_pages;
+ 
+ 	stock = this_cpu_ptr(&memcg_stock);
+ 	if (READ_ONCE(stock->cached) != memcg) { /* reset if necessary */
+@@ -2544,9 +2549,10 @@ static void __refill_stock(struct mem_cg
+ 		css_get(&memcg->css);
+ 		WRITE_ONCE(stock->cached, memcg);
+ 	}
+-	stock->nr_pages += nr_pages;
++	stock_pages = READ_ONCE(stock->nr_pages) + nr_pages;
++	WRITE_ONCE(stock->nr_pages, stock_pages);
+ 
+-	if (stock->nr_pages > MEMCG_CHARGE_BATCH)
++	if (stock_pages > MEMCG_CHARGE_BATCH)
+ 		drain_stock(stock);
+ }
+ 
+@@ -2585,7 +2591,7 @@ static void drain_all_stock(struct mem_c
+ 
+ 		rcu_read_lock();
+ 		memcg = READ_ONCE(stock->cached);
+-		if (memcg && stock->nr_pages &&
++		if (memcg && READ_ONCE(stock->nr_pages) &&
+ 		    mem_cgroup_is_descendant(memcg, root_memcg))
+ 			flush = true;
+ 		else if (obj_stock_flush_required(stock, root_memcg))
+_
