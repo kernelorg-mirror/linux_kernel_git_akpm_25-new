@@ -1,0 +1,100 @@
+From: Zi Yan <ziy@nvidia.com>
+Subject: mm/rmap: do not add fully unmapped large folio to deferred split list
+Date: Thu, 2 May 2024 09:28:51 -0400
+
+In __folio_remove_rmap(), a large folio is added to deferred split list if
+any page in a folio loses its final mapping.  But it is possible that the
+folio is fully unmapped and adding it to deferred split list is
+unnecessary.
+
+For PMD-mapped THPs, that was not really an issue, because removing the
+last PMD mapping in the absence of PTE mappings would not have added the
+folio to the deferred split queue.
+
+However, for PTE-mapped THPs, which are now more prominent due to mTHP,
+they are always added to the deferred split queue.  One side effect is
+that the THP_DEFERRED_SPLIT_PAGE stat for a PTE-mapped folio can be
+unintentionally increased, making it look like there are many partially
+mapped folios -- although the whole folio is fully unmapped stepwise.
+
+Core-mm now tries batch-unmapping consecutive PTEs of PTE-mapped THPs
+where possible starting from commit b06dc281aa99 ("mm/rmap: introduce
+folio_remove_rmap_[pte|ptes|pmd]()").  When it happens, a whole PTE-mapped
+folio is unmapped in one go and can avoid being added to deferred split
+list, reducing the THP_DEFERRED_SPLIT_PAGE noise.  But there will still be
+noise when we cannot batch-unmap a complete PTE-mapped folio in one go --
+or where this type of batching is not implemented yet, e.g., migration.
+
+To avoid the unnecessary addition, folio->_nr_pages_mapped is checked to
+tell if the whole folio is unmapped.  If the folio is already on deferred
+split list, it will be skipped, too.
+
+Note: commit 98046944a159 ("mm: huge_memory: add the missing
+folio_test_pmd_mappable() for THP split statistics") tried to exclude mTHP
+deferred split stats from THP_DEFERRED_SPLIT_PAGE, but it does not fix the
+above issue.  A fully unmapped PTE-mapped order-9 THP was still added to
+deferred split list and counted as THP_DEFERRED_SPLIT_PAGE, since nr is
+512 (non zero), level is RMAP_LEVEL_PTE, and inside deferred_split_folio()
+the order-9 folio is folio_test_pmd_mappable().
+
+Link: https://lkml.kernel.org/r/20240502132852.862138-1-zi.yan@sent.com
+Signed-off-by: Zi Yan <ziy@nvidia.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Reviewed-by: Lance Yang <ioworker0@gmail.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/rmap.c |   13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/mm/rmap.c~mm-rmap-do-not-add-fully-unmapped-large-folio-to-deferred-split-list-v6
++++ a/mm/rmap.c
+@@ -1494,6 +1494,7 @@ static __always_inline void __folio_remo
+ {
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+ 	int last, nr = 0, nr_pmdmapped = 0;
++	bool partially_mapped = false;
+ 	enum node_stat_item idx;
+ 
+ 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+@@ -1514,6 +1515,8 @@ static __always_inline void __folio_remo
+ 					nr++;
+ 			}
+ 		} while (page++, --nr_pages > 0);
++
++		partially_mapped = nr && atomic_read(mapped);
+ 		break;
+ 	case RMAP_LEVEL_PMD:
+ 		atomic_dec(&folio->_large_mapcount);
+@@ -1531,6 +1534,8 @@ static __always_inline void __folio_remo
+ 				nr = 0;
+ 			}
+ 		}
++
++		partially_mapped = nr < nr_pmdmapped;
+ 		break;
+ 	}
+ 
+@@ -1551,10 +1556,12 @@ static __always_inline void __folio_remo
+ 		 * Queue anon large folio for deferred split if at least one
+ 		 * page of the folio is unmapped and at least one page
+ 		 * is still mapped.
++		 *
++		 * Check partially_mapped first to ensure it is a large folio.
+ 		 */
+-		if (folio_test_large(folio) && folio_test_anon(folio))
+-			if (level == RMAP_LEVEL_PTE || nr < nr_pmdmapped)
+-				deferred_split_folio(folio);
++		if (folio_test_anon(folio) && partially_mapped &&
++		    list_empty(&folio->_deferred_list))
++			deferred_split_folio(folio);
+ 	}
+ 
+ 	/*
+_
