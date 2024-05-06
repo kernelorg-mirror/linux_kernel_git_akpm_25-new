@@ -1,14 +1,15 @@
 From: Lance Yang <ioworker0@gmail.com>
 Subject: mm/rmap: integrate PMD-mapped folio splitting into pagewalk loop
-Date: Mon, 29 Apr 2024 21:23:07 +0800
+Date: Wed, 1 May 2024 12:26:59 +0800
 
 In preparation for supporting try_to_unmap_one() to unmap PMD-mapped
 folios, start the pagewalk first, then call split_huge_pmd_address() to
 split the folio.
 
-Link: https://lkml.kernel.org/r/20240429132308.38794-3-ioworker0@gmail.com
+Link: https://lkml.kernel.org/r/20240501042700.83974-3-ioworker0@gmail.com
 Signed-off-by: Lance Yang <ioworker0@gmail.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
+Tested-by: SeongJae Park <sj@kernel.org>
 Cc: Barry Song <21cnbao@gmail.com>
 Cc: Fangrui Song <maskray@google.com>
 Cc: Jeff Xie <xiehuan09@gmail.com>
@@ -26,25 +27,50 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/huge_mm.h |    2 +
+ include/linux/huge_mm.h |   20 ++++++++++++++++++
  mm/huge_memory.c        |   42 +++++++++++++++++++-------------------
- mm/rmap.c               |   26 ++++++++++++++++++-----
- 3 files changed, 44 insertions(+), 26 deletions(-)
+ mm/rmap.c               |   24 ++++++++++++++++-----
+ 3 files changed, 60 insertions(+), 26 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
 +++ a/include/linux/huge_mm.h
-@@ -36,6 +36,8 @@ bool move_huge_pmd(struct vm_area_struct
- int change_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
- 		    pmd_t *pmd, unsigned long addr, pgprot_t newprot,
- 		    unsigned long cp_flags);
+@@ -409,6 +409,20 @@ static inline bool thp_migration_support
+ 	return IS_ENABLED(CONFIG_ARCH_ENABLE_THP_MIGRATION);
+ }
+ 
 +void split_huge_pmd_locked(struct vm_area_struct *vma, unsigned long address,
 +			   pmd_t *pmd, bool freeze, struct folio *folio);
++
++static inline void align_huge_pmd_range(struct vm_area_struct *vma,
++					unsigned long *start,
++					unsigned long *end)
++{
++	*start = ALIGN(*start, HPAGE_PMD_SIZE);
++	*end = ALIGN_DOWN(*end, HPAGE_PMD_SIZE);
++
++	VM_WARN_ON_ONCE(vma->vm_start > *start);
++	VM_WARN_ON_ONCE(vma->vm_end < *end);
++}
++
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
  
- vm_fault_t vmf_insert_pfn_pmd(struct vm_fault *vmf, pfn_t pfn, bool write);
- vm_fault_t vmf_insert_pfn_pud(struct vm_fault *vmf, pfn_t pfn, bool write);
+ static inline bool folio_test_pmd_mappable(struct folio *folio)
+@@ -471,6 +485,12 @@ static inline void __split_huge_pmd(stru
+ 		unsigned long address, bool freeze, struct folio *folio) {}
+ static inline void split_huge_pmd_address(struct vm_area_struct *vma,
+ 		unsigned long address, bool freeze, struct folio *folio) {}
++static inline void split_huge_pmd_locked(struct vm_area_struct *vma,
++					 unsigned long address, pmd_t *pmd,
++					 bool freeze, struct folio *folio) {}
++static inline void align_huge_pmd_range(struct vm_area_struct *vma,
++					unsigned long *start,
++					unsigned long *end) {}
+ 
+ #define split_huge_pud(__vma, __pmd, __address)	\
+ 	do { } while (0)
 --- a/mm/huge_memory.c~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
 +++ a/mm/huge_memory.c
-@@ -2584,6 +2584,27 @@ static void __split_huge_pmd_locked(stru
+@@ -2583,6 +2583,27 @@ static void __split_huge_pmd_locked(stru
  	pmd_populate(mm, pmd, pgtable);
  }
  
@@ -72,7 +98,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
  		unsigned long address, bool freeze, struct folio *folio)
  {
-@@ -2595,26 +2616,7 @@ void __split_huge_pmd(struct vm_area_str
+@@ -2594,26 +2615,7 @@ void __split_huge_pmd(struct vm_area_str
  				(address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE);
  	mmu_notifier_invalidate_range_start(&range);
  	ptl = pmd_lock(vma->vm_mm, pmd);
@@ -102,7 +128,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/mm/rmap.c~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
 +++ a/mm/rmap.c
-@@ -1636,9 +1636,6 @@ static bool try_to_unmap_one(struct foli
+@@ -1637,9 +1637,6 @@ static bool try_to_unmap_one(struct foli
  	if (flags & TTU_SYNC)
  		pvmw.flags = PVMW_SYNC;
  
@@ -112,18 +138,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * For THP, we have to assume the worse case ie pmd for invalidation.
  	 * For hugetlb, it could be much worse if we need to do pud
-@@ -1650,6 +1647,10 @@ static bool try_to_unmap_one(struct foli
+@@ -1651,6 +1648,8 @@ static bool try_to_unmap_one(struct foli
  	range.end = vma_address_end(&pvmw);
  	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma->vm_mm,
  				address, range.end);
-+	if (flags & TTU_SPLIT_HUGE_PMD) {
-+		range.start = address & HPAGE_PMD_MASK;
-+		range.end = (address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE;
-+	}
++	if (flags & TTU_SPLIT_HUGE_PMD)
++		align_huge_pmd_range(vma, &range.start, &range.end);
  	if (folio_test_hugetlb(folio)) {
  		/*
  		 * If sharing is possible, start and end will be adjusted
-@@ -1664,9 +1665,6 @@ static bool try_to_unmap_one(struct foli
+@@ -1665,9 +1664,6 @@ static bool try_to_unmap_one(struct foli
  	mmu_notifier_invalidate_range_start(&range);
  
  	while (page_vma_mapped_walk(&pvmw)) {
@@ -133,7 +157,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * If the folio is in an mlock()d vma, we must not swap it out.
  		 */
-@@ -1678,6 +1676,22 @@ static bool try_to_unmap_one(struct foli
+@@ -1679,6 +1675,22 @@ static bool try_to_unmap_one(struct foli
  			goto walk_done_err;
  		}
  
