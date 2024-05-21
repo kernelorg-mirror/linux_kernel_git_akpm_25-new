@@ -1,0 +1,161 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: mm: refactor folio_undo_large_rmappable()
+Date: Tue, 21 May 2024 21:03:15 +0800
+
+Folios of order <= 1 are not in deferred list, the check of order is added
+into folio_undo_large_rmappable() from commit 8897277acfef ("mm: support
+order-1 folios in the page cache"), but there is a repeated check for
+small folio (order 0) during each call of the
+folio_undo_large_rmappable(), so only keep folio_order() check inside the
+function.
+
+In addition, move all the checks into header file to save a function call
+for non-large-rmappable or empty deferred_list folio.
+
+Link: https://lkml.kernel.org/r/20240521130315.46072-1-wangkefeng.wang@huawei.com
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   13 +------------
+ mm/internal.h    |   17 ++++++++++++++++-
+ mm/memcontrol.c  |    3 +--
+ mm/page_alloc.c  |    3 +--
+ mm/swap.c        |    8 ++------
+ mm/vmscan.c      |    8 ++------
+ 6 files changed, 23 insertions(+), 29 deletions(-)
+
+--- a/mm/huge_memory.c~mm-refactor-folio_undo_large_rmappable
++++ a/mm/huge_memory.c
+@@ -3182,22 +3182,11 @@ out:
+ 	return ret;
+ }
+ 
+-void folio_undo_large_rmappable(struct folio *folio)
++void __folio_undo_large_rmappable(struct folio *folio)
+ {
+ 	struct deferred_split *ds_queue;
+ 	unsigned long flags;
+ 
+-	if (folio_order(folio) <= 1)
+-		return;
+-
+-	/*
+-	 * At this point, there is no one trying to add the folio to
+-	 * deferred_list. If folio is not in deferred_list, it's safe
+-	 * to check without acquiring the split_queue_lock.
+-	 */
+-	if (data_race(list_empty(&folio->_deferred_list)))
+-		return;
+-
+ 	ds_queue = get_deferred_split_queue(folio);
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	if (!list_empty(&folio->_deferred_list)) {
+--- a/mm/internal.h~mm-refactor-folio_undo_large_rmappable
++++ a/mm/internal.h
+@@ -605,7 +605,22 @@ static inline void folio_set_order(struc
+ #endif
+ }
+ 
+-void folio_undo_large_rmappable(struct folio *folio);
++void __folio_undo_large_rmappable(struct folio *folio);
++static inline void folio_undo_large_rmappable(struct folio *folio)
++{
++	if (folio_order(folio) <= 1 || !folio_test_large_rmappable(folio))
++		return;
++
++	/*
++	 * At this point, there is no one trying to add the folio to
++	 * deferred_list. If folio is not in deferred_list, it's safe
++	 * to check without acquiring the split_queue_lock.
++	 */
++	if (data_race(list_empty(&folio->_deferred_list)))
++		return;
++
++	__folio_undo_large_rmappable(folio);
++}
+ 
+ static inline struct folio *page_rmappable_folio(struct page *page)
+ {
+--- a/mm/memcontrol.c~mm-refactor-folio_undo_large_rmappable
++++ a/mm/memcontrol.c
+@@ -7835,8 +7835,7 @@ void mem_cgroup_migrate(struct folio *ol
+ 	 * In addition, the old folio is about to be freed after migration, so
+ 	 * removing from the split queue a bit earlier seems reasonable.
+ 	 */
+-	if (folio_test_large(old) && folio_test_large_rmappable(old))
+-		folio_undo_large_rmappable(old);
++	folio_undo_large_rmappable(old);
+ 	old->memcg_data = 0;
+ }
+ 
+--- a/mm/page_alloc.c~mm-refactor-folio_undo_large_rmappable
++++ a/mm/page_alloc.c
+@@ -2609,8 +2609,7 @@ void free_unref_folios(struct folio_batc
+ 		unsigned long pfn = folio_pfn(folio);
+ 		unsigned int order = folio_order(folio);
+ 
+-		if (order > 0 && folio_test_large_rmappable(folio))
+-			folio_undo_large_rmappable(folio);
++		folio_undo_large_rmappable(folio);
+ 		if (!free_pages_prepare(&folio->page, order))
+ 			continue;
+ 		/*
+--- a/mm/swap.c~mm-refactor-folio_undo_large_rmappable
++++ a/mm/swap.c
+@@ -123,8 +123,7 @@ void __folio_put(struct folio *folio)
+ 	}
+ 
+ 	page_cache_release(folio);
+-	if (folio_test_large(folio) && folio_test_large_rmappable(folio))
+-		folio_undo_large_rmappable(folio);
++	folio_undo_large_rmappable(folio);
+ 	mem_cgroup_uncharge(folio);
+ 	free_unref_page(&folio->page, folio_order(folio));
+ }
+@@ -1002,10 +1001,7 @@ void folios_put_refs(struct folio_batch
+ 			free_huge_folio(folio);
+ 			continue;
+ 		}
+-		if (folio_test_large(folio) &&
+-		    folio_test_large_rmappable(folio))
+-			folio_undo_large_rmappable(folio);
+-
++		folio_undo_large_rmappable(folio);
+ 		__page_cache_release(folio, &lruvec, &flags);
+ 
+ 		if (j != i)
+--- a/mm/vmscan.c~mm-refactor-folio_undo_large_rmappable
++++ a/mm/vmscan.c
+@@ -1440,9 +1440,7 @@ free_it:
+ 		 */
+ 		nr_reclaimed += nr_pages;
+ 
+-		if (folio_test_large(folio) &&
+-		    folio_test_large_rmappable(folio))
+-			folio_undo_large_rmappable(folio);
++		folio_undo_large_rmappable(folio);
+ 		if (folio_batch_add(&free_folios, folio) == 0) {
+ 			mem_cgroup_uncharge_folios(&free_folios);
+ 			try_to_unmap_flush();
+@@ -1849,9 +1847,7 @@ static unsigned int move_folios_to_lru(s
+ 		if (unlikely(folio_put_testzero(folio))) {
+ 			__folio_clear_lru_flags(folio);
+ 
+-			if (folio_test_large(folio) &&
+-			    folio_test_large_rmappable(folio))
+-				folio_undo_large_rmappable(folio);
++			folio_undo_large_rmappable(folio);
+ 			if (folio_batch_add(&free_folios, folio) == 0) {
+ 				spin_unlock_irq(&lruvec->lru_lock);
+ 				mem_cgroup_uncharge_folios(&free_folios);
+_
