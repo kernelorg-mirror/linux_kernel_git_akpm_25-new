@@ -1,0 +1,125 @@
+From: Wei Yang <richard.weiyang@gmail.com>
+Subject: mm/mm_init.c: not always search next deferred_init_pfn from very beginning
+Date: Fri, 31 May 2024 00:26:13 +0000
+
+In deferred_init_memmap(), we call deferred_init_mem_pfn_range_in_zone()
+to get the next deferred_init_pfn.  But we always search it from the very
+beginning.
+
+Since we save the index in i, we can leverage this to search from i next
+time.
+
+Link: https://lkml.kernel.org/r/20240531002613.5231-3-richard.weiyang@gmail.com
+Signed-off-by: Wei Yang <richard.weiyang@gmail.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memblock.h |   19 -------------------
+ mm/mm_init.c             |   21 ++++++++++++---------
+ 2 files changed, 12 insertions(+), 28 deletions(-)
+
+--- a/include/linux/memblock.h~mm-mm_initc-not-always-search-next-deferred_init_pfn-from-very-beginning
++++ a/include/linux/memblock.h
+@@ -299,25 +299,6 @@ void __next_mem_pfn_range(int *idx, int
+ void __next_mem_pfn_range_in_zone(u64 *idx, struct zone *zone,
+ 				  unsigned long *out_spfn,
+ 				  unsigned long *out_epfn);
+-/**
+- * for_each_free_mem_pfn_range_in_zone - iterate through zone specific free
+- * memblock areas
+- * @i: u64 used as loop variable
+- * @zone: zone in which all of the memory blocks reside
+- * @p_start: ptr to phys_addr_t for start address of the range, can be %NULL
+- * @p_end: ptr to phys_addr_t for end address of the range, can be %NULL
+- *
+- * Walks over free (memory && !reserved) areas of memblock in a specific
+- * zone. Available once memblock and an empty zone is initialized. The main
+- * assumption is that the zone start, end, and pgdat have been associated.
+- * This way we can use the zone to determine NUMA node, and if a given part
+- * of the memblock is valid for the zone.
+- */
+-#define for_each_free_mem_pfn_range_in_zone(i, zone, p_start, p_end)	\
+-	for (i = 0,							\
+-	     __next_mem_pfn_range_in_zone(&i, zone, p_start, p_end);	\
+-	     i != U64_MAX;					\
+-	     __next_mem_pfn_range_in_zone(&i, zone, p_start, p_end))
+ 
+ /**
+  * for_each_free_mem_pfn_range_in_zone_from - iterate through zone specific
+--- a/mm/mm_init.c~mm-mm_initc-not-always-search-next-deferred_init_pfn-from-very-beginning
++++ a/mm/mm_init.c
+@@ -2025,18 +2025,21 @@ static unsigned long  __init deferred_in
+  * return false indicating there are no valid ranges left.
+  */
+ static bool __init
+-deferred_init_mem_pfn_range_in_zone(u64 *i, struct zone *zone,
++deferred_init_mem_pfn_range_in_zone_from(u64 *i, struct zone *zone,
+ 				    unsigned long *spfn, unsigned long *epfn,
+ 				    unsigned long first_init_pfn)
+ {
+-	u64 j;
++	u64 j = *i;
++
++	if (j == 0)
++		__next_mem_pfn_range_in_zone(&j, zone, spfn, epfn);
+ 
+ 	/*
+ 	 * Start out by walking through the ranges in this zone that have
+ 	 * already been initialized. We don't need to do anything with them
+ 	 * so we just need to flush them out of the system.
+ 	 */
+-	for_each_free_mem_pfn_range_in_zone(j, zone, spfn, epfn) {
++	for_each_free_mem_pfn_range_in_zone_from(j, zone, spfn, epfn) {
+ 		if (*epfn <= first_init_pfn)
+ 			continue;
+ 		if (*spfn < first_init_pfn)
+@@ -2108,9 +2111,9 @@ deferred_init_memmap_chunk(unsigned long
+ {
+ 	unsigned long spfn, epfn;
+ 	struct zone *zone = arg;
+-	u64 i;
++	u64 i = 0;
+ 
+-	deferred_init_mem_pfn_range_in_zone(&i, zone, &spfn, &epfn, start_pfn);
++	deferred_init_mem_pfn_range_in_zone_from(&i, zone, &spfn, &epfn, start_pfn);
+ 
+ 	/*
+ 	 * Initialize and free pages in MAX_PAGE_ORDER sized increments so that
+@@ -2139,7 +2142,7 @@ static int __init deferred_init_memmap(v
+ 	unsigned long start = jiffies;
+ 	struct zone *zone;
+ 	int max_threads;
+-	u64 i;
++	u64 i = 0;
+ 
+ 	/* Bind memory initialisation thread to a local node if possible */
+ 	if (!cpumask_empty(cpumask))
+@@ -2170,7 +2173,7 @@ static int __init deferred_init_memmap(v
+ 
+ 	max_threads = deferred_page_init_max_threads(cpumask);
+ 
+-	while (deferred_init_mem_pfn_range_in_zone(&i, zone, &spfn, &epfn, first_init_pfn)) {
++	while (deferred_init_mem_pfn_range_in_zone_from(&i, zone, &spfn, &epfn, first_init_pfn)) {
+ 		first_init_pfn = ALIGN(epfn, PAGES_PER_SECTION);
+ 		struct padata_mt_job job = {
+ 			.thread_fn   = deferred_init_memmap_chunk,
+@@ -2214,7 +2217,7 @@ bool __init deferred_grow_zone(struct zo
+ 	unsigned long first_deferred_pfn = pgdat->first_deferred_pfn;
+ 	unsigned long spfn, epfn, flags;
+ 	unsigned long nr_pages = 0;
+-	u64 i;
++	u64 i = 0;
+ 
+ 	/* Only the last zone may have deferred pages */
+ 	if (zone_end_pfn(zone) != pgdat_end_pfn(pgdat))
+@@ -2232,7 +2235,7 @@ bool __init deferred_grow_zone(struct zo
+ 	}
+ 
+ 	/* If the zone is empty somebody else may have cleared out the zone */
+-	if (!deferred_init_mem_pfn_range_in_zone(&i, zone, &spfn, &epfn,
++	if (!deferred_init_mem_pfn_range_in_zone_from(&i, zone, &spfn, &epfn,
+ 						 first_deferred_pfn)) {
+ 		pgdat->first_deferred_pfn = ULONG_MAX;
+ 		pgdat_resize_unlock(pgdat, &flags);
+_
