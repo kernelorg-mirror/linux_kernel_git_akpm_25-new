@@ -1,0 +1,124 @@
+From: Barry Song <v-songbaohua@oppo.com>
+Subject: mm: swap: reuse exclusive folio directly instead of wp page faults
+Date: Sun, 2 Jun 2024 12:45:02 +1200
+
+After swapping out, we perform a swap-in operation.  If we first read and
+then write, we encounter a major fault in do_swap_page for reading, along
+with additional minor faults in do_wp_page for writing.  However, the
+latter appears to be unnecessary and inefficient.  Instead, we can
+directly reuse in do_swap_page and completely eliminate the need for
+do_wp_page.
+
+This patch achieves that optimization specifically for exclusive folios. 
+The following microbenchmark demonstrates the significant reduction in
+minor faults.
+
+ #define DATA_SIZE (2UL * 1024 * 1024)
+ #define PAGE_SIZE (4UL * 1024)
+
+ static void *read_write_data(char *addr)
+ {
+         char tmp;
+
+         for (int i = 0; i < DATA_SIZE; i += PAGE_SIZE) {
+                 tmp = *(volatile char *)(addr + i);
+                 *(volatile char *)(addr + i) = tmp;
+         }
+ }
+
+ int main(int argc, char **argv)
+ {
+         struct rusage ru;
+
+         char *addr = mmap(NULL, DATA_SIZE, PROT_READ | PROT_WRITE,
+                         MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+         memset(addr, 0x11, DATA_SIZE);
+
+         do {
+                 long old_ru_minflt, old_ru_majflt;
+                 long new_ru_minflt, new_ru_majflt;
+
+                 madvise(addr, DATA_SIZE, MADV_PAGEOUT);
+
+                 getrusage(RUSAGE_SELF, &ru);
+                 old_ru_minflt = ru.ru_minflt;
+                 old_ru_majflt = ru.ru_majflt;
+
+                 read_write_data(addr);
+                 getrusage(RUSAGE_SELF, &ru);
+                 new_ru_minflt = ru.ru_minflt;
+                 new_ru_majflt = ru.ru_majflt;
+
+                 printf("minor faults:%ld major faults:%ld\n",
+                         new_ru_minflt - old_ru_minflt,
+                         new_ru_majflt - old_ru_majflt);
+         } while(0);
+
+         return 0;
+ }
+
+w/o patch,
+/ # ~/a.out
+minor faults:512 major faults:512
+
+w/ patch,
+/ # ~/a.out
+minor faults:0 major faults:512
+
+Minor faults decrease to 0!
+
+Link: https://lkml.kernel.org/r/20240602004502.26895-1-21cnbao@gmail.com
+Signed-off-by: Barry Song <v-songbaohua@oppo.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+--- a/mm/memory.c~mm-swap-reuse-exclusive-folio-directly-instead-of-wp-page-faults
++++ a/mm/memory.c
+@@ -4308,6 +4308,10 @@ check_folio:
+ 	add_mm_counter(vma->vm_mm, MM_ANONPAGES, nr_pages);
+ 	add_mm_counter(vma->vm_mm, MM_SWAPENTS, -nr_pages);
+ 	pte = mk_pte(page, vma->vm_page_prot);
++	if (pte_swp_soft_dirty(vmf->orig_pte))
++		pte = pte_mksoft_dirty(pte);
++	if (pte_swp_uffd_wp(vmf->orig_pte))
++		pte = pte_mkuffd_wp(pte);
+ 
+ 	/*
+ 	 * Same logic as in do_wp_page(); however, optimize for pages that are
+@@ -4317,18 +4321,18 @@ check_folio:
+ 	 */
+ 	if (!folio_test_ksm(folio) &&
+ 	    (exclusive || folio_ref_count(folio) == 1)) {
+-		if (vmf->flags & FAULT_FLAG_WRITE) {
+-			pte = maybe_mkwrite(pte_mkdirty(pte), vma);
+-			vmf->flags &= ~FAULT_FLAG_WRITE;
++		if ((vma->vm_flags & VM_WRITE) && !userfaultfd_pte_wp(vma, pte) &&
++		    !vma_soft_dirty_enabled(vma)) {
++			pte = pte_mkwrite(pte, vma);
++			if (vmf->flags & FAULT_FLAG_WRITE) {
++				pte = pte_mkdirty(pte);
++				vmf->flags &= ~FAULT_FLAG_WRITE;
++			}
+ 		}
+ 		rmap_flags |= RMAP_EXCLUSIVE;
+ 	}
+ 	folio_ref_add(folio, nr_pages - 1);
+ 	flush_icache_pages(vma, page, nr_pages);
+-	if (pte_swp_soft_dirty(vmf->orig_pte))
+-		pte = pte_mksoft_dirty(pte);
+-	if (pte_swp_uffd_wp(vmf->orig_pte))
+-		pte = pte_mkuffd_wp(pte);
+ 	vmf->orig_pte = pte_advance_pfn(pte, page_idx);
+ 
+ 	/* ksm created a completely new copy */
+_
