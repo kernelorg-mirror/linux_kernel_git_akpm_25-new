@@ -1,0 +1,68 @@
+From: Oleg Nesterov <oleg@redhat.com>
+Subject: zap_pid_ns_processes: don't send SIGKILL to sub-threads
+Date: Sat, 8 Jun 2024 17:48:35 +0200
+
+The comment above the idr_for_each_entry_continue() loop tries to explain
+why we have to signal each thread in the namespace, but it is outdated. 
+This code no longer uses kill_proc_info(), we have a target task so we can
+check thread_group_leader() and avoid the unnecessary group_send_sig_info.
+Better yet, we can change pid_task() to use PIDTYPE_TGID rather than
+_PID, this way it returns NULL if this pid is not a group-leader pid.
+
+Also, change this code to check SIGNAL_GROUP_EXIT, the exiting process /
+thread doesn't necessarily has a pending SIGKILL.  Either way these checks
+are racy without siglock, so the patch uses data_race() to shut up KCSAN.
+
+Link: https://lkml.kernel.org/r/20240608154835.GD7947@redhat.com
+Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Allen Pais <apais@linux.microsoft.com>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Frederic Weisbecker <frederic@kernel.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Joel Fernandes (Google) <joel@joelfernandes.org>
+Cc: Joel Granados <j.granados@samsung.com>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Lai Jiangshan <jiangshanlai@gmail.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Mike Christie <michael.christie@oracle.com>
+Cc: Neeraj Upadhyay <neeraj.upadhyay@kernel.org>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Cc: Wei Fu <fuweid89@gmail.com>
+Cc: Zqiang <qiang.zhang1211@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/pid_namespace.c |   13 +++----------
+ 1 file changed, 3 insertions(+), 10 deletions(-)
+
+--- a/kernel/pid_namespace.c~zap_pid_ns_processes-dont-send-sigkill-to-sub-threads
++++ a/kernel/pid_namespace.c
+@@ -191,21 +191,14 @@ void zap_pid_ns_processes(struct pid_nam
+ 	 * The last thread in the cgroup-init thread group is terminating.
+ 	 * Find remaining pid_ts in the namespace, signal and wait for them
+ 	 * to exit.
+-	 *
+-	 * Note:  This signals each threads in the namespace - even those that
+-	 * 	  belong to the same thread group, To avoid this, we would have
+-	 * 	  to walk the entire tasklist looking a processes in this
+-	 * 	  namespace, but that could be unnecessarily expensive if the
+-	 * 	  pid namespace has just a few processes. Or we need to
+-	 * 	  maintain a tasklist for each pid namespace.
+-	 *
+ 	 */
+ 	rcu_read_lock();
+ 	read_lock(&tasklist_lock);
+ 	nr = 2;
+ 	idr_for_each_entry_continue(&pid_ns->idr, pid, nr) {
+-		task = pid_task(pid, PIDTYPE_PID);
+-		if (task && !__fatal_signal_pending(task))
++		task = pid_task(pid, PIDTYPE_TGID);
++		/* reading signal->flags is racy without sighand->siglock */
++		if (task && !(data_race(task->signal->flags) & SIGNAL_GROUP_EXIT))
+ 			group_send_sig_info(SIGKILL, SEND_SIG_PRIV, task, PIDTYPE_MAX);
+ 	}
+ 	read_unlock(&tasklist_lock);
+_
