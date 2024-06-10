@@ -1,6 +1,6 @@
 From: Lance Yang <ioworker0@gmail.com>
 Subject: mm/vmscan: avoid split lazyfree THP during shrink_folio_list()
-Date: Wed, 1 May 2024 12:27:00 +0800
+Date: Tue, 21 May 2024 12:02:44 +0800
 
 When the user no longer requires the pages, they would use
 madvise(MADV_FREE) to mark the pages as lazy free.  Subsequently, they
@@ -9,9 +9,11 @@ typically would not re-write to that memory again.
 During memory reclaim, if we detect that the large folio and its PMD are
 both still marked as clean and there are no unexpected references (such as
 GUP), so we can just discard the memory lazily, improving the efficiency
-of memory reclamation in this case.  On an Intel i5 CPU, reclaiming 1GiB
-of lazyfree THPs using mem_cgroup_force_empty() results in the following
-runtimes in seconds (shorter is better):
+of memory reclamation in this case.
+
+On an Intel i5 CPU, reclaiming 1GiB of lazyfree THPs using
+mem_cgroup_force_empty() results in the following runtimes in seconds
+(shorter is better):
 
 --------------------------------------------
 |     Old       |      New       |  Change  |
@@ -19,11 +21,11 @@ runtimes in seconds (shorter is better):
 |   0.683426    |    0.049197    |  -92.80% |
 --------------------------------------------
 
-Link: https://lkml.kernel.org/r/20240501042700.83974-4-ioworker0@gmail.com
+Link: https://lkml.kernel.org/r/20240521040244.48760-4-ioworker0@gmail.com
 Signed-off-by: Lance Yang <ioworker0@gmail.com>
 Suggested-by: Zi Yan <ziy@nvidia.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
-Tested-by: SeongJae Park <sj@kernel.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <21cnbao@gmail.com>
 Cc: Fangrui Song <maskray@google.com>
 Cc: Jeff Xie <xiehuan09@gmail.com>
@@ -41,24 +43,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/huge_mm.h |    9 ++++
- mm/huge_memory.c        |   73 ++++++++++++++++++++++++++++++++++++++
- mm/rmap.c               |    3 +
- 3 files changed, 85 insertions(+)
+ mm/huge_memory.c        |   80 ++++++++++++++++++++++++++++++++++++++
+ mm/rmap.c               |   41 +++++++++++++------
+ 3 files changed, 117 insertions(+), 13 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/include/linux/huge_mm.h
-@@ -411,6 +411,8 @@ static inline bool thp_migration_support
+@@ -417,6 +417,8 @@ static inline bool thp_migration_support
  
  void split_huge_pmd_locked(struct vm_area_struct *vma, unsigned long address,
  			   pmd_t *pmd, bool freeze, struct folio *folio);
 +bool unmap_huge_pmd_locked(struct vm_area_struct *vma, unsigned long addr,
 +			   pmd_t *pmdp, struct folio *folio);
  
- static inline void align_huge_pmd_range(struct vm_area_struct *vma,
- 					unsigned long *start,
-@@ -492,6 +494,13 @@ static inline void align_huge_pmd_range(
- 					unsigned long *start,
- 					unsigned long *end) {}
+ #else /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+@@ -484,6 +486,13 @@ static inline void split_huge_pmd_locked
+ 					 unsigned long address, pmd_t *pmd,
+ 					 bool freeze, struct folio *folio) {}
  
 +static inline bool unmap_huge_pmd_locked(struct vm_area_struct *vma,
 +					 unsigned long addr, pmd_t *pmdp,
@@ -72,7 +74,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/huge_memory.c~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/mm/huge_memory.c
-@@ -2689,6 +2689,79 @@ static void unmap_folio(struct folio *fo
+@@ -2687,6 +2687,86 @@ static void unmap_folio(struct folio *fo
  	try_to_unmap_flush();
  }
  
@@ -80,14 +82,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				       unsigned long addr, pmd_t *pmdp,
 +				       struct folio *folio)
 +{
++	VM_WARN_ON_FOLIO(folio_test_swapbacked(folio), folio);
++	VM_WARN_ON_FOLIO(!folio_test_anon(folio), folio);
++
 +	struct mm_struct *mm = vma->vm_mm;
 +	int ref_count, map_count;
 +	pmd_t orig_pmd = *pmdp;
-+	struct mmu_gather tlb;
 +	struct page *page;
 +
-+	if (pmd_dirty(orig_pmd) || folio_test_dirty(folio))
-+		return false;
 +	if (unlikely(!pmd_present(orig_pmd) || !pmd_trans_huge(orig_pmd)))
 +		return false;
 +
@@ -95,9 +97,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (unlikely(page_folio(page) != folio))
 +		return false;
 +
-+	tlb_gather_mmu(&tlb, mm);
-+	orig_pmd = pmdp_huge_get_and_clear(mm, addr, pmdp);
-+	tlb_remove_pmd_tlb_entry(&tlb, pmdp, addr);
++	if (folio_test_dirty(folio) || pmd_dirty(orig_pmd)) {
++		folio_set_swapbacked(folio);
++		return false;
++	}
++
++	orig_pmd = pmdp_huge_clear_flush(vma, addr, pmdp);
 +
 +	/*
 +	 * Syncing against concurrent GUP-fast:
@@ -116,14 +121,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	smp_rmb();
 +
 +	/*
-+	 * If the PMD or folio is redirtied at this point, or if there are
-+	 * unexpected references, we will give up to discard this folio
++	 * If the folio or its PMD is redirtied at this point, or if there
++	 * are unexpected references, we will give up to discard this folio
 +	 * and remap it.
 +	 *
 +	 * The only folio refs must be one from isolation plus the rmap(s).
 +	 */
-+	if (ref_count != map_count + 1 || folio_test_dirty(folio) ||
-+	    pmd_dirty(orig_pmd)) {
++	if (folio_test_dirty(folio) || pmd_dirty(orig_pmd))
++		folio_set_swapbacked(folio);
++
++	if (folio_test_swapbacked(folio) || ref_count != map_count + 1) {
 +		set_pmd_at(mm, addr, pmdp, orig_pmd);
 +		return false;
 +	}
@@ -131,6 +138,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	folio_remove_rmap_pmd(folio, page, vma);
 +	zap_deposited_table(mm, pmdp);
 +	add_mm_counter(mm, MM_ANONPAGES, -HPAGE_PMD_NR);
++	if (vma->vm_flags & VM_LOCKED)
++		mlock_drain_local();
 +	folio_put(folio);
 +
 +	return true;
@@ -154,14 +163,66 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int i = 0;
 --- a/mm/rmap.c~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/mm/rmap.c
-@@ -1676,6 +1676,9 @@ static bool try_to_unmap_one(struct foli
+@@ -1630,6 +1630,7 @@ static bool try_to_unmap_one(struct foli
+ 	enum ttu_flags flags = (enum ttu_flags)(long)arg;
+ 	unsigned long pfn;
+ 	unsigned long hsz = 0;
++	bool pmd_mapped = false;
+ 
+ 	/*
+ 	 * When racing against e.g. zap_pte_range() on another cpu,
+@@ -1677,18 +1678,26 @@ static bool try_to_unmap_one(struct foli
+ 			goto walk_done_err;
  		}
  
- 		if (!pvmw.pte && (flags & TTU_SPLIT_HUGE_PMD)) {
+-		if (!pvmw.pte && (flags & TTU_SPLIT_HUGE_PMD)) {
+-			/*
+-			 * We temporarily have to drop the PTL and start once
+-			 * again from that now-PTE-mapped page table.
+-			 */
+-			split_huge_pmd_locked(vma, range.start, pvmw.pmd, false,
+-					      folio);
+-			pvmw.pmd = NULL;
+-			spin_unlock(pvmw.ptl);
+-			pvmw.ptl = NULL;
+-			flags &= ~TTU_SPLIT_HUGE_PMD;
+-			continue;
++		if (!pvmw.pte) {
++			pmd_mapped = true;
 +			if (unmap_huge_pmd_locked(vma, range.start, pvmw.pmd,
 +						  folio))
 +				goto walk_done;
- 			/*
- 			 * We temporarily have to drop the PTL and start once
- 			 * again from that now-PTE-mapped page table.
++
++			if (flags & TTU_SPLIT_HUGE_PMD) {
++				/*
++				 * We temporarily have to drop the PTL and start
++				 * once again from that now-PTE-mapped page
++				 * table.
++				 */
++				split_huge_pmd_locked(vma, range.start,
++						      pvmw.pmd, false, folio);
++				pvmw.pmd = NULL;
++				spin_unlock(pvmw.ptl);
++				pvmw.ptl = NULL;
++				flags &= ~TTU_SPLIT_HUGE_PMD;
++				continue;
++			}
+ 		}
+ 
+ 		/* Unexpected PMD-mapped THP? */
+@@ -1816,7 +1825,13 @@ static bool try_to_unmap_one(struct foli
+ 			 */
+ 			if (unlikely(folio_test_swapbacked(folio) !=
+ 					folio_test_swapcache(folio))) {
+-				WARN_ON_ONCE(1);
++				/*
++				 * unmap_huge_pmd_locked() will unmark a
++				 * PMD-mapped folio as lazyfree if the folio or
++				 * its PMD was redirtied.
++				 */
++				if (!pmd_mapped)
++					WARN_ON_ONCE(1);
+ 				goto walk_done_err;
+ 			}
+ 
 _
