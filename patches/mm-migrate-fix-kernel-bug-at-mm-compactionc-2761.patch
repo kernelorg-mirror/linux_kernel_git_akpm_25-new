@@ -1,0 +1,59 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm/migrate: fix kernel BUG at mm/compaction.c:2761!
+Date: Tue, 11 Jun 2024 22:06:20 -0700 (PDT)
+
+I hit the VM_BUG_ON(!list_empty(&cc->migratepages)) in compact_zone(); and
+if DEBUG_VM were off, then pages would be lost on a local list.
+
+Our convention is that if migrate_pages() reports complete success (0),
+then the migratepages list will be empty; but if it reports an error or
+some pages remaining, then its caller must putback_movable_pages().
+
+There's a new case in which migrate_pages() has been reporting complete
+success, but returning with pages left on the migratepages list: when
+migrate_pages_batch() successfully split a folio on the deferred list, but
+then the "Failure isn't counted" call does not dispose of them all.
+
+Since that block is expecting the large folio to have been counted as 1
+failure already, and since the return code is later adjusted to success
+whenever the returned list is found empty, the simple way to fix this
+safely is to count splitting the deferred folio as "a failure".
+
+Link: https://lkml.kernel.org/r/46c948b4-4dd8-6e03-4c7b-ce4e81cfa536@google.com
+Fixes: 7262f208ca68 ("mm/migrate: split source folio if it is on deferred split list")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/migrate.c |    8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+--- a/mm/migrate.c~mm-migrate-fix-kernel-bug-at-mm-compactionc-2761
++++ a/mm/migrate.c
+@@ -1654,7 +1654,12 @@ static int migrate_pages_batch(struct li
+ 
+ 			/*
+ 			 * The rare folio on the deferred split list should
+-			 * be split now. It should not count as a failure.
++			 * be split now. It should not count as a failure:
++			 * but increment nr_failed because, without doing so,
++			 * migrate_pages() may report success with (split but
++			 * unmigrated) pages still on its fromlist; whereas it
++			 * always reports success when its fromlist is empty.
++			 *
+ 			 * Only check it without removing it from the list.
+ 			 * Since the folio can be on deferred_split_scan()
+ 			 * local list and removing it can cause the local list
+@@ -1669,6 +1674,7 @@ static int migrate_pages_batch(struct li
+ 			if (nr_pages > 2 &&
+ 			   !list_empty(&folio->_deferred_list)) {
+ 				if (try_split_folio(folio, split_folios) == 0) {
++					nr_failed++;
+ 					stats->nr_thp_split += is_thp;
+ 					stats->nr_split++;
+ 					continue;
+_
