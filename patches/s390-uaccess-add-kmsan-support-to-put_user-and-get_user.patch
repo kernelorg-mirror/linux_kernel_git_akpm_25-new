@@ -1,0 +1,242 @@
+From: Ilya Leoshkevich <iii@linux.ibm.com>
+Subject: s390/uaccess: add KMSAN support to put_user() and get_user()
+Date: Thu, 13 Jun 2024 17:34:34 +0200
+
+put_user() uses inline assembly with precise constraints, so Clang is
+in principle capable of instrumenting it automatically. Unfortunately,
+one of the constraints contains a dereferenced user pointer, and Clang
+does not currently distinguish user and kernel pointers. Therefore
+KMSAN attempts to access shadow for user pointers, which is not a right
+thing to do.
+
+An obvious fix to add __no_sanitize_memory to __put_user_fn() does not
+work, since it's __always_inline. And __always_inline cannot be removed
+due to the __put_user_bad() trick.
+
+A different obvious fix of using the "a" instead of the "+Q" constraint
+degrades the code quality, which is very important here, since it's a
+hot path.
+
+Instead, repurpose the __put_user_asm() macro to define
+__put_user_{char,short,int,long}_noinstr() functions and mark them with
+__no_sanitize_memory. For the non-KMSAN builds make them
+__always_inline in order to keep the generated code quality. Also
+define __put_user_{char,short,int,long}() functions, which call the
+aforementioned ones and which *are* instrumented, because they call
+KMSAN hooks, which may be implemented as macros.
+
+The same applies to get_user() as well.
+
+Link: https://lkml.kernel.org/r/20240613153924.961511-33-iii@linux.ibm.com
+Signed-off-by: Ilya Leoshkevich <iii@linux.ibm.com>
+Acked-by: Heiko Carstens <hca@linux.ibm.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/s390/include/asm/uaccess.h |  111 +++++++++++++++++++++---------
+ 1 file changed, 79 insertions(+), 32 deletions(-)
+
+--- a/arch/s390/include/asm/uaccess.h~s390-uaccess-add-kmsan-support-to-put_user-and-get_user
++++ a/arch/s390/include/asm/uaccess.h
+@@ -78,13 +78,24 @@ union oac {
+ 
+ int __noreturn __put_user_bad(void);
+ 
+-#define __put_user_asm(to, from, size)					\
+-({									\
++#ifdef CONFIG_KMSAN
++#define GET_PUT_USER_NOINSTR_ATTRIBUTES \
++	noinline __maybe_unused __no_sanitize_memory
++#else
++#define GET_PUT_USER_NOINSTR_ATTRIBUTES __always_inline
++#endif
++
++#define DEFINE_PUT_USER(type)						\
++static GET_PUT_USER_NOINSTR_ATTRIBUTES int				\
++__put_user_##type##_noinstr(unsigned type __user *to,			\
++			    unsigned type *from,			\
++			    unsigned long size)				\
++{									\
+ 	union oac __oac_spec = {					\
+ 		.oac1.as = PSW_BITS_AS_SECONDARY,			\
+ 		.oac1.a = 1,						\
+ 	};								\
+-	int __rc;							\
++	int rc;								\
+ 									\
+ 	asm volatile(							\
+ 		"	lr	0,%[spec]\n"				\
+@@ -93,12 +104,28 @@ int __noreturn __put_user_bad(void);
+ 		"2:\n"							\
+ 		EX_TABLE_UA_STORE(0b, 2b, %[rc])			\
+ 		EX_TABLE_UA_STORE(1b, 2b, %[rc])			\
+-		: [rc] "=&d" (__rc), [_to] "+Q" (*(to))			\
++		: [rc] "=&d" (rc), [_to] "+Q" (*(to))			\
+ 		: [_size] "d" (size), [_from] "Q" (*(from)),		\
+ 		  [spec] "d" (__oac_spec.val)				\
+ 		: "cc", "0");						\
+-	__rc;								\
+-})
++	return rc;							\
++}									\
++									\
++static __always_inline int						\
++__put_user_##type(unsigned type __user *to, unsigned type *from,	\
++		  unsigned long size)					\
++{									\
++	int rc;								\
++									\
++	rc = __put_user_##type##_noinstr(to, from, size);		\
++	instrument_put_user(*from, to, size);				\
++	return rc;							\
++}
++
++DEFINE_PUT_USER(char);
++DEFINE_PUT_USER(short);
++DEFINE_PUT_USER(int);
++DEFINE_PUT_USER(long);
+ 
+ static __always_inline int __put_user_fn(void *x, void __user *ptr, unsigned long size)
+ {
+@@ -106,24 +133,24 @@ static __always_inline int __put_user_fn
+ 
+ 	switch (size) {
+ 	case 1:
+-		rc = __put_user_asm((unsigned char __user *)ptr,
+-				    (unsigned char *)x,
+-				    size);
++		rc = __put_user_char((unsigned char __user *)ptr,
++				     (unsigned char *)x,
++				     size);
+ 		break;
+ 	case 2:
+-		rc = __put_user_asm((unsigned short __user *)ptr,
+-				    (unsigned short *)x,
+-				    size);
++		rc = __put_user_short((unsigned short __user *)ptr,
++				      (unsigned short *)x,
++				      size);
+ 		break;
+ 	case 4:
+-		rc = __put_user_asm((unsigned int __user *)ptr,
++		rc = __put_user_int((unsigned int __user *)ptr,
+ 				    (unsigned int *)x,
+ 				    size);
+ 		break;
+ 	case 8:
+-		rc = __put_user_asm((unsigned long __user *)ptr,
+-				    (unsigned long *)x,
+-				    size);
++		rc = __put_user_long((unsigned long __user *)ptr,
++				     (unsigned long *)x,
++				     size);
+ 		break;
+ 	default:
+ 		__put_user_bad();
+@@ -134,13 +161,17 @@ static __always_inline int __put_user_fn
+ 
+ int __noreturn __get_user_bad(void);
+ 
+-#define __get_user_asm(to, from, size)					\
+-({									\
++#define DEFINE_GET_USER(type)						\
++static GET_PUT_USER_NOINSTR_ATTRIBUTES int				\
++__get_user_##type##_noinstr(unsigned type *to,				\
++			    unsigned type __user *from,			\
++			    unsigned long size)				\
++{									\
+ 	union oac __oac_spec = {					\
+ 		.oac2.as = PSW_BITS_AS_SECONDARY,			\
+ 		.oac2.a = 1,						\
+ 	};								\
+-	int __rc;							\
++	int rc;								\
+ 									\
+ 	asm volatile(							\
+ 		"	lr	0,%[spec]\n"				\
+@@ -149,13 +180,29 @@ int __noreturn __get_user_bad(void);
+ 		"2:\n"							\
+ 		EX_TABLE_UA_LOAD_MEM(0b, 2b, %[rc], %[_to], %[_ksize])	\
+ 		EX_TABLE_UA_LOAD_MEM(1b, 2b, %[rc], %[_to], %[_ksize])	\
+-		: [rc] "=&d" (__rc), "=Q" (*(to))			\
++		: [rc] "=&d" (rc), "=Q" (*(to))				\
+ 		: [_size] "d" (size), [_from] "Q" (*(from)),		\
+ 		  [spec] "d" (__oac_spec.val), [_to] "a" (to),		\
+ 		  [_ksize] "K" (size)					\
+ 		: "cc", "0");						\
+-	__rc;								\
+-})
++	return rc;							\
++}									\
++									\
++static __always_inline int						\
++__get_user_##type(unsigned type *to, unsigned type __user *from,	\
++		  unsigned long size)					\
++{									\
++	int rc;								\
++									\
++	rc = __get_user_##type##_noinstr(to, from, size);		\
++	instrument_get_user(*to);					\
++	return rc;							\
++}
++
++DEFINE_GET_USER(char);
++DEFINE_GET_USER(short);
++DEFINE_GET_USER(int);
++DEFINE_GET_USER(long);
+ 
+ static __always_inline int __get_user_fn(void *x, const void __user *ptr, unsigned long size)
+ {
+@@ -163,24 +210,24 @@ static __always_inline int __get_user_fn
+ 
+ 	switch (size) {
+ 	case 1:
+-		rc = __get_user_asm((unsigned char *)x,
+-				    (unsigned char __user *)ptr,
+-				    size);
++		rc = __get_user_char((unsigned char *)x,
++				     (unsigned char __user *)ptr,
++				     size);
+ 		break;
+ 	case 2:
+-		rc = __get_user_asm((unsigned short *)x,
+-				    (unsigned short __user *)ptr,
+-				    size);
++		rc = __get_user_short((unsigned short *)x,
++				      (unsigned short __user *)ptr,
++				      size);
+ 		break;
+ 	case 4:
+-		rc = __get_user_asm((unsigned int *)x,
++		rc = __get_user_int((unsigned int *)x,
+ 				    (unsigned int __user *)ptr,
+ 				    size);
+ 		break;
+ 	case 8:
+-		rc = __get_user_asm((unsigned long *)x,
+-				    (unsigned long __user *)ptr,
+-				    size);
++		rc = __get_user_long((unsigned long *)x,
++				     (unsigned long __user *)ptr,
++				     size);
+ 		break;
+ 	default:
+ 		__get_user_bad();
+_
