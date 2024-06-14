@@ -1,6 +1,6 @@
 From: Lance Yang <ioworker0@gmail.com>
 Subject: mm/vmscan: avoid split lazyfree THP during shrink_folio_list()
-Date: Tue, 21 May 2024 12:02:44 +0800
+Date: Mon, 10 Jun 2024 20:08:09 +0800
 
 When the user no longer requires the pages, they would use
 madvise(MADV_FREE) to mark the pages as lazy free.  Subsequently, they
@@ -21,12 +21,12 @@ mem_cgroup_force_empty() results in the following runtimes in seconds
 |   0.683426    |    0.049197    |  -92.80% |
 --------------------------------------------
 
-Link: https://lkml.kernel.org/r/20240521040244.48760-4-ioworker0@gmail.com
+Link: https://lkml.kernel.org/r/20240610120809.66601-1-ioworker0@gmail.com
 Signed-off-by: Lance Yang <ioworker0@gmail.com>
 Suggested-by: Zi Yan <ziy@nvidia.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
+Cc: Bang Li <libang.li@antgroup.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: Barry Song <21cnbao@gmail.com>
 Cc: Fangrui Song <maskray@google.com>
 Cc: Jeff Xie <xiehuan09@gmail.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
@@ -36,7 +36,7 @@ Cc: Minchan Kim <minchan@kernel.org>
 Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
-Cc: Yang Shi <shy828301@gmail.com>
+Cc: SeongJae Park <sj@kernel.org>
 Cc: Yin Fengwei <fengwei.yin@intel.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -44,12 +44,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  include/linux/huge_mm.h |    9 ++++
  mm/huge_memory.c        |   80 ++++++++++++++++++++++++++++++++++++++
- mm/rmap.c               |   41 +++++++++++++------
- 3 files changed, 117 insertions(+), 13 deletions(-)
+ mm/rmap.c               |   36 +++++++++++------
+ 3 files changed, 114 insertions(+), 11 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/include/linux/huge_mm.h
-@@ -417,6 +417,8 @@ static inline bool thp_migration_support
+@@ -430,6 +430,8 @@ static inline bool thp_migration_support
  
  void split_huge_pmd_locked(struct vm_area_struct *vma, unsigned long address,
  			   pmd_t *pmd, bool freeze, struct folio *folio);
@@ -58,7 +58,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #else /* CONFIG_TRANSPARENT_HUGEPAGE */
  
-@@ -484,6 +486,13 @@ static inline void split_huge_pmd_locked
+@@ -497,6 +499,13 @@ static inline void split_huge_pmd_locked
  					 unsigned long address, pmd_t *pmd,
  					 bool freeze, struct folio *folio) {}
  
@@ -74,13 +74,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/huge_memory.c~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/mm/huge_memory.c
-@@ -2687,6 +2687,86 @@ static void unmap_folio(struct folio *fo
+@@ -2688,6 +2688,86 @@ static void unmap_folio(struct folio *fo
  	try_to_unmap_flush();
  }
  
-+static bool __discard_trans_pmd_locked(struct vm_area_struct *vma,
-+				       unsigned long addr, pmd_t *pmdp,
-+				       struct folio *folio)
++static bool __discard_anon_folio_pmd_locked(struct vm_area_struct *vma,
++					    unsigned long addr, pmd_t *pmdp,
++					    struct folio *folio)
 +{
 +	VM_WARN_ON_FOLIO(folio_test_swapbacked(folio), folio);
 +	VM_WARN_ON_FOLIO(!folio_test_anon(folio), folio);
@@ -153,7 +153,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	VM_WARN_ON_ONCE(!IS_ALIGNED(addr, HPAGE_PMD_SIZE));
 +
 +	if (folio_test_anon(folio) && !folio_test_swapbacked(folio))
-+		return __discard_trans_pmd_locked(vma, addr, pmdp, folio);
++		return __discard_anon_folio_pmd_locked(vma, addr, pmdp, folio);
 +
 +	return false;
 +}
@@ -163,7 +163,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int i = 0;
 --- a/mm/rmap.c~mm-vmscan-avoid-split-lazyfree-thp-during-shrink_folio_list
 +++ a/mm/rmap.c
-@@ -1630,6 +1630,7 @@ static bool try_to_unmap_one(struct foli
+@@ -1632,6 +1632,7 @@ static bool try_to_unmap_one(struct foli
  	enum ttu_flags flags = (enum ttu_flags)(long)arg;
  	unsigned long pfn;
  	unsigned long hsz = 0;
@@ -171,7 +171,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * When racing against e.g. zap_pte_range() on another cpu,
-@@ -1677,18 +1678,26 @@ static bool try_to_unmap_one(struct foli
+@@ -1678,16 +1679,24 @@ static bool try_to_unmap_one(struct foli
  			goto walk_done_err;
  		}
  
@@ -180,16 +180,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			 * We temporarily have to drop the PTL and start once
 -			 * again from that now-PTE-mapped page table.
 -			 */
--			split_huge_pmd_locked(vma, range.start, pvmw.pmd, false,
--					      folio);
--			pvmw.pmd = NULL;
--			spin_unlock(pvmw.ptl);
--			pvmw.ptl = NULL;
+-			split_huge_pmd_locked(vma, pvmw.address, pvmw.pmd,
+-					      false, folio);
 -			flags &= ~TTU_SPLIT_HUGE_PMD;
+-			page_vma_mapped_walk_restart(&pvmw);
 -			continue;
 +		if (!pvmw.pte) {
 +			pmd_mapped = true;
-+			if (unmap_huge_pmd_locked(vma, range.start, pvmw.pmd,
++			if (unmap_huge_pmd_locked(vma, pvmw.address, pvmw.pmd,
 +						  folio))
 +				goto walk_done;
 +
@@ -199,18 +197,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				 * once again from that now-PTE-mapped page
 +				 * table.
 +				 */
-+				split_huge_pmd_locked(vma, range.start,
++				split_huge_pmd_locked(vma, pvmw.address,
 +						      pvmw.pmd, false, folio);
-+				pvmw.pmd = NULL;
-+				spin_unlock(pvmw.ptl);
-+				pvmw.ptl = NULL;
 +				flags &= ~TTU_SPLIT_HUGE_PMD;
++				page_vma_mapped_walk_restart(&pvmw);
 +				continue;
 +			}
  		}
  
  		/* Unexpected PMD-mapped THP? */
-@@ -1816,7 +1825,13 @@ static bool try_to_unmap_one(struct foli
+@@ -1815,7 +1824,12 @@ static bool try_to_unmap_one(struct foli
  			 */
  			if (unlikely(folio_test_swapbacked(folio) !=
  					folio_test_swapcache(folio))) {
@@ -220,8 +216,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				 * PMD-mapped folio as lazyfree if the folio or
 +				 * its PMD was redirtied.
 +				 */
-+				if (!pmd_mapped)
-+					WARN_ON_ONCE(1);
++				WARN_ON_ONCE(!pmd_mapped);
  				goto walk_done_err;
  			}
  
