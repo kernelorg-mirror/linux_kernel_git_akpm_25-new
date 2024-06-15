@@ -1,13 +1,13 @@
 From: Kefeng Wang <wangkefeng.wang@huawei.com>
 Subject: mm: fix possible OOB in numa_rebuild_large_mapping()
-Date: Fri, 7 Jun 2024 18:32:41 +0800
+Date: Wed, 12 Jun 2024 20:28:22 +0800
 
-The large folio is mapped with folio size aligned virtual address during
-the pagefault, ie, 'addr = ALIGN_DOWN(vmf->address, nr_pages * PAGE_SIZE)'
-in do_anonymous_page().  But after the mremap(), the virtual address only
-requires PAGE_SIZE alignment.  Also pte is moved to new in
-move_page_tables(), then traversal of the new pte in
-numa_rebuild_large_mapping() will hit the following issue,
+The large folio is mapped with folio size(not greater PMD_SIZE) aligned
+virtual address during the pagefault, ie, 'addr = ALIGN_DOWN(vmf->address,
+nr_pages * PAGE_SIZE)' in do_anonymous_page().  But after the mremap(),
+the virtual address only requires PAGE_SIZE alignment.  Also pte is moved
+to new in move_page_tables(), then traversal of the new pte in the
+numa_rebuild_large_mapping() could hit the following issue,
 
    Unable to handle kernel paging request at virtual address 00000a80c021a788
    Mem abort info:
@@ -53,15 +53,14 @@ numa_rebuild_large_mapping() will hit the following issue,
     el0t_64_sync_handler+0xe4/0x158
     el0t_64_sync+0x188/0x190
 
-Fix it by correcting the start and end, which may lead to only rebuild
-part of large mapping in one numa page fault, there is no issue since
-other part could rebuild by another pagefault.
+Fix it by making the start and end not only within the vma range, but also
+within the page table range.
 
-Link: https://lkml.kernel.org/r/20240607103241.1298388-1-wangkefeng.wang@huawei.com
+Link: https://lkml.kernel.org/r/20240612122822.4033433-1-wangkefeng.wang@huawei.com
 Fixes: d2136d749d76 ("mm: support multi-size THP numa balancing")
 Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: David Hildenbrand <david@redhat.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: "Huang, Ying" <ying.huang@intel.com>
 Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Liu Shixin <liushixin2@huawei.com>
@@ -70,49 +69,30 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memory.c |   24 +++++++++++++++---------
- 1 file changed, 15 insertions(+), 9 deletions(-)
+ mm/memory.c |   14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
 
 --- a/mm/memory.c~mm-fix-possible-oob-in-numa_rebuild_large_mapping
 +++ a/mm/memory.c
-@@ -5095,15 +5095,21 @@ static void numa_rebuild_single_mapping(
- 	update_mmu_cache_range(vmf, vma, fault_addr, fault_pte, 1);
- }
- 
--static void numa_rebuild_large_mapping(struct vm_fault *vmf, struct vm_area_struct *vma,
--				       struct folio *folio, pte_t fault_pte,
--				       bool ignore_writable, bool pte_write_upgrade)
-+static void numa_rebuild_large_mapping(struct vm_fault *vmf,
-+		struct vm_area_struct *vma, struct folio *folio, int nr_pages,
-+		pte_t fault_pte, bool ignore_writable, bool pte_write_upgrade)
+@@ -5100,10 +5100,16 @@ static void numa_rebuild_large_mapping(s
+ 				       bool ignore_writable, bool pte_write_upgrade)
  {
  	int nr = pte_pfn(fault_pte) - folio_pfn(folio);
 -	unsigned long start = max(vmf->address - nr * PAGE_SIZE, vma->vm_start);
 -	unsigned long end = min(vmf->address + (folio_nr_pages(folio) - nr) * PAGE_SIZE, vma->vm_end);
 -	pte_t *start_ptep = vmf->pte - (vmf->address - start) / PAGE_SIZE;
 -	unsigned long addr;
-+	unsigned long folio_size = nr_pages * PAGE_SIZE;
-+	unsigned long addr = vmf->address;
-+	unsigned long start, end, align_addr;
++	unsigned long start, end, addr = vmf->address;
++	unsigned long addr_start = addr - (nr << PAGE_SHIFT);
++	unsigned long pt_start = ALIGN_DOWN(addr, PMD_SIZE);
 +	pte_t *start_ptep;
 +
-+	align_addr = ALIGN_DOWN(addr, folio_size);
-+	start = max3(addr - nr * PAGE_SIZE, align_addr, vma->vm_start);
-+	end = min3(addr + (nr_pages - nr) * PAGE_SIZE, align_addr + folio_size,
++	/* Stay within the VMA and within the page table. */
++	start = max3(addr_start, pt_start, vma->vm_start);
++	end = min3(addr_start + folio_size(folio), pt_start + PMD_SIZE,
 +		   vma->vm_end);
-+	start_ptep = vmf->pte - (addr - start) / PAGE_SIZE;
++	start_ptep = vmf->pte - ((addr - start) >> PAGE_SHIFT);
  
  	/* Restore all PTEs' mapping of the large folio */
  	for (addr = start; addr != end; start_ptep++, addr += PAGE_SIZE) {
-@@ -5233,8 +5239,8 @@ out_map:
- 	 * non-accessible ptes, some can allow access by kernel mode.
- 	 */
- 	if (folio && folio_test_large(folio))
--		numa_rebuild_large_mapping(vmf, vma, folio, pte, ignore_writable,
--					   pte_write_upgrade);
-+		numa_rebuild_large_mapping(vmf, vma, folio, nr_pages, pte,
-+					   ignore_writable, pte_write_upgrade);
- 	else
- 		numa_rebuild_single_mapping(vmf, vma, vmf->address, vmf->pte,
- 					    writable);
 _
