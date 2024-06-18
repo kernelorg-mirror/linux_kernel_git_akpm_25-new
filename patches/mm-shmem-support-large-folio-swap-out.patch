@@ -1,0 +1,117 @@
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+Subject: mm: shmem: support large folio swap out
+Date: Tue, 18 Jun 2024 14:54:21 +0800
+
+Shmem will support large folio allocation [1] [2] to get a better
+performance, however, the memory reclaim still splits the precious large
+folios when trying to swap out shmem, which may lead to the memory
+fragmentation issue and can not take advantage of the large folio for
+shmeme.
+
+Moreover, the swap code already supports for swapping out large folio
+without split, hence this patch set supports the large folio swap out for
+shmem.
+
+Note the i915_gem_shmem driver still need to be split when swapping, thus
+add a new flag 'split_large_folio' for writeback_control to indicate
+spliting the large folio.
+
+[1] https://lore.kernel.org/all/cover.1717495894.git.baolin.wang@linux.alibaba.com/
+[2] https://lore.kernel.org/all/20240515055719.32577-1-da.gomez@samsung.com/
+Link: https://lkml.kernel.org/r/df16cdc6c7ce9b3f8e4f71cc6005738c67b3dacf.1718690645.git.baolin.wang@linux.alibaba.com
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Pankaj Raghav <p.raghav@samsung.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/gpu/drm/i915/gem/i915_gem_shmem.c |    1 +
+ include/linux/writeback.h                 |    1 +
+ mm/shmem.c                                |    3 +--
+ mm/vmscan.c                               |   14 ++++++++++++--
+ 4 files changed, 15 insertions(+), 4 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c~mm-shmem-support-large-folio-swap-out
++++ a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+@@ -308,6 +308,7 @@ void __shmem_writeback(size_t size, stru
+ 		.range_start = 0,
+ 		.range_end = LLONG_MAX,
+ 		.for_reclaim = 1,
++		.split_large_folio = 1,
+ 	};
+ 	unsigned long i;
+ 
+--- a/include/linux/writeback.h~mm-shmem-support-large-folio-swap-out
++++ a/include/linux/writeback.h
+@@ -63,6 +63,7 @@ struct writeback_control {
+ 	unsigned range_cyclic:1;	/* range_start is cyclic */
+ 	unsigned for_sync:1;		/* sync(2) WB_SYNC_ALL writeback */
+ 	unsigned unpinned_netfs_wb:1;	/* Cleared I_PINNING_NETFS_WB */
++	unsigned split_large_folio:1;	/* Split large folio for shmem writeback */
+ 
+ 	/*
+ 	 * When writeback IOs are bounced through async layers, only the
+--- a/mm/shmem.c~mm-shmem-support-large-folio-swap-out
++++ a/mm/shmem.c
+@@ -775,7 +775,6 @@ static int shmem_add_to_page_cache(struc
+ 	VM_BUG_ON_FOLIO(index != round_down(index, nr), folio);
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+ 	VM_BUG_ON_FOLIO(!folio_test_swapbacked(folio), folio);
+-	VM_BUG_ON(expected && folio_test_large(folio));
+ 
+ 	folio_ref_add(folio, nr);
+ 	folio->mapping = mapping;
+@@ -1462,7 +1461,7 @@ static int shmem_writepage(struct page *
+ 	 * "force", drivers/gpu/drm/i915/gem/i915_gem_shmem.c gets huge pages,
+ 	 * and its shmem_writeback() needs them to be split when swapping.
+ 	 */
+-	if (folio_test_large(folio)) {
++	if (wbc->split_large_folio && folio_test_large(folio)) {
+ 		/* Ensure the subpages are still dirty */
+ 		folio_test_set_dirty(folio);
+ 		if (split_huge_page(page) < 0)
+--- a/mm/vmscan.c~mm-shmem-support-large-folio-swap-out
++++ a/mm/vmscan.c
+@@ -1245,8 +1245,12 @@ retry:
+ 			if (!total_swap_pages)
+ 				goto activate_locked;
+ 
+-			/* Split shmem folio */
+-			if (split_folio_to_list(folio, folio_list))
++			/*
++			 * Only split shmem folio when CONFIG_THP_SWAP
++			 * is not enabled.
++			 */
++			if (!IS_ENABLED(CONFIG_THP_SWAP) &&
++			    split_folio_to_list(folio, folio_list))
+ 				goto keep_locked;
+ 		}
+ 
+@@ -1348,10 +1352,16 @@ retry:
+ 			 * starts and then write it out here.
+ 			 */
+ 			try_to_unmap_flush_dirty();
++try_pageout:
+ 			switch (pageout(folio, mapping, &plug)) {
+ 			case PAGE_KEEP:
+ 				goto keep_locked;
+ 			case PAGE_ACTIVATE:
++				if (shmem_mapping(mapping) && folio_test_large(folio) &&
++				    !split_folio_to_list(folio, folio_list)) {
++					nr_pages = 1;
++					goto try_pageout;
++				}
+ 				goto activate_locked;
+ 			case PAGE_SUCCESS:
+ 				stat->nr_pageout += nr_pages;
+_
