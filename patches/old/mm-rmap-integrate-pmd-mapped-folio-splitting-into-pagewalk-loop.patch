@@ -1,16 +1,19 @@
 From: Lance Yang <ioworker0@gmail.com>
 Subject: mm/rmap: integrate PMD-mapped folio splitting into pagewalk loop
-Date: Mon, 10 Jun 2024 20:06:18 +0800
+Date: Fri, 14 Jun 2024 09:51:37 +0800
 
 In preparation for supporting try_to_unmap_one() to unmap PMD-mapped
 folios, start the pagewalk first, then call split_huge_pmd_address() to
 split the folio.
 
-Link: https://lkml.kernel.org/r/20240610120618.66520-1-ioworker0@gmail.com
+Link: https://lkml.kernel.org/r/20240614015138.31461-3-ioworker0@gmail.com
 Signed-off-by: Lance Yang <ioworker0@gmail.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Suggested-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
 Cc: Bang Li <libang.li@antgroup.com>
+Cc: Barry Song <baohua@kernel.org>
 Cc: Fangrui Song <maskray@google.com>
 Cc: Jeff Xie <xiehuan09@gmail.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
@@ -21,16 +24,17 @@ Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: SeongJae Park <sj@kernel.org>
+Cc: Yang Shi <shy828301@gmail.com>
 Cc: Yin Fengwei <fengwei.yin@intel.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
-Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/huge_mm.h |    6 +++++
+ include/linux/rmap.h    |   24 +++++++++++++++++++++
  mm/huge_memory.c        |   42 +++++++++++++++++++-------------------
  mm/rmap.c               |   21 +++++++++++++------
- 3 files changed, 43 insertions(+), 26 deletions(-)
+ 4 files changed, 67 insertions(+), 26 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
 +++ a/include/linux/huge_mm.h
@@ -54,9 +58,42 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #define split_huge_pud(__vma, __pmd, __address)	\
  	do { } while (0)
+--- a/include/linux/rmap.h~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
++++ a/include/linux/rmap.h
+@@ -703,6 +703,30 @@ static inline void page_vma_mapped_walk_
+ 		spin_unlock(pvmw->ptl);
+ }
+ 
++/**
++ * page_vma_mapped_walk_restart - Restart the page table walk.
++ * @pvmw: Pointer to struct page_vma_mapped_walk.
++ *
++ * It restarts the page table walk when changes occur in the page
++ * table, such as splitting a PMD. Ensures that the PTL held during
++ * the previous walk is released and resets the state to allow for
++ * a new walk starting at the current address stored in pvmw->address.
++ */
++static inline void
++page_vma_mapped_walk_restart(struct page_vma_mapped_walk *pvmw)
++{
++	WARN_ON_ONCE(!pvmw->pmd && !pvmw->pte);
++
++	if (likely(pvmw->ptl))
++		spin_unlock(pvmw->ptl);
++	else
++		WARN_ON_ONCE(1);
++
++	pvmw->ptl = NULL;
++	pvmw->pmd = NULL;
++	pvmw->pte = NULL;
++}
++
+ bool page_vma_mapped_walk(struct page_vma_mapped_walk *pvmw);
+ 
+ /*
 --- a/mm/huge_memory.c~mm-rmap-integrate-pmd-mapped-folio-splitting-into-pagewalk-loop
 +++ a/mm/huge_memory.c
-@@ -2582,6 +2582,27 @@ static void __split_huge_pmd_locked(stru
+@@ -2583,6 +2583,27 @@ static void __split_huge_pmd_locked(stru
  	pmd_populate(mm, pmd, pgtable);
  }
  
@@ -84,7 +121,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  void __split_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
  		unsigned long address, bool freeze, struct folio *folio)
  {
-@@ -2593,26 +2614,7 @@ void __split_huge_pmd(struct vm_area_str
+@@ -2594,26 +2615,7 @@ void __split_huge_pmd(struct vm_area_str
  				(address & HPAGE_PMD_MASK) + HPAGE_PMD_SIZE);
  	mmu_notifier_invalidate_range_start(&range);
  	ptl = pmd_lock(vma->vm_mm, pmd);
@@ -135,7 +172,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 * If the folio is in an mlock()d vma, we must not swap it out.
  		 */
 @@ -1684,6 +1678,21 @@ static bool try_to_unmap_one(struct foli
- 			goto walk_done_err;
+ 			goto walk_abort;
  		}
  
 +		if (!pvmw.pte && (flags & TTU_SPLIT_HUGE_PMD)) {

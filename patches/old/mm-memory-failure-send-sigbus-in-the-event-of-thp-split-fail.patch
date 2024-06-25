@@ -1,72 +1,94 @@
 From: Jane Chu <jane.chu@oracle.com>
 Subject: mm/memory-failure: send SIGBUS in the event of thp split fail
-Date: Wed, 1 May 2024 17:24:58 -0600
+Date: Fri, 24 May 2024 15:53:06 -0600
 
-When handle hwpoison in a GUP longterm pin'ed thp page,
-try_to_split_thp_page() will fail.  And at this point, there is little
-else the kernel could do except sending a SIGBUS to the user process, thus
-give it a chance to recover.
+While handling hwpoison in a THP page, it is possible that
+try_to_split_thp_page() fails.  For example, when the THP page has been
+RDMA pinned.  At this point, the kernel cannot isolate the poisoned THP
+page, all it could do is to send a SIGBUS to the user process with
+meaningful payload to give user-level recovery a chance.
 
-[akpm@linux-foundation.org: update for folio conversions]
-Link: https://lkml.kernel.org/r/20240501232458.3919593-4-jane.chu@oracle.com
+Link: https://lkml.kernel.org/r/20240524215306.2705454-6-jane.chu@oracle.com
 Signed-off-by: Jane Chu <jane.chu@oracle.com>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Oscar Salvador <oalvador@suse.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memory-failure.c |   35 +++++++++++++++++++++++++++++++++++
- 1 file changed, 35 insertions(+)
+ mm/memory-failure.c |   34 +++++++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
 
 --- a/mm/memory-failure.c~mm-memory-failure-send-sigbus-in-the-event-of-thp-split-fail
 +++ a/mm/memory-failure.c
-@@ -2162,6 +2162,36 @@ out:
+@@ -1706,7 +1706,12 @@ static int identify_page_state(unsigned
+ 	return page_action(ps, p, pfn);
+ }
+ 
+-static int try_to_split_thp_page(struct page *page)
++/*
++ * When 'release' is 'false', it means that if thp split has failed,
++ * there is still more to do, hence the page refcount we took earlier
++ * is still needed.
++ */
++static int try_to_split_thp_page(struct page *page, bool release)
+ {
+ 	int ret;
+ 
+@@ -1714,7 +1719,7 @@ static int try_to_split_thp_page(struct
+ 	ret = split_huge_page(page);
+ 	unlock_page(page);
+ 
+-	if (unlikely(ret))
++	if (ret && release)
+ 		put_page(page);
+ 
+ 	return ret;
+@@ -2186,6 +2191,22 @@ out:
  	return rc;
  }
  
 +/*
 + * The calling condition is as such: thp split failed, page might have
-+ * been GUP longterm pinned, not much can be done for recovery.
++ * been RDMA pinned, not much can be done for recovery.
 + * But a SIGBUS should be delivered with vaddr provided so that the user
 + * application has a chance to recover. Also, application processes'
 + * election for MCE early killed will be honored.
 + */
-+static int kill_procs_now(struct page *p, unsigned long pfn, int flags,
-+			struct folio *folio)
++static void kill_procs_now(struct page *p, unsigned long pfn, int flags,
++				struct folio *folio)
 +{
 +	LIST_HEAD(tokill);
-+	int res = -EHWPOISON;
 +
-+	/* deal with user pages only */
-+	if (PageReserved(p) || PageSlab(p) || PageTable(p) || PageOffline(p))
-+		res = -EBUSY;
-+	if (!(folio_test_lru(folio) || PageHuge(p)))
-+		res = -EBUSY;
-+
-+	if (res == -EHWPOISON) {
-+		collect_procs(folio, p, &tokill, flags & MF_ACTION_REQUIRED);
-+		kill_procs(&tokill, true, pfn, flags);
-+	}
-+
-+	if (flags & MF_COUNT_INCREASED)
-+		put_page(p);
-+
-+	return res;
++	collect_procs(folio, p, &tokill, flags & MF_ACTION_REQUIRED);
++	kill_procs(&tokill, true, pfn, flags);
 +}
 +
  /**
   * memory_failure - Handle memory failure of a page.
   * @pfn: Page Number of the corrupted page
-@@ -2291,6 +2321,11 @@ try_again:
+@@ -2327,8 +2348,11 @@ try_again:
+ 		 * page is a valid handlable page.
  		 */
  		folio_set_has_hwpoisoned(folio);
- 		if (try_to_split_thp_page(p) < 0) {
-+			if (flags & MF_ACTION_REQUIRED) {
-+				pr_err("%#lx: thp split failed\n", pfn);
-+				res = kill_procs_now(p, pfn, flags, folio);
-+				goto unlock_mutex;
-+			}
- 			res = action_result(pfn, MF_MSG_UNSPLIT_THP, MF_IGNORED);
+-		if (try_to_split_thp_page(p) < 0) {
+-			res = action_result(pfn, MF_MSG_UNSPLIT_THP, MF_IGNORED);
++		if (try_to_split_thp_page(p, false) < 0) {
++			res = -EHWPOISON;
++			kill_procs_now(p, pfn, flags, folio);
++			put_page(p);
++			action_result(pfn, MF_MSG_UNSPLIT_THP, MF_FAILED);
  			goto unlock_mutex;
+ 		}
+ 		VM_BUG_ON_PAGE(!page_count(p), p);
+@@ -2709,7 +2733,7 @@ static int soft_offline_in_use_page(stru
+ 	};
+ 
+ 	if (!huge && folio_test_large(folio)) {
+-		if (try_to_split_thp_page(page)) {
++		if (try_to_split_thp_page(page, true)) {
+ 			pr_info("soft offline: %#lx: thp split failed\n", pfn);
+ 			return -EBUSY;
  		}
 _

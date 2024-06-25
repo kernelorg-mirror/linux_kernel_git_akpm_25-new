@@ -1,8 +1,8 @@
 From: Chuanhua Han <hanchuanhua@oppo.com>
 Subject: mm: swap: introduce swap_free_nr() for batched swap_free()
-Date: Tue, 9 Apr 2024 20:26:27 +1200
+Date: Wed, 29 May 2024 20:28:19 +1200
 
-Patch series "large folios swap-in: handle refault cases first", v2.
+Patch series "large folios swap-in: handle refault cases first", v5.
 
 This patchset is extracted from the large folio swapin series[1],
 primarily addressing the handling of scenarios involving large folios in
@@ -10,6 +10,9 @@ the swap cache.  Currently, it is particularly focused on addressing the
 refaulting of mTHP, which is still undergoing reclamation.  This approach
 aims to streamline code review and expedite the integration of this
 segment into the MM tree.
+
+It relies on Ryan's swap-out series[2], leveraging the helper function
+swap_pte_batch() introduced by that series.
 
 Presently, do_swap_page only encounters a large folio in the swap cache
 before the large folio is released by vmscan.  However, the code should
@@ -21,41 +24,55 @@ recent MTE patchset[3].
 The large folio swap-in for SWP_SYNCHRONOUS_IO and swapin_readahead() will
 be split into separate patch sets and sent at a later time.
 
+[1] https://lore.kernel.org/linux-mm/20240304081348.197341-1-21cnbao@gmail.com/
+[2] https://lore.kernel.org/linux-mm/20240408183946.2991168-1-ryan.roberts@arm.com/
+[3] https://lore.kernel.org/linux-mm/20240322114136.61386-1-21cnbao@gmail.com/ 
 
-This patch (of 5):
+
+This patch (of 6):
 
 While swapping in a large folio, we need to free swaps related to the
 whole folio.  To avoid frequently acquiring and releasing swap locks, it
-is better to introduce an API for batched free.
+is better to introduce an API for batched free.  Furthermore, this new
+function, swap_free_nr(), is designed to efficiently handle various
+scenarios for releasing a specified number, nr, of swap entries.
 
-Link: https://lkml.kernel.org/r/20240409082631.187483-1-21cnbao@gmail.com
-Link: https://lkml.kernel.org/r/20240409082631.187483-2-21cnbao@gmail.com
+Link: https://lkml.kernel.org/r/20240529082824.150954-1-21cnbao@gmail.com
+Link: https://lkml.kernel.org/r/20240529082824.150954-2-21cnbao@gmail.com
 Signed-off-by: Chuanhua Han <hanchuanhua@oppo.com>
 Co-developed-by: Barry Song <v-songbaohua@oppo.com>
 Signed-off-by: Barry Song <v-songbaohua@oppo.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Acked-by: Chris Li <chrisl@kernel.org>
+Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: Chris Li <chrisl@kernel.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Gao Xiang <xiang@kernel.org>
-Cc: "Huang, Ying" <ying.huang@intel.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kairui Song <kasong@tencent.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Yosry Ahmed <yosryahmed@google.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
+Cc: Andreas Larsson <andreas@gaisler.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Khalid Aziz <khalid.aziz@oracle.com>
+Cc: Len Brown <len.brown@intel.com>
+Cc: Pavel Machek <pavel@ucw.cz>
+Cc: "Rafael J. Wysocki" <rafael@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/swap.h |    5 ++++
- mm/swapfile.c        |   51 +++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 56 insertions(+)
+ mm/swapfile.c        |   47 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+)
 
 --- a/include/linux/swap.h~mm-swap-introduce-swap_free_nr-for-batched-swap_free
 +++ a/include/linux/swap.h
-@@ -480,6 +480,7 @@ extern void swap_shmem_alloc(swp_entry_t
+@@ -478,6 +478,7 @@ extern void swap_shmem_alloc(swp_entry_t
  extern int swap_duplicate(swp_entry_t);
  extern int swapcache_prepare(swp_entry_t);
  extern void swap_free(swp_entry_t);
@@ -63,11 +80,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  extern void swapcache_free_entries(swp_entry_t *entries, int n);
  extern void free_swap_and_cache_nr(swp_entry_t entry, int nr);
  int swap_type_of(dev_t device, sector_t offset);
-@@ -561,6 +562,10 @@ static inline void swap_free(swp_entry_t
+@@ -559,6 +560,10 @@ static inline void swap_free(swp_entry_t
  {
  }
  
-+void swap_free_nr(swp_entry_t entry, int nr_pages)
++static inline void swap_free_nr(swp_entry_t entry, int nr_pages)
 +{
 +}
 +
@@ -76,62 +93,58 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/mm/swapfile.c~mm-swap-introduce-swap_free_nr-for-batched-swap_free
 +++ a/mm/swapfile.c
-@@ -1357,6 +1357,57 @@ void swap_free(swp_entry_t entry)
+@@ -1356,6 +1356,53 @@ void swap_free(swp_entry_t entry)
+ 		__swap_entry_free(p, entry);
  }
  
- /*
-+ * Free up the maximum number of swap entries at once to limit the
-+ * maximum kernel stack usage.
-+ */
-+#define SWAP_BATCH_NR (SWAPFILE_CLUSTER > 512 ? 512 : SWAPFILE_CLUSTER)
++static void cluster_swap_free_nr(struct swap_info_struct *sis,
++		unsigned long offset, int nr_pages)
++{
++	struct swap_cluster_info *ci;
++	DECLARE_BITMAP(to_free, BITS_PER_LONG) = { 0 };
++	int i, nr;
 +
-+/*
-+ * Called after swapping in a large folio, batched free swap entries
-+ * for this large folio, entry should be for the first subpage and
-+ * its offset is aligned with nr_pages
-+ */
++	ci = lock_cluster_or_swap_info(sis, offset);
++	while (nr_pages) {
++		nr = min(BITS_PER_LONG, nr_pages);
++		for (i = 0; i < nr; i++) {
++			if (!__swap_entry_free_locked(sis, offset + i, 1))
++				bitmap_set(to_free, i, 1);
++		}
++		if (!bitmap_empty(to_free, BITS_PER_LONG)) {
++			unlock_cluster_or_swap_info(sis, ci);
++			for_each_set_bit(i, to_free, BITS_PER_LONG)
++				free_swap_slot(swp_entry(sis->type, offset + i));
++			if (nr == nr_pages)
++				return;
++			bitmap_clear(to_free, 0, BITS_PER_LONG);
++			ci = lock_cluster_or_swap_info(sis, offset);
++		}
++		offset += nr;
++		nr_pages -= nr;
++	}
++	unlock_cluster_or_swap_info(sis, ci);
++}
++
 +void swap_free_nr(swp_entry_t entry, int nr_pages)
 +{
-+	int i, j;
-+	struct swap_cluster_info *ci;
-+	struct swap_info_struct *p;
-+	unsigned int type = swp_type(entry);
++	int nr;
++	struct swap_info_struct *sis;
 +	unsigned long offset = swp_offset(entry);
-+	int batch_nr, remain_nr;
-+	DECLARE_BITMAP(usage, SWAP_BATCH_NR) = { 0 };
 +
-+	/* all swap entries are within a cluster for mTHP */
-+	VM_BUG_ON(offset % SWAPFILE_CLUSTER + nr_pages > SWAPFILE_CLUSTER);
-+
-+	if (nr_pages == 1) {
-+		swap_free(entry);
++	sis = _swap_info_get(entry);
++	if (!sis)
 +		return;
-+	}
 +
-+	remain_nr = nr_pages;
-+	p = _swap_info_get(entry);
-+	if (p) {
-+		for (i = 0; i < nr_pages; i += batch_nr) {
-+			batch_nr = min_t(int, SWAP_BATCH_NR, remain_nr);
-+
-+			ci = lock_cluster_or_swap_info(p, offset);
-+			for (j = 0; j < batch_nr; j++) {
-+				if (__swap_entry_free_locked(p, offset + i * SWAP_BATCH_NR + j, 1))
-+					__bitmap_set(usage, j, 1);
-+			}
-+			unlock_cluster_or_swap_info(p, ci);
-+
-+			for_each_clear_bit(j, usage, batch_nr)
-+				free_swap_slot(swp_entry(type, offset + i * SWAP_BATCH_NR + j));
-+
-+			bitmap_clear(usage, 0, SWAP_BATCH_NR);
-+			remain_nr -= batch_nr;
-+		}
++	while (nr_pages) {
++		nr = min_t(int, nr_pages, SWAPFILE_CLUSTER - offset % SWAPFILE_CLUSTER);
++		cluster_swap_free_nr(sis, offset, nr);
++		offset += nr;
++		nr_pages -= nr;
 +	}
 +}
 +
-+/*
+ /*
   * Called after dropping swapcache to decrease refcnt to swap entries.
   */
- void put_swap_folio(struct folio *folio, swp_entry_t entry)
 _
