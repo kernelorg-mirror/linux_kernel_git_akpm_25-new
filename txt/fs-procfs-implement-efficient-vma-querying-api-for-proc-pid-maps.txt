@@ -1,0 +1,145 @@
+From: Andrii Nakryiko <andrii@kernel.org>
+Subject: fs/procfs: implement efficient VMA querying API for /proc/<pid>/maps
+Date: Thu, 27 Jun 2024 10:08:54 -0700
+
+/proc/<pid>/maps file is extremely useful in practice for various tasks
+involving figuring out process memory layout, what files are backing any
+given memory range, etc.  One important class of applications that
+absolutely rely on this are profilers/stack symbolizers (perf tool being
+one of them).  Patterns of use differ, but they generally would fall into
+two categories.
+
+In on-demand pattern, a profiler/symbolizer would normally capture stack
+trace containing absolute memory addresses of some functions, and would
+then use /proc/<pid>/maps file to find corresponding backing ELF files
+(normally, only executable VMAs are of interest), file offsets within
+them, and then continue from there to get yet more information (ELF
+symbols, DWARF information) to get human-readable symbolic information. 
+This pattern is used by Meta's fleet-wide profiler, as one example.
+
+In preprocessing pattern, application doesn't know the set of addresses of
+interest, so it has to fetch all relevant VMAs (again, probably only
+executable ones), store or cache them, then proceed with profiling and
+stack trace capture.  Once done, it would do symbolization based on stored
+VMA information.  This can happen at much later point in time.  This
+patterns is used by perf tool, as an example.
+
+In either case, there are both performance and correctness requirement
+involved.  This address to VMA information translation has to be done as
+efficiently as possible, but also not miss any VMA (especially in the case
+of loading/unloading shared libraries).  In practice, correctness can't be
+guaranteed (due to process dying before VMA data can be captured, or
+shared library being unloaded, etc), but any effort to maximize the chance
+of finding the VMA is appreciated.
+
+Unfortunately, for all the /proc/<pid>/maps file universality and
+usefulness, it doesn't fit the above use cases 100%.
+
+First, it's main purpose is to emit all VMAs sequentially, but in practice
+captured addresses would fall only into a smaller subset of all process'
+VMAs, mainly containing executable text.  Yet, library would need to parse
+most or all of the contents to find needed VMAs, as there is no way to
+skip VMAs that are of no use.  Efficient library can do the linear pass
+and it is still relatively efficient, but it's definitely an overhead that
+can be avoided, if there was a way to do more targeted querying of the
+relevant VMA information.
+
+Second, it's a text based interface, which makes its programmatic use from
+applications and libraries more cumbersome and inefficient due to the need
+to handle text parsing to get necessary pieces of information.  The
+overhead is actually payed both by kernel, formatting originally binary
+VMA data into text, and then by user space application, parsing it back
+into binary data for further use.
+
+For the on-demand pattern of usage, described above, another problem when
+writing generic stack trace symbolization library is an unfortunate
+performance-vs-correctness tradeoff that needs to be made.  Library has to
+make a decision to either cache parsed contents of /proc/<pid>/maps (after
+initial processing) to service future requests (if application requests to
+symbolize another set of addresses (for the same process), captured at
+some later time, which is typical for periodic/continuous profiling cases)
+to avoid higher costs of re-parsing this file.  Or it has to choose to
+cache the contents in memory to speed up future requests.  In the former
+case, more memory is used for the cache and there is a risk of getting
+stale data if application loads or unloads shared libraries, or otherwise
+changed its set of VMAs somehow, e.g., through additional mmap() calls. 
+In the latter case, it's the performance hit that comes from re-opening
+the file and re-parsing its contents all over again.
+
+This patch aims to solve this problem by providing a new API built on top
+of /proc/<pid>/maps.  It's meant to address both non-selectiveness and
+text nature of /proc/<pid>/maps, by giving user more control of what sort
+of VMA(s) needs to be queried, and being binary-based interface eliminates
+the overhead of text formatting (on kernel side) and parsing (on user
+space side).
+
+It's also designed to be extensible and forward/backward compatible by
+including required struct size field, which user has to provide.  We use
+established copy_struct_from_user() approach to handle extensibility.
+
+User has a choice to pick either getting VMA that covers provided address
+or -ENOENT if none is found (exact, least surprising, case).  Or, with an
+extra query flag (PROCMAP_QUERY_COVERING_OR_NEXT_VMA), they can get either
+VMA that covers the address (if there is one), or the closest next VMA
+(i.e., VMA with the smallest vm_start > addr).  The latter allows more
+efficient use, but, given it could be a surprising behavior, requires an
+explicit opt-in.
+
+There is another query flag that is useful for some use cases. 
+PROCMAP_QUERY_FILE_BACKED_VMA instructs this API to only return
+file-backed VMAs.  Combining this with PROCMAP_QUERY_COVERING_OR_NEXT_VMA
+makes it possible to efficiently iterate only file-backed VMAs of the
+process, which is what profilers/symbolizers are normally interested in.
+
+All the above querying flags can be combined with (also optional) set of
+desired VMA permissions flags.  This allows to, for example, iterate only
+an executable subset of VMAs, which is what preprocessing pattern, used by
+perf tool, would benefit from, as the assumption is that captured stack
+traces would have addresses of executable code.  This saves time by
+skipping non-executable VMAs altogether efficienty.
+
+All these querying flags (modifiers) are orthogonal and can be combined in
+a semantically meaningful and natural way.
+
+Basing this ioctl()-based API on top of /proc/<pid>/maps's FD makes sense
+given it's querying the same set of VMA data.  It's also benefitial
+because permission checks for /proc/<pid>/maps is performed at open time
+once, and the actual data read of text contents of /proc/<pid>/maps is
+done without further permission checks.  We piggyback on this pattern with
+ioctl()-based API as well, as that's a desired property.  Both for
+performance reasons, but also for security and flexibility reasons.
+
+Allowing application to open an FD for /proc/self/maps without any extra
+capabilities, and then passing it to some sort of profiling agent through
+Unix-domain socket, would allow such profiling agent to not require some
+of the capabilities that are otherwise expected when opening
+/proc/<pid>/maps file for *another* process.  This is a desirable property
+for some more restricted setups.
+
+This new ioctl-based implementation doesn't interfere with seq_file-based
+implementation of /proc/<pid>/maps textual interface, and so could be used
+together or independently without paying any price for that.
+
+Note also, that fetching VMA name (e.g., backing file path, or special
+hard-coded or user-provided names) is optional just like build ID.  If
+user sets vma_name_size to zero, kernel code won't attempt to retrieve it,
+saving resources.
+
+Earlier versions of this patch set were adding per-VMA locking, which is
+why we have a code structure that is ready for abstracting mmap_lock vs
+vm_lock differences (query_vma_setup(), query_vma_teardown(), and
+query_vma_find_by_addr()), but given anon_vma_name() is not yet compatible
+with per-VMA locking, initial implementation sticks to using only
+mmap_lock for now.  It will be easy to add back per-VMA locking once all
+the pieces are ready later on.  Which is why we keep existing code
+structure with setup/teardown/query helper functions.
+
+Link: https://lkml.kernel.org/r/20240627170900.1672542-3-andrii@kernel.org
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>

@@ -1,0 +1,174 @@
+From: Andrii Nakryiko <andrii@kernel.org>
+Subject: fs/procfs: add build ID fetching to PROCMAP_QUERY API
+Date: Thu, 27 Jun 2024 10:08:55 -0700
+
+The need to get ELF build ID reliably is an important aspect when dealing
+with profiling and stack trace symbolization, and /proc/<pid>/maps textual
+representation doesn't help with this.
+
+To get backing file's ELF build ID, application has to first resolve VMA,
+then use it's start/end address range to follow a special
+/proc/<pid>/map_files/<start>-<end> symlink to open the ELF file (this is
+necessary because backing file might have been removed from the disk or
+was already replaced with another binary in the same file path.
+
+Such approach, beyond just adding complexity of having to do a bunch of
+extra work, has extra security implications.  Because application opens
+underlying ELF file and needs read access to its entire contents (as far
+as kernel is concerned), kernel puts additional capable() checks on
+following /proc/<pid>/map_files/<start>-<end> symlink.  And that makes
+sense in general.
+
+But in the case of build ID, profiler/symbolizer doesn't need the contents
+of ELF file, per se.  It's only build ID that is of interest, and ELF
+build ID itself doesn't provide any sensitive information.
+
+So this patch adds a way to request backing file's ELF build ID along the
+rest of VMA information in the same API.  User has control over whether
+this piece of information is requested or not by either setting
+build_id_size field to zero or non-zero maximum buffer size they provided
+through build_id_addr field (which encodes user pointer as __u64 field). 
+This is a completely optional piece of information, and so has no
+performance implications for user cases that don't care about build ID,
+while improving performance and simplifying the setup for those
+application that do need it.
+
+Kernel already implements build ID fetching, which is used from BPF
+subsystem.  We are reusing this code here, but plan a follow up changes to
+make it work better under more relaxed assumption (compared to what
+existing code assumes) of being called from user process context, in which
+page faults are allowed.  BPF-specific implementation currently bails out
+if necessary part of ELF file is not paged in, all due to extra
+BPF-specific restrictions (like the need to fetch build ID in restrictive
+contexts such as NMI handler).
+
+Link: https://lkml.kernel.org/r/20240627170900.1672542-4-andrii@kernel.org
+Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/proc/task_mmu.c      |   25 ++++++++++++++++++++++++-
+ include/uapi/linux/fs.h |   28 ++++++++++++++++++++++++++++
+ 2 files changed, 52 insertions(+), 1 deletion(-)
+
+--- a/fs/proc/task_mmu.c~fs-procfs-add-build-id-fetching-to-procmap_query-api
++++ a/fs/proc/task_mmu.c
+@@ -22,6 +22,7 @@
+ #include <linux/pkeys.h>
+ #include <linux/minmax.h>
+ #include <linux/overflow.h>
++#include <linux/buildid.h>
+ 
+ #include <asm/elf.h>
+ #include <asm/tlb.h>
+@@ -445,6 +446,7 @@ skip_vma:
+ 	addr = vma->vm_end;
+ 	if (flags & PROCMAP_QUERY_COVERING_OR_NEXT_VMA)
+ 		goto next_vma;
++
+ no_vma:
+ 	return ERR_PTR(-ENOENT);
+ }
+@@ -455,7 +457,7 @@ static int do_procmap_query(struct proc_
+ 	struct vm_area_struct *vma;
+ 	struct mm_struct *mm;
+ 	const char *name = NULL;
+-	char *name_buf = NULL;
++	char build_id_buf[BUILD_ID_SIZE_MAX], *name_buf = NULL;
+ 	__u64 usize;
+ 	int err;
+ 
+@@ -477,6 +479,8 @@ static int do_procmap_query(struct proc_
+ 	/* either both buffer address and size are set, or both should be zero */
+ 	if (!!karg.vma_name_size != !!karg.vma_name_addr)
+ 		return -EINVAL;
++	if (!!karg.build_id_size != !!karg.build_id_addr)
++		return -EINVAL;
+ 
+ 	mm = priv->mm;
+ 	if (!mm || !mmget_not_zero(mm))
+@@ -539,6 +543,21 @@ static int do_procmap_query(struct proc_
+ 		}
+ 	}
+ 
++	if (karg.build_id_size) {
++		__u32 build_id_sz;
++
++		err = build_id_parse(vma, build_id_buf, &build_id_sz);
++		if (err) {
++			karg.build_id_size = 0;
++		} else {
++			if (karg.build_id_size < build_id_sz) {
++				err = -ENAMETOOLONG;
++				goto out;
++			}
++			karg.build_id_size = build_id_sz;
++		}
++	}
++
+ 	if (karg.vma_name_size) {
+ 		size_t name_buf_sz = min_t(size_t, PATH_MAX, karg.vma_name_size);
+ 		const struct path *path;
+@@ -583,6 +602,10 @@ static int do_procmap_query(struct proc_
+ 	}
+ 	kfree(name_buf);
+ 
++	if (karg.build_id_size && copy_to_user((void __user *)karg.build_id_addr,
++					       build_id_buf, karg.build_id_size))
++		return -EFAULT;
++
+ 	if (copy_to_user(uarg, &karg, min_t(size_t, sizeof(karg), usize)))
+ 		return -EFAULT;
+ 
+--- a/include/uapi/linux/fs.h~fs-procfs-add-build-id-fetching-to-procmap_query-api
++++ a/include/uapi/linux/fs.h
+@@ -512,6 +512,26 @@ struct procmap_query {
+ 	 */
+ 	__u32 vma_name_size;		/* in/out */
+ 	/*
++	 * If set to non-zero value, signals the request to extract and return
++	 * VMA's backing file's build ID, if the backing file is an ELF file
++	 * and it contains embedded build ID.
++	 *
++	 * Kernel will set this field to zero, if VMA has no backing file,
++	 * backing file is not an ELF file, or ELF file has no build ID
++	 * embedded.
++	 *
++	 * Build ID is a binary value (not a string). Kernel will set
++	 * build_id_size field to exact number of bytes used for build ID.
++	 * If build ID is requested and present, but needs more bytes than
++	 * user-supplied maximum buffer size (see build_id_addr field below),
++	 * -E2BIG error will be returned.
++	 *
++	 * If this field is set to non-zero value, build_id_addr should point
++	 * to valid user space memory buffer of at least build_id_size bytes.
++	 * If set to zero, build_id_addr should be set to zero as well
++	 */
++	__u32 build_id_size;		/* in/out */
++	/*
+ 	 * User-supplied address of a buffer of at least vma_name_size bytes
+ 	 * for kernel to fill with matched VMA's name (see vma_name_size field
+ 	 * description above for details).
+@@ -519,6 +539,14 @@ struct procmap_query {
+ 	 * Should be set to zero if VMA name should not be returned.
+ 	 */
+ 	__u64 vma_name_addr;		/* in */
++	/*
++	 * User-supplied address of a buffer of at least build_id_size bytes
++	 * for kernel to fill with matched VMA's ELF build ID, if available
++	 * (see build_id_size field description above for details).
++	 *
++	 * Should be set to zero if build ID should not be returned.
++	 */
++	__u64 build_id_addr;		/* in */
+ };
+ 
+ #endif /* _UAPI_LINUX_FS_H */
+_
