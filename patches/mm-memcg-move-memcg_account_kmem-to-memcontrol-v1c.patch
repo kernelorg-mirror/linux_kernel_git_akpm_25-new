@@ -1,0 +1,162 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: memcg: move memcg_account_kmem() to memcontrol-v1.c
+Date: Fri, 28 Jun 2024 21:03:09 +0000
+
+Patch series "mm: memcg: put cgroup v1-specific memcg data under
+CONFIG_MEMCG_V1".
+
+This patchset puts all cgroup v1's members of struct mem_cgroup, struct
+mem_cgroup_per_node and struct task_struct under the CONFIG_MEMCG_V1
+config option.  If cgroup v1 support is not required (and it's true for
+many cgroup users these days), it allows to save a bit of memory and
+compile out some code, some of which is on relatively hot paths.  It also
+structures the code a bit better by grouping cgroup v1-specific stuff in
+one place.
+
+
+This patch (of 9):
+
+memcg_account_kmem() consists of a trivial statistics change via
+mod_memcg_state() call and a relatively large memcg1-specific part.
+
+Let's factor out the mod_memcg_state() call and move the rest into the
+mm/memcontrol-v1.c file.  Also rename memcg_account_kmem() into
+memcg1_account_kmem() for consistency.
+
+Link: https://lkml.kernel.org/r/20240628210317.272856-1-roman.gushchin@linux.dev
+Link: https://lkml.kernel.org/r/20240628210317.272856-2-roman.gushchin@linux.dev
+Signed-off-by: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol-v1.c |   12 ++++++++++++
+ mm/memcontrol-v1.h |    2 ++
+ mm/memcontrol.c    |   31 ++++++++++---------------------
+ 3 files changed, 24 insertions(+), 21 deletions(-)
+
+--- a/mm/memcontrol.c~mm-memcg-move-memcg_account_kmem-to-memcontrol-v1c
++++ a/mm/memcontrol.c
+@@ -1721,7 +1721,6 @@ static DEFINE_MUTEX(percpu_charge_mutex)
+ static struct obj_cgroup *drain_obj_stock(struct memcg_stock_pcp *stock);
+ static bool obj_stock_flush_required(struct memcg_stock_pcp *stock,
+ 				     struct mem_cgroup *root_memcg);
+-static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages);
+ 
+ #else
+ static inline struct obj_cgroup *drain_obj_stock(struct memcg_stock_pcp *stock)
+@@ -1733,9 +1732,6 @@ static bool obj_stock_flush_required(str
+ {
+ 	return false;
+ }
+-static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages)
+-{
+-}
+ #endif
+ 
+ /**
+@@ -2645,18 +2641,6 @@ struct obj_cgroup *get_obj_cgroup_from_f
+ 	return objcg;
+ }
+ 
+-static void memcg_account_kmem(struct mem_cgroup *memcg, int nr_pages)
+-{
+-	mod_memcg_state(memcg, MEMCG_KMEM, nr_pages);
+-	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys)) {
+-		if (nr_pages > 0)
+-			page_counter_charge(&memcg->kmem, nr_pages);
+-		else
+-			page_counter_uncharge(&memcg->kmem, -nr_pages);
+-	}
+-}
+-
+-
+ /*
+  * obj_cgroup_uncharge_pages: uncharge a number of kernel pages from a objcg
+  * @objcg: object cgroup to uncharge
+@@ -2669,7 +2653,8 @@ static void obj_cgroup_uncharge_pages(st
+ 
+ 	memcg = get_mem_cgroup_from_objcg(objcg);
+ 
+-	memcg_account_kmem(memcg, -nr_pages);
++	mod_memcg_state(memcg, MEMCG_KMEM, -nr_pages);
++	memcg1_account_kmem(memcg, -nr_pages);
+ 	refill_stock(memcg, nr_pages);
+ 
+ 	css_put(&memcg->css);
+@@ -2695,7 +2680,8 @@ static int obj_cgroup_charge_pages(struc
+ 	if (ret)
+ 		goto out;
+ 
+-	memcg_account_kmem(memcg, nr_pages);
++	mod_memcg_state(memcg, MEMCG_KMEM, nr_pages);
++	memcg1_account_kmem(memcg, nr_pages);
+ out:
+ 	css_put(&memcg->css);
+ 
+@@ -2848,7 +2834,8 @@ static struct obj_cgroup *drain_obj_stoc
+ 
+ 			memcg = get_mem_cgroup_from_objcg(old);
+ 
+-			memcg_account_kmem(memcg, -nr_pages);
++			mod_memcg_state(memcg, MEMCG_KMEM, -nr_pages);
++			memcg1_account_kmem(memcg, -nr_pages);
+ 			__refill_stock(memcg, nr_pages);
+ 
+ 			css_put(&memcg->css);
+@@ -4809,8 +4796,10 @@ static void uncharge_batch(const struct
+ 		page_counter_uncharge(&ug->memcg->memory, ug->nr_memory);
+ 		if (do_memsw_account())
+ 			page_counter_uncharge(&ug->memcg->memsw, ug->nr_memory);
+-		if (ug->nr_kmem)
+-			memcg_account_kmem(ug->memcg, -ug->nr_kmem);
++		if (ug->nr_kmem) {
++			mod_memcg_state(ug->memcg, MEMCG_KMEM, -ug->nr_kmem);
++			memcg1_account_kmem(ug->memcg, -ug->nr_kmem);
++		}
+ 		memcg1_oom_recover(ug->memcg);
+ 	}
+ 
+--- a/mm/memcontrol-v1.c~mm-memcg-move-memcg_account_kmem-to-memcontrol-v1c
++++ a/mm/memcontrol-v1.c
+@@ -2913,6 +2913,18 @@ struct cftype memsw_files[] = {
+ 	{ },	/* terminate */
+ };
+ 
++#ifdef CONFIG_MEMCG_KMEM
++void memcg1_account_kmem(struct mem_cgroup *memcg, int nr_pages)
++{
++	if (!cgroup_subsys_on_dfl(memory_cgrp_subsys)) {
++		if (nr_pages > 0)
++			page_counter_charge(&memcg->kmem, nr_pages);
++		else
++			page_counter_uncharge(&memcg->kmem, -nr_pages);
++	}
++}
++#endif /* CONFIG_MEMCG_KMEM */
++
+ static int __init memcg1_init(void)
+ {
+ 	int node;
+--- a/mm/memcontrol-v1.h~mm-memcg-move-memcg_account_kmem-to-memcontrol-v1c
++++ a/mm/memcontrol-v1.h
+@@ -107,6 +107,7 @@ void memcg1_check_events(struct mem_cgro
+ 
+ void memcg1_stat_format(struct mem_cgroup *memcg, struct seq_buf *s);
+ 
++void memcg1_account_kmem(struct mem_cgroup *memcg, int nr_pages);
+ extern struct cftype memsw_files[];
+ extern struct cftype mem_cgroup_legacy_files[];
+ 
+@@ -125,6 +126,7 @@ static inline void memcg1_check_events(s
+ 
+ static inline void memcg1_stat_format(struct mem_cgroup *memcg, struct seq_buf *s) {}
+ 
++static inline void memcg1_account_kmem(struct mem_cgroup *memcg, int nr_pages) {}
+ extern struct cftype memsw_files[];
+ extern struct cftype mem_cgroup_legacy_files[];
+ #endif	/* CONFIG_MEMCG_V1 */
+_

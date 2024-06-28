@@ -1,0 +1,137 @@
+From: Lance Yang <ioworker0@gmail.com>
+Subject: mm: add per-order mTHP split counters
+Date: Fri, 28 Jun 2024 21:07:49 +0800
+
+Patch series "mm: introduce per-order mTHP split counters", v2.
+
+Currently, the split counters in THP statistics no longer include
+PTE-mapped mTHP.  Therefore, we propose introducing per-order mTHP split
+counters to monitor the frequency of mTHP splits.  This will help
+developers better analyze and optimize system performance.
+
+/sys/kernel/mm/transparent_hugepage/hugepages-<size>/stats
+        split
+        split_failed
+        split_deferred
+
+
+This patch (of 2):
+
+Currently, the split counters in THP statistics no longer include
+PTE-mapped mTHP.  Therefore, we propose introducing per-order mTHP split
+counters to monitor the frequency of mTHP splits.  This will help
+developers better analyze and optimize system performance.
+
+/sys/kernel/mm/transparent_hugepage/hugepages-<size>/stats
+        split
+        split_failed
+        split_deferred
+
+Link: https://lkml.kernel.org/r/20240628130750.73097-1-ioworker0@gmail.com
+Link: https://lkml.kernel.org/r/20240628130750.73097-2-ioworker0@gmail.com
+Signed-off-by: Mingzhe Yang <mingzhe.yang@ly.com>
+Signed-off-by: Lance Yang <ioworker0@gmail.com>
+Cc: Bang Li <libang.li@antgroup.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/huge_mm.h |    3 +++
+ mm/huge_memory.c        |   19 ++++++++++++++-----
+ 2 files changed, 17 insertions(+), 5 deletions(-)
+
+--- a/include/linux/huge_mm.h~mm-add-per-order-mthp-split-counters
++++ a/include/linux/huge_mm.h
+@@ -284,6 +284,9 @@ enum mthp_stat_item {
+ 	MTHP_STAT_FILE_ALLOC,
+ 	MTHP_STAT_FILE_FALLBACK,
+ 	MTHP_STAT_FILE_FALLBACK_CHARGE,
++	MTHP_STAT_SPLIT,
++	MTHP_STAT_SPLIT_FAILED,
++	MTHP_STAT_SPLIT_DEFERRED,
+ 	__MTHP_STAT_COUNT
+ };
+ 
+--- a/mm/huge_memory.c~mm-add-per-order-mthp-split-counters
++++ a/mm/huge_memory.c
+@@ -559,6 +559,9 @@ DEFINE_MTHP_STAT_ATTR(swpout_fallback, M
+ DEFINE_MTHP_STAT_ATTR(file_alloc, MTHP_STAT_FILE_ALLOC);
+ DEFINE_MTHP_STAT_ATTR(file_fallback, MTHP_STAT_FILE_FALLBACK);
+ DEFINE_MTHP_STAT_ATTR(file_fallback_charge, MTHP_STAT_FILE_FALLBACK_CHARGE);
++DEFINE_MTHP_STAT_ATTR(split, MTHP_STAT_SPLIT);
++DEFINE_MTHP_STAT_ATTR(split_failed, MTHP_STAT_SPLIT_FAILED);
++DEFINE_MTHP_STAT_ATTR(split_deferred, MTHP_STAT_SPLIT_DEFERRED);
+ 
+ static struct attribute *stats_attrs[] = {
+ 	&anon_fault_alloc_attr.attr,
+@@ -569,6 +572,9 @@ static struct attribute *stats_attrs[] =
+ 	&file_alloc_attr.attr,
+ 	&file_fallback_attr.attr,
+ 	&file_fallback_charge_attr.attr,
++	&split_attr.attr,
++	&split_failed_attr.attr,
++	&split_deferred_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -3068,7 +3074,7 @@ int split_huge_page_to_list_to_order(str
+ 	XA_STATE_ORDER(xas, &folio->mapping->i_pages, folio->index, new_order);
+ 	struct anon_vma *anon_vma = NULL;
+ 	struct address_space *mapping = NULL;
+-	bool is_thp = folio_test_pmd_mappable(folio);
++	int order = folio_order(folio);
+ 	int extra_pins, ret;
+ 	pgoff_t end;
+ 	bool is_hzp;
+@@ -3076,7 +3082,7 @@ int split_huge_page_to_list_to_order(str
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+ 	VM_BUG_ON_FOLIO(!folio_test_large(folio), folio);
+ 
+-	if (new_order >= folio_order(folio))
++	if (new_order >= order)
+ 		return -EINVAL;
+ 
+ 	if (folio_test_anon(folio)) {
+@@ -3253,8 +3259,9 @@ out_unlock:
+ 		i_mmap_unlock_read(mapping);
+ out:
+ 	xas_destroy(&xas);
+-	if (is_thp)
++	if (order >= HPAGE_PMD_ORDER)
+ 		count_vm_event(!ret ? THP_SPLIT_PAGE : THP_SPLIT_PAGE_FAILED);
++	count_mthp_stat(order, !ret ? MTHP_STAT_SPLIT : MTHP_STAT_SPLIT_FAILED);
+ 	return ret;
+ }
+ 
+@@ -3278,13 +3285,14 @@ void deferred_split_folio(struct folio *
+ #ifdef CONFIG_MEMCG
+ 	struct mem_cgroup *memcg = folio_memcg(folio);
+ #endif
++	int order = folio_order(folio);
+ 	unsigned long flags;
+ 
+ 	/*
+ 	 * Order 1 folios have no space for a deferred list, but we also
+ 	 * won't waste much memory by not adding them to the deferred list.
+ 	 */
+-	if (folio_order(folio) <= 1)
++	if (order <= 1)
+ 		return;
+ 
+ 	/*
+@@ -3305,8 +3313,9 @@ void deferred_split_folio(struct folio *
+ 
+ 	spin_lock_irqsave(&ds_queue->split_queue_lock, flags);
+ 	if (list_empty(&folio->_deferred_list)) {
+-		if (folio_test_pmd_mappable(folio))
++		if (order >= HPAGE_PMD_ORDER)
+ 			count_vm_event(THP_DEFERRED_SPLIT_PAGE);
++		count_mthp_stat(order, MTHP_STAT_SPLIT_DEFERRED);
+ 		list_add_tail(&folio->_deferred_list, &ds_queue->split_queue);
+ 		ds_queue->split_queue_len++;
+ #ifdef CONFIG_MEMCG
+_
