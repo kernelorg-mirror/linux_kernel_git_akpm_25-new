@@ -41,6 +41,13 @@ disabled).
 
 [1] https://lore.kernel.org/all/20171018104832epcms5p1b2232e2236258de3d03d1344dde9fce0@epcms5p1/
 
+[usamaarif642@gmail.com: v6]
+  Link: https://lkml.kernel.org/r/20240624140427.1334871-2-usamaarif642@gmail.com
+[usamaarif642@gmail.com: v7]
+  Link: https://lkml.kernel.org/r/20240627105730.3110705-2-usamaarif642@gmail.com
+[akpm@linux-foundation.org: reflow to 80 cols]
+[usamaarif642@gmail.com: v8]
+  Link: https://lkml.kernel.org/r/6f8b64f8-b7b0-42f4-a1d4-bf79624cff1e@gmail.com
 Link: https://lkml.kernel.org/r/20240624140427.1334871-1-usamaarif642@gmail.com
 Link: https://lkml.kernel.org/r/20240614100902.3469724-1-usamaarif642@gmail.com
 Link: https://lkml.kernel.org/r/20240614100902.3469724-2-usamaarif642@gmail.com
@@ -48,10 +55,10 @@ Signed-off-by: Usama Arif <usamaarif642@gmail.com>
 Reviewed-by: Chengming Zhou <chengming.zhou@linux.dev>
 Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
 Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: "Huang, Ying" <ying.huang@intel.com>
 Cc: Hugh Dickins <hughd@google.com>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Usama Arif <usamaarif642@gmail.com>
@@ -60,9 +67,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/swap.h |    1 
- mm/page_io.c         |  113 ++++++++++++++++++++++++++++++++++++++++-
- mm/swapfile.c        |   15 +++++
- 3 files changed, 128 insertions(+), 1 deletion(-)
+ mm/page_io.c         |  117 ++++++++++++++++++++++++++++++++++++++++-
+ mm/swapfile.c        |   21 +++++++
+ 3 files changed, 138 insertions(+), 1 deletion(-)
 
 --- a/include/linux/swap.h~mm-store-zero-pages-to-be-swapped-out-in-a-bitmap
 +++ a/include/linux/swap.h
@@ -70,52 +77,44 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	signed char	type;		/* strange name for an index */
  	unsigned int	max;		/* extent of the swap_map */
  	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
-+	unsigned long *zeromap;		/* vmalloc'ed bitmap to track zero pages */
++	unsigned long *zeromap;		/* kvmalloc'ed bitmap to track zero pages */
  	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
  	struct swap_cluster_list free_clusters; /* free clusters list */
  	unsigned int lowest_bit;	/* index of first free in swap_map */
 --- a/mm/page_io.c~mm-store-zero-pages-to-be-swapped-out-in-a-bitmap
 +++ a/mm/page_io.c
-@@ -172,6 +172,88 @@ bad_bmap:
+@@ -172,6 +172,80 @@ bad_bmap:
  	goto out;
  }
  
-+static bool is_folio_page_zero_filled(struct folio *folio, int i)
-+{
-+	unsigned long *data;
-+	unsigned int pos, last_pos = PAGE_SIZE / sizeof(*data) - 1;
-+	bool ret = false;
-+
-+	data = kmap_local_folio(folio, i * PAGE_SIZE);
-+	if (data[last_pos])
-+		goto out;
-+	for (pos = 0; pos < PAGE_SIZE / sizeof(*data); pos++) {
-+		if (data[pos])
-+			goto out;
-+	}
-+	ret = true;
-+out:
-+	kunmap_local(data);
-+	return ret;
-+}
-+
 +static bool is_folio_zero_filled(struct folio *folio)
 +{
++	unsigned int pos, last_pos;
++	unsigned long *data;
 +	unsigned int i;
 +
++	last_pos = PAGE_SIZE / sizeof(*data) - 1;
 +	for (i = 0; i < folio_nr_pages(folio); i++) {
-+		if (!is_folio_page_zero_filled(folio, i))
++		data = kmap_local_folio(folio, i * PAGE_SIZE);
++		/*
++		 * Check last word first, incase the page is zero-filled at
++		 * the start and has non-zero data at the end, which is common
++		 * in real-world workloads.
++		 */
++		if (data[last_pos]) {
++			kunmap_local(data);
 +			return false;
++		}
++		for (pos = 0; pos < last_pos; pos++) {
++			if (data[pos]) {
++				kunmap_local(data);
++				return false;
++			}
++		}
++		kunmap_local(data);
 +	}
++
 +	return true;
-+}
-+
-+static void folio_zero_fill(struct folio *folio)
-+{
-+	unsigned int i;
-+
-+	for (i = 0; i < folio_nr_pages(folio); i++)
-+		clear_highpage(folio_page(folio, i));
 +}
 +
 +static void swap_zeromap_folio_set(struct folio *folio)
@@ -165,21 +164,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * We may have stale swap cache pages in memory: notice
   * them here and get rid of the unnecessary final write.
-@@ -195,6 +277,13 @@ int swap_writepage(struct page *page, st
+@@ -195,6 +269,25 @@ int swap_writepage(struct page *page, st
  		folio_unlock(folio);
  		return ret;
  	}
 +
++	/*
++	 * Use a bitmap (zeromap) to avoid doing IO for zero-filled pages.
++	 * The bits in zeromap are protected by the locked swapcache folio
++	 * and atomic updates are used to protect against read-modify-write
++	 * corruption due to other zero swap entries seeing concurrent updates.
++	 */
 +	if (is_folio_zero_filled(folio)) {
 +		swap_zeromap_folio_set(folio);
 +		folio_unlock(folio);
 +		return 0;
++	} else {
++		/*
++		 * Clear bits this folio occupies in the zeromap to prevent
++		 * zero data being read in from any previous zero writes that
++		 * occupied the same swap entries.
++		 */
++		swap_zeromap_folio_clear(folio);
 +	}
-+	swap_zeromap_folio_clear(folio);
  	if (zswap_store(folio)) {
  		folio_unlock(folio);
  		return 0;
-@@ -424,6 +513,26 @@ static void sio_read_complete(struct kio
+@@ -424,6 +517,26 @@ static void sio_read_complete(struct kio
  	mempool_free(sio, sio_pool);
  }
  
@@ -198,7 +209,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (WARN_ON_ONCE(idx < folio_nr_pages(folio)))
 +		return true;
 +
-+	folio_zero_fill(folio);
++	folio_zero_range(folio, 0, folio_size(folio));
 +	folio_mark_uptodate(folio);
 +	return true;
 +}
@@ -206,7 +217,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void swap_read_folio_fs(struct folio *folio, struct swap_iocb **plug)
  {
  	struct swap_info_struct *sis = swp_swap_info(folio->swap);
-@@ -514,7 +623,9 @@ void swap_read_folio(struct folio *folio
+@@ -514,7 +627,9 @@ void swap_read_folio(struct folio *folio
  	}
  	delayacct_swapin_start();
  
@@ -238,21 +249,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	free_percpu(p->cluster_next_cpu);
  	p->cluster_next_cpu = NULL;
  	vfree(swap_map);
-+	bitmap_free(p->zeromap);
++	kvfree(p->zeromap);
  	kvfree(cluster_info);
  	/* Destroy swap account information */
  	swap_cgroup_swapoff(p->type);
-@@ -3170,6 +3179,12 @@ SYSCALL_DEFINE2(swapon, const char __use
- 		error = -ENOMEM;
+@@ -3171,6 +3180,17 @@ SYSCALL_DEFINE2(swapon, const char __use
  		goto bad_swap_unlock_inode;
  	}
-+
-+	p->zeromap = bitmap_zalloc(maxpages, GFP_KERNEL);
+ 
++	/*
++	 * Use kvmalloc_array instead of bitmap_zalloc as the allocation order might
++	 * be above MAX_PAGE_ORDER incase of a large swap file.
++	 */
++	p->zeromap = kvmalloc_array(BITS_TO_LONGS(maxpages), sizeof(long),
++				    GFP_KERNEL | __GFP_ZERO);
 +	if (!p->zeromap) {
 +		error = -ENOMEM;
 +		goto bad_swap_unlock_inode;
 +	}
- 
++
  	if (p->bdev && bdev_stable_writes(p->bdev))
  		p->flags |= SWP_STABLE_WRITES;
+ 
+@@ -3325,6 +3345,7 @@ bad_swap:
+ 	p->flags = 0;
+ 	spin_unlock(&swap_lock);
+ 	vfree(swap_map);
++	kvfree(p->zeromap);
+ 	kvfree(cluster_info);
+ 	if (inced_nr_rotate_swap)
+ 		atomic_dec(&nr_rotate_swap);
 _
