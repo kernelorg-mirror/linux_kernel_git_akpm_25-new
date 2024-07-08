@@ -1,6 +1,6 @@
 From: Kefeng Wang <wangkefeng.wang@huawei.com>
 Subject: mm: migrate: support poisoned recover from migrate folio
-Date: Mon, 3 Jun 2024 17:24:37 +0800
+Date: Wed, 26 Jun 2024 16:53:26 +0800
 
 The folio migration is widely used in kernel, memory compaction, memory
 hotplug, soft offline page, numa balance, memory demote/promotion, etc,
@@ -40,13 +40,20 @@ this could avoid the similar panic shown below.
    vfs_write+0x238/0x2d8
    ksys_write+0x74/0x110
 
-Link: https://lkml.kernel.org/r/20240603092439.3360652-5-wangkefeng.wang@huawei.com
+Note, folio copy is moved in the begin of the __migrate_folio(), which
+could simplify the error handling since there is no turning back if
+folio_migrate_mapping() return success, the downside is the folio copied
+even though folio_migrate_mapping() return fail, an optimization is to
+check whether source folio does not have extra refs before we do folio
+copy.
+
+Link: https://lkml.kernel.org/r/20240626085328.608006-5-wangkefeng.wang@huawei.com
 Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
-Reviewed-by: Jane Chu <jane.chu@oracle.com>
 Cc: Alistair Popple <apopple@nvidia.com>
 Cc: Benjamin LaHaise <bcrl@kvack.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Hugh Dickins <hughd@google.com>
+Cc: Jane Chu <jane.chu@oracle.com>
 Cc: Jérôme Glisse <jglisse@redhat.com>
 Cc: Jiaqi Yan <jiaqiyan@google.com>
 Cc: Lance Yang <ioworker0@gmail.com>
@@ -60,37 +67,30 @@ Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/migrate.c |   23 ++++++++++++++++++-----
- 1 file changed, 18 insertions(+), 5 deletions(-)
+ mm/migrate.c |   14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
 
 --- a/mm/migrate.c~mm-migrate-support-poisoned-recover-from-migrate-folio
 +++ a/mm/migrate.c
-@@ -663,16 +663,29 @@ static int __migrate_folio(struct addres
+@@ -681,16 +681,24 @@ static int __migrate_folio(struct addres
  			   struct folio *src, void *src_private,
  			   enum migrate_mode mode)
  {
 -	int rc;
-+	int ret, expected_cnt = folio_expected_refs(mapping, src);
++	int rc, expected_count = folio_expected_refs(mapping, src);
  
 -	rc = folio_migrate_mapping(mapping, dst, src, 0);
--	if (rc != MIGRATEPAGE_SUCCESS)
--		return rc;
-+	if (!mapping) {
-+		if (folio_ref_count(src) != expected_cnt)
-+			return -EAGAIN;
-+	} else {
-+		if (!folio_ref_freeze(src, expected_cnt))
-+			return -EAGAIN;
-+	}
++	/* Check whether src does not have extra refs before we do more work */
++	if (folio_ref_count(src) != expected_count)
++		return -EAGAIN;
 +
-+	ret = folio_mc_copy(dst, src);
-+	if (unlikely(ret)) {
-+		if (mapping)
-+			folio_ref_unfreeze(src, expected_cnt);
-+		return ret;
-+	}
++	rc = folio_mc_copy(dst, src);
++	if (unlikely(rc))
++		return rc;
 +
-+	__folio_migrate_mapping(mapping, dst, src, expected_cnt);
++	rc = __folio_migrate_mapping(mapping, dst, src, expected_count);
+ 	if (rc != MIGRATEPAGE_SUCCESS)
+ 		return rc;
  
  	if (src_private)
  		folio_attach_private(dst, folio_detach_private(src));
