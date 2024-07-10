@@ -1,0 +1,117 @@
+From: Donet Tom <donettom@linux.ibm.com>
+Subject: hugetlbfs: ensure generic_hugetlb_get_unmapped_area() returns higher address than mmap_min_addr
+Date: Wed, 10 Jul 2024 00:19:12 -0500
+
+generic_hugetlb_get_unmapped_area() was returning an address less than
+mmap_min_addr if the mmap argument addr, after alignment, was less than
+mmap_min_addr, causing mmap to fail.
+
+This is because current generic_hugetlb_get_unmapped_area() code does not
+take into account mmap_min_addr.
+
+This patch ensures that generic_hugetlb_get_unmapped_area() always returns
+an address that is greater than mmap_min_addr.  Additionally, similar to
+generic_get_unmapped_area(), vm_end_gap() checks are included to maintain
+stack gap.
+
+How to reproduce
+================
+
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+
+ #define HUGEPAGE_SIZE (16 * 1024 * 1024)
+
+ int main() {
+
+    void *addr = mmap((void *)-1, HUGEPAGE_SIZE,
+                 PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (addr == MAP_FAILED) {
+        perror("mmap");
+        exit(EXIT_FAILURE);
+    }
+
+    snprintf((char *)addr, HUGEPAGE_SIZE, "Hello, Huge Pages!");
+
+    printf("%s\n", (char *)addr);
+
+    if (munmap(addr, HUGEPAGE_SIZE) == -1) {
+        perror("munmap");
+        exit(EXIT_FAILURE);
+    }
+
+    return 0;
+ }
+
+Result without fix
+==================
+ # cat /proc/meminfo |grep -i HugePages_Free
+ HugePages_Free:       20
+ # ./test
+ mmap: Permission denied
+ #
+
+Result with fix
+===============
+ # cat /proc/meminfo |grep -i HugePages_Free
+ HugePages_Free:       20
+ # ./test
+ Hello, Huge Pages!
+ #
+
+Link: https://lkml.kernel.org/r/20240710051912.4681-1-donettom@linux.ibm.com
+Signed-off-by: Donet Tom <donettom@linux.ibm.com>
+Reported-by Pavithra Prakash <pavrampu@linux.vnet.ibm.com>
+Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Ritesh Harjani (IBM) <ritesh.list@gmail.com>
+Cc: Tony Battersby <tonyb@cybernetics.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c |   11 ++++++-----
+ 1 file changed, 6 insertions(+), 5 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~hugetlbfs-ensure-generic_hugetlb_get_unmapped_area-returns-higher-address-than-mmap_min_addr
++++ a/fs/hugetlbfs/inode.c
+@@ -222,13 +222,13 @@ generic_hugetlb_get_unmapped_area(struct
+ 				  unsigned long flags)
+ {
+ 	struct mm_struct *mm = current->mm;
+-	struct vm_area_struct *vma;
++	struct vm_area_struct *vma, *prev;
+ 	struct hstate *h = hstate_file(file);
+ 	const unsigned long mmap_end = arch_get_mmap_end(addr, len, flags);
+ 
+ 	if (len & ~huge_page_mask(h))
+ 		return -EINVAL;
+-	if (len > TASK_SIZE)
++	if (len > mmap_end - mmap_min_addr)
+ 		return -ENOMEM;
+ 
+ 	if (flags & MAP_FIXED) {
+@@ -239,9 +239,10 @@ generic_hugetlb_get_unmapped_area(struct
+ 
+ 	if (addr) {
+ 		addr = ALIGN(addr, huge_page_size(h));
+-		vma = find_vma(mm, addr);
+-		if (mmap_end - len >= addr &&
+-		    (!vma || addr + len <= vm_start_gap(vma)))
++		vma = find_vma_prev(mm, addr, &prev);
++		if (mmap_end - len >= addr && addr >= mmap_min_addr &&
++		    (!vma || addr + len <= vm_start_gap(vma)) &&
++		    (!prev || addr >= vm_end_gap(prev)))
+ 			return addr;
+ 	}
+ 
+_
