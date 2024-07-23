@@ -1,0 +1,164 @@
+From: Danilo Krummrich <dakr@kernel.org>
+Subject: mm: vmalloc: implement vrealloc()
+Date: Mon, 22 Jul 2024 18:29:23 +0200
+
+Patch series "Align kvrealloc() with krealloc()", v2.
+
+Besides the obvious (and desired) difference between krealloc() and
+kvrealloc(), there is some inconsistency in their function signatures and
+behavior:
+
+ - krealloc() frees the memory when the requested size is zero, whereas
+   kvrealloc() simply returns a pointer to the existing allocation.
+
+ - krealloc() behaves like kmalloc() if a NULL pointer is passed, whereas
+   kvrealloc() does not accept a NULL pointer at all and, if passed, would fault
+   instead.
+
+ - krealloc() is self-contained, whereas kvrealloc() relies on the caller to
+   provide the size of the previous allocation.
+
+Inconsistent behavior throughout allocation APIs is error prone, hence
+make kvrealloc() behave like krealloc(), which seems superior in all
+mentioned aspects.
+
+In order to be able to get rid of kvrealloc()'s oldsize parameter,
+introduce vrealloc() and make use of it in kvrealloc().
+
+Making use of vrealloc() in kvrealloc() also provides oppertunities to
+grow (and shrink) allocations more efficiently.  For instance, vrealloc()
+can be optimized to allocate and map additional pages to grow the
+allocation or unmap and free unused pages to shrink the allocation.
+
+Besides the above, those functions are required by Rust's allocator abstractons
+[1] (rework based on this series in [2]). With `Vec` or `KVec` respectively,
+potentially growing (and shrinking) data structures are rather common.
+
+[1] https://lore.kernel.org/lkml/20240704170738.3621-1-dakr@redhat.com/
+[2] https://git.kernel.org/pub/scm/linux/kernel/git/dakr/linux.git/log/?h=rust/mm
+
+
+This patch (of 2):
+
+Implement vrealloc() analogous to krealloc().
+
+Currently, krealloc() requires the caller to pass the size of the previous
+memory allocation, which, instead, should be self-contained.
+
+We attempt to fix this in a subsequent patch which, in order to do so,
+requires vrealloc().
+
+Besides that, we need realloc() functions for kernel allocators in Rust
+too.  With `Vec` or `KVec` respectively, potentially growing (and
+shrinking) data structures are rather common.
+
+Link: https://lkml.kernel.org/r/20240722163111.4766-1-dakr@kernel.org
+Link: https://lkml.kernel.org/r/20240722163111.4766-2-dakr@kernel.org
+Signed-off-by: Danilo Krummrich <dakr@kernel.org>
+Cc: Chandan Babu R <chandan.babu@oracle.com>
+Cc: Christian König <christian.koenig@amd.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Hyeonggon Yoo <42.hyeyoo@gmail.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Oliver Upton <oliver.upton@linux.dev>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Uladzislau Rezki <urezki@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wedson Almeida Filho <wedsonaf@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/vmalloc.h |    4 ++
+ mm/vmalloc.c            |   59 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 63 insertions(+)
+
+--- a/include/linux/vmalloc.h~mm-vmalloc-implement-vrealloc
++++ a/include/linux/vmalloc.h
+@@ -189,6 +189,10 @@ extern void *__vcalloc_noprof(size_t n,
+ extern void *vcalloc_noprof(size_t n, size_t size) __alloc_size(1, 2);
+ #define vcalloc(...)		alloc_hooks(vcalloc_noprof(__VA_ARGS__))
+ 
++void * __must_check vrealloc_noprof(const void *p, size_t size, gfp_t flags)
++		__realloc_size(2);
++#define vrealloc(...)		alloc_hooks(vrealloc_noprof(__VA_ARGS__))
++
+ extern void vfree(const void *addr);
+ extern void vfree_atomic(const void *addr);
+ 
+--- a/mm/vmalloc.c~mm-vmalloc-implement-vrealloc
++++ a/mm/vmalloc.c
+@@ -4037,6 +4037,65 @@ void *vzalloc_node_noprof(unsigned long
+ }
+ EXPORT_SYMBOL(vzalloc_node_noprof);
+ 
++/**
++ * vrealloc - reallocate virtually contiguous memory; contents remain unchanged
++ * @p: object to reallocate memory for
++ * @size: the size to reallocate
++ * @flags: the flags for the page level allocator
++ *
++ * The contents of the object pointed to are preserved up to the lesser of the
++ * new and old size (__GFP_ZERO flag is effectively ignored).
++ *
++ * If @p is %NULL, vrealloc() behaves exactly like vmalloc(). If @size is 0 and
++ * @p is not a %NULL pointer, the object pointed to is freed.
++ *
++ * Return: pointer to the allocated memory; %NULL if @size is zero or in case of
++ *         failure
++ */
++void *vrealloc_noprof(const void *p, size_t size, gfp_t flags)
++{
++	size_t old_size = 0;
++	void *n;
++
++	if (!size) {
++		vfree(p);
++		return NULL;
++	}
++
++	if (p) {
++		struct vm_struct *vm;
++
++		vm = find_vm_area(p);
++		if (unlikely(!vm)) {
++			WARN(1, "Trying to vrealloc() nonexistent vm area (%p)\n", p);
++			return NULL;
++		}
++
++		old_size = get_vm_area_size(vm);
++	}
++
++	if (size <= old_size) {
++		/*
++		 * TODO: Shrink the vm_area, i.e. unmap and free unused pages.
++		 * What would be a good heuristic for when to shrink the
++		 * vm_area?
++		 */
++		return (void *)p;
++	}
++
++	/* TODO: Grow the vm_area, i.e. allocate and map additional pages. */
++	n = __vmalloc_noprof(size, flags);
++	if (!n)
++		return NULL;
++
++	if (p) {
++		memcpy(n, p, old_size);
++		vfree(p);
++	}
++
++	return n;
++}
++
+ #if defined(CONFIG_64BIT) && defined(CONFIG_ZONE_DMA32)
+ #define GFP_VMALLOC32 (GFP_DMA32 | GFP_KERNEL)
+ #elif defined(CONFIG_64BIT) && defined(CONFIG_ZONE_DMA)
+_
