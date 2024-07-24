@@ -1,0 +1,179 @@
+From: Julian Sun <sunjunchao2870@gmail.com>
+Subject: scripts: add macro_checker script to check unused parameters in macros
+Date: Tue, 23 Jul 2024 05:11:54 -0400
+
+Recently, I saw a patch[1] on the ext4 mailing list regarding
+the correction of a macro definition error. Jan mentioned
+that "The bug in the macro is a really nasty trap...".
+Because existing compilers are unable to detect
+unused parameters in macro definitions. This inspired me
+to write a script to check for unused parameters in
+macro definitions and to run it.
+
+Surprisingly, the script uncovered numerous issues across
+various subsystems, including filesystems, drivers, and sound etc.
+
+Some of these issues involved parameters that were accepted
+but never used, for example:
+	#define	XFS_DAENTER_DBS(mp,w)	\
+	(XFS_DA_NODE_MAXDEPTH + (((w) == XFS_DATA_FORK) ? 2 : 0))
+where mp was unused.
+
+While others are actual bugs.
+For example:
+	#define HAL_SEQ_WCSS_UMAC_CE0_SRC_REG(x) \
+		(ab->hw_params.regs->hal_seq_wcss_umac_ce0_src_reg)
+	#define HAL_SEQ_WCSS_UMAC_CE0_DST_REG(x) \
+		(ab->hw_params.regs->hal_seq_wcss_umac_ce0_dst_reg)
+	#define HAL_SEQ_WCSS_UMAC_CE1_SRC_REG(x) \
+		(ab->hw_params.regs->hal_seq_wcss_umac_ce1_src_reg)
+	#define HAL_SEQ_WCSS_UMAC_CE1_DST_REG(x) \
+		(ab->hw_params.regs->hal_seq_wcss_umac_ce1_dst_reg)
+where x was entirely unused, and instead, a local variable ab was used.
+
+I have submitted patches[2-5] to fix some of these issues,
+but due to the large number, many still remain unaddressed.
+I believe that the kernel and matainers would benefit from
+this script to check for unused parameters in macro definitions.
+
+It should be noted that it may cause some false positives
+in conditional compilation scenarios, such as
+	#ifdef DEBUG
+	static int debug(arg) {};
+	#else
+	#define debug(arg)
+	#endif
+So the caller needs to manually verify whether it is a true
+issue. But this should be fine, because Maintainers should only
+need to review their own subsystems, which typically results
+in only a few reports.
+
+[1]: https://patchwork.ozlabs.org/project/linux-ext4/patch/1717652596-58760-1-git-send-email-carrionbent@linux.alibaba.com/
+[2]: https://lore.kernel.org/linux-xfs/20240721112701.212342-1-sunjunchao2870@gmail.com/
+[3]: https://lore.kernel.org/linux-bcachefs/20240721123943.246705-1-sunjunchao2870@gmail.com/
+[4]: https://sourceforge.net/p/linux-f2fs/mailman/message/58797811/
+[5]: https://sourceforge.net/p/linux-f2fs/mailman/message/58797812/
+
+Link: https://lkml.kernel.org/r/20240723091154.52458-1-sunjunchao2870@gmail.com
+Signed-off-by: Julian Sun <sunjunchao2870@gmail.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Junchao Sun <sunjunchao2870@gmail.com>
+Cc: Kalle Valo <kvalo@kernel.org>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Nicolas Schier <n.schier@avm.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ scripts/macro_checker.py |  101 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 101 insertions(+)
+
+--- /dev/null
++++ a/scripts/macro_checker.py
+@@ -0,0 +1,101 @@
++#!/usr/bin/python3
++# SPDX-License-Identifier: GPL-2.0
++# Author: Julian Sun <sunjunchao2870@gmail.com>
++
++""" Find macro definitions with unused parameters. """
++
++import argparse
++import os
++import re
++
++macro_pattern = r"#define\s+(\w+)\(([^)]*)\)"
++# below two vars were used to reduce false positives
++do_while0_pattern = r"\s*do\s*\{\s*\}\s*while\s*\(\s*0\s*\)"
++correct_macros = []
++
++def check_macro(macro_line, report):
++    match = re.match(macro_pattern, macro_line)
++    if match:
++        macro_def = re.sub(macro_pattern, '', macro_line)
++        identifier = match.group(1)
++        content = match.group(2)
++        arguments = [item.strip() for item in content.split(',') if item.strip()]
++
++        if (re.match(do_while0_pattern, macro_def)):
++            return
++
++        for arg in arguments:
++            # used to reduce false positives
++            if "..." in arg:
++                continue
++            if not arg in macro_def and report == False:
++                return
++            if not arg in macro_def and identifier not in correct_macros:
++                print(f"Argument {arg} is not used in function-line macro {identifier}")
++                return
++
++        correct_macros.append(identifier)
++
++
++# remove comment and whitespace
++def macro_strip(macro):
++    comment_pattern1 = r"\/\/*"
++    comment_pattern2 = r"\/\**\*\/"
++
++    macro = macro.strip()
++    macro = re.sub(comment_pattern1, '', macro)
++    macro = re.sub(comment_pattern2, '', macro)
++
++    return macro
++
++def file_check_macro(file_path, report):
++    # only check .c and .h file
++    if not file_path.endswith(".c") and not file_path.endswith(".h"):
++        return
++
++    with open(file_path, "r") as f:
++        while True:
++            line = f.readline()
++            if not line:
++                return
++
++            macro = re.match(macro_pattern, line)
++            if macro:
++                macro = macro_strip(macro.string)
++                while macro[-1] == '\\':
++                    macro = macro[0:-1]
++                    macro = macro.strip()
++                    macro += f.readline()
++                    macro = macro_strip(macro)
++                check_macro(macro, report)
++
++def get_correct_macros(path):
++    file_check_macro(path, False)
++
++def dir_check_macro(dir_path):
++
++    for dentry in os.listdir(dir_path):
++        path = os.path.join(dir_path, dentry)
++        if os.path.isdir(path):
++            dir_check_macro(path)
++        elif os.path.isfile(path):
++            get_correct_macros(path)
++            file_check_macro(path, True)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++
++    parser.add_argument("path", type=str, help="The file or dir path that needs check")
++    args = parser.parse_args()
++
++    if os.path.isfile(args.path):
++        get_correct_macros(args.path)
++        file_check_macro(args.path, True)
++    elif os.path.isdir(args.path):
++        dir_check_macro(args.path)
++    else:
++        print(f"{args.path} doesn't exit or is neither a file nor a dir")
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+_
