@@ -1,0 +1,188 @@
+From: Pasha Tatashin <pasha.tatashin@soleen.com>
+Subject: vmstat: kernel stack usage histogram
+Date: Wed, 24 Jul 2024 20:33:21 +0000
+
+As part of the dynamic kernel stack project, we need to know the amount of
+data that can be saved by reducing the default kernel stack size [1].
+
+Provide a kernel stack usage histogram to aid in optimizing kernel stack
+sizes and minimizing memory waste in large-scale environments.  The
+histogram divides stack usage into power-of-two buckets and reports the
+results in /proc/vmstat.  This information is especially valuable in
+environments with millions of machines, where even small optimizations can
+have a significant impact.
+
+The histogram data is presented in /proc/vmstat with entries like
+"kstack_1k", "kstack_2k", and so on, indicating the number of threads that
+exited with stack usage falling within each respective bucket.
+
+Example outputs:
+Intel:
+$ grep kstack /proc/vmstat
+kstack_1k 3
+kstack_2k 188
+kstack_4k 11391
+kstack_8k 243
+kstack_16k 0
+
+ARM with 64K page_size:
+$ grep kstack /proc/vmstat
+kstack_1k 1
+kstack_2k 340
+kstack_4k 25212
+kstack_8k 1659
+kstack_16k 0
+kstack_32k 0
+kstack_64k 0
+
+Note: once the dynamic kernel stack is implemented it will depend on the
+implementation the usability of this feature: On hardware that supports
+faults on kernel stacks, we will have other metrics that show the total
+number of pages allocated for stacks.  On hardware where faults are not
+supported, we will most likely have some optimization where only some
+threads are extended, and for those, these metrics will still be very
+useful.
+
+[1] https://lwn.net/Articles/974367
+
+Link: https://lkml.kernel.org/r/20240724203322.2765486-3-pasha.tatashin@soleen.com
+Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Kent Overstreet <kent.overstreet@linux.dev>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Domenico Cerasuolo <cerasuolodomenico@gmail.com>
+Cc: Li Zhijian <lizhijian@fujitsu.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/vm_event_item.h |   24 ++++++++++++++++++++
+ kernel/exit.c                 |   38 ++++++++++++++++++++++++++++++++
+ mm/vmstat.c                   |   24 ++++++++++++++++++++
+ 3 files changed, 86 insertions(+)
+
+--- a/include/linux/vm_event_item.h~vmstat-kernel-stack-usage-histogram
++++ a/include/linux/vm_event_item.h
+@@ -155,6 +155,30 @@ enum vm_event_item { PGPGIN, PGPGOUT, PS
+ 		VMA_LOCK_RETRY,
+ 		VMA_LOCK_MISS,
+ #endif
++#ifdef CONFIG_DEBUG_STACK_USAGE
++		KSTACK_1K,
++#if THREAD_SIZE > 1024
++		KSTACK_2K,
++#endif
++#if THREAD_SIZE > 2048
++		KSTACK_4K,
++#endif
++#if THREAD_SIZE > 4096
++		KSTACK_8K,
++#endif
++#if THREAD_SIZE > 8192
++		KSTACK_16K,
++#endif
++#if THREAD_SIZE > 16384
++		KSTACK_32K,
++#endif
++#if THREAD_SIZE > 32768
++		KSTACK_64K,
++#endif
++#if THREAD_SIZE > 65536
++		KSTACK_REST,
++#endif
++#endif /* CONFIG_DEBUG_STACK_USAGE */
+ 		NR_VM_EVENT_ITEMS
+ };
+ 
+--- a/kernel/exit.c~vmstat-kernel-stack-usage-histogram
++++ a/kernel/exit.c
+@@ -778,6 +778,43 @@ static void exit_notify(struct task_stru
+ }
+ 
+ #ifdef CONFIG_DEBUG_STACK_USAGE
++/* Count the maximum pages reached in kernel stacks */
++static inline void kstack_histogram(unsigned long used_stack)
++{
++#ifdef CONFIG_VM_EVENT_COUNTERS
++	if (used_stack <= 1024)
++		count_vm_event(KSTACK_1K);
++#if THREAD_SIZE > 1024
++	else if (used_stack <= 2048)
++		count_vm_event(KSTACK_2K);
++#endif
++#if THREAD_SIZE > 2048
++	else if (used_stack <= 4096)
++		count_vm_event(KSTACK_4K);
++#endif
++#if THREAD_SIZE > 4096
++	else if (used_stack <= 8192)
++		count_vm_event(KSTACK_8K);
++#endif
++#if THREAD_SIZE > 8192
++	else if (used_stack <= 16384)
++		count_vm_event(KSTACK_16K);
++#endif
++#if THREAD_SIZE > 16384
++	else if (used_stack <= 32768)
++		count_vm_event(KSTACK_32K);
++#endif
++#if THREAD_SIZE > 32768
++	else if (used_stack <= 65536)
++		count_vm_event(KSTACK_64K);
++#endif
++#if THREAD_SIZE > 65536
++	else
++		count_vm_event(KSTACK_REST);
++#endif
++#endif /* CONFIG_VM_EVENT_COUNTERS */
++}
++
+ static void check_stack_usage(void)
+ {
+ 	static DEFINE_SPINLOCK(low_water_lock);
+@@ -785,6 +822,7 @@ static void check_stack_usage(void)
+ 	unsigned long free;
+ 
+ 	free = stack_not_used(current);
++	kstack_histogram(THREAD_SIZE - free);
+ 
+ 	if (free >= lowest_to_date)
+ 		return;
+--- a/mm/vmstat.c~vmstat-kernel-stack-usage-histogram
++++ a/mm/vmstat.c
+@@ -1418,6 +1418,30 @@ const char * const vmstat_text[] = {
+ 	"vma_lock_retry",
+ 	"vma_lock_miss",
+ #endif
++#ifdef CONFIG_DEBUG_STACK_USAGE
++	"kstack_1k",
++#if THREAD_SIZE > 1024
++	"kstack_2k",
++#endif
++#if THREAD_SIZE > 2048
++	"kstack_4k",
++#endif
++#if THREAD_SIZE > 4096
++	"kstack_8k",
++#endif
++#if THREAD_SIZE > 8192
++	"kstack_16k",
++#endif
++#if THREAD_SIZE > 16384
++	"kstack_32k",
++#endif
++#if THREAD_SIZE > 32768
++	"kstack_64k",
++#endif
++#if THREAD_SIZE > 65536
++	"kstack_rest",
++#endif
++#endif
+ #endif /* CONFIG_VM_EVENT_COUNTERS || CONFIG_MEMCG */
+ };
+ #endif /* CONFIG_PROC_FS || CONFIG_SYSFS || CONFIG_NUMA || CONFIG_MEMCG */
+_
