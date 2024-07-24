@@ -1,0 +1,219 @@
+From: Jinjie Ruan <ruanjinjie@huawei.com>
+Subject: ARM: use generic interface to simplify crashkernel reservation
+Date: Thu, 18 Jul 2024 11:54:44 +0800
+
+Currently, x86, arm64, riscv and loongarch has been switched to generic
+crashkernel reservation, which is also ready for 32bit system.  So with
+the help of function parse_crashkernel() and generic
+reserve_crashkernel_generic(), arm32 crashkernel reservation can also be
+simplified by steps:
+
+1) Add a new header file <asm/crash_reserve.h>, and define CRASH_ALIGN,
+   CRASH_ADDR_LOW_MAX, CRASH_ADDR_HIGH_MAX in it;
+
+2) Add arch_reserve_crashkernel() to call parse_crashkernel() and
+   reserve_crashkernel_generic();
+
+3) Add ARCH_HAS_GENERIC_CRASHKERNEL_RESERVATION Kconfig in
+   arch/arm/Kconfig.
+
+The old reserve_crashkernel() can be removed.
+
+Following test cases have been performed as expected on QEMU vexpress-a9
+(1GB system memory):
+
+1) crashkernel=4G,high				// invalid
+2) crashkernel=1G,high				// invalid
+3) crashkernel=1G,high crashkernel=0M,low	// invalid
+4) crashkernel=256M,high			// invalid
+5) crashkernel=256M,low				// invalid
+6) crashkernel=256M crashkernel=256M,high	// high is ignored, ok
+7) crashkernel=256M crashkernel=256M,low	// low is ignored, ok
+8) crashkernel=256M,high crashkernel=256M,low	// invalid
+9) crashkernel=256M,high crashkernel=4G,low	// invalid
+10) crashkernel=256M				// ok
+11) crashkernel=512M				// ok
+12) crashkernel=256M@0x88000000			// ok
+13) crashkernel=256M@0x78000000			// ok
+14) crashkernel=512M@0x78000000			// ok
+
+Link: https://lkml.kernel.org/r/20240718035444.2977105-4-ruanjinjie@huawei.com
+Signed-off-by: Jinjie Ruan <ruanjinjie@huawei.com>
+Tested-by: Jinjie Ruan <ruanjinjie@huawei.com>
+Cc: Albert Ou <aou@eecs.berkeley.edu>
+Cc: Andrew Davis <afd@ti.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Chen Jiahao <chenjiahao16@huawei.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: Eric DeVolder <eric.devolder@oracle.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Hari Bathini <hbathini@linux.ibm.com>
+Cc: Helge Deller <deller@gmx.de>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Javier Martinez Canillas <javierm@redhat.com>
+Cc: Linus Walleij <linus.walleij@linaro.org>
+Cc: Palmer Dabbelt <palmer@dabbelt.com>
+Cc: Paul Walmsley <paul.walmsley@sifive.com>
+Cc: Rob Herring <robh@kernel.org>
+Cc: Russell King <linux@armlinux.org.uk>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zhen Lei <thunder.leizhen@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm/Kconfig                     |    3 +
+ arch/arm/include/asm/crash_reserve.h |   24 +++++++++
+ arch/arm/kernel/setup.c              |   63 +++----------------------
+ 3 files changed, 36 insertions(+), 54 deletions(-)
+
+--- /dev/null
++++ a/arch/arm/include/asm/crash_reserve.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ARM_CRASH_RESERVE_H
++#define _ARM_CRASH_RESERVE_H
++
++/*
++ * The crash region must be aligned to 128MB to avoid
++ * zImage relocating below the reserved region.
++ */
++#define CRASH_ALIGN			(128 << 20)
++
++#define CRASH_ADDR_LOW_MAX		crash_addr_low_max()
++#define CRASH_ADDR_HIGH_MAX		memblock_end_of_DRAM()
++
++static inline unsigned long crash_addr_low_max(void)
++{
++	unsigned long long crash_max = idmap_to_phys((u32)~0);
++	unsigned long long lowmem_max = __pa(high_memory - 1) + 1;
++
++	return (crash_max > lowmem_max) ? lowmem_max : crash_max;
++}
++
++
++#define HAVE_ARCH_ADD_CRASH_RES_TO_IOMEM_EARLY
++#endif
+--- a/arch/arm/Kconfig~arm-use-generic-interface-to-simplify-crashkernel-reservation
++++ a/arch/arm/Kconfig
+@@ -1593,6 +1593,9 @@ config ATAGS_PROC
+ config ARCH_SUPPORTS_CRASH_DUMP
+ 	def_bool y
+ 
++config ARCH_HAS_GENERIC_CRASHKERNEL_RESERVATION
++	def_bool CRASH_RESERVE
++
+ config AUTO_ZRELADDR
+ 	bool "Auto calculation of the decompressed kernel image address" if !ARCH_MULTIPLATFORM
+ 	default !(ARCH_FOOTBRIDGE || ARCH_RPC || ARCH_SA1100)
+--- a/arch/arm/kernel/setup.c~arm-use-generic-interface-to-simplify-crashkernel-reservation
++++ a/arch/arm/kernel/setup.c
+@@ -979,13 +979,6 @@ static int __init init_machine_late(void
+ }
+ late_initcall(init_machine_late);
+ 
+-#ifdef CONFIG_CRASH_RESERVE
+-/*
+- * The crash region must be aligned to 128MB to avoid
+- * zImage relocating below the reserved region.
+- */
+-#define CRASH_ALIGN	(128 << 20)
+-
+ static inline unsigned long long get_total_mem(void)
+ {
+ 	unsigned long total;
+@@ -994,60 +987,25 @@ static inline unsigned long long get_tot
+ 	return total << PAGE_SHIFT;
+ }
+ 
+-/**
+- * reserve_crashkernel() - reserves memory are for crash kernel
+- *
+- * This function reserves memory area given in "crashkernel=" kernel command
+- * line parameter. The memory reserved is used by a dump capture kernel when
+- * primary kernel is crashing.
+- */
+-static void __init reserve_crashkernel(void)
++static void __init arch_reserve_crashkernel(void)
+ {
+-	unsigned long long crash_size, crash_base;
++	unsigned long long crash_size, crash_base, low_size = 0;
+ 	unsigned long long total_mem;
++	bool high = false;
+ 	int ret;
+ 
++	if (!IS_ENABLED(CONFIG_CRASH_RESERVE))
++		return;
++
+ 	total_mem = get_total_mem();
+ 	ret = parse_crashkernel(boot_command_line, total_mem,
+ 				&crash_size, &crash_base,
+-				NULL, NULL);
++				&low_size, &high);
+ 	/* invalid value specified or crashkernel=0 */
+ 	if (ret || !crash_size)
+ 		return;
+ 
+-	if (crash_base <= 0) {
+-		unsigned long long crash_max = idmap_to_phys((u32)~0);
+-		unsigned long long lowmem_max = __pa(high_memory - 1) + 1;
+-		if (crash_max > lowmem_max)
+-			crash_max = lowmem_max;
+-
+-		crash_base = memblock_phys_alloc_range(crash_size, CRASH_ALIGN,
+-						       CRASH_ALIGN, crash_max);
+-		if (!crash_base) {
+-			pr_err("crashkernel reservation failed - No suitable area found.\n");
+-			return;
+-		}
+-	} else {
+-		unsigned long long crash_max = crash_base + crash_size;
+-		unsigned long long start;
+-
+-		start = memblock_phys_alloc_range(crash_size, SECTION_SIZE,
+-						  crash_base, crash_max);
+-		if (!start) {
+-			pr_err("crashkernel reservation failed - memory is in use.\n");
+-			return;
+-		}
+-	}
+-
+-	pr_info("Reserving %ldMB of memory at %ldMB for crashkernel (System RAM: %ldMB)\n",
+-		(unsigned long)(crash_size >> 20),
+-		(unsigned long)(crash_base >> 20),
+-		(unsigned long)(total_mem >> 20));
+-
+-	/* The crashk resource must always be located in normal mem */
+-	crashk_res.start = crash_base;
+-	crashk_res.end = crash_base + crash_size - 1;
+-	insert_resource(&iomem_resource, &crashk_res);
++	reserve_crashkernel_generic(boot_command_line, crash_size, crash_base, low_size, high);
+ 
+ 	if (arm_has_idmap_alias()) {
+ 		/*
+@@ -1064,9 +1022,6 @@ static void __init reserve_crashkernel(v
+ 		insert_resource(&iomem_resource, &crashk_boot_res);
+ 	}
+ }
+-#else
+-static inline void reserve_crashkernel(void) {}
+-#endif /* CONFIG_CRASH_RESERVE*/
+ 
+ void __init hyp_mode_check(void)
+ {
+@@ -1189,7 +1144,7 @@ void __init setup_arch(char **cmdline_p)
+ 	if (!is_smp())
+ 		hyp_mode_check();
+ 
+-	reserve_crashkernel();
++	arch_reserve_crashkernel();
+ 
+ #ifdef CONFIG_VT
+ #if defined(CONFIG_VGA_CONSOLE)
+_
