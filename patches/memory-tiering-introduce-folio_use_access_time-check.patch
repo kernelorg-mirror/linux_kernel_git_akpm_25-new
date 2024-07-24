@@ -1,0 +1,142 @@
+From: Zi Yan <ziy@nvidia.com>
+Subject: memory tiering: introduce folio_use_access_time() check
+Date: Wed, 24 Jul 2024 09:01:14 -0400
+
+If memory tiering mode is on and a folio is not in the top tier memory,
+folio's cpupid field is repurposed to store page access time.  Instead of
+an open coded check, use a function to encapsulate the check.
+
+Link: https://lkml.kernel.org/r/20240724130115.793641-3-ziy@nvidia.com
+Signed-off-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: "Huang, Ying" <ying.huang@intel.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h  |    6 ++++++
+ kernel/sched/fair.c |    3 +--
+ mm/huge_memory.c    |    6 ++----
+ mm/memory-tiers.c   |   19 +++++++++++++++++++
+ mm/memory.c         |    3 +--
+ mm/mprotect.c       |    3 +--
+ 6 files changed, 30 insertions(+), 10 deletions(-)
+
+--- a/include/linux/mm.h~memory-tiering-introduce-folio_use_access_time-check
++++ a/include/linux/mm.h
+@@ -1717,6 +1717,8 @@ static inline void vma_set_access_pid_bi
+ 		__set_bit(pid_bit, &vma->numab_state->pids_active[1]);
+ 	}
+ }
++
++bool folio_use_access_time(struct folio *folio);
+ #else /* !CONFIG_NUMA_BALANCING */
+ static inline int folio_xchg_last_cpupid(struct folio *folio, int cpupid)
+ {
+@@ -1770,6 +1772,10 @@ static inline bool cpupid_match_pid(stru
+ static inline void vma_set_access_pid_bit(struct vm_area_struct *vma)
+ {
+ }
++static inline bool folio_use_access_time(struct folio *folio)
++{
++	return false;
++}
+ #endif /* CONFIG_NUMA_BALANCING */
+ 
+ #if defined(CONFIG_KASAN_SW_TAGS) || defined(CONFIG_KASAN_HW_TAGS)
+--- a/kernel/sched/fair.c~memory-tiering-introduce-folio_use_access_time-check
++++ a/kernel/sched/fair.c
+@@ -1840,8 +1840,7 @@ bool should_numa_migrate_memory(struct t
+ 	 * The pages in slow memory node should be migrated according
+ 	 * to hot/cold instead of private/shared.
+ 	 */
+-	if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+-	    !node_is_toptier(src_nid)) {
++	if (folio_use_access_time(folio)) {
+ 		struct pglist_data *pgdat;
+ 		unsigned long rate_limit;
+ 		unsigned int latency, th, def_th;
+--- a/mm/huge_memory.c~memory-tiering-introduce-folio_use_access_time-check
++++ a/mm/huge_memory.c
+@@ -1707,8 +1707,7 @@ vm_fault_t do_huge_pmd_numa_page(struct
+ 	 * For memory tiering mode, cpupid of slow memory page is used
+ 	 * to record page access time.  So use default value.
+ 	 */
+-	if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) ||
+-	    node_is_toptier(nid))
++	if (!folio_use_access_time(folio))
+ 		last_cpupid = folio_last_cpupid(folio);
+ 	target_nid = numa_migrate_prep(folio, vmf, haddr, nid, &flags);
+ 	if (target_nid == NUMA_NO_NODE)
+@@ -2061,8 +2060,7 @@ int change_huge_pmd(struct mmu_gather *t
+ 		    toptier)
+ 			goto unlock;
+ 
+-		if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+-		    !toptier)
++		if (folio_use_access_time(folio))
+ 			folio_xchg_access_time(folio,
+ 					       jiffies_to_msecs(jiffies));
+ 	}
+--- a/mm/memory.c~memory-tiering-introduce-folio_use_access_time-check
++++ a/mm/memory.c
+@@ -5337,8 +5337,7 @@ static vm_fault_t do_numa_page(struct vm
+ 	 * For memory tiering mode, cpupid of slow memory page is used
+ 	 * to record page access time.  So use default value.
+ 	 */
+-	if ((sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
+-	    !node_is_toptier(nid))
++	if (folio_use_access_time(folio))
+ 		last_cpupid = (-1 & LAST_CPUPID_MASK);
+ 	else
+ 		last_cpupid = folio_last_cpupid(folio);
+--- a/mm/memory-tiers.c~memory-tiering-introduce-folio_use_access_time-check
++++ a/mm/memory-tiers.c
+@@ -6,6 +6,7 @@
+ #include <linux/memory.h>
+ #include <linux/memory-tiers.h>
+ #include <linux/notifier.h>
++#include <linux/sched/sysctl.h>
+ 
+ #include "internal.h"
+ 
+@@ -50,6 +51,24 @@ static const struct bus_type memory_tier
+ 	.dev_name = "memory_tier",
+ };
+ 
++#ifdef CONFIG_NUMA_BALANCING
++/**
++ * folio_use_access_time - check if a folio reuses cpupid for page access time
++ * @folio: folio to check
++ *
++ * folio's _last_cpupid field is repurposed by memory tiering. In memory
++ * tiering mode, cpupid of slow memory folio (not toptier memory) is used to
++ * record page access time.
++ *
++ * Return: the folio _last_cpupid is used to record page access time
++ */
++bool folio_use_access_time(struct folio *folio)
++{
++	return (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING) &&
++	       !node_is_toptier(folio_nid(folio));
++}
++#endif
++
+ #ifdef CONFIG_MIGRATION
+ static int top_tier_adistance;
+ /*
+--- a/mm/mprotect.c~memory-tiering-introduce-folio_use_access_time-check
++++ a/mm/mprotect.c
+@@ -161,8 +161,7 @@ static long change_pte_range(struct mmu_
+ 				if (!(sysctl_numa_balancing_mode & NUMA_BALANCING_NORMAL) &&
+ 				    toptier)
+ 					continue;
+-				if (sysctl_numa_balancing_mode & NUMA_BALANCING_MEMORY_TIERING &&
+-				    !toptier)
++				if (folio_use_access_time(folio))
+ 					folio_xchg_access_time(folio,
+ 						jiffies_to_msecs(jiffies));
+ 			}
+_

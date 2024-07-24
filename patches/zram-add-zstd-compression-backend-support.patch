@@ -1,0 +1,199 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: add zstd compression backend support
+Date: Fri, 12 Jul 2024 14:18:19 +0900
+
+Add s/w zstd compression.
+
+Link: https://lkml.kernel.org/r/20240712051850.484318-9-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Nick Terrell <terrelln@fb.com>
+Cc: Nitin Gupta <ngupta@vflare.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/block/zram/Kconfig        |   11 +++
+ drivers/block/zram/Makefile       |    1 
+ drivers/block/zram/backend_zstd.c |   97 ++++++++++++++++++++++++++++
+ drivers/block/zram/backend_zstd.h |   10 ++
+ drivers/block/zram/zcomp.c        |    4 +
+ 5 files changed, 123 insertions(+)
+
+--- /dev/null
++++ a/drivers/block/zram/backend_zstd.c
+@@ -0,0 +1,97 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++#include <linux/zstd.h>
++
++#include "backend_zstd.h"
++
++struct zstd_ctx {
++	zstd_cctx *cctx;
++	zstd_dctx *dctx;
++	void *cctx_mem;
++	void *dctx_mem;
++	s32 level;
++};
++
++static void zstd_destroy(void *ctx)
++{
++	struct zstd_ctx *zctx = ctx;
++
++	vfree(zctx->cctx_mem);
++	vfree(zctx->dctx_mem);
++	kfree(zctx);
++}
++
++static void *zstd_create(void)
++{
++	zstd_parameters params;
++	struct zstd_ctx *ctx;
++	size_t sz;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return NULL;
++
++	ctx->level = zstd_default_clevel();
++	params = zstd_get_params(ctx->level, 0);
++	sz = zstd_cctx_workspace_bound(&params.cParams);
++	ctx->cctx_mem = vzalloc(sz);
++	if (!ctx->cctx_mem)
++		goto error;
++
++	ctx->cctx = zstd_init_cctx(ctx->cctx_mem, sz);
++	if (!ctx->cctx)
++		goto error;
++
++	sz = zstd_dctx_workspace_bound();
++	ctx->dctx_mem = vzalloc(sz);
++	if (!ctx->dctx_mem)
++		goto error;
++
++	ctx->dctx = zstd_init_dctx(ctx->dctx_mem, sz);
++	if (!ctx->dctx)
++		goto error;
++
++	return ctx;
++
++error:
++	zstd_destroy(ctx);
++	return NULL;
++}
++
++static int zstd_compress(void *ctx, const unsigned char *src, size_t src_len,
++			 unsigned char *dst, size_t *dst_len)
++{
++	struct zstd_ctx *zctx = ctx;
++	const zstd_parameters params = zstd_get_params(zctx->level, 0);
++	size_t ret;
++
++	ret = zstd_compress_cctx(zctx->cctx, dst, *dst_len,
++				 src, src_len, &params);
++	if (zstd_is_error(ret))
++		return -EINVAL;
++	*dst_len = ret;
++	return 0;
++}
++
++static int zstd_decompress(void *ctx, const unsigned char *src, size_t src_len,
++			   unsigned char *dst, size_t dst_len)
++{
++	struct zstd_ctx *zctx = ctx;
++	size_t ret;
++
++	ret = zstd_decompress_dctx(zctx->dctx, dst, dst_len, src, src_len);
++	if (zstd_is_error(ret))
++		return -EINVAL;
++	return 0;
++}
++
++const struct zcomp_ops backend_zstd = {
++	.compress	= zstd_compress,
++	.decompress	= zstd_decompress,
++	.create_ctx	= zstd_create,
++	.destroy_ctx	= zstd_destroy,
++	.name		= "zstd",
++};
+--- /dev/null
++++ a/drivers/block/zram/backend_zstd.h
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef __BACKEND_ZSTD_H__
++#define __BACKEND_ZSTD_H__
++
++#include "zcomp.h"
++
++extern const struct zcomp_ops backend_zstd;
++
++#endif /* __BACKEND_ZSTD_H__ */
+--- a/drivers/block/zram/Kconfig~zram-add-zstd-compression-backend-support
++++ a/drivers/block/zram/Kconfig
+@@ -33,6 +33,12 @@ config ZRAM_BACKEND_LZ4HC
+ 	select LZ4HC_COMPRESS
+ 	select LZ4_DECOMPRESS
+ 
++config ZRAM_BACKEND_ZSTD
++	bool "zstd compression support"
++	depends on ZRAM
++	select ZSTD_COMPRESS
++	select ZSTD_DECOMPRESS
++
+ choice
+ 	prompt "Default zram compressor"
+ 	default ZRAM_DEF_COMP_LZORLE
+@@ -54,6 +60,10 @@ config ZRAM_DEF_COMP_LZ4HC
+ 	bool "lz4hc"
+ 	depends on ZRAM_BACKEND_LZ4HC
+ 
++config ZRAM_DEF_COMP_ZSTD
++	bool "zstd"
++	depends on ZRAM_BACKEND_ZSTD
++
+ endchoice
+ 
+ config ZRAM_DEF_COMP
+@@ -62,6 +72,7 @@ config ZRAM_DEF_COMP
+ 	default "lzo" if ZRAM_DEF_COMP_LZO
+ 	default "lz4" if ZRAM_DEF_COMP_LZ4
+ 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
++	default "zstd" if ZRAM_DEF_COMP_ZSTD
+ 	default "unset-value"
+ 
+ config ZRAM_WRITEBACK
+--- a/drivers/block/zram/Makefile~zram-add-zstd-compression-backend-support
++++ a/drivers/block/zram/Makefile
+@@ -5,5 +5,6 @@ zram-y	:=	zcomp.o zram_drv.o
+ zram-$(CONFIG_ZRAM_BACKEND_LZO)		+= backend_lzorle.o backend_lzo.o
+ zram-$(CONFIG_ZRAM_BACKEND_LZ4)		+= backend_lz4.o
+ zram-$(CONFIG_ZRAM_BACKEND_LZ4HC)	+= backend_lz4hc.o
++zram-$(CONFIG_ZRAM_BACKEND_ZSTD)	+= backend_zstd.o
+ 
+ obj-$(CONFIG_ZRAM)	+=	zram.o
+--- a/drivers/block/zram/zcomp.c~zram-add-zstd-compression-backend-support
++++ a/drivers/block/zram/zcomp.c
+@@ -16,6 +16,7 @@
+ #include "backend_lzorle.h"
+ #include "backend_lz4.h"
+ #include "backend_lz4hc.h"
++#include "backend_zstd.h"
+ 
+ static const struct zcomp_ops *backends[] = {
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZO)
+@@ -28,6 +29,9 @@ static const struct zcomp_ops *backends[
+ #if IS_ENABLED(CONFIG_ZRAM_BACKEND_LZ4HC)
+ 	&backend_lz4hc,
+ #endif
++#if IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
++	&backend_zstd,
++#endif
+ 	NULL
+ };
+ 
+_

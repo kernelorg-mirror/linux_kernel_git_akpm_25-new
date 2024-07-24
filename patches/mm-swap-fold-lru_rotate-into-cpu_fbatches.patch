@@ -1,0 +1,106 @@
+From: Yu Zhao <yuzhao@google.com>
+Subject: mm/swap: fold lru_rotate into cpu_fbatches
+Date: Wed, 10 Jul 2024 20:13:15 -0600
+
+Fold lru_rotate into cpu_fbatches, and rename the folio_batch and the lock
+protecting it to lru_move_tail and lock_irq respectively so that all the
+boilerplate can be removed at the end of this series.
+
+Also remove data_race() around folio_batch_count(), which is out of place:
+all folio_batch_count() calls on remote cpu_fbatches are subject to
+data_race(), and therefore data_race() should be inside
+folio_batch_count().
+
+Link: https://lkml.kernel.org/r/20240711021317.596178-4-yuzhao@google.com
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/swap.c |   36 ++++++++++++++++--------------------
+ 1 file changed, 16 insertions(+), 20 deletions(-)
+
+--- a/mm/swap.c~mm-swap-fold-lru_rotate-into-cpu_fbatches
++++ a/mm/swap.c
+@@ -47,20 +47,11 @@
+ int page_cluster;
+ const int page_cluster_max = 31;
+ 
+-/* Protecting only lru_rotate.fbatch which requires disabling interrupts */
+-struct lru_rotate {
+-	local_lock_t lock;
+-	struct folio_batch fbatch;
+-};
+-static DEFINE_PER_CPU(struct lru_rotate, lru_rotate) = {
+-	.lock = INIT_LOCAL_LOCK(lock),
+-};
+-
+-/*
+- * The following folio batches are grouped together because they are protected
+- * by disabling preemption (and interrupts remain enabled).
+- */
+ struct cpu_fbatches {
++	/*
++	 * The following folio batches are grouped together because they are protected
++	 * by disabling preemption (and interrupts remain enabled).
++	 */
+ 	local_lock_t lock;
+ 	struct folio_batch lru_add;
+ 	struct folio_batch lru_deactivate_file;
+@@ -69,9 +60,14 @@ struct cpu_fbatches {
+ #ifdef CONFIG_SMP
+ 	struct folio_batch lru_activate;
+ #endif
++	/* Protecting the following batches which require disabling interrupts */
++	local_lock_t lock_irq;
++	struct folio_batch lru_move_tail;
+ };
++
+ static DEFINE_PER_CPU(struct cpu_fbatches, cpu_fbatches) = {
+ 	.lock = INIT_LOCAL_LOCK(lock),
++	.lock_irq = INIT_LOCAL_LOCK(lock_irq),
+ };
+ 
+ static void __page_cache_release(struct folio *folio, struct lruvec **lruvecp,
+@@ -267,10 +263,10 @@ void folio_rotate_reclaimable(struct fol
+ 		return;
+ 	}
+ 
+-	local_lock_irqsave(&lru_rotate.lock, flags);
+-	fbatch = this_cpu_ptr(&lru_rotate.fbatch);
++	local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
++	fbatch = this_cpu_ptr(&cpu_fbatches.lru_move_tail);
+ 	folio_batch_add_and_move(fbatch, folio, lru_move_tail_fn);
+-	local_unlock_irqrestore(&lru_rotate.lock, flags);
++	local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
+ }
+ 
+ void lru_note_cost(struct lruvec *lruvec, bool file,
+@@ -668,15 +664,15 @@ void lru_add_drain_cpu(int cpu)
+ 	if (folio_batch_count(fbatch))
+ 		folio_batch_move_lru(fbatch, lru_add_fn);
+ 
+-	fbatch = &per_cpu(lru_rotate.fbatch, cpu);
++	fbatch = &fbatches->lru_move_tail;
+ 	/* Disabling interrupts below acts as a compiler barrier. */
+ 	if (data_race(folio_batch_count(fbatch))) {
+ 		unsigned long flags;
+ 
+ 		/* No harm done if a racing interrupt already did this */
+-		local_lock_irqsave(&lru_rotate.lock, flags);
++		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
+ 		folio_batch_move_lru(fbatch, lru_move_tail_fn);
+-		local_unlock_irqrestore(&lru_rotate.lock, flags);
++		local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
+ 	}
+ 
+ 	fbatch = &fbatches->lru_deactivate_file;
+@@ -825,7 +821,7 @@ static bool cpu_needs_drain(unsigned int
+ 
+ 	/* Check these in order of likelihood that they're not zero */
+ 	return folio_batch_count(&fbatches->lru_add) ||
+-		data_race(folio_batch_count(&per_cpu(lru_rotate.fbatch, cpu))) ||
++		folio_batch_count(&fbatches->lru_move_tail) ||
+ 		folio_batch_count(&fbatches->lru_deactivate_file) ||
+ 		folio_batch_count(&fbatches->lru_deactivate) ||
+ 		folio_batch_count(&fbatches->lru_lazyfree) ||
+_

@@ -1,0 +1,80 @@
+From: Zhiguo Jiang <justinjiang@vivo.com>
+Subject: mm: shrink skip folio mapped by an exiting process
+Date: Wed, 10 Jul 2024 16:36:41 +0800
+
+The releasing process of the non-shared anonymous folio mapped solely by
+an exiting process may go through two flows: 1) the anonymous folio is
+firstly is swaped-out into swapspace and transformed into a swp_entry in
+shrink_folio_list; 2) then the swp_entry is released in the process
+exiting flow.  This will result in the high cpu load of releasing a
+non-shared anonymous folio mapped solely by an exiting process.
+
+When the low system memory and the exiting process exist at the same time,
+it will be likely to happen, because the non-shared anonymous folio mapped
+solely by an exiting process may be reclaimed by shrink_folio_list.
+
+This patch is that shrink skips the non-shared anonymous folio solely
+mapped by an exting process and this folio is only released directly in
+the process exiting flow, which will save swap-out time and alleviate the
+load of the process exiting.
+
+Link: https://lkml.kernel.org/r/20240710083641.546-1-justinjiang@vivo.com
+Signed-off-by: Zhiguo Jiang <justinjiang@vivo.com>
+Acked-by: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/rmap.c   |   15 +++++++++++++++
+ mm/vmscan.c |    7 ++++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+--- a/mm/rmap.c~mm-shrink-skip-folio-mapped-by-an-exiting-process
++++ a/mm/rmap.c
+@@ -75,6 +75,7 @@
+ #include <linux/memremap.h>
+ #include <linux/userfaultfd_k.h>
+ #include <linux/mm_inline.h>
++#include <linux/oom.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -870,6 +871,20 @@ static bool folio_referenced_one(struct
+ 			continue;
+ 		}
+ 
++		/*
++		 * Skip the non-shared swapbacked folio mapped solely by
++		 * the exiting or OOM-reaped process. This avoids redundant
++		 * swap-out followed by an immediate unmap.
++		 */
++		if ((!atomic_read(&vma->vm_mm->mm_users) ||
++		    check_stable_address_space(vma->vm_mm)) &&
++		    folio_test_anon(folio) && folio_test_swapbacked(folio) &&
++		    !folio_likely_mapped_shared(folio)) {
++			pra->referenced = -1;
++			page_vma_mapped_walk_done(&pvmw);
++			return false;
++		}
++
+ 		if (pvmw.pte) {
+ 			if (lru_gen_enabled() &&
+ 			    pte_young(ptep_get(pvmw.pte))) {
+--- a/mm/vmscan.c~mm-shrink-skip-folio-mapped-by-an-exiting-process
++++ a/mm/vmscan.c
+@@ -863,7 +863,12 @@ static enum folio_references folio_check
+ 	if (vm_flags & VM_LOCKED)
+ 		return FOLIOREF_ACTIVATE;
+ 
+-	/* rmap lock contention: rotate */
++	/*
++	 * There are two cases to consider.
++	 * 1) Rmap lock contention: rotate.
++	 * 2) Skip the non-shared swapbacked folio mapped solely by
++	 *    the exiting or OOM-reaped process.
++	 */
+ 	if (referenced_ptes == -1)
+ 		return FOLIOREF_KEEP;
+ 
+_
