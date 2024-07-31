@@ -1,0 +1,132 @@
+From: Oscar Salvador <osalvador@suse.de>
+Subject: mm: make hugetlb mappings go through mm_get_unmapped_area_vmflags
+Date: Mon, 29 Jul 2024 11:10:15 +0200
+
+Hugetlb mappings will no longer be special cased but rather go through the
+generic mm_get_unmapped_area_vmflags function.  For that to happen, let us
+remove the .get_unmapped_area from hugetlbfs_file_operations struct, and
+hint __get_unmapped_area that it should not send hugetlb mappings through
+thp_get_unmapped_area_vmflags but through mm_get_unmapped_area_vmflags.
+
+Create also a function called hugetlb_mmap_check_and_align() where a
+couple of safety checks are being done and the addr is aligned to the huge
+page size.  Otherwise we will have to do this in every single function,
+which duplicates quite a lot of code.
+
+Link: https://lkml.kernel.org/r/20240729091018.2152-7-osalvador@suse.de
+Signed-off-by: Oscar Salvador <osalvador@suse.de>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Donet Tom <donettom@linux.ibm.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c    |   22 ++++++++++++++--------
+ include/linux/hugetlb.h |    8 +++-----
+ mm/mmap.c               |   15 ++++++++++++++-
+ 3 files changed, 31 insertions(+), 14 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~mm-make-hugetlb-mappings-go-through-mm_get_unmapped_area_vmflags
++++ a/fs/hugetlbfs/inode.c
+@@ -258,15 +258,22 @@ generic_hugetlb_get_unmapped_area(struct
+ 			pgoff, flags);
+ }
+ 
+-#ifndef HAVE_ARCH_HUGETLB_UNMAPPED_AREA
+-static unsigned long
+-hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+-			  unsigned long len, unsigned long pgoff,
+-			  unsigned long flags)
++unsigned long
++hugetlb_mmap_check_and_align(struct file *file, unsigned long addr,
++			     unsigned long len, unsigned long flags)
+ {
+-	return generic_hugetlb_get_unmapped_area(file, addr, len, pgoff, flags);
++	unsigned long addr0 = 0;
++	struct hstate *h = hstate_file(file);
++
++	if (len & ~huge_page_mask(h))
++		return -EINVAL;
++	if ((flags & MAP_FIXED) && prepare_hugepage_range(file, addr, len))
++		return -EINVAL;
++	if (addr)
++		addr0 = ALIGN(addr, huge_page_size(h));
++
++	return addr0;
+ }
+-#endif
+ 
+ /*
+  * Someone wants to read @bytes from a HWPOISON hugetlb @page from @offset.
+@@ -1300,7 +1307,6 @@ static const struct file_operations huge
+ 	.read_iter		= hugetlbfs_read_iter,
+ 	.mmap			= hugetlbfs_file_mmap,
+ 	.fsync			= noop_fsync,
+-	.get_unmapped_area	= hugetlb_get_unmapped_area,
+ 	.llseek			= default_llseek,
+ 	.fallocate		= hugetlbfs_fallocate,
+ 	.fop_flags		= FOP_HUGE_PAGES,
+--- a/include/linux/hugetlb.h~mm-make-hugetlb-mappings-go-through-mm_get_unmapped_area_vmflags
++++ a/include/linux/hugetlb.h
+@@ -549,11 +549,9 @@ static inline struct hstate *hstate_inod
+ }
+ #endif /* !CONFIG_HUGETLBFS */
+ 
+-#ifdef HAVE_ARCH_HUGETLB_UNMAPPED_AREA
+-unsigned long hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+-					unsigned long len, unsigned long pgoff,
+-					unsigned long flags);
+-#endif /* HAVE_ARCH_HUGETLB_UNMAPPED_AREA */
++unsigned long
++hugetlb_mmap_check_and_align(struct file *file, unsigned long addr,
++			     unsigned long len, unsigned long flags);
+ 
+ unsigned long
+ generic_hugetlb_get_unmapped_area(struct file *file, unsigned long addr,
+--- a/mm/mmap.c~mm-make-hugetlb-mappings-go-through-mm_get_unmapped_area_vmflags
++++ a/mm/mmap.c
+@@ -879,6 +879,7 @@ __get_unmapped_area(struct file *file, u
+ 				  unsigned long, unsigned long, unsigned long)
+ 				  = NULL;
+ 
++	bool is_hugetlb = false;
+ 	unsigned long error = arch_mmap_check(addr, len, flags);
+ 	if (error)
+ 		return error;
+@@ -887,6 +888,9 @@ __get_unmapped_area(struct file *file, u
+ 	if (len > TASK_SIZE)
+ 		return -ENOMEM;
+ 
++	if (file && is_file_hugepages(file))
++		is_hugetlb = true;
++
+ 	if (file) {
+ 		if (file->f_op->get_unmapped_area)
+ 			get_area = file->f_op->get_unmapped_area;
+@@ -904,11 +908,20 @@ __get_unmapped_area(struct file *file, u
+ 
+ 	if (get_area) {
+ 		addr = get_area(file, addr, len, pgoff, flags);
+-	} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
++	} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && !is_hugetlb) {
+ 		/* Ensures that larger anonymous mappings are THP aligned. */
+ 		addr = thp_get_unmapped_area_vmflags(file, addr, len,
+ 						     pgoff, flags, vm_flags);
+ 	} else {
++		/*
++		 * Consolidate hugepages checks in one place, and also align addr
++		 * to hugepage size.
++		 */
++		if (is_hugetlb) {
++			addr = hugetlb_mmap_check_and_align(file, addr, len, flags);
++			if (IS_ERR_VALUE(addr))
++				return addr;
++		}
+ 		addr = mm_get_unmapped_area_vmflags(current->mm, file, addr, len,
+ 						    pgoff, flags, vm_flags);
+ 	}
+_

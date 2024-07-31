@@ -1,0 +1,127 @@
+From: Nhat Pham <nphamcs@gmail.com>
+Subject: zswap: implement a second chance algorithm for dynamic zswap shrinker
+Date: Tue, 30 Jul 2024 15:27:06 -0700
+
+Patch series "improving dynamic zswap shrinker protection scheme", v2.
+
+When experimenting with the memory-pressure based (i.e "dynamic") zswap
+shrinker in production, we observed a sharp increase in the number of
+swapins, which led to performance regression.  We were able to trace this
+regression to the following problems with the shrinker's warm pages
+protection scheme: 
+
+1. The protection decays way too rapidly, and the decaying is coupled with
+   zswap stores, leading to anomalous patterns, in which a small batch of
+   zswap stores effectively erase all the protection in place for the
+   warmer pages in the zswap LRU.
+
+   This observation has also been corroborated upstream by Takero Funaki
+   (in [1]).
+
+2. We inaccurately track the number of swapped in pages, missing the
+   non-pivot pages that are part of the readahead window, while counting
+   the pages that are found in the zswap pool.
+
+
+To alleviate these two issues, this patch series improve the dynamic zswap
+shrinker in the following manner:
+
+1. Replace the protection size tracking scheme with a second chance
+   algorithm. This new scheme removes the need for haphazard stats
+   decaying, and automatically adjusts the pace of pages aging with memory
+   pressure, and writeback rate with pool activities: slowing down when
+   the pool is dominated with zswpouts, and speeding up when the pool is
+   dominated with stale entries.
+
+2. Fix the tracking of the number of swapins to take into account
+   non-pivot pages in the readahead window.
+
+With these two changes in place, in a kernel-building benchmark without
+any cold data added, the number of swapins is reduced by 64.12%.  This
+translate to a 10.32% reduction in build time.  We also observe a 3%
+reduction in kernel CPU time.
+
+In another benchmark, with cold data added (to gauge the new algorithm's
+ability to offload cold data), the new second chance scheme outperforms
+the old protection scheme by around 0.7%, and actually written back around
+21% more pages to backing swap device.  So the new scheme is just as good,
+if not even better than the old scheme on this front as well.
+
+[1]: https://lore.kernel.org/linux-mm/CAPpodddcGsK=0Xczfuk8usgZ47xeyf4ZjiofdT+ujiyz6V2pFQ@mail.gmail.com/
+
+
+This patch (of 2):
+
+Current zswap shrinker's heuristics to prevent overshrinking is brittle
+and inaccurate, specifically in the way we decay the protection size (i.e
+making pages in the zswap LRU eligible for reclaim).
+
+We currently decay protection aggressively in zswap_lru_add() calls.  This
+leads to the following unfortunate effect: when a new batch of pages enter
+zswap, the protection size rapidly decays to below 25% of the zswap LRU
+size, which is way too low.
+
+We have observed this effect in production, when experimenting with the
+zswap shrinker: the rate of shrinking shoots up massively right after a
+new batch of zswap stores.  This is somewhat the opposite of what we want
+originally - when new pages enter zswap, we want to protect both these new
+pages AND the pages that are already protected in the zswap LRU.
+
+Replace existing heuristics with a second chance algorithm
+
+1. When a new zswap entry is stored in the zswap pool, its reference bit
+   is set.
+2. When the zswap shrinker encounters a zswap entry with the reference
+   bit set, give it a second chance - only flips the reference bit and
+   rotate it in the LRU.
+3. If the shrinker encounters the entry again, this time with its
+   reference bit unset, then it can reclaim the entry.
+
+In this manner, the aging of the pages in the zswap LRUs are decoupled
+from zswap stores, and picks up the pace with increasing memory pressure
+(which is what we want).
+
+The second chance scheme allows us to modulate the writeback rate based on
+recent pool activities.  Entries that recently entered the pool will be
+protected, so if the pool is dominated by such entries the writeback rate
+will reduce proportionally, protecting the workload's workingset.On the
+other hand, stale entries will be written back quickly, which increases
+the effective writeback rate.
+
+We will still maintain the count of swapins, which is consumed and
+subtracted from the lru size in zswap_shrinker_count(), to further
+penalize past overshrinking that led to disk swapins.  The idea is that
+had we considered this many more pages in the LRU active/protected, they
+would not have been written back and we would not have had to swapped them
+in.
+
+To test this new heuristics, I built the kernel under a cgroup with
+memory.max set to 2G, on a host with 36 cores:
+
+With the old shrinker:
+
+real: 263.89s
+user: 4318.11s
+sys: 673.29s
+swapins: 227300.5
+
+With the second chance algorithm:
+
+real: 244.85s
+user: 4327.22s
+sys: 664.39s
+swapins: 94663
+
+(average over 5 runs)
+
+We observe an 1.3% reduction in kernel CPU usage, and around 7.2%
+reduction in real time. Note that the number of swapped in pages
+dropped by 58%.
+
+Link: https://lkml.kernel.org/r/20240730222707.2324536-1-nphamcs@gmail.com
+Link: https://lkml.kernel.org/r/20240730222707.2324536-2-nphamcs@gmail.com
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Yosry Ahmed <yosryahmed@google.com>
