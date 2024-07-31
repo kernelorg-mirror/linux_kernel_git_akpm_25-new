@@ -1,0 +1,762 @@
+From: Chris Li <chrisl@kernel.org>
+Subject: mm: swap: swap cluster switch to double link list
+Date: Tue, 30 Jul 2024 23:49:13 -0700
+
+Patch series "mm: swap: mTHP swap allocator base on swap cluster order",
+v5.
+
+This is the short term solutions "swap cluster order" listed in my "Swap
+Abstraction" discussion slice 8 in the recent LSF/MM conference.
+
+When commit 845982eb264bc "mm: swap: allow storage of all mTHP orders" is
+introduced, it only allocates the mTHP swap entries from the new empty
+cluster list.   It has a fragmentation issue reported by Barry.
+
+https://lore.kernel.org/all/CAGsJ_4zAcJkuW016Cfi6wicRr8N9X+GJJhgMQdSMp+Ah+NSgNQ@mail.gmail.com/
+
+The reason is that all the empty clusters have been exhausted while there
+are plenty of free swap entries in the cluster that are not 100% free.
+
+Remember the swap allocation order in the cluster.  Keep track of the per
+order non full cluster list for later allocation.
+
+This series gives the swap SSD allocation a new separate code path from
+the HDD allocation.  The new allocator use cluster list only and do not
+global scan swap_map[] without lock any more.
+
+This streamline the swap allocation for SSD.  The code matches the
+execution flow much better.
+
+User impact: For users that allocate and free mix order mTHP swapping, It
+greatly improves the success rate of the mTHP swap allocation after the
+initial phase.
+
+It also performs faster when the swapfile is close to full, because the
+allocator can get the non full cluster from a list rather than scanning a
+lot of swap_map entries. 
+
+With Barry's mthp test program V2:
+
+Without:
+$ ./thp_swap_allocator_test -a
+Iteration 1: swpout inc: 32, swpout fallback inc: 192, Fallback percentage: 85.71%
+Iteration 2: swpout inc: 0, swpout fallback inc: 231, Fallback percentage: 100.00%
+Iteration 3: swpout inc: 0, swpout fallback inc: 227, Fallback percentage: 100.00%
+...
+Iteration 98: swpout inc: 0, swpout fallback inc: 224, Fallback percentage: 100.00%
+Iteration 99: swpout inc: 0, swpout fallback inc: 215, Fallback percentage: 100.00%
+Iteration 100: swpout inc: 0, swpout fallback inc: 222, Fallback percentage: 100.00%
+
+$ ./thp_swap_allocator_test -a -s
+Iteration 1: swpout inc: 0, swpout fallback inc: 224, Fallback percentage: 100.00%
+Iteration 2: swpout inc: 0, swpout fallback inc: 218, Fallback percentage: 100.00%
+Iteration 3: swpout inc: 0, swpout fallback inc: 222, Fallback percentage: 100.00%
+..
+Iteration 98: swpout inc: 0, swpout fallback inc: 228, Fallback percentage: 100.00%
+Iteration 99: swpout inc: 0, swpout fallback inc: 230, Fallback percentage: 100.00%
+Iteration 100: swpout inc: 0, swpout fallback inc: 229, Fallback percentage: 100.00%
+
+$ ./thp_swap_allocator_test -s
+Iteration 1: swpout inc: 0, swpout fallback inc: 224, Fallback percentage: 100.00%
+Iteration 2: swpout inc: 0, swpout fallback inc: 218, Fallback percentage: 100.00%
+Iteration 3: swpout inc: 0, swpout fallback inc: 222, Fallback percentage: 100.00%
+..
+Iteration 98: swpout inc: 0, swpout fallback inc: 228, Fallback percentage: 100.00%
+Iteration 99: swpout inc: 0, swpout fallback inc: 230, Fallback percentage: 100.00%
+Iteration 100: swpout inc: 0, swpout fallback inc: 229, Fallback percentage: 100.00%
+
+$ ./thp_swap_allocator_test
+Iteration 1: swpout inc: 0, swpout fallback inc: 224, Fallback percentage: 100.00%
+Iteration 2: swpout inc: 0, swpout fallback inc: 218, Fallback percentage: 100.00%
+Iteration 3: swpout inc: 0, swpout fallback inc: 222, Fallback percentage: 100.00%
+..
+Iteration 98: swpout inc: 0, swpout fallback inc: 228, Fallback percentage: 100.00%
+Iteration 99: swpout inc: 0, swpout fallback inc: 230, Fallback percentage: 100.00%
+Iteration 100: swpout inc: 0, swpout fallback inc: 229, Fallback percentage: 100.00%
+
+With: # with all 0.00% filter out
+$ ./thp_swap_allocator_test -a | grep -v "0.00%"
+$ # all result are 0.00%
+
+$ ./thp_swap_allocator_test -a -s | grep -v "0.00%"
+./thp_swap_allocator_test -a -s | grep -v "0.00%" 
+Iteration 14: swpout inc: 223, swpout fallback inc: 3, Fallback percentage: 1.33%
+Iteration 19: swpout inc: 219, swpout fallback inc: 7, Fallback percentage: 3.10%
+Iteration 28: swpout inc: 225, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 29: swpout inc: 227, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 34: swpout inc: 220, swpout fallback inc: 8, Fallback percentage: 3.51%
+Iteration 35: swpout inc: 222, swpout fallback inc: 11, Fallback percentage: 4.72%
+Iteration 38: swpout inc: 217, swpout fallback inc: 4, Fallback percentage: 1.81%
+Iteration 40: swpout inc: 222, swpout fallback inc: 6, Fallback percentage: 2.63%
+Iteration 42: swpout inc: 221, swpout fallback inc: 2, Fallback percentage: 0.90%
+Iteration 43: swpout inc: 215, swpout fallback inc: 7, Fallback percentage: 3.15%
+Iteration 47: swpout inc: 226, swpout fallback inc: 2, Fallback percentage: 0.88%
+Iteration 49: swpout inc: 217, swpout fallback inc: 1, Fallback percentage: 0.46%
+Iteration 52: swpout inc: 221, swpout fallback inc: 8, Fallback percentage: 3.49%
+Iteration 56: swpout inc: 224, swpout fallback inc: 4, Fallback percentage: 1.75%
+Iteration 58: swpout inc: 214, swpout fallback inc: 5, Fallback percentage: 2.28%
+Iteration 62: swpout inc: 220, swpout fallback inc: 3, Fallback percentage: 1.35%
+Iteration 64: swpout inc: 224, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 67: swpout inc: 221, swpout fallback inc: 1, Fallback percentage: 0.45%
+Iteration 75: swpout inc: 220, swpout fallback inc: 9, Fallback percentage: 3.93%
+Iteration 82: swpout inc: 227, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 86: swpout inc: 211, swpout fallback inc: 12, Fallback percentage: 5.38%
+Iteration 89: swpout inc: 226, swpout fallback inc: 2, Fallback percentage: 0.88%
+Iteration 93: swpout inc: 220, swpout fallback inc: 1, Fallback percentage: 0.45%
+Iteration 94: swpout inc: 224, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 96: swpout inc: 221, swpout fallback inc: 6, Fallback percentage: 2.64%
+Iteration 98: swpout inc: 227, swpout fallback inc: 1, Fallback percentage: 0.44%
+Iteration 99: swpout inc: 227, swpout fallback inc: 3, Fallback percentage: 1.30%
+
+$ ./thp_swap_allocator_test      
+./thp_swap_allocator_test 
+Iteration 1: swpout inc: 233, swpout fallback inc: 0, Fallback percentage: 0.00%
+Iteration 2: swpout inc: 131, swpout fallback inc: 101, Fallback percentage: 43.53%
+Iteration 3: swpout inc: 71, swpout fallback inc: 155, Fallback percentage: 68.58%
+Iteration 4: swpout inc: 55, swpout fallback inc: 168, Fallback percentage: 75.34%
+Iteration 5: swpout inc: 35, swpout fallback inc: 191, Fallback percentage: 84.51%
+Iteration 6: swpout inc: 25, swpout fallback inc: 199, Fallback percentage: 88.84%
+Iteration 7: swpout inc: 23, swpout fallback inc: 205, Fallback percentage: 89.91%
+Iteration 8: swpout inc: 9, swpout fallback inc: 219, Fallback percentage: 96.05%
+Iteration 9: swpout inc: 13, swpout fallback inc: 213, Fallback percentage: 94.25%
+Iteration 10: swpout inc: 12, swpout fallback inc: 216, Fallback percentage: 94.74%
+Iteration 11: swpout inc: 16, swpout fallback inc: 213, Fallback percentage: 93.01%
+Iteration 12: swpout inc: 10, swpout fallback inc: 210, Fallback percentage: 95.45%
+Iteration 13: swpout inc: 16, swpout fallback inc: 212, Fallback percentage: 92.98%
+Iteration 14: swpout inc: 12, swpout fallback inc: 212, Fallback percentage: 94.64%
+Iteration 15: swpout inc: 15, swpout fallback inc: 211, Fallback percentage: 93.36%
+Iteration 16: swpout inc: 15, swpout fallback inc: 200, Fallback percentage: 93.02%
+Iteration 17: swpout inc: 9, swpout fallback inc: 220, Fallback percentage: 96.07%
+
+$ ./thp_swap_allocator_test -s
+ ./thp_swap_allocator_test -s
+Iteration 1: swpout inc: 233, swpout fallback inc: 0, Fallback percentage: 0.00%
+Iteration 2: swpout inc: 97, swpout fallback inc: 135, Fallback percentage: 58.19%
+Iteration 3: swpout inc: 42, swpout fallback inc: 192, Fallback percentage: 82.05%
+Iteration 4: swpout inc: 19, swpout fallback inc: 214, Fallback percentage: 91.85%
+Iteration 5: swpout inc: 12, swpout fallback inc: 213, Fallback percentage: 94.67%
+Iteration 6: swpout inc: 11, swpout fallback inc: 217, Fallback percentage: 95.18%
+Iteration 7: swpout inc: 9, swpout fallback inc: 214, Fallback percentage: 95.96%
+Iteration 8: swpout inc: 8, swpout fallback inc: 213, Fallback percentage: 96.38%
+Iteration 9: swpout inc: 2, swpout fallback inc: 223, Fallback percentage: 99.11%
+Iteration 10: swpout inc: 2, swpout fallback inc: 228, Fallback percentage: 99.13%
+Iteration 11: swpout inc: 4, swpout fallback inc: 214, Fallback percentage: 98.17%
+Iteration 12: swpout inc: 5, swpout fallback inc: 226, Fallback percentage: 97.84%
+Iteration 13: swpout inc: 3, swpout fallback inc: 212, Fallback percentage: 98.60%
+Iteration 14: swpout inc: 0, swpout fallback inc: 222, Fallback percentage: 100.00%
+Iteration 15: swpout inc: 3, swpout fallback inc: 222, Fallback percentage: 98.67%
+Iteration 16: swpout inc: 4, swpout fallback inc: 223, Fallback percentage: 98.24%
+
+=========
+Kernel compile under tmpfs with cgroup memory.max = 470M.
+12 core 24 hyperthreading, 32 jobs. 10 Run each group
+
+SSD swap 10 runs average, 20G swap partition:
+With:
+user    2929.064
+system  1479.381 : 1376.89 1398.22 1444.64 1477.39 1479.04 1497.27
+1504.47 1531.4 1532.92 1551.57
+real    1441.324
+
+Without:
+user    2910.872
+system  1482.732 : 1440.01 1451.4 1462.01 1467.47 1467.51 1469.3
+1470.19 1496.32 1544.1 1559.01
+real    1580.822
+
+Two zram swap: zram0 3.0G zram1 20G.
+
+The idea is forcing the zram0 almost full then overflow to zram1:
+
+With:
+user    4320.301
+system  4272.403 : 4236.24 4262.81 4264.75 4269.13 4269.44 4273.06
+4279.85 4285.98 4289.64 4293.13
+real    431.759
+
+Without
+user    4301.393
+system  4387.672 : 4374.47 4378.3 4380.95 4382.84 4383.06 4388.05
+4389.76 4397.16 4398.23 4403.9
+real    433.979
+
+------ more test result from Kaiui ----------
+
+Test with build linux kernel using a 4G ZRAM, 1G memory.max limit on top of shmem:
+
+System info: 32 Core AMD Zen2, 64G total memory.
+
+Test 3 times using only 4K pages:
+=================================
+
+With:
+-----
+1838.74user 2411.21system 2:37.86elapsed 2692%CPU (0avgtext+0avgdata 847060maxresident)k
+1839.86user 2465.77system 2:39.35elapsed 2701%CPU (0avgtext+0avgdata 847060maxresident)k
+1840.26user 2454.68system 2:39.43elapsed 2693%CPU (0avgtext+0avgdata 847060maxresident)k
+
+Summary (~4.6% improment of system time):
+User: 1839.62
+System: 2443.89: 2465.77 2454.68 2411.21
+Real: 158.88
+
+Without:
+--------
+1837.99user 2575.95system 2:43.09elapsed 2706%CPU (0avgtext+0avgdata 846520maxresident)k
+1838.32user 2555.15system 2:42.52elapsed 2709%CPU (0avgtext+0avgdata 846520maxresident)k
+1843.02user 2561.55system 2:43.35elapsed 2702%CPU (0avgtext+0avgdata 846520maxresident)k
+
+Summary:
+User: 1839.78
+System: 2564.22: 2575.95 2555.15 2561.55
+Real: 162.99
+
+Test 5 times using enabled all mTHP pages:
+==========================================
+
+With:
+-----
+1796.44user 2937.33system 2:59.09elapsed 2643%CPU (0avgtext+0avgdata 846936maxresident)k
+1802.55user 3002.32system 2:54.68elapsed 2750%CPU (0avgtext+0avgdata 847072maxresident)k
+1806.59user 2986.53system 2:55.17elapsed 2736%CPU (0avgtext+0avgdata 847092maxresident)k
+1803.27user 2982.40system 2:54.49elapsed 2742%CPU (0avgtext+0avgdata 846796maxresident)k
+1807.43user 3036.08system 2:56.06elapsed 2751%CPU (0avgtext+0avgdata 846488maxresident)k
+
+Summary (~8.4% improvement of system time):
+User: 1803.25
+System: 2988.93: 2937.33 3002.32 2986.53 2982.40 3036.08
+Real: 175.90
+
+mTHP swapout status:
+/sys/kernel/mm/transparent_hugepage/hugepages-32kB/stats/swpout:347721
+/sys/kernel/mm/transparent_hugepage/hugepages-32kB/stats/swpout_fallback:3110
+/sys/kernel/mm/transparent_hugepage/hugepages-512kB/stats/swpout:3365
+/sys/kernel/mm/transparent_hugepage/hugepages-512kB/stats/swpout_fallback:8269
+/sys/kernel/mm/transparent_hugepage/hugepages-2048kB/stats/swpout:24
+/sys/kernel/mm/transparent_hugepage/hugepages-2048kB/stats/swpout_fallback:3341
+/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/stats/swpout:145
+/sys/kernel/mm/transparent_hugepage/hugepages-1024kB/stats/swpout_fallback:5038
+/sys/kernel/mm/transparent_hugepage/hugepages-64kB/stats/swpout:322737
+/sys/kernel/mm/transparent_hugepage/hugepages-64kB/stats/swpout_fallback:36808
+/sys/kernel/mm/transparent_hugepage/hugepages-16kB/stats/swpout:380455
+/sys/kernel/mm/transparent_hugepage/hugepages-16kB/stats/swpout_fallback:1010
+/sys/kernel/mm/transparent_hugepage/hugepages-256kB/stats/swpout:24973
+/sys/kernel/mm/transparent_hugepage/hugepages-256kB/stats/swpout_fallback:13223
+/sys/kernel/mm/transparent_hugepage/hugepages-128kB/stats/swpout:197348
+/sys/kernel/mm/transparent_hugepage/hugepages-128kB/stats/swpout_fallback:80541
+
+Without:
+--------
+1794.41user 3151.29system 3:05.97elapsed 2659%CPU (0avgtext+0avgdata 846704maxresident)k
+1810.27user 3304.48system 3:05.38elapsed 2759%CPU (0avgtext+0avgdata 846636maxresident)k
+1809.84user 3254.85system 3:03.83elapsed 2755%CPU (0avgtext+0avgdata 846952maxresident)k
+1813.54user 3259.56system 3:04.28elapsed 2752%CPU (0avgtext+0avgdata 846848maxresident)k
+1829.97user 3338.40system 3:07.32elapsed 2759%CPU (0avgtext+0avgdata 847024maxresident)k
+
+Summary:
+User: 1811.61
+System: 3261.72 : 3151.29 3304.48 3254.85 3259.56 3338.40
+Real: 185.356
+
+mTHP swapout status:
+hugepages-32kB/stats/swpout:35630
+hugepages-32kB/stats/swpout_fallback:1809908
+hugepages-512kB/stats/swpout:523
+hugepages-512kB/stats/swpout_fallback:55235
+hugepages-2048kB/stats/swpout:53
+hugepages-2048kB/stats/swpout_fallback:17264
+hugepages-1024kB/stats/swpout:85
+hugepages-1024kB/stats/swpout_fallback:24979
+hugepages-64kB/stats/swpout:30117
+hugepages-64kB/stats/swpout_fallback:1825399
+hugepages-16kB/stats/swpout:42775
+hugepages-16kB/stats/swpout_fallback:1951123
+hugepages-256kB/stats/swpout:2326
+hugepages-256kB/stats/swpout_fallback:170165
+hugepages-128kB/stats/swpout:17925
+hugepages-128kB/stats/swpout_fallback:1309757
+
+
+This patch (of 9):
+
+Previously, the swap cluster used a cluster index as a pointer to
+construct a custom single link list type "swap_cluster_list".  The next
+cluster pointer is shared with the cluster->count.  It prevents puting the
+non free cluster into a list.
+
+Change the cluster to use the standard double link list instead.  This
+allows tracing the nonfull cluster in the follow up patch.  That way, it
+is faster to get to the nonfull cluster of that order.
+
+Remove the cluster getter/setter for accessing the cluster struct member.
+
+The list operation is protected by the swap_info_struct->lock.
+
+Change cluster code to use "struct swap_cluster_info *" to reference the
+cluster rather than by using index.  That is more consistent with the list
+manipulation.  It avoids the repeat adding index to the cluser_info.  The
+code is easier to understand.
+
+Remove the cluster next pointer is NULL flag, the double link list can
+handle the empty list pretty well.
+
+The "swap_cluster_info" struct is two pointer bigger, because 512 swap
+entries share one swap_cluster_info struct, it has very little impact on
+the average memory usage per swap entry.  For 1TB swapfile, the swap
+cluster data structure increases from 8MB to 24MB.
+
+Other than the list conversion, there is no real function change in this
+patch.
+
+Link: https://lkml.kernel.org/r/20240730-swap-allocator-v5-0-cb9c148b9297@kernel.org
+Link: https://lkml.kernel.org/r/20240730-swap-allocator-v5-1-cb9c148b9297@kernel.org
+Signed-off-by: Chris Li <chrisl@kernel.org>
+Reported-by: Barry Song <21cnbao@gmail.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/swap.h |   25 +---
+ mm/swapfile.c        |  226 +++++++++++------------------------------
+ 2 files changed, 71 insertions(+), 180 deletions(-)
+
+--- a/include/linux/swap.h~mm-swap-swap-cluster-switch-to-double-link-list
++++ a/include/linux/swap.h
+@@ -243,22 +243,20 @@ enum {
+  * free clusters are organized into a list. We fetch an entry from the list to
+  * get a free cluster.
+  *
+- * The data field stores next cluster if the cluster is free or cluster usage
+- * counter otherwise. The flags field determines if a cluster is free. This is
+- * protected by swap_info_struct.lock.
++ * The flags field determines if a cluster is free. This is
++ * protected by cluster lock.
+  */
+ struct swap_cluster_info {
+ 	spinlock_t lock;	/*
+ 				 * Protect swap_cluster_info fields
+-				 * and swap_info_struct->swap_map
+-				 * elements correspond to the swap
+-				 * cluster
++				 * other than list, and swap_info_struct->swap_map
++				 * elements corresponding to the swap cluster.
+ 				 */
+-	unsigned int data:24;
+-	unsigned int flags:8;
++	u16 count;
++	u8 flags;
++	struct list_head list;
+ };
+ #define CLUSTER_FLAG_FREE 1 /* This cluster is free */
+-#define CLUSTER_FLAG_NEXT_NULL 2 /* This cluster has no next cluster */
+ 
+ /*
+  * The first page in the swap file is the swap header, which is always marked
+@@ -283,11 +281,6 @@ struct percpu_cluster {
+ 	unsigned int next[SWAP_NR_ORDERS]; /* Likely next allocation offset */
+ };
+ 
+-struct swap_cluster_list {
+-	struct swap_cluster_info head;
+-	struct swap_cluster_info tail;
+-};
+-
+ /*
+  * The in-memory structure used to track swap areas.
+  */
+@@ -300,7 +293,7 @@ struct swap_info_struct {
+ 	unsigned int	max;		/* extent of the swap_map */
+ 	unsigned char *swap_map;	/* vmalloc'ed array of usage counts */
+ 	struct swap_cluster_info *cluster_info; /* cluster info. Only for SSD */
+-	struct swap_cluster_list free_clusters; /* free clusters list */
++	struct list_head free_clusters; /* free clusters list */
+ 	unsigned int lowest_bit;	/* index of first free in swap_map */
+ 	unsigned int highest_bit;	/* index of last free in swap_map */
+ 	unsigned int pages;		/* total of usable pages of swap */
+@@ -331,7 +324,7 @@ struct swap_info_struct {
+ 					 * list.
+ 					 */
+ 	struct work_struct discard_work; /* discard worker */
+-	struct swap_cluster_list discard_clusters; /* discard clusters list */
++	struct list_head discard_clusters; /* discard clusters list */
+ 	struct plist_node avail_lists[]; /*
+ 					   * entries in swap_avail_heads, one
+ 					   * entry per node.
+--- a/mm/swapfile.c~mm-swap-swap-cluster-switch-to-double-link-list
++++ a/mm/swapfile.c
+@@ -290,62 +290,15 @@ static void discard_swap_cluster(struct
+ #endif
+ #define LATENCY_LIMIT		256
+ 
+-static inline void cluster_set_flag(struct swap_cluster_info *info,
+-	unsigned int flag)
+-{
+-	info->flags = flag;
+-}
+-
+-static inline unsigned int cluster_count(struct swap_cluster_info *info)
+-{
+-	return info->data;
+-}
+-
+-static inline void cluster_set_count(struct swap_cluster_info *info,
+-				     unsigned int c)
+-{
+-	info->data = c;
+-}
+-
+-static inline void cluster_set_count_flag(struct swap_cluster_info *info,
+-					 unsigned int c, unsigned int f)
+-{
+-	info->flags = f;
+-	info->data = c;
+-}
+-
+-static inline unsigned int cluster_next(struct swap_cluster_info *info)
+-{
+-	return info->data;
+-}
+-
+-static inline void cluster_set_next(struct swap_cluster_info *info,
+-				    unsigned int n)
+-{
+-	info->data = n;
+-}
+-
+-static inline void cluster_set_next_flag(struct swap_cluster_info *info,
+-					 unsigned int n, unsigned int f)
+-{
+-	info->flags = f;
+-	info->data = n;
+-}
+-
+ static inline bool cluster_is_free(struct swap_cluster_info *info)
+ {
+ 	return info->flags & CLUSTER_FLAG_FREE;
+ }
+ 
+-static inline bool cluster_is_null(struct swap_cluster_info *info)
+-{
+-	return info->flags & CLUSTER_FLAG_NEXT_NULL;
+-}
+-
+-static inline void cluster_set_null(struct swap_cluster_info *info)
++static inline unsigned int cluster_index(struct swap_info_struct *si,
++					 struct swap_cluster_info *ci)
+ {
+-	info->flags = CLUSTER_FLAG_NEXT_NULL;
+-	info->data = 0;
++	return ci - si->cluster_info;
+ }
+ 
+ static inline struct swap_cluster_info *lock_cluster(struct swap_info_struct *si,
+@@ -394,65 +347,11 @@ static inline void unlock_cluster_or_swa
+ 		spin_unlock(&si->lock);
+ }
+ 
+-static inline bool cluster_list_empty(struct swap_cluster_list *list)
+-{
+-	return cluster_is_null(&list->head);
+-}
+-
+-static inline unsigned int cluster_list_first(struct swap_cluster_list *list)
+-{
+-	return cluster_next(&list->head);
+-}
+-
+-static void cluster_list_init(struct swap_cluster_list *list)
+-{
+-	cluster_set_null(&list->head);
+-	cluster_set_null(&list->tail);
+-}
+-
+-static void cluster_list_add_tail(struct swap_cluster_list *list,
+-				  struct swap_cluster_info *ci,
+-				  unsigned int idx)
+-{
+-	if (cluster_list_empty(list)) {
+-		cluster_set_next_flag(&list->head, idx, 0);
+-		cluster_set_next_flag(&list->tail, idx, 0);
+-	} else {
+-		struct swap_cluster_info *ci_tail;
+-		unsigned int tail = cluster_next(&list->tail);
+-
+-		/*
+-		 * Nested cluster lock, but both cluster locks are
+-		 * only acquired when we held swap_info_struct->lock
+-		 */
+-		ci_tail = ci + tail;
+-		spin_lock_nested(&ci_tail->lock, SINGLE_DEPTH_NESTING);
+-		cluster_set_next(ci_tail, idx);
+-		spin_unlock(&ci_tail->lock);
+-		cluster_set_next_flag(&list->tail, idx, 0);
+-	}
+-}
+-
+-static unsigned int cluster_list_del_first(struct swap_cluster_list *list,
+-					   struct swap_cluster_info *ci)
+-{
+-	unsigned int idx;
+-
+-	idx = cluster_next(&list->head);
+-	if (cluster_next(&list->tail) == idx) {
+-		cluster_set_null(&list->head);
+-		cluster_set_null(&list->tail);
+-	} else
+-		cluster_set_next_flag(&list->head,
+-				      cluster_next(&ci[idx]), 0);
+-
+-	return idx;
+-}
+-
+ /* Add a cluster to discard list and schedule it to do discard */
+ static void swap_cluster_schedule_discard(struct swap_info_struct *si,
+-		unsigned int idx)
++		struct swap_cluster_info *ci)
+ {
++	unsigned int idx = cluster_index(si, ci);
+ 	/*
+ 	 * If scan_swap_map_slots() can't find a free cluster, it will check
+ 	 * si->swap_map directly. To make sure the discarding cluster isn't
+@@ -462,17 +361,14 @@ static void swap_cluster_schedule_discar
+ 	memset(si->swap_map + idx * SWAPFILE_CLUSTER,
+ 			SWAP_MAP_BAD, SWAPFILE_CLUSTER);
+ 
+-	cluster_list_add_tail(&si->discard_clusters, si->cluster_info, idx);
+-
++	list_add_tail(&ci->list, &si->discard_clusters);
+ 	schedule_work(&si->discard_work);
+ }
+ 
+-static void __free_cluster(struct swap_info_struct *si, unsigned long idx)
++static void __free_cluster(struct swap_info_struct *si, struct swap_cluster_info *ci)
+ {
+-	struct swap_cluster_info *ci = si->cluster_info;
+-
+-	cluster_set_flag(ci + idx, CLUSTER_FLAG_FREE);
+-	cluster_list_add_tail(&si->free_clusters, ci, idx);
++	ci->flags = CLUSTER_FLAG_FREE;
++	list_add_tail(&ci->list, &si->free_clusters);
+ }
+ 
+ /*
+@@ -481,24 +377,25 @@ static void __free_cluster(struct swap_i
+ */
+ static void swap_do_scheduled_discard(struct swap_info_struct *si)
+ {
+-	struct swap_cluster_info *info, *ci;
++	struct swap_cluster_info *ci;
+ 	unsigned int idx;
+ 
+-	info = si->cluster_info;
+-
+-	while (!cluster_list_empty(&si->discard_clusters)) {
+-		idx = cluster_list_del_first(&si->discard_clusters, info);
++	while (!list_empty(&si->discard_clusters)) {
++		ci = list_first_entry(&si->discard_clusters, struct swap_cluster_info, list);
++		list_del(&ci->list);
++		idx = cluster_index(si, ci);
+ 		spin_unlock(&si->lock);
+ 
+ 		discard_swap_cluster(si, idx * SWAPFILE_CLUSTER,
+ 				SWAPFILE_CLUSTER);
+ 
+ 		spin_lock(&si->lock);
+-		ci = lock_cluster(si, idx * SWAPFILE_CLUSTER);
+-		__free_cluster(si, idx);
++
++		spin_lock(&ci->lock);
++		__free_cluster(si, ci);
+ 		memset(si->swap_map + idx * SWAPFILE_CLUSTER,
+ 				0, SWAPFILE_CLUSTER);
+-		unlock_cluster(ci);
++		spin_unlock(&ci->lock);
+ 	}
+ }
+ 
+@@ -521,20 +418,21 @@ static void swap_users_ref_free(struct p
+ 	complete(&si->comp);
+ }
+ 
+-static void alloc_cluster(struct swap_info_struct *si, unsigned long idx)
++static struct swap_cluster_info *alloc_cluster(struct swap_info_struct *si, unsigned long idx)
+ {
+-	struct swap_cluster_info *ci = si->cluster_info;
++	struct swap_cluster_info *ci = list_first_entry(&si->free_clusters,
++							struct swap_cluster_info, list);
+ 
+-	VM_BUG_ON(cluster_list_first(&si->free_clusters) != idx);
+-	cluster_list_del_first(&si->free_clusters, ci);
+-	cluster_set_count_flag(ci + idx, 0, 0);
++	VM_BUG_ON(cluster_index(si, ci) != idx);
++	list_del(&ci->list);
++	ci->count = 0;
++	ci->flags = 0;
++	return ci;
+ }
+ 
+-static void free_cluster(struct swap_info_struct *si, unsigned long idx)
++static void free_cluster(struct swap_info_struct *si, struct swap_cluster_info *ci)
+ {
+-	struct swap_cluster_info *ci = si->cluster_info + idx;
+-
+-	VM_BUG_ON(cluster_count(ci) != 0);
++	VM_BUG_ON(ci->count != 0);
+ 	/*
+ 	 * If the swap is discardable, prepare discard the cluster
+ 	 * instead of free it immediately. The cluster will be freed
+@@ -542,11 +440,11 @@ static void free_cluster(struct swap_inf
+ 	 */
+ 	if ((si->flags & (SWP_WRITEOK | SWP_PAGE_DISCARD)) ==
+ 	    (SWP_WRITEOK | SWP_PAGE_DISCARD)) {
+-		swap_cluster_schedule_discard(si, idx);
++		swap_cluster_schedule_discard(si, ci);
+ 		return;
+ 	}
+ 
+-	__free_cluster(si, idx);
++	__free_cluster(si, ci);
+ }
+ 
+ /*
+@@ -559,15 +457,15 @@ static void add_cluster_info_page(struct
+ 	unsigned long count)
+ {
+ 	unsigned long idx = page_nr / SWAPFILE_CLUSTER;
++	struct swap_cluster_info *ci = cluster_info + idx;
+ 
+ 	if (!cluster_info)
+ 		return;
+-	if (cluster_is_free(&cluster_info[idx]))
++	if (cluster_is_free(ci))
+ 		alloc_cluster(p, idx);
+ 
+-	VM_BUG_ON(cluster_count(&cluster_info[idx]) + count > SWAPFILE_CLUSTER);
+-	cluster_set_count(&cluster_info[idx],
+-		cluster_count(&cluster_info[idx]) + count);
++	VM_BUG_ON(ci->count + count > SWAPFILE_CLUSTER);
++	ci->count += count;
+ }
+ 
+ /*
+@@ -581,24 +479,20 @@ static void inc_cluster_info_page(struct
+ }
+ 
+ /*
+- * The cluster corresponding to page_nr decreases one usage. If the usage
+- * counter becomes 0, which means no page in the cluster is in using, we can
+- * optionally discard the cluster and add it to free cluster list.
++ * The cluster ci decreases one usage. If the usage counter becomes 0,
++ * which means no page in the cluster is in use, we can optionally discard
++ * the cluster and add it to free cluster list.
+  */
+-static void dec_cluster_info_page(struct swap_info_struct *p,
+-	struct swap_cluster_info *cluster_info, unsigned long page_nr)
++static void dec_cluster_info_page(struct swap_info_struct *p, struct swap_cluster_info *ci)
+ {
+-	unsigned long idx = page_nr / SWAPFILE_CLUSTER;
+-
+-	if (!cluster_info)
++	if (!p->cluster_info)
+ 		return;
+ 
+-	VM_BUG_ON(cluster_count(&cluster_info[idx]) == 0);
+-	cluster_set_count(&cluster_info[idx],
+-		cluster_count(&cluster_info[idx]) - 1);
++	VM_BUG_ON(ci->count == 0);
++	ci->count--;
+ 
+-	if (cluster_count(&cluster_info[idx]) == 0)
+-		free_cluster(p, idx);
++	if (!ci->count)
++		free_cluster(p, ci);
+ }
+ 
+ /*
+@@ -611,10 +505,12 @@ scan_swap_map_ssd_cluster_conflict(struc
+ {
+ 	struct percpu_cluster *percpu_cluster;
+ 	bool conflict;
++	struct swap_cluster_info *first = list_first_entry(&si->free_clusters,
++							   struct swap_cluster_info, list);
+ 
+ 	offset /= SWAPFILE_CLUSTER;
+-	conflict = !cluster_list_empty(&si->free_clusters) &&
+-		offset != cluster_list_first(&si->free_clusters) &&
++	conflict = !list_empty(&si->free_clusters) &&
++		offset !=  cluster_index(si, first) &&
+ 		cluster_is_free(&si->cluster_info[offset]);
+ 
+ 	if (!conflict)
+@@ -655,10 +551,10 @@ new_cluster:
+ 	cluster = this_cpu_ptr(si->percpu_cluster);
+ 	tmp = cluster->next[order];
+ 	if (tmp == SWAP_NEXT_INVALID) {
+-		if (!cluster_list_empty(&si->free_clusters)) {
+-			tmp = cluster_next(&si->free_clusters.head) *
+-					SWAPFILE_CLUSTER;
+-		} else if (!cluster_list_empty(&si->discard_clusters)) {
++		if (!list_empty(&si->free_clusters)) {
++			ci = list_first_entry(&si->free_clusters, struct swap_cluster_info, list);
++			tmp = cluster_index(si, ci) * SWAPFILE_CLUSTER;
++		} else if (!list_empty(&si->discard_clusters)) {
+ 			/*
+ 			 * we don't have free cluster but have some clusters in
+ 			 * discarding, do discard now and reclaim them, then
+@@ -1062,8 +958,9 @@ static void swap_free_cluster(struct swa
+ 
+ 	ci = lock_cluster(si, offset);
+ 	memset(si->swap_map + offset, 0, SWAPFILE_CLUSTER);
+-	cluster_set_count_flag(ci, 0, 0);
+-	free_cluster(si, idx);
++	ci->count = 0;
++	ci->flags = 0;
++	free_cluster(si, ci);
+ 	unlock_cluster(ci);
+ 	swap_range_free(si, offset, SWAPFILE_CLUSTER);
+ }
+@@ -1336,7 +1233,7 @@ static void swap_entry_free(struct swap_
+ 	count = p->swap_map[offset];
+ 	VM_BUG_ON(count != SWAP_HAS_CACHE);
+ 	p->swap_map[offset] = 0;
+-	dec_cluster_info_page(p, p->cluster_info, offset);
++	dec_cluster_info_page(p, ci);
+ 	unlock_cluster(ci);
+ 
+ 	mem_cgroup_uncharge_swap(entry, 1);
+@@ -3014,8 +2911,8 @@ static int setup_swap_map_and_extents(st
+ 
+ 	nr_good_pages = maxpages - 1;	/* omit header page */
+ 
+-	cluster_list_init(&p->free_clusters);
+-	cluster_list_init(&p->discard_clusters);
++	INIT_LIST_HEAD(&p->free_clusters);
++	INIT_LIST_HEAD(&p->discard_clusters);
+ 
+ 	for (i = 0; i < swap_header->info.nr_badpages; i++) {
+ 		unsigned int page_nr = swap_header->info.badpages[i];
+@@ -3066,14 +2963,15 @@ static int setup_swap_map_and_extents(st
+ 	for (k = 0; k < SWAP_CLUSTER_COLS; k++) {
+ 		j = (k + col) % SWAP_CLUSTER_COLS;
+ 		for (i = 0; i < DIV_ROUND_UP(nr_clusters, SWAP_CLUSTER_COLS); i++) {
++			struct swap_cluster_info *ci;
+ 			idx = i * SWAP_CLUSTER_COLS + j;
++			ci = cluster_info + idx;
+ 			if (idx >= nr_clusters)
+ 				continue;
+-			if (cluster_count(&cluster_info[idx]))
++			if (ci->count)
+ 				continue;
+-			cluster_set_flag(&cluster_info[idx], CLUSTER_FLAG_FREE);
+-			cluster_list_add_tail(&p->free_clusters, cluster_info,
+-					      idx);
++			ci->flags = CLUSTER_FLAG_FREE;
++			list_add_tail(&ci->list, &p->free_clusters);
+ 		}
+ 	}
+ 	return nr_extents;
+_

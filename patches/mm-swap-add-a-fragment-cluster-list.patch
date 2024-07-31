@@ -1,0 +1,163 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm: swap: add a fragment cluster list
+Date: Tue, 30 Jul 2024 23:49:19 -0700
+
+Now swap cluster allocator arranges the clusters in LRU style, so the
+"cold" cluster stay at the head of nonfull lists are the ones that were
+used for allocation long time ago and still partially occupied.  So if
+allocator can't find enough contiguous slots to satisfy an high order
+allocation, it's unlikely there will be slot being free on them to satisfy
+the allocation, at least in a short period.
+
+As a result, nonfull cluster scanning will waste time repeatly scanning
+the unusable head of the list.
+
+Also, multiple CPUs could content on the same head cluster of nonfull
+list.  Unlike free clusters which are removed from the list when any CPU
+starts using it, nonfull cluster stays on the head.
+
+So introduce a new list frag list, all scanned nonfull clusters will be
+moved to this list.  Both for avoiding repeated scanning and contention.
+
+Frag list is still used as fallback for allocations, so if one CPU failed
+to allocate one order of slots, it can still steal other CPU's clusters. 
+And order 0 will favor the fragmented clusters to better protect nonfull
+clusters
+
+If any slots on a fragment list are being freed, move the fragment list
+back to nonfull list indicating it worth another scan on the cluster. 
+Compared to scan upon freeing a slot, this keep the scanning lazy and save
+some CPU if there are still other clusters to use.
+
+It may seems unneccessay to keep the fragmented cluster on list at all if
+they can't be used for specific order allocation.  But this will start to
+make sense once reclaim dring scanning is ready.
+
+Link: https://lkml.kernel.org/r/20240730-swap-allocator-v5-7-cb9c148b9297@kernel.org
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Reported-by: Barry Song <21cnbao@gmail.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/swap.h |    3 +++
+ mm/swapfile.c        |   41 +++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+--- a/include/linux/swap.h~mm-swap-add-a-fragment-cluster-list
++++ a/include/linux/swap.h
+@@ -259,6 +259,7 @@ struct swap_cluster_info {
+ };
+ #define CLUSTER_FLAG_FREE 1 /* This cluster is free */
+ #define CLUSTER_FLAG_NONFULL 2 /* This cluster is on nonfull list */
++#define CLUSTER_FLAG_FRAG 4 /* This cluster is on nonfull list */
+ 
+ /*
+  * The first page in the swap file is the swap header, which is always marked
+@@ -298,6 +299,8 @@ struct swap_info_struct {
+ 	struct list_head free_clusters; /* free clusters list */
+ 	struct list_head nonfull_clusters[SWAP_NR_ORDERS];
+ 					/* list of cluster that contains at least one free slot */
++	struct list_head frag_clusters[SWAP_NR_ORDERS];
++					/* list of cluster that are fragmented or contented */
+ 	unsigned int lowest_bit;	/* index of first free in swap_map */
+ 	unsigned int highest_bit;	/* index of last free in swap_map */
+ 	unsigned int pages;		/* total of usable pages of swap */
+--- a/mm/swapfile.c~mm-swap-add-a-fragment-cluster-list
++++ a/mm/swapfile.c
+@@ -572,7 +572,10 @@ static void dec_cluster_info_page(struct
+ 
+ 	if (!(ci->flags & CLUSTER_FLAG_NONFULL)) {
+ 		VM_BUG_ON(ci->flags & CLUSTER_FLAG_FREE);
+-		list_add_tail(&ci->list, &p->nonfull_clusters[ci->order]);
++		if (ci->flags & CLUSTER_FLAG_FRAG)
++			list_move_tail(&ci->list, &p->nonfull_clusters[ci->order]);
++		else
++			list_add_tail(&ci->list, &p->nonfull_clusters[ci->order]);
+ 		ci->flags = CLUSTER_FLAG_NONFULL;
+ 	}
+ }
+@@ -610,7 +613,8 @@ static inline void cluster_alloc_range(s
+ 	ci->count += nr_pages;
+ 
+ 	if (ci->count == SWAPFILE_CLUSTER) {
+-		VM_BUG_ON(!(ci->flags & (CLUSTER_FLAG_FREE | CLUSTER_FLAG_NONFULL)));
++		VM_BUG_ON(!(ci->flags &
++			  (CLUSTER_FLAG_FREE | CLUSTER_FLAG_NONFULL | CLUSTER_FLAG_FRAG)));
+ 		list_del(&ci->list);
+ 		ci->flags = 0;
+ 	}
+@@ -666,6 +670,7 @@ static unsigned long cluster_alloc_swap_
+ 	struct percpu_cluster *cluster;
+ 	struct swap_cluster_info *ci, *n;
+ 	unsigned int offset, found = 0;
++	LIST_HEAD(fraged);
+ 
+ new_cluster:
+ 	lockdep_assert_held(&si->lock);
+@@ -686,13 +691,29 @@ new_cluster:
+ 
+ 	if (order < PMD_ORDER) {
+ 		list_for_each_entry_safe(ci, n, &si->nonfull_clusters[order], list) {
++			list_move_tail(&ci->list, &fraged);
++			ci->flags = CLUSTER_FLAG_FRAG;
+ 			offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
+ 							 &found, order, usage);
+ 			if (found)
+-				goto done;
++				break;
+ 		}
++
++		if (!found) {
++			list_for_each_entry_safe(ci, n, &si->frag_clusters[order], list) {
++				offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
++								 &found, order, usage);
++				if (found)
++					break;
++			}
++		}
++
++		list_splice_tail(&fraged, &si->frag_clusters[order]);
+ 	}
+ 
++	if (found)
++		goto done;
++
+ 	if (!list_empty(&si->discard_clusters)) {
+ 		/*
+ 		 * we don't have free cluster but have some clusters in
+@@ -706,7 +727,17 @@ new_cluster:
+ 	if (order)
+ 		goto done;
+ 
++	/* Order 0 stealing from higher order */
+ 	for (int o = 1; o < PMD_ORDER; o++) {
++		if (!list_empty(&si->frag_clusters[o])) {
++			ci = list_first_entry(&si->frag_clusters[o],
++					      struct swap_cluster_info, list);
++			offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci), &found,
++							 0, usage);
++			VM_BUG_ON(!found);
++			goto done;
++		}
++
+ 		if (!list_empty(&si->nonfull_clusters[o])) {
+ 			ci = list_first_entry(&si->nonfull_clusters[o], struct swap_cluster_info,
+ 					      list);
+@@ -3011,8 +3042,10 @@ static int setup_swap_map_and_extents(st
+ 	INIT_LIST_HEAD(&p->free_clusters);
+ 	INIT_LIST_HEAD(&p->discard_clusters);
+ 
+-	for (i = 0; i < SWAP_NR_ORDERS; i++)
++	for (i = 0; i < SWAP_NR_ORDERS; i++) {
+ 		INIT_LIST_HEAD(&p->nonfull_clusters[i]);
++		INIT_LIST_HEAD(&p->frag_clusters[i]);
++	}
+ 
+ 	for (i = 0; i < swap_header->info.nr_badpages; i++) {
+ 		unsigned int page_nr = swap_header->info.badpages[i];
+_
