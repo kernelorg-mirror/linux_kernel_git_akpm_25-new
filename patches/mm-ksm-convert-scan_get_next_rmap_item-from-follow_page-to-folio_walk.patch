@@ -1,0 +1,97 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/ksm: convert scan_get_next_rmap_item() from follow_page() to folio_walk
+Date: Fri, 2 Aug 2024 17:55:19 +0200
+
+Let's use folio_walk instead, for example avoiding taking temporary folio
+references if the folio does obviously not even apply and getting rid of
+one more follow_page() user.  We cannot move all handling under the PTL,
+so leave the rmap handling (which implies an allocation) out.
+
+Note that zeropages obviously don't apply: old code could just have
+specified FOLL_DUMP.  Further, we don't care about losing the secretmem
+check in follow_page(): these are never anon pages and
+vma_ksm_compatible() would never consider secretmem vmas (VM_SHARED |
+VM_MAYSHARE must be set for secretmem, see secretmem_mmap()).
+
+Link: https://lkml.kernel.org/r/20240802155524.517137-7-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Janosch Frank <frankja@linux.ibm.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/ksm.c |   38 ++++++++++++++++++++++++--------------
+ 1 file changed, 24 insertions(+), 14 deletions(-)
+
+--- a/mm/ksm.c~mm-ksm-convert-scan_get_next_rmap_item-from-follow_page-to-folio_walk
++++ a/mm/ksm.c
+@@ -2564,36 +2564,46 @@ next_mm:
+ 			ksm_scan.address = vma->vm_end;
+ 
+ 		while (ksm_scan.address < vma->vm_end) {
++			struct page *tmp_page = NULL;
++			struct folio_walk fw;
++			struct folio *folio;
++
+ 			if (ksm_test_exit(mm))
+ 				break;
+-			*page = follow_page(vma, ksm_scan.address, FOLL_GET);
+-			if (IS_ERR_OR_NULL(*page)) {
+-				ksm_scan.address += PAGE_SIZE;
+-				cond_resched();
+-				continue;
++
++			folio = folio_walk_start(&fw, vma, ksm_scan.address, 0);
++			if (folio) {
++				if (!folio_is_zone_device(folio) &&
++				     folio_test_anon(folio)) {
++					folio_get(folio);
++					tmp_page = fw.page;
++				}
++				folio_walk_end(&fw, vma);
+ 			}
+-			if (is_zone_device_page(*page))
+-				goto next_page;
+-			if (PageAnon(*page)) {
+-				flush_anon_page(vma, *page, ksm_scan.address);
+-				flush_dcache_page(*page);
++
++			if (tmp_page) {
++				flush_anon_page(vma, tmp_page, ksm_scan.address);
++				flush_dcache_page(tmp_page);
+ 				rmap_item = get_next_rmap_item(mm_slot,
+ 					ksm_scan.rmap_list, ksm_scan.address);
+ 				if (rmap_item) {
+ 					ksm_scan.rmap_list =
+ 							&rmap_item->rmap_list;
+ 
+-					if (should_skip_rmap_item(*page, rmap_item))
++					if (should_skip_rmap_item(tmp_page, rmap_item)) {
++						folio_put(folio);
+ 						goto next_page;
++					}
+ 
+ 					ksm_scan.address += PAGE_SIZE;
+-				} else
+-					put_page(*page);
++					*page = tmp_page;
++				} else {
++					folio_put(folio);
++				}
+ 				mmap_read_unlock(mm);
+ 				return rmap_item;
+ 			}
+ next_page:
+-			put_page(*page);
+ 			ksm_scan.address += PAGE_SIZE;
+ 			cond_resched();
+ 		}
+_
