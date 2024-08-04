@@ -5,46 +5,51 @@ Date: Wed, 10 Jul 2024 20:13:17 -0600
 Remove boilerplate by using a macro to choose the corresponding lock and
 handler for each folio_batch in cpu_fbatches.
 
+[yuzhao@google.com: fix "BUG: using smp_processor_id() in preemptible"]
+  Link: https://lkml.kernel.org/r/ZqNHHMiHn-9vy_II@google.com
 Link: https://lkml.kernel.org/r/20240711021317.596178-6-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Barry Song <21cnbao@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/swap.c |  107 +++++++++++++++++-----------------------------------
- 1 file changed, 37 insertions(+), 70 deletions(-)
+ mm/swap.c |  111 +++++++++++++++++-----------------------------------
+ 1 file changed, 38 insertions(+), 73 deletions(-)
 
 --- a/mm/swap.c~mm-swap-remove-boilerplate
 +++ a/mm/swap.c
-@@ -220,16 +220,45 @@ static void folio_batch_move_lru(struct
+@@ -220,16 +220,43 @@ static void folio_batch_move_lru(struct
  	folios_put(fbatch);
  }
  
 -static void folio_batch_add_and_move(struct folio_batch *fbatch,
 -		struct folio *folio, move_fn_t move_fn)
-+static void __folio_batch_add_and_move(struct folio_batch *fbatch,
++static void __folio_batch_add_and_move(struct folio_batch __percpu *fbatch,
 +		struct folio *folio, move_fn_t move_fn,
 +		bool on_lru, bool disable_irq)
  {
+-	if (folio_batch_add(fbatch, folio) && !folio_test_large(folio) &&
+-	    !lru_cache_disabled())
 +	unsigned long flags;
 +
 +	folio_get(folio);
 +
 +	if (on_lru && !folio_test_clear_lru(folio)) {
 +		folio_put(folio);
-+		return;
+ 		return;
 +	}
 +
- 	if (folio_batch_add(fbatch, folio) && !folio_test_large(folio) &&
- 	    !lru_cache_disabled())
- 		return;
- 
 +	if (disable_irq)
 +		local_lock_irqsave(&cpu_fbatches.lock_irq, flags);
 +	else
 +		local_lock(&cpu_fbatches.lock);
 +
- 	folio_batch_move_lru(fbatch, move_fn);
-+
++	if (!folio_batch_add(this_cpu_ptr(fbatch), folio) || folio_test_large(folio) ||
++	    lru_cache_disabled())
++		folio_batch_move_lru(this_cpu_ptr(fbatch), move_fn);
+ 
+-	folio_batch_move_lru(fbatch, move_fn);
 +	if (disable_irq)
 +		local_unlock_irqrestore(&cpu_fbatches.lock_irq, flags);
 +	else
@@ -53,7 +58,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 +#define folio_batch_add_and_move(folio, op, on_lru)						\
 +	__folio_batch_add_and_move(								\
-+		this_cpu_ptr(&cpu_fbatches.op),							\
++		&cpu_fbatches.op,								\
 +		folio,										\
 +		op,										\
 +		on_lru,										\
@@ -63,7 +68,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void lru_move_tail(struct lruvec *lruvec, struct folio *folio)
  {
  	if (folio_test_unevictable(folio))
-@@ -250,23 +279,11 @@ static void lru_move_tail(struct lruvec
+@@ -250,23 +277,11 @@ static void lru_move_tail(struct lruvec
   */
  void folio_rotate_reclaimable(struct folio *folio)
  {
@@ -88,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  void lru_note_cost(struct lruvec *lruvec, bool file,
-@@ -355,21 +372,10 @@ static void folio_activate_drain(int cpu
+@@ -355,21 +370,10 @@ static void folio_activate_drain(int cpu
  
  void folio_activate(struct folio *folio)
  {
@@ -111,7 +116,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  #else
-@@ -513,8 +519,6 @@ EXPORT_SYMBOL(folio_mark_accessed);
+@@ -513,8 +517,6 @@ EXPORT_SYMBOL(folio_mark_accessed);
   */
  void folio_add_lru(struct folio *folio)
  {
@@ -120,7 +125,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VM_BUG_ON_FOLIO(folio_test_active(folio) &&
  			folio_test_unevictable(folio), folio);
  	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
-@@ -524,11 +528,7 @@ void folio_add_lru(struct folio *folio)
+@@ -524,11 +526,7 @@ void folio_add_lru(struct folio *folio)
  	    lru_gen_in_fault() && !(current->flags & PF_MEMALLOC))
  		folio_set_active(folio);
  
@@ -133,7 +138,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  EXPORT_SYMBOL(folio_add_lru);
  
-@@ -702,22 +702,11 @@ void lru_add_drain_cpu(int cpu)
+@@ -702,22 +700,11 @@ void lru_add_drain_cpu(int cpu)
   */
  void deactivate_file_folio(struct folio *folio)
  {
@@ -157,7 +162,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -730,21 +719,10 @@ void deactivate_file_folio(struct folio
+@@ -730,21 +717,10 @@ void deactivate_file_folio(struct folio
   */
  void folio_deactivate(struct folio *folio)
  {
@@ -180,7 +185,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -756,22 +734,11 @@ void folio_deactivate(struct folio *foli
+@@ -756,22 +732,11 @@ void folio_deactivate(struct folio *foli
   */
  void folio_mark_lazyfree(struct folio *folio)
  {
