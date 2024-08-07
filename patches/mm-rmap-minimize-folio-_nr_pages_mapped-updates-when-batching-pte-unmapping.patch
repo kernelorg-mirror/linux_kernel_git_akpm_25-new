@@ -1,0 +1,100 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/rmap: minimize folio->_nr_pages_mapped updates when batching PTE (un)mapping
+Date: Wed, 7 Aug 2024 13:55:15 +0200
+
+It is not immediately obvious, but we can move the folio->_nr_pages_mapped
+update out of the loop and reduce the number of atomic ops without
+affecting the stats.
+
+The important point to realize is that only removing the last PMD mapping
+will result in _nr_pages_mapped going below ENTIRELY_MAPPED, not the
+individual atomic_inc_return_relaxed() calls.  Concurrent races with
+removal of PMD mappings should be handled as expected, just like when we
+would have such races right now on a single mapcount update.
+
+In a simple munmap() microbenchmark [1] on 1 GiB of memory backed by the
+same PTE-mapped folio size (only mapped by a single process such that they
+will get completely unmapped), this change results in a speedup (positive
+is good) per folio size on a x86-64 Intel machine of roughly (a bit of
+noise expected):
+
+* 16 KiB: +10%
+* 32 KiB: +15%
+* 64 KiB: +17%
+* 128 KiB: +21%
+* 256 KiB: +22%
+* 512 KiB: +22%
+* 1024 KiB: +23%
+* 2048 KiB: +27%
+
+[1] https://gitlab.com/davidhildenbrand/scratchspace/-/blob/main/pte-mapped-folio-benchmarks.c
+
+Link: https://lkml.kernel.org/r/20240807115515.1640951-1-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/rmap.c |   27 +++++++++++++--------------
+ 1 file changed, 13 insertions(+), 14 deletions(-)
+
+--- a/mm/rmap.c~mm-rmap-minimize-folio-_nr_pages_mapped-updates-when-batching-pte-unmapping
++++ a/mm/rmap.c
+@@ -1158,7 +1158,7 @@ static __always_inline unsigned int __fo
+ {
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+ 	const int orig_nr_pages = nr_pages;
+-	int first, nr = 0;
++	int first = 0, nr = 0;
+ 
+ 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+ 
+@@ -1170,13 +1170,13 @@ static __always_inline unsigned int __fo
+ 		}
+ 
+ 		do {
+-			first = atomic_inc_and_test(&page->_mapcount);
+-			if (first) {
+-				first = atomic_inc_return_relaxed(mapped);
+-				if (first < ENTIRELY_MAPPED)
+-					nr++;
+-			}
++			first += atomic_inc_and_test(&page->_mapcount);
+ 		} while (page++, --nr_pages > 0);
++
++		if (first &&
++		    atomic_add_return_relaxed(first, mapped) < ENTIRELY_MAPPED)
++			nr = first;
++
+ 		atomic_add(orig_nr_pages, &folio->_large_mapcount);
+ 		break;
+ 	case RMAP_LEVEL_PMD:
+@@ -1527,7 +1527,7 @@ static __always_inline void __folio_remo
+ 		enum rmap_level level)
+ {
+ 	atomic_t *mapped = &folio->_nr_pages_mapped;
+-	int last, nr = 0, nr_pmdmapped = 0;
++	int last = 0, nr = 0, nr_pmdmapped = 0;
+ 	bool partially_mapped = false;
+ 
+ 	__folio_rmap_sanity_checks(folio, page, nr_pages, level);
+@@ -1541,14 +1541,13 @@ static __always_inline void __folio_remo
+ 
+ 		atomic_sub(nr_pages, &folio->_large_mapcount);
+ 		do {
+-			last = atomic_add_negative(-1, &page->_mapcount);
+-			if (last) {
+-				last = atomic_dec_return_relaxed(mapped);
+-				if (last < ENTIRELY_MAPPED)
+-					nr++;
+-			}
++			last += atomic_add_negative(-1, &page->_mapcount);
+ 		} while (page++, --nr_pages > 0);
+ 
++		if (last &&
++		    atomic_sub_return_relaxed(last, mapped) < ENTIRELY_MAPPED)
++			nr = last;
++
+ 		partially_mapped = nr && atomic_read(mapped);
+ 		break;
+ 	case RMAP_LEVEL_PMD:
+_
