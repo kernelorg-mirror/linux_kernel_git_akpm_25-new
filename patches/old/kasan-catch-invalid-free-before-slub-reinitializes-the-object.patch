@@ -1,9 +1,9 @@
 From: Jann Horn <jannh@google.com>
 Subject: kasan: catch invalid free before SLUB reinitializes the object
-Date: Wed, 24 Jul 2024 18:34:12 +0200
+Date: Tue, 30 Jul 2024 13:06:03 +0200
 
 Patch series "allow KASAN to detect UAF in SLAB_TYPESAFE_BY_RCU slabs",
-v3.
+v5.
 
 The purpose of the series is to allow KASAN to detect use-after-free
 access in SLAB_TYPESAFE_BY_RCU slab caches, by essentially making them
@@ -107,22 +107,29 @@ This patch (of 2):
 Currently, when KASAN is combined with init-on-free behavior, the
 initialization happens before KASAN's "invalid free" checks.
 
-More importantly, a subsequent commit will want to use the object metadata
-region to store an rcu_head, and we should let KASAN check that the object
-pointer is valid before that.  (Otherwise that change will make the
-existing testcase kmem_cache_invalid_free fail.)
+More importantly, a subsequent commit will want to RCU-delay the actual
+SLUB freeing of an object, and we'd like KASAN to still validate
+synchronously that freeing the object is permitted.  (Otherwise this
+change will make the existing testcase kmem_cache_invalid_free fail.)
 
 So add a new KASAN hook that allows KASAN to pre-validate a
 kmem_cache_free() operation before SLUB actually starts modifying the
 object or its metadata.
 
-Link: https://lkml.kernel.org/r/20240725-kasan-tsbrcu-v3-0-51c92f8f1101@google.com
-Link: https://lkml.kernel.org/r/20240724-kasan-tsbrcu-v2-0-45f898064468@google.com
-Link: https://lkml.kernel.org/r/20240724-kasan-tsbrcu-v2-1-45f898064468@google.com
+Inside KASAN, this:
+
+ - moves checks from poison_slab_object() into check_slab_free()
+ - moves kasan_arch_is_ready() up into callers of poison_slab_object()
+ - removes "ip" argument of poison_slab_object() and __kasan_slab_free()
+   (since those functions no longer do any reporting)
+ - renames check_slab_free() to check_slab_allocation()
+
+Link: https://lkml.kernel.org/r/20240730-kasan-tsbrcu-v5-0-48d3cbdfccc5@google.com
+Link: https://lkml.kernel.org/r/20240730-kasan-tsbrcu-v5-1-48d3cbdfccc5@google.com
 Signed-off-by: Jann Horn <jannh@google.com>
 Acked-by: Vlastimil Babka <vbabka@suse.cz>	[slub]
+Reviewed-by: Andrey Konovalov <andreyknvl@gmail.com>
 Cc: Alexander Potapenko <glider@google.com>
-Cc: Andrey Konovalov <andreyknvl@gmail.com>
 Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
 Cc: Christoph Lameter <cl@linux.com>
 Cc: David Rientjes <rientjes@google.com>
@@ -136,19 +143,33 @@ Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/kasan.h |   10 +++++++
- mm/kasan/common.c     |   51 ++++++++++++++++++++++++++++++----------
- mm/slub.c             |    7 +++++
- 3 files changed, 56 insertions(+), 12 deletions(-)
+ include/linux/kasan.h |   43 +++++++++++++++++++++++++++--
+ mm/kasan/common.c     |   59 ++++++++++++++++++++++++----------------
+ mm/slub.c             |    7 ++++
+ 3 files changed, 83 insertions(+), 26 deletions(-)
 
 --- a/include/linux/kasan.h~kasan-catch-invalid-free-before-slub-reinitializes-the-object
 +++ a/include/linux/kasan.h
-@@ -175,6 +175,16 @@ static __always_inline void * __must_che
+@@ -178,13 +178,44 @@ static __always_inline void * __must_che
  	return (void *)object;
  }
  
+-bool __kasan_slab_free(struct kmem_cache *s, void *object,
+-			unsigned long ip, bool init);
 +bool __kasan_slab_pre_free(struct kmem_cache *s, void *object,
 +			unsigned long ip);
++/**
++ * kasan_slab_pre_free - Validate a slab object freeing request.
++ * @object: Object to free.
++ *
++ * This function checks whether freeing the given object might be permitted; it
++ * checks things like whether the given object is properly aligned and not
++ * already freed.
++ *
++ * This function is only intended for use by the slab allocator.
++ *
++ * @Return true if freeing the object is known to be invalid; false otherwise.
++ */
 +static __always_inline bool kasan_slab_pre_free(struct kmem_cache *s,
 +						void *object)
 +{
@@ -157,41 +178,63 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return false;
 +}
 +
- bool __kasan_slab_free(struct kmem_cache *s, void *object,
- 			unsigned long ip, bool init);
++bool __kasan_slab_free(struct kmem_cache *s, void *object, bool init);
++/**
++ * kasan_slab_free - Possibly handle slab object freeing.
++ * @object: Object to free.
++ *
++ * This hook is called from the slab allocator to give KASAN a chance to take
++ * ownership of the object and handle its freeing.
++ * kasan_slab_pre_free() must have already been called on the same object.
++ *
++ * @Return true if KASAN took ownership of the object; false otherwise.
++ */
  static __always_inline bool kasan_slab_free(struct kmem_cache *s,
+ 						void *object, bool init)
+ {
+ 	if (kasan_enabled())
+-		return __kasan_slab_free(s, object, _RET_IP_, init);
++		return __kasan_slab_free(s, object, init);
+ 	return false;
+ }
+ 
+@@ -374,6 +405,12 @@ static inline void *kasan_init_slab_obj(
+ {
+ 	return (void *)object;
+ }
++
++static inline bool kasan_slab_pre_free(struct kmem_cache *s, void *object)
++{
++	return false;
++}
++
+ static inline bool kasan_slab_free(struct kmem_cache *s, void *object, bool init)
+ {
+ 	return false;
 --- a/mm/kasan/common.c~kasan-catch-invalid-free-before-slub-reinitializes-the-object
 +++ a/mm/kasan/common.c
-@@ -208,31 +208,52 @@ void * __must_check __kasan_init_slab_ob
+@@ -208,15 +208,12 @@ void * __must_check __kasan_init_slab_ob
  	return (void *)object;
  }
  
 -static inline bool poison_slab_object(struct kmem_cache *cache, void *object,
 -				      unsigned long ip, bool init)
-+enum free_validation_result {
-+	KASAN_FREE_IS_IGNORED,
-+	KASAN_FREE_IS_VALID,
-+	KASAN_FREE_IS_INVALID
-+};
-+
-+static enum free_validation_result check_slab_free(struct kmem_cache *cache,
-+						void *object, unsigned long ip)
++/* returns true for invalid request */
++static bool check_slab_allocation(struct kmem_cache *cache, void *object,
++				  unsigned long ip)
  {
 -	void *tagged_object;
-+	void *tagged_object = object;
- 
+-
 -	if (!kasan_arch_is_ready())
 -		return false;
-+	if (is_kfence_address(object) || !kasan_arch_is_ready())
-+		return KASAN_FREE_IS_IGNORED;
++	void *tagged_object = object;
  
 -	tagged_object = object;
  	object = kasan_reset_tag(object);
  
  	if (unlikely(nearest_obj(cache, virt_to_slab(object), object) != object)) {
- 		kasan_report_invalid_free(tagged_object, ip, KASAN_REPORT_INVALID_FREE);
--		return true;
-+		return KASAN_FREE_IS_INVALID;
+@@ -224,37 +221,46 @@ static inline bool poison_slab_object(st
+ 		return true;
  	}
  
 -	/* RCU slabs could be legally used after free within the RCU period. */
@@ -200,46 +243,76 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -
  	if (!kasan_byte_accessible(tagged_object)) {
  		kasan_report_invalid_free(tagged_object, ip, KASAN_REPORT_DOUBLE_FREE);
--		return true;
-+		return KASAN_FREE_IS_INVALID;
+ 		return true;
  	}
  
-+	return KASAN_FREE_IS_VALID;
++	return false;
 +}
 +
-+static inline bool poison_slab_object(struct kmem_cache *cache, void *object,
-+				      unsigned long ip, bool init)
++static inline void poison_slab_object(struct kmem_cache *cache, void *object,
++				      bool init)
 +{
 +	void *tagged_object = object;
-+	enum free_validation_result valid = check_slab_free(cache, object, ip);
-+
-+	if (valid == KASAN_FREE_IS_IGNORED)
-+		return false;
-+	if (valid == KASAN_FREE_IS_INVALID)
-+		return true;
 +
 +	object = kasan_reset_tag(object);
 +
 +	/* RCU slabs could be legally used after free within the RCU period. */
 +	if (unlikely(cache->flags & SLAB_TYPESAFE_BY_RCU))
-+		return false;
++		return;
 +
  	kasan_poison(object, round_up(cache->object_size, KASAN_GRANULE_SIZE),
  			KASAN_SLAB_FREE, init);
  
-@@ -242,6 +263,12 @@ static inline bool poison_slab_object(st
- 	return false;
- }
+ 	if (kasan_stack_collection_enabled())
+ 		kasan_save_free_info(cache, tagged_object);
++}
  
+-	return false;
 +bool __kasan_slab_pre_free(struct kmem_cache *cache, void *object,
 +				unsigned long ip)
 +{
-+	return check_slab_free(cache, object, ip) == KASAN_FREE_IS_INVALID;
-+}
-+
- bool __kasan_slab_free(struct kmem_cache *cache, void *object,
- 				unsigned long ip, bool init)
++	if (!kasan_arch_is_ready() || is_kfence_address(object))
++		return false;
++	return check_slab_allocation(cache, object, ip);
+ }
+ 
+-bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+-				unsigned long ip, bool init)
++bool __kasan_slab_free(struct kmem_cache *cache, void *object, bool init)
  {
+-	if (is_kfence_address(object))
++	if (!kasan_arch_is_ready() || is_kfence_address(object))
+ 		return false;
+ 
+-	/*
+-	 * If the object is buggy, do not let slab put the object onto the
+-	 * freelist. The object will thus never be allocated again and its
+-	 * metadata will never get released.
+-	 */
+-	if (poison_slab_object(cache, object, ip, init))
+-		return true;
++	poison_slab_object(cache, object, init);
+ 
+ 	/*
+ 	 * If the object is put into quarantine, do not let slab put the object
+@@ -506,9 +512,16 @@ bool __kasan_mempool_poison_object(void
+ 
+ 	if (is_kfence_address(ptr))
+ 		return false;
++	if (!kasan_arch_is_ready())
++		return true;
+ 
+ 	slab = folio_slab(folio);
+-	return !poison_slab_object(slab->slab_cache, ptr, ip, false);
++
++	if (check_slab_allocation(slab->slab_cache, ptr, ip))
++		return false;
++
++	poison_slab_object(slab->slab_cache, ptr, false);
++	return true;
+ }
+ 
+ void __kasan_mempool_unpoison_object(void *ptr, size_t size, unsigned long ip)
 --- a/mm/slub.c~kasan-catch-invalid-free-before-slub-reinitializes-the-object
 +++ a/mm/slub.c
 @@ -2227,6 +2227,13 @@ bool slab_free_hook(struct kmem_cache *s
