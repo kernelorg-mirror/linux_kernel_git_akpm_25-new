@@ -1,0 +1,256 @@
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Subject: mm: rework accept memory helpers
+Date: Fri, 9 Aug 2024 14:48:51 +0300
+
+Make accept_memory() and range_contains_unaccepted_memory() take 'start'
+and 'size' arguments instead of 'start' and 'end'.
+
+Remove accept_page(), replacing it with direct calls to accept_memory(). 
+The accept_page() name is going to be used for a different function.
+
+Link: https://lkml.kernel.org/r/20240809114854.3745464-6-kirill.shutemov@linux.intel.com
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/boot/compressed/misc.c                  |    2 -
+ arch/x86/boot/compressed/misc.h                  |    2 -
+ drivers/firmware/efi/libstub/efistub.h           |    2 -
+ drivers/firmware/efi/libstub/unaccepted_memory.c |    3 +-
+ drivers/firmware/efi/unaccepted_memory.c         |   18 ++++++------
+ include/linux/mm.h                               |   12 +++-----
+ mm/memblock.c                                    |    2 -
+ mm/mm_init.c                                     |    2 -
+ mm/page_alloc.c                                  |   19 ++-----------
+ tools/testing/memblock/internal.h                |    2 -
+ 10 files changed, 26 insertions(+), 38 deletions(-)
+
+--- a/arch/x86/boot/compressed/misc.c~mm-rework-accept-memory-helpers
++++ a/arch/x86/boot/compressed/misc.c
+@@ -511,7 +511,7 @@ asmlinkage __visible void *extract_kerne
+ 
+ 	if (init_unaccepted_memory()) {
+ 		debug_putstr("Accepting memory... ");
+-		accept_memory(__pa(output), __pa(output) + needed_size);
++		accept_memory(__pa(output), needed_size);
+ 	}
+ 
+ 	entry_offset = decompress_kernel(output, virt_addr, error);
+--- a/arch/x86/boot/compressed/misc.h~mm-rework-accept-memory-helpers
++++ a/arch/x86/boot/compressed/misc.h
+@@ -256,6 +256,6 @@ static inline bool init_unaccepted_memor
+ 
+ /* Defined in EFI stub */
+ extern struct efi_unaccepted_memory *unaccepted_table;
+-void accept_memory(phys_addr_t start, phys_addr_t end);
++void accept_memory(phys_addr_t start, unsigned long size);
+ 
+ #endif /* BOOT_COMPRESSED_MISC_H */
+--- a/drivers/firmware/efi/libstub/efistub.h~mm-rework-accept-memory-helpers
++++ a/drivers/firmware/efi/libstub/efistub.h
+@@ -1229,7 +1229,7 @@ efi_zboot_entry(efi_handle_t handle, efi
+ efi_status_t allocate_unaccepted_bitmap(__u32 nr_desc,
+ 					struct efi_boot_memmap *map);
+ void process_unaccepted_memory(u64 start, u64 end);
+-void accept_memory(phys_addr_t start, phys_addr_t end);
++void accept_memory(phys_addr_t start, unsigned long size);
+ void arch_accept_memory(phys_addr_t start, phys_addr_t end);
+ 
+ #endif
+--- a/drivers/firmware/efi/libstub/unaccepted_memory.c~mm-rework-accept-memory-helpers
++++ a/drivers/firmware/efi/libstub/unaccepted_memory.c
+@@ -177,9 +177,10 @@ void process_unaccepted_memory(u64 start
+ 		   start / unit_size, (end - start) / unit_size);
+ }
+ 
+-void accept_memory(phys_addr_t start, phys_addr_t end)
++void accept_memory(phys_addr_t start, unsigned long size)
+ {
+ 	unsigned long range_start, range_end;
++	phys_addr_t end = start + size;
+ 	unsigned long bitmap_size;
+ 	u64 unit_size;
+ 
+--- a/drivers/firmware/efi/unaccepted_memory.c~mm-rework-accept-memory-helpers
++++ a/drivers/firmware/efi/unaccepted_memory.c
+@@ -30,11 +30,12 @@ static LIST_HEAD(accepting_list);
+  *  - memory that is below phys_base;
+  *  - memory that is above the memory that addressable by the bitmap;
+  */
+-void accept_memory(phys_addr_t start, phys_addr_t end)
++void accept_memory(phys_addr_t start, unsigned long size)
+ {
+ 	struct efi_unaccepted_memory *unaccepted;
+ 	unsigned long range_start, range_end;
+ 	struct accept_range range, *entry;
++	phys_addr_t end = start + size;
+ 	unsigned long flags;
+ 	u64 unit_size;
+ 
+@@ -74,13 +75,13 @@ void accept_memory(phys_addr_t start, ph
+ 	 * "guard" page is accepted in addition to the memory that needs to be
+ 	 * used:
+ 	 *
+-	 * 1. Implicitly extend the range_contains_unaccepted_memory(start, end)
+-	 *    checks up to end+unit_size if 'end' is aligned on a unit_size
+-	 *    boundary.
++	 * 1. Implicitly extend the range_contains_unaccepted_memory(start, size)
++	 *    checks up to the next unit_size if 'start+size' is aligned on a
++	 *    unit_size boundary.
+ 	 *
+-	 * 2. Implicitly extend accept_memory(start, end) to end+unit_size if
+-	 *    'end' is aligned on a unit_size boundary. (immediately following
+-	 *    this comment)
++	 * 2. Implicitly extend accept_memory(start, size) to the next unit_size
++	 *    if 'size+end' is aligned on a unit_size boundary. (immediately
++	 *    following this comment)
+ 	 */
+ 	if (!(end % unit_size))
+ 		end += unit_size;
+@@ -156,9 +157,10 @@ retry:
+ 	spin_unlock_irqrestore(&unaccepted_memory_lock, flags);
+ }
+ 
+-bool range_contains_unaccepted_memory(phys_addr_t start, phys_addr_t end)
++bool range_contains_unaccepted_memory(phys_addr_t start, unsigned long size)
+ {
+ 	struct efi_unaccepted_memory *unaccepted;
++	phys_addr_t end = start + size;
+ 	unsigned long flags;
+ 	bool ret = false;
+ 	u64 unit_size;
+--- a/include/linux/mm.h~mm-rework-accept-memory-helpers
++++ a/include/linux/mm.h
+@@ -4062,18 +4062,18 @@ madvise_set_anon_name(struct mm_struct *
+ 
+ #ifdef CONFIG_UNACCEPTED_MEMORY
+ 
+-bool range_contains_unaccepted_memory(phys_addr_t start, phys_addr_t end);
+-void accept_memory(phys_addr_t start, phys_addr_t end);
++bool range_contains_unaccepted_memory(phys_addr_t start, unsigned long size);
++void accept_memory(phys_addr_t start, unsigned long size);
+ 
+ #else
+ 
+ static inline bool range_contains_unaccepted_memory(phys_addr_t start,
+-						    phys_addr_t end)
++						    unsigned long size)
+ {
+ 	return false;
+ }
+ 
+-static inline void accept_memory(phys_addr_t start, phys_addr_t end)
++static inline void accept_memory(phys_addr_t start, unsigned long size)
+ {
+ }
+ 
+@@ -4081,9 +4081,7 @@ static inline void accept_memory(phys_ad
+ 
+ static inline bool pfn_is_unaccepted_memory(unsigned long pfn)
+ {
+-	phys_addr_t paddr = pfn << PAGE_SHIFT;
+-
+-	return range_contains_unaccepted_memory(paddr, paddr + PAGE_SIZE);
++	return range_contains_unaccepted_memory(pfn << PAGE_SHIFT, PAGE_SIZE);
+ }
+ 
+ void vma_pgtable_walk_begin(struct vm_area_struct *vma);
+--- a/mm/memblock.c~mm-rework-accept-memory-helpers
++++ a/mm/memblock.c
+@@ -1500,7 +1500,7 @@ done:
+ 	 *
+ 	 * Accept the memory of the allocated buffer.
+ 	 */
+-	accept_memory(found, found + size);
++	accept_memory(found, size);
+ 
+ 	return found;
+ }
+--- a/mm/mm_init.c~mm-rework-accept-memory-helpers
++++ a/mm/mm_init.c
+@@ -1933,7 +1933,7 @@ static void __init deferred_free_pages(u
+ 	}
+ 
+ 	/* Accept chunks smaller than MAX_PAGE_ORDER upfront */
+-	accept_memory(PFN_PHYS(pfn), PFN_PHYS(pfn + nr_pages));
++	accept_memory(PFN_PHYS(pfn), nr_pages * PAGE_SIZE);
+ 
+ 	for (i = 0; i < nr_pages; i++, page++, pfn++) {
+ 		if (pageblock_aligned(pfn))
+--- a/mm/page_alloc.c~mm-rework-accept-memory-helpers
++++ a/mm/page_alloc.c
+@@ -286,7 +286,6 @@ EXPORT_SYMBOL(nr_online_nodes);
+ #endif
+ 
+ static bool page_contains_unaccepted(struct page *page, unsigned int order);
+-static void accept_page(struct page *page, unsigned int order);
+ static bool cond_accept_memory(struct zone *zone, unsigned int order);
+ static inline bool has_unaccepted_memory(void);
+ static bool __free_unaccepted(struct page *page);
+@@ -1268,7 +1267,7 @@ void __meminit __free_pages_core(struct
+ 		if (order == MAX_PAGE_ORDER && __free_unaccepted(page))
+ 			return;
+ 
+-		accept_page(page, order);
++		accept_memory(page_to_phys(page), PAGE_SIZE << order);
+ 	}
+ 
+ 	/*
+@@ -6941,16 +6940,8 @@ early_param("accept_memory", accept_memo
+ static bool page_contains_unaccepted(struct page *page, unsigned int order)
+ {
+ 	phys_addr_t start = page_to_phys(page);
+-	phys_addr_t end = start + (PAGE_SIZE << order);
+ 
+-	return range_contains_unaccepted_memory(start, end);
+-}
+-
+-static void accept_page(struct page *page, unsigned int order)
+-{
+-	phys_addr_t start = page_to_phys(page);
+-
+-	accept_memory(start, start + (PAGE_SIZE << order));
++	return range_contains_unaccepted_memory(start, PAGE_SIZE << order);
+ }
+ 
+ static bool try_to_accept_memory_one(struct zone *zone)
+@@ -6975,7 +6966,7 @@ static bool try_to_accept_memory_one(str
+ 	__ClearPageUnaccepted(page);
+ 	spin_unlock_irqrestore(&zone->lock, flags);
+ 
+-	accept_page(page, MAX_PAGE_ORDER);
++	accept_memory(page_to_phys(page), PAGE_SIZE << MAX_PAGE_ORDER);
+ 
+ 	__free_pages_ok(page, MAX_PAGE_ORDER, FPI_TO_TAIL);
+ 
+@@ -7047,10 +7038,6 @@ static bool page_contains_unaccepted(str
+ 	return false;
+ }
+ 
+-static void accept_page(struct page *page, unsigned int order)
+-{
+-}
+-
+ static bool cond_accept_memory(struct zone *zone, unsigned int order)
+ {
+ 	return false;
+--- a/tools/testing/memblock/internal.h~mm-rework-accept-memory-helpers
++++ a/tools/testing/memblock/internal.h
+@@ -20,7 +20,7 @@ void memblock_free_pages(struct page *pa
+ {
+ }
+ 
+-static inline void accept_memory(phys_addr_t start, phys_addr_t end)
++static inline void accept_memory(phys_addr_t start, unsigned long size)
+ {
+ }
+ 
+_
