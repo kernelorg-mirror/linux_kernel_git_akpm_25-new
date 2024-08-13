@@ -1,0 +1,165 @@
+From: Takaya Saeki <takayas@chromium.org>
+Subject: filemap: add trace events for get_pages, map_pages, and fault
+Date: Tue, 13 Aug 2024 10:03:12 +0000
+
+To allow precise tracking of page caches accessed, add new tracepoints
+that trigger when a process actually accesses them.
+
+The ureadahead program used by ChromeOS traces the disk access of programs
+as they start up at boot up.  It uses mincore(2) or the
+'mm_filemap_add_to_page_cache' trace event to accomplish this.  It stores
+this information in a "pack" file and on subsequent boots, it will read
+the pack file and call readahead(2) on the information so that disk
+storage can be loaded into RAM before the applications actually need it.
+
+A problem we see is that due to the kernel's readahead algorithm that can
+aggressively pull in more data than needed (to try and accomplish the same
+goal) and this data is also recorded.  The end result is that the pack
+file contains a lot of pages on disk that are never actually used. 
+Calling readahead(2) on these unused pages can slow down the system boot
+up times.
+
+To solve this, add 3 new trace events, get_pages, map_pages, and fault. 
+These will be used to trace the pages are not only pulled in from disk,
+but are actually used by the application.  Only those pages will be stored
+in the pack file, and this helps out the performance of boot up.
+
+With the combination of these 3 new trace events and
+mm_filemap_add_to_page_cache, we observed a reduction in the pack file by
+7.3% - 20% on ChromeOS varying by device.
+
+Link: https://lkml.kernel.org/r/20240813100312.3930505-1-takayas@chromium.org
+Signed-off-by: Takaya Saeki <takayas@chromium.org>
+Reviewed-by: Masami Hiramatsu (Google) <mhiramat@kernel.org>
+Reviewed-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+Cc: Junichi Uekawa <uekawa@chromium.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/trace/events/filemap.h |   84 +++++++++++++++++++++++++++++++
+ mm/filemap.c                   |    4 +
+ 2 files changed, 88 insertions(+)
+
+--- a/include/trace/events/filemap.h~filemap-add-trace-events-for-get_pages-map_pages-and-fault
++++ a/include/trace/events/filemap.h
+@@ -56,6 +56,90 @@ DEFINE_EVENT(mm_filemap_op_page_cache, m
+ 	TP_ARGS(folio)
+ 	);
+ 
++DECLARE_EVENT_CLASS(mm_filemap_op_page_cache_range,
++
++	TP_PROTO(
++		struct address_space *mapping,
++		pgoff_t index,
++		pgoff_t last_index
++	),
++
++	TP_ARGS(mapping, index, last_index),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, i_ino)
++		__field(dev_t, s_dev)
++		__field(unsigned long, index)
++		__field(unsigned long, last_index)
++	),
++
++	TP_fast_assign(
++		__entry->i_ino = mapping->host->i_ino;
++		if (mapping->host->i_sb)
++			__entry->s_dev =
++				mapping->host->i_sb->s_dev;
++		else
++			__entry->s_dev = mapping->host->i_rdev;
++		__entry->index = index;
++		__entry->last_index = last_index;
++	),
++
++	TP_printk(
++		"dev=%d:%d ino=%lx ofs=%lld-%lld",
++		MAJOR(__entry->s_dev),
++		MINOR(__entry->s_dev), __entry->i_ino,
++		((loff_t)__entry->index) << PAGE_SHIFT,
++		((((loff_t)__entry->last_index + 1) << PAGE_SHIFT) - 1)
++	)
++);
++
++DEFINE_EVENT(mm_filemap_op_page_cache_range, mm_filemap_get_pages,
++	TP_PROTO(
++		struct address_space *mapping,
++		pgoff_t index,
++		pgoff_t last_index
++	),
++	TP_ARGS(mapping, index, last_index)
++);
++
++DEFINE_EVENT(mm_filemap_op_page_cache_range, mm_filemap_map_pages,
++	TP_PROTO(
++		struct address_space *mapping,
++		pgoff_t index,
++		pgoff_t last_index
++	),
++	TP_ARGS(mapping, index, last_index)
++);
++
++TRACE_EVENT(mm_filemap_fault,
++	TP_PROTO(struct address_space *mapping, pgoff_t index),
++
++	TP_ARGS(mapping, index),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, i_ino)
++		__field(dev_t, s_dev)
++		__field(unsigned long, index)
++	),
++
++	TP_fast_assign(
++		__entry->i_ino = mapping->host->i_ino;
++		if (mapping->host->i_sb)
++			__entry->s_dev =
++				mapping->host->i_sb->s_dev;
++		else
++			__entry->s_dev = mapping->host->i_rdev;
++		__entry->index = index;
++	),
++
++	TP_printk(
++		"dev=%d:%d ino=%lx ofs=%lld",
++		MAJOR(__entry->s_dev),
++		MINOR(__entry->s_dev), __entry->i_ino,
++		((loff_t)__entry->index) << PAGE_SHIFT
++	)
++);
++
+ TRACE_EVENT(filemap_set_wb_err,
+ 		TP_PROTO(struct address_space *mapping, errseq_t eseq),
+ 
+--- a/mm/filemap.c~filemap-add-trace-events-for-get_pages-map_pages-and-fault
++++ a/mm/filemap.c
+@@ -2552,6 +2552,7 @@ retry:
+ 			goto err;
+ 	}
+ 
++	trace_mm_filemap_get_pages(mapping, index, last_index);
+ 	return 0;
+ err:
+ 	if (err < 0)
+@@ -3283,6 +3284,8 @@ vm_fault_t filemap_fault(struct vm_fault
+ 	if (unlikely(index >= max_idx))
+ 		return VM_FAULT_SIGBUS;
+ 
++	trace_mm_filemap_fault(mapping, index);
++
+ 	/*
+ 	 * Do we have something in the page cache already?
+ 	 */
+@@ -3649,6 +3652,7 @@ vm_fault_t filemap_map_pages(struct vm_f
+ 	} while ((folio = next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+ 	add_mm_counter(vma->vm_mm, folio_type, rss);
+ 	pte_unmap_unlock(vmf->pte, vmf->ptl);
++	trace_mm_filemap_map_pages(mapping, start_pgoff, end_pgoff);
+ out:
+ 	rcu_read_unlock();
+ 
+_
