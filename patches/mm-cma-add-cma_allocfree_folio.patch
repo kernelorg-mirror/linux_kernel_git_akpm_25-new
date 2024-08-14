@@ -1,0 +1,137 @@
+From: Yu Zhao <yuzhao@google.com>
+Subject: mm/cma: add cma_{alloc,free}_folio()
+Date: Tue, 13 Aug 2024 21:54:50 -0600
+
+With alloc_contig_range() and free_contig_range() supporting large folios,
+CMA can allocate and free large folios too, by cma_alloc_folio() and
+cma_free_folio().
+
+Link: https://lkml.kernel.org/r/20240814035451.773331-3-yuzhao@google.com
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+Cc: Frank van der Linden <fvdl@google.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/cma.h |   16 ++++++++++++
+ mm/cma.c            |   55 ++++++++++++++++++++++++++++++------------
+ 2 files changed, 56 insertions(+), 15 deletions(-)
+
+--- a/include/linux/cma.h~mm-cma-add-cma_allocfree_folio
++++ a/include/linux/cma.h
+@@ -52,4 +52,20 @@ extern bool cma_release(struct cma *cma,
+ extern int cma_for_each_area(int (*it)(struct cma *cma, void *data), void *data);
+ 
+ extern void cma_reserve_pages_on_error(struct cma *cma);
++
++#ifdef CONFIG_CMA
++struct folio *cma_alloc_folio(struct cma *cma, int order, gfp_t gfp);
++bool cma_free_folio(struct cma *cma, const struct folio *folio);
++#else
++static inline struct folio *cma_alloc_folio(struct cma *cma, int order, gfp_t gfp)
++{
++	return NULL;
++}
++
++static inline bool cma_free_folio(struct cma *cma, const struct folio *folio)
++{
++	return false;
++}
++#endif
++
+ #endif
+--- a/mm/cma.c~mm-cma-add-cma_allocfree_folio
++++ a/mm/cma.c
+@@ -403,18 +403,8 @@ static void cma_debug_show_areas(struct
+ 	spin_unlock_irq(&cma->lock);
+ }
+ 
+-/**
+- * cma_alloc() - allocate pages from contiguous area
+- * @cma:   Contiguous memory region for which the allocation is performed.
+- * @count: Requested number of pages.
+- * @align: Requested alignment of pages (in PAGE_SIZE order).
+- * @no_warn: Avoid printing message about failed allocation
+- *
+- * This function allocates part of contiguous memory on specific
+- * contiguous memory area.
+- */
+-struct page *cma_alloc(struct cma *cma, unsigned long count,
+-		       unsigned int align, bool no_warn)
++static struct page *__cma_alloc(struct cma *cma, unsigned long count,
++				unsigned int align, gfp_t gfp)
+ {
+ 	unsigned long mask, offset;
+ 	unsigned long pfn = -1;
+@@ -463,8 +453,7 @@ struct page *cma_alloc(struct cma *cma,
+ 
+ 		pfn = cma->base_pfn + (bitmap_no << cma->order_per_bit);
+ 		mutex_lock(&cma_mutex);
+-		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA,
+-				     GFP_KERNEL | (no_warn ? __GFP_NOWARN : 0));
++		ret = alloc_contig_range(pfn, pfn + count, MIGRATE_CMA, gfp);
+ 		mutex_unlock(&cma_mutex);
+ 		if (ret == 0) {
+ 			page = pfn_to_page(pfn);
+@@ -494,7 +483,7 @@ struct page *cma_alloc(struct cma *cma,
+ 			page_kasan_tag_reset(nth_page(page, i));
+ 	}
+ 
+-	if (ret && !no_warn) {
++	if (ret && !(gfp & __GFP_NOWARN)) {
+ 		pr_err_ratelimited("%s: %s: alloc failed, req-size: %lu pages, ret: %d\n",
+ 				   __func__, cma->name, count, ret);
+ 		cma_debug_show_areas(cma);
+@@ -513,6 +502,34 @@ struct page *cma_alloc(struct cma *cma,
+ 	return page;
+ }
+ 
++/**
++ * cma_alloc() - allocate pages from contiguous area
++ * @cma:   Contiguous memory region for which the allocation is performed.
++ * @count: Requested number of pages.
++ * @align: Requested alignment of pages (in PAGE_SIZE order).
++ * @no_warn: Avoid printing message about failed allocation
++ *
++ * This function allocates part of contiguous memory on specific
++ * contiguous memory area.
++ */
++struct page *cma_alloc(struct cma *cma, unsigned long count,
++		       unsigned int align, bool no_warn)
++{
++	return __cma_alloc(cma, count, align, GFP_KERNEL | (no_warn ? __GFP_NOWARN : 0));
++}
++
++struct folio *cma_alloc_folio(struct cma *cma, int order, gfp_t gfp)
++{
++	struct page *page;
++
++	if (WARN_ON(!order || !(gfp | __GFP_COMP)))
++		return NULL;
++
++	page = __cma_alloc(cma, 1 << order, order, gfp);
++
++	return page ? page_folio(page) : NULL;
++}
++
+ bool cma_pages_valid(struct cma *cma, const struct page *pages,
+ 		     unsigned long count)
+ {
+@@ -564,6 +581,14 @@ bool cma_release(struct cma *cma, const
+ 	return true;
+ }
+ 
++bool cma_free_folio(struct cma *cma, const struct folio *folio)
++{
++	if (WARN_ON(!folio_test_large(folio)))
++		return false;
++
++	return cma_release(cma, &folio->page, folio_nr_pages(folio));
++}
++
+ int cma_for_each_area(int (*it)(struct cma *cma, void *data), void *data)
+ {
+ 	int i;
+_
