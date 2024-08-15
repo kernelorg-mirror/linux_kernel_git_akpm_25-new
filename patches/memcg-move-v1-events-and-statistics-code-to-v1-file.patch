@@ -1,0 +1,179 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: memcg: move v1 events and statistics code to v1 file
+Date: Wed, 14 Aug 2024 22:04:50 -0700
+
+Currently the common code path for charge commit, swapout and batched
+uncharge are executing v1 only code which is completely useless for the v2
+deployments where CONFIG_MEMCG_V1 is disabled.  In addition, it is mucking
+with IRQs which might be slow on some architectures.  Let's move all of
+this code to v1 only code and remove them from v2 only deployments.
+
+Link: https://lkml.kernel.org/r/20240815050453.1298138-5-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: T.J. Mercier <tjmercier@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol-v1.c |   37 +++++++++++++++++++++++++++++++++++++
+ mm/memcontrol-v1.h |   14 ++++++++++++++
+ mm/memcontrol.c    |   33 ++++-----------------------------
+ 3 files changed, 55 insertions(+), 29 deletions(-)
+
+--- a/mm/memcontrol.c~memcg-move-v1-events-and-statistics-code-to-v1-file
++++ a/mm/memcontrol.c
+@@ -2396,11 +2396,7 @@ void mem_cgroup_commit_charge(struct fol
+ {
+ 	css_get(&memcg->css);
+ 	commit_charge(folio, memcg);
+-
+-	local_irq_disable();
+-	memcg1_charge_statistics(memcg, folio_nr_pages(folio));
+-	memcg1_check_events(memcg, folio_nid(folio));
+-	local_irq_enable();
++	memcg1_commit_charge(folio, memcg);
+ }
+ 
+ static inline void __mod_objcg_mlstate(struct obj_cgroup *objcg,
+@@ -4622,8 +4618,6 @@ static inline void uncharge_gather_clear
+ 
+ static void uncharge_batch(const struct uncharge_gather *ug)
+ {
+-	unsigned long flags;
+-
+ 	if (ug->nr_memory) {
+ 		page_counter_uncharge(&ug->memcg->memory, ug->nr_memory);
+ 		if (do_memsw_account())
+@@ -4635,11 +4629,7 @@ static void uncharge_batch(const struct
+ 		memcg1_oom_recover(ug->memcg);
+ 	}
+ 
+-	local_irq_save(flags);
+-	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
+-	__this_cpu_add(ug->memcg->events_percpu->nr_page_events, ug->nr_memory);
+-	memcg1_check_events(ug->memcg, ug->nid);
+-	local_irq_restore(flags);
++	memcg1_uncharge_batch(ug->memcg, ug->pgpgout, ug->nr_memory, ug->nid);
+ 
+ 	/* drop reference from uncharge_folio */
+ 	css_put(&ug->memcg->css);
+@@ -4747,7 +4737,6 @@ void mem_cgroup_replace_folio(struct fol
+ {
+ 	struct mem_cgroup *memcg;
+ 	long nr_pages = folio_nr_pages(new);
+-	unsigned long flags;
+ 
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+ 	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+@@ -4775,11 +4764,7 @@ void mem_cgroup_replace_folio(struct fol
+ 
+ 	css_get(&memcg->css);
+ 	commit_charge(new, memcg);
+-
+-	local_irq_save(flags);
+-	memcg1_charge_statistics(memcg, nr_pages);
+-	memcg1_check_events(memcg, folio_nid(new));
+-	local_irq_restore(flags);
++	memcg1_commit_charge(new, memcg);
+ }
+ 
+ /**
+@@ -5015,17 +5000,7 @@ void mem_cgroup_swapout(struct folio *fo
+ 		page_counter_uncharge(&memcg->memsw, nr_entries);
+ 	}
+ 
+-	/*
+-	 * Interrupts should be disabled here because the caller holds the
+-	 * i_pages lock which is taken with interrupts-off. It is
+-	 * important here to have the interrupts disabled because it is the
+-	 * only synchronisation we have for updating the per-CPU variables.
+-	 */
+-	memcg_stats_lock();
+-	memcg1_charge_statistics(memcg, -nr_entries);
+-	memcg_stats_unlock();
+-	memcg1_check_events(memcg, folio_nid(folio));
+-
++	memcg1_swapout(folio, memcg);
+ 	css_put(&memcg->css);
+ }
+ 
+--- a/mm/memcontrol-v1.c~memcg-move-v1-events-and-statistics-code-to-v1-file
++++ a/mm/memcontrol-v1.c
+@@ -1502,6 +1502,43 @@ void memcg1_check_events(struct mem_cgro
+ 	}
+ }
+ 
++void memcg1_commit_charge(struct folio *folio, struct mem_cgroup *memcg)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	memcg1_charge_statistics(memcg, folio_nr_pages(folio));
++	memcg1_check_events(memcg, folio_nid(folio));
++	local_irq_restore(flags);
++}
++
++void memcg1_swapout(struct folio *folio, struct mem_cgroup *memcg)
++{
++	/*
++	 * Interrupts should be disabled here because the caller holds the
++	 * i_pages lock which is taken with interrupts-off. It is
++	 * important here to have the interrupts disabled because it is the
++	 * only synchronisation we have for updating the per-CPU variables.
++	 */
++	preempt_disable_nested();
++	VM_WARN_ON_IRQS_ENABLED();
++	memcg1_charge_statistics(memcg, -folio_nr_pages(folio));
++	preempt_enable_nested();
++	memcg1_check_events(memcg, folio_nid(folio));
++}
++
++void memcg1_uncharge_batch(struct mem_cgroup *memcg, unsigned long pgpgout,
++			   unsigned long nr_memory, int nid)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	__count_memcg_events(memcg, PGPGOUT, pgpgout);
++	__this_cpu_add(memcg->events_percpu->nr_page_events, nr_memory);
++	memcg1_check_events(memcg, nid);
++	local_irq_restore(flags);
++}
++
+ static int compare_thresholds(const void *a, const void *b)
+ {
+ 	const struct mem_cgroup_threshold *_a = a;
+--- a/mm/memcontrol-v1.h~memcg-move-v1-events-and-statistics-code-to-v1-file
++++ a/mm/memcontrol-v1.h
+@@ -118,6 +118,11 @@ void memcg1_oom_recover(struct mem_cgrou
+ void memcg1_charge_statistics(struct mem_cgroup *memcg, int nr_pages);
+ void memcg1_check_events(struct mem_cgroup *memcg, int nid);
+ 
++void memcg1_commit_charge(struct folio *folio, struct mem_cgroup *memcg);
++void memcg1_swapout(struct folio *folio, struct mem_cgroup *memcg);
++void memcg1_uncharge_batch(struct mem_cgroup *memcg, unsigned long pgpgout,
++			   unsigned long nr_memory, int nid);
++
+ void memcg1_stat_format(struct mem_cgroup *memcg, struct seq_buf *s);
+ 
+ void memcg1_account_kmem(struct mem_cgroup *memcg, int nr_pages);
+@@ -150,6 +155,15 @@ static inline void memcg1_oom_recover(st
+ static inline void memcg1_charge_statistics(struct mem_cgroup *memcg, int nr_pages) {}
+ static inline void memcg1_check_events(struct mem_cgroup *memcg, int nid) {}
+ 
++static inline void memcg1_commit_charge(struct folio *folio,
++					struct mem_cgroup *memcg) {}
++
++static inline void memcg1_swapout(struct folio *folio, struct mem_cgroup *memcg) {}
++
++static inline void memcg1_uncharge_batch(struct mem_cgroup *memcg,
++					 unsigned long pgpgout,
++					 unsigned long nr_memory, int nid) {}
++
+ static inline void memcg1_stat_format(struct mem_cgroup *memcg, struct seq_buf *s) {}
+ 
+ static inline void memcg1_account_kmem(struct mem_cgroup *memcg, int nr_pages) {}
+_
