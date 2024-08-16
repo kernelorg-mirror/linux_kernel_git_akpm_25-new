@@ -1,6 +1,6 @@
 From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
-Subject: mm: fix endless reclaim on machines with unaccepted memory.
-Date: Tue, 16 Jul 2024 16:00:13 +0300
+Subject: mm: fix endless reclaim on machines with unaccepted memory
+Date: Fri, 9 Aug 2024 14:48:47 +0300
 
 Unaccepted memory is considered unusable free memory, which is not counted
 as free on the zone watermark check.  This causes get_page_from_freelist()
@@ -14,131 +14,140 @@ progress.  This can occur early in the boot process, just after start of
 the init process when the only reclaimable memory is the page cache of the
 init executable and its libraries.
 
-To address this issue, teach shrink_node() and shrink_zones() to accept
-memory before attempting to reclaim.
+Make unaccepted memory free from watermark check point of view.  This way
+unaccepted memory will never be the trigger of memory reclaim.  Accept
+more memory in the get_page_from_freelist() if needed.
 
-Link: https://lkml.kernel.org/r/20240716130013.1997325-1-kirill.shutemov@linux.intel.com
+Link: https://lkml.kernel.org/r/20240809114854.3745464-2-kirill.shutemov@linux.intel.com
 Fixes: dcdfdd40fa82 ("mm: Add support for unaccepted memory")
 Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
 Reported-by: Jianxiong Gao <jxgao@google.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Tested-by: Jianxiong Gao <jxgao@google.com>
-Cc: Borislav Petkov (AMD) <bp@alien8.de>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mel Gorman <mgorman@suse.de>
-Cc: Mike Rapoport (IBM) <rppt@kernel.org>
+Cc: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Cc: Tom Lendacky <thomas.lendacky@amd.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: <stable@vger.kernel.org>	[6.5+]
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/internal.h   |    9 +++++++++
- mm/page_alloc.c |    8 +-------
- mm/vmscan.c     |   36 ++++++++++++++++++++++++++++++++++++
- 3 files changed, 46 insertions(+), 7 deletions(-)
+ mm/page_alloc.c |   42 ++++++++++++++++++++----------------------
+ 1 file changed, 20 insertions(+), 22 deletions(-)
 
---- a/mm/internal.h~mm-fix-endless-reclaim-on-machines-with-unaccepted-memory
-+++ a/mm/internal.h
-@@ -1432,4 +1432,13 @@ unsigned long move_page_tables(struct vm
- 	unsigned long new_addr, unsigned long len,
- 	bool need_rmap_locks, bool for_stack);
- 
-+#ifdef CONFIG_UNACCEPTED_MEMORY
-+bool try_to_accept_memory(struct zone *zone, unsigned int order);
-+#else
-+static inline bool try_to_accept_memory(struct zone *zone, unsigned int order)
-+{
-+	return false;
-+}
-+#endif /* CONFIG_UNACCEPTED_MEMORY */
-+
- #endif	/* __MM_INTERNAL_H */
 --- a/mm/page_alloc.c~mm-fix-endless-reclaim-on-machines-with-unaccepted-memory
 +++ a/mm/page_alloc.c
-@@ -287,7 +287,6 @@ EXPORT_SYMBOL(nr_online_nodes);
+@@ -287,7 +287,7 @@ EXPORT_SYMBOL(nr_online_nodes);
  
  static bool page_contains_unaccepted(struct page *page, unsigned int order);
  static void accept_page(struct page *page, unsigned int order);
 -static bool try_to_accept_memory(struct zone *zone, unsigned int order);
++static bool cond_accept_memory(struct zone *zone, unsigned int order);
  static inline bool has_unaccepted_memory(void);
  static bool __free_unaccepted(struct page *page);
  
-@@ -6980,7 +6979,7 @@ static bool try_to_accept_memory_one(str
+@@ -3072,9 +3072,6 @@ static inline long __zone_watermark_unus
+ 	if (!(alloc_flags & ALLOC_CMA))
+ 		unusable_free += zone_page_state(z, NR_FREE_CMA_PAGES);
+ #endif
+-#ifdef CONFIG_UNACCEPTED_MEMORY
+-	unusable_free += zone_page_state(z, NR_UNACCEPTED);
+-#endif
+ 
+ 	return unusable_free;
+ }
+@@ -3368,6 +3365,8 @@ retry:
+ 			}
+ 		}
+ 
++		cond_accept_memory(zone, order);
++
+ 		/*
+ 		 * Detect whether the number of free pages is below high
+ 		 * watermark.  If so, we will decrease pcp->high and free
+@@ -3393,10 +3392,8 @@ check_alloc_wmark:
+ 				       gfp_mask)) {
+ 			int ret;
+ 
+-			if (has_unaccepted_memory()) {
+-				if (try_to_accept_memory(zone, order))
+-					goto try_this_zone;
+-			}
++			if (cond_accept_memory(zone, order))
++				goto try_this_zone;
+ 
+ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+ 			/*
+@@ -3450,10 +3447,8 @@ try_this_zone:
+ 
+ 			return page;
+ 		} else {
+-			if (has_unaccepted_memory()) {
+-				if (try_to_accept_memory(zone, order))
+-					goto try_this_zone;
+-			}
++			if (cond_accept_memory(zone, order))
++				goto try_this_zone;
+ 
+ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+ 			/* Try again if zone has deferred pages */
+@@ -6950,9 +6945,6 @@ static bool try_to_accept_memory_one(str
+ 	struct page *page;
+ 	bool last;
+ 
+-	if (list_empty(&zone->unaccepted_pages))
+-		return false;
+-
+ 	spin_lock_irqsave(&zone->lock, flags);
+ 	page = list_first_entry_or_null(&zone->unaccepted_pages,
+ 					struct page, lru);
+@@ -6978,23 +6970,29 @@ static bool try_to_accept_memory_one(str
  	return true;
  }
  
 -static bool try_to_accept_memory(struct zone *zone, unsigned int order)
-+bool try_to_accept_memory(struct zone *zone, unsigned int order)
++static bool cond_accept_memory(struct zone *zone, unsigned int order)
  {
  	long to_accept;
- 	int ret = false;
-@@ -7039,11 +7038,6 @@ static void accept_page(struct page *pag
+-	int ret = false;
++	bool ret = false;
++
++	if (!has_unaccepted_memory())
++		return false;
++
++	if (list_empty(&zone->unaccepted_pages))
++		return false;
+ 
+ 	/* How much to accept to get to high watermark? */
+ 	to_accept = high_wmark_pages(zone) -
+ 		    (zone_page_state(zone, NR_FREE_PAGES) -
+-		    __zone_watermark_unusable_free(zone, order, 0));
++		    __zone_watermark_unusable_free(zone, order, 0) -
++		    zone_page_state(zone, NR_UNACCEPTED));
+ 
+-	/* Accept at least one page */
+-	do {
++	while (to_accept > 0) {
+ 		if (!try_to_accept_memory_one(zone))
+ 			break;
+ 		ret = true;
+ 		to_accept -= MAX_ORDER_NR_PAGES;
+-	} while (to_accept > 0);
++	}
+ 
+ 	return ret;
+ }
+@@ -7037,7 +7035,7 @@ static void accept_page(struct page *pag
  {
  }
  
 -static bool try_to_accept_memory(struct zone *zone, unsigned int order)
--{
--	return false;
--}
--
- static inline bool has_unaccepted_memory(void)
++static bool cond_accept_memory(struct zone *zone, unsigned int order)
  {
  	return false;
---- a/mm/vmscan.c~mm-fix-endless-reclaim-on-machines-with-unaccepted-memory
-+++ a/mm/vmscan.c
-@@ -5947,12 +5947,44 @@ static void shrink_node_memcgs(pg_data_t
- 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
  }
- 
-+#ifdef CONFIG_UNACCEPTED_MEMORY
-+static bool node_try_to_accept_memory(pg_data_t *pgdat, struct scan_control *sc)
-+{
-+	bool progress = false;
-+	struct zone *zone;
-+	int z;
-+
-+	for (z = 0; z <= sc->reclaim_idx; z++) {
-+		zone = pgdat->node_zones + z;
-+		if (!managed_zone(zone))
-+			continue;
-+
-+		if (try_to_accept_memory(zone, sc->order))
-+			progress = true;
-+	}
-+
-+	return progress;
-+}
-+#else
-+static inline bool node_try_to_accept_memory(pg_data_t *pgdat,
-+					     struct scan_control *sc)
-+{
-+	return false;
-+}
-+#endif /* CONFIG_UNACCEPTED_MEMORY */
-+
- static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
- {
- 	unsigned long nr_reclaimed, nr_scanned, nr_node_reclaimed;
- 	struct lruvec *target_lruvec;
- 	bool reclaimable = false;
- 
-+	/* Try to accept memory before going for reclaim */
-+	if (node_try_to_accept_memory(pgdat, sc)) {
-+		if (!should_continue_reclaim(pgdat, 0, sc))
-+			return;
-+	}
-+
- 	if (lru_gen_enabled() && root_reclaim(sc)) {
- 		lru_gen_shrink_node(pgdat, sc);
- 		return;
-@@ -6165,6 +6197,10 @@ static void shrink_zones(struct zonelist
- 						 GFP_KERNEL | __GFP_HARDWALL))
- 				continue;
- 
-+			/* Try to accept memory before going for reclaim */
-+			if (try_to_accept_memory(zone, sc->order))
-+				continue;
-+
- 			/*
- 			 * If we already have plenty of memory free for
- 			 * compaction in this zone, don't free any more.
 _
