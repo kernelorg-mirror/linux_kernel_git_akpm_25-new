@@ -1,0 +1,78 @@
+From: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Subject: nilfs2: treat missing sufile header block as metadata corruption
+Date: Thu, 22 Aug 2024 00:46:23 +0900
+
+Patch series "nilfs2: prevent unexpected ENOENT propagation".
+
+This series fixes potential issues where the result code -ENOENT, which is
+returned internally when a metadata file operation encouters a hole block,
+is exposed to user space without being properly handled.
+
+Several issues with the same cause leading to hangs or WARN_ON check
+failures have been reported by syzbot and fixed each time in the past. 
+This collectively fixes the missing -ENOENT conversions that do not cause
+stability issues and are not covered by syzbot.
+
+
+This patch (of 5):
+
+The sufile, a metadata file that holds metadata for segment management,
+has statistical information in its first block, but if reading this block
+fails, it receives the internal code -ENOENT and returns it unchanged to
+the callers.
+
+To prevent this -ENOENT from being propagated to system calls, if reading
+the header block fails, return -EIO (or -EINVAL depending on the context)
+instead.
+
+Link: https://lkml.kernel.org/r/20240821154627.11848-1-konishi.ryusuke@gmail.com
+Link: https://lkml.kernel.org/r/20240821154627.11848-2-konishi.ryusuke@gmail.com
+Signed-off-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/nilfs2/sufile.c |   23 ++++++++++++++++++-----
+ 1 file changed, 18 insertions(+), 5 deletions(-)
+
+--- a/fs/nilfs2/sufile.c~nilfs2-treat-missing-sufile-header-block-as-metadata-corruption
++++ a/fs/nilfs2/sufile.c
+@@ -79,10 +79,17 @@ nilfs_sufile_block_get_segment_usage(con
+ 		NILFS_MDT(sufile)->mi_entry_size;
+ }
+ 
+-static inline int nilfs_sufile_get_header_block(struct inode *sufile,
+-						struct buffer_head **bhp)
++static int nilfs_sufile_get_header_block(struct inode *sufile,
++					 struct buffer_head **bhp)
+ {
+-	return nilfs_mdt_get_block(sufile, 0, 0, NULL, bhp);
++	int err = nilfs_mdt_get_block(sufile, 0, 0, NULL, bhp);
++
++	if (unlikely(err == -ENOENT)) {
++		nilfs_error(sufile->i_sb,
++			    "missing header block in segment usage metadata");
++		err = -EIO;
++	}
++	return err;
+ }
+ 
+ static inline int
+@@ -1237,9 +1244,15 @@ int nilfs_sufile_read(struct super_block
+ 	if (err)
+ 		goto failed;
+ 
+-	err = nilfs_sufile_get_header_block(sufile, &header_bh);
+-	if (err)
++	err = nilfs_mdt_get_block(sufile, 0, 0, NULL, &header_bh);
++	if (unlikely(err)) {
++		if (err == -ENOENT) {
++			nilfs_err(sb,
++				  "missing header block in segment usage metadata");
++			err = -EINVAL;
++		}
+ 		goto failed;
++	}
+ 
+ 	sui = NILFS_SUI(sufile);
+ 	kaddr = kmap_local_page(header_bh->b_page);
+_
