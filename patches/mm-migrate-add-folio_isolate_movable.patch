@@ -1,0 +1,134 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: mm: migrate: add folio_isolate_movable()
+Date: Mon, 26 Aug 2024 12:01:29 +0800
+
+Patch series "mm: convert to folio_isolate_movable()".
+
+Add a new helper folio_isolate_movable() and convert various sites to use
+it.  Then remove the newly-unused isolate_movable_page().
+
+
+This patch (of 4):
+
+Like isolate_lru_page(), make isolate_movable_page() as a wrapper around
+folio_isolate_movable(), since isolate_movable_page() always fails on a
+tail page, return immediately for a tail page in the warpper, and the
+wrapper will be removed once all callers are converted to
+folio_isolate_movable().
+
+Link: https://lkml.kernel.org/r/20240826040132.1202297-1-wangkefeng.wang@huawei.com
+Link: https://lkml.kernel.org/r/20240826040132.1202297-2-wangkefeng.wang@huawei.com
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/migrate.h |    4 +++
+ mm/migrate.c            |   41 ++++++++++++++++++++++----------------
+ 2 files changed, 28 insertions(+), 17 deletions(-)
+
+--- a/include/linux/migrate.h~mm-migrate-add-folio_isolate_movable
++++ a/include/linux/migrate.h
+@@ -70,6 +70,7 @@ int migrate_pages(struct list_head *l, n
+ 		  unsigned int *ret_succeeded);
+ struct folio *alloc_migration_target(struct folio *src, unsigned long private);
+ bool isolate_movable_page(struct page *page, isolate_mode_t mode);
++bool folio_isolate_movable(struct folio *folio, isolate_mode_t mode);
+ bool isolate_folio_to_list(struct folio *folio, struct list_head *list);
+ 
+ int migrate_huge_page_move_mapping(struct address_space *mapping,
+@@ -92,6 +93,9 @@ static inline struct folio *alloc_migrat
+ 	{ return NULL; }
+ static inline bool isolate_movable_page(struct page *page, isolate_mode_t mode)
+ 	{ return false; }
++static inline bool folio_isolate_movable(struct folio *folio,
++					 isolate_mode_t mode)
++	{ return false; }
+ static inline bool isolate_folio_to_list(struct folio *folio, struct list_head *list)
+ 	{ return false; }
+ 
+--- a/mm/migrate.c~mm-migrate-add-folio_isolate_movable
++++ a/mm/migrate.c
+@@ -58,21 +58,20 @@
+ 
+ #include "internal.h"
+ 
+-bool isolate_movable_page(struct page *page, isolate_mode_t mode)
++bool folio_isolate_movable(struct folio *folio, isolate_mode_t mode)
+ {
+-	struct folio *folio = folio_get_nontail_page(page);
+ 	const struct movable_operations *mops;
+ 
+ 	/*
+-	 * Avoid burning cycles with pages that are yet under __free_pages(),
++	 * Avoid burning cycles with folios that are yet under __free_pages(),
+ 	 * or just got freed under us.
+ 	 *
+-	 * In case we 'win' a race for a movable page being freed under us and
++	 * In case we 'win' a race for a movable folio being freed under us and
+ 	 * raise its refcount preventing __free_pages() from doing its job
+-	 * the put_page() at the end of this block will take care of
+-	 * release this page, thus avoiding a nasty leakage.
++	 * the folio_put() at the end of this block will take care of
++	 * release this folio, thus avoiding a nasty leakage.
+ 	 */
+-	if (!folio)
++	if (!folio_try_get(folio))
+ 		goto out;
+ 
+ 	if (unlikely(folio_test_slab(folio)))
+@@ -80,9 +79,9 @@ bool isolate_movable_page(struct page *p
+ 	/* Pairs with smp_wmb() in slab freeing, e.g. SLUB's __free_slab() */
+ 	smp_rmb();
+ 	/*
+-	 * Check movable flag before taking the page lock because
+-	 * we use non-atomic bitops on newly allocated page flags so
+-	 * unconditionally grabbing the lock ruins page's owner side.
++	 * Check movable flag before taking the folio lock because
++	 * we use non-atomic bitops on newly allocated folio flags so
++	 * unconditionally grabbing the lock ruins folio's owner side.
+ 	 */
+ 	if (unlikely(!__folio_test_movable(folio)))
+ 		goto out_putfolio;
+@@ -92,15 +91,15 @@ bool isolate_movable_page(struct page *p
+ 		goto out_putfolio;
+ 
+ 	/*
+-	 * As movable pages are not isolated from LRU lists, concurrent
+-	 * compaction threads can race against page migration functions
+-	 * as well as race against the releasing a page.
++	 * As movable folios are not isolated from LRU lists, concurrent
++	 * compaction threads can race against folio migration functions
++	 * as well as race against the releasing a folio.
+ 	 *
+-	 * In order to avoid having an already isolated movable page
++	 * In order to avoid having an already isolated movable folio
+ 	 * being (wrongly) re-isolated while it is under migration,
+-	 * or to avoid attempting to isolate pages being released,
+-	 * lets be sure we have the page lock
+-	 * before proceeding with the movable page isolation steps.
++	 * or to avoid attempting to isolate folios being released,
++	 * lets be sure we have the folio lock
++	 * before proceeding with the movable folio isolation steps.
+ 	 */
+ 	if (unlikely(!folio_trylock(folio)))
+ 		goto out_putfolio;
+@@ -129,6 +128,14 @@ out:
+ 	return false;
+ }
+ 
++bool isolate_movable_page(struct page *page, isolate_mode_t mode)
++{
++	if (PageTail(page))
++		return false;
++
++	return folio_isolate_movable((struct folio *)page, mode);
++}
++
+ static void putback_movable_folio(struct folio *folio)
+ {
+ 	const struct movable_operations *mops = folio_movable_ops(folio);
+_

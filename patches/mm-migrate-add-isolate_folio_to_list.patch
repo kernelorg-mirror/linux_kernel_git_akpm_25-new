@@ -1,0 +1,153 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: mm: migrate: add isolate_folio_to_list()
+Date: Tue, 27 Aug 2024 19:47:27 +0800
+
+Add isolate_folio_to_list() helper to try to isolate HugeTLB, no-LRU
+movable and LRU folios to a list, which will be reused by
+do_migrate_range() from memory hotplug soon, also drop the
+mf_isolate_folio() since we could directly use new helper in the
+soft_offline_in_use_page().
+
+Link: https://lkml.kernel.org/r/20240827114728.3212578-5-wangkefeng.wang@huawei.com
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Miaohe Lin <linmiaohe@huawei.com>
+Tested-by: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Dan Carpenter <dan.carpenter@linaro.org>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/migrate.h |    3 ++
+ mm/memory-failure.c     |   48 ++++++++++----------------------------
+ mm/migrate.c            |   26 ++++++++++++++++++++
+ 3 files changed, 42 insertions(+), 35 deletions(-)
+
+--- a/include/linux/migrate.h~mm-migrate-add-isolate_folio_to_list
++++ a/include/linux/migrate.h
+@@ -70,6 +70,7 @@ int migrate_pages(struct list_head *l, n
+ 		  unsigned int *ret_succeeded);
+ struct folio *alloc_migration_target(struct folio *src, unsigned long private);
+ bool isolate_movable_page(struct page *page, isolate_mode_t mode);
++bool isolate_folio_to_list(struct folio *folio, struct list_head *list);
+ 
+ int migrate_huge_page_move_mapping(struct address_space *mapping,
+ 		struct folio *dst, struct folio *src);
+@@ -91,6 +92,8 @@ static inline struct folio *alloc_migrat
+ 	{ return NULL; }
+ static inline bool isolate_movable_page(struct page *page, isolate_mode_t mode)
+ 	{ return false; }
++static inline bool isolate_folio_to_list(struct folio *folio, struct list_head *list)
++	{ return false; }
+ 
+ static inline int migrate_huge_page_move_mapping(struct address_space *mapping,
+ 				  struct folio *dst, struct folio *src)
+--- a/mm/memory-failure.c~mm-migrate-add-isolate_folio_to_list
++++ a/mm/memory-failure.c
+@@ -2652,40 +2652,6 @@ EXPORT_SYMBOL(unpoison_memory);
+ #undef pr_fmt
+ #define pr_fmt(fmt) "Soft offline: " fmt
+ 
+-static bool mf_isolate_folio(struct folio *folio, struct list_head *pagelist)
+-{
+-	bool isolated = false;
+-
+-	if (folio_test_hugetlb(folio)) {
+-		isolated = isolate_hugetlb(folio, pagelist);
+-	} else {
+-		bool lru = !__folio_test_movable(folio);
+-
+-		if (lru)
+-			isolated = folio_isolate_lru(folio);
+-		else
+-			isolated = isolate_movable_page(&folio->page,
+-							ISOLATE_UNEVICTABLE);
+-
+-		if (isolated) {
+-			list_add(&folio->lru, pagelist);
+-			if (lru)
+-				node_stat_add_folio(folio, NR_ISOLATED_ANON +
+-						    folio_is_file_lru(folio));
+-		}
+-	}
+-
+-	/*
+-	 * If we succeed to isolate the folio, we grabbed another refcount on
+-	 * the folio, so we can safely drop the one we got from get_any_page().
+-	 * If we failed to isolate the folio, it means that we cannot go further
+-	 * and we will return an error, so drop the reference we got from
+-	 * get_any_page() as well.
+-	 */
+-	folio_put(folio);
+-	return isolated;
+-}
+-
+ /*
+  * soft_offline_in_use_page handles hugetlb-pages and non-hugetlb pages.
+  * If the page is a non-dirty unmapped page-cache page, it simply invalidates.
+@@ -2698,6 +2664,7 @@ static int soft_offline_in_use_page(stru
+ 	struct folio *folio = page_folio(page);
+ 	char const *msg_page[] = {"page", "hugepage"};
+ 	bool huge = folio_test_hugetlb(folio);
++	bool isolated;
+ 	LIST_HEAD(pagelist);
+ 	struct migration_target_control mtc = {
+ 		.nid = NUMA_NO_NODE,
+@@ -2737,7 +2704,18 @@ static int soft_offline_in_use_page(stru
+ 		return 0;
+ 	}
+ 
+-	if (mf_isolate_folio(folio, &pagelist)) {
++	isolated = isolate_folio_to_list(folio, &pagelist);
++
++	/*
++	 * If we succeed to isolate the folio, we grabbed another refcount on
++	 * the folio, so we can safely drop the one we got from get_any_page().
++	 * If we failed to isolate the folio, it means that we cannot go further
++	 * and we will return an error, so drop the reference we got from
++	 * get_any_page() as well.
++	 */
++	folio_put(folio);
++
++	if (isolated) {
+ 		ret = migrate_pages(&pagelist, alloc_migration_target, NULL,
+ 			(unsigned long)&mtc, MIGRATE_SYNC, MR_MEMORY_FAILURE, NULL);
+ 		if (!ret) {
+--- a/mm/migrate.c~mm-migrate-add-isolate_folio_to_list
++++ a/mm/migrate.c
+@@ -178,6 +178,32 @@ void putback_movable_pages(struct list_h
+ 	}
+ }
+ 
++/* Must be called with an elevated refcount on the non-hugetlb folio */
++bool isolate_folio_to_list(struct folio *folio, struct list_head *list)
++{
++	bool isolated, lru;
++
++	if (folio_test_hugetlb(folio))
++		return isolate_hugetlb(folio, list);
++
++	lru = !__folio_test_movable(folio);
++	if (lru)
++		isolated = folio_isolate_lru(folio);
++	else
++		isolated = isolate_movable_page(&folio->page,
++						ISOLATE_UNEVICTABLE);
++
++	if (!isolated)
++		return false;
++
++	list_add(&folio->lru, list);
++	if (lru)
++		node_stat_add_folio(folio, NR_ISOLATED_ANON +
++				    folio_is_file_lru(folio));
++
++	return true;
++}
++
+ /*
+  * Restore a potential migration pte to a working pte entry
+  */
+_
