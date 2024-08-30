@@ -1,126 +1,147 @@
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Subject: zram: add dictionary support to lz4hc
-Date: Wed, 15 May 2024 16:12:57 +0900
+Date: Fri, 12 Jul 2024 14:18:32 +0900
 
-Support pre-trained dictionary param.  Just like lz4, lz4hc doesn't
-mandate specific format of the dictionary and zstd --train can be used to
-train a dictionary for lz4, according to [1].
+Support pre-trained dictionary param. Just like lz4,
+lz4hc doesn't mandate specific format of the dictionary
+and zstd --train can be used to train a dictionary for
+lz4, according to [1].
 
 TEST
 ====
 
-- default lz4hc
-
+*** lz4hc
 /sys/block/zram0/mm_stat
-1750315008 609010918 621006848        0 621006848        2        0    34288    34288
+1750638592 608954620 621031424        0 621031424        1        0    34288    34288
 
-- lz4hc dict=/etc/dictionary
-
+*** lz4hc dict=/home/ss/lz4-dict-amd64
 /sys/block/zram0/mm_stat
-1750319104 499629401 509485056        0 509485056        1        0    34288    34288
+1750671360 505068582 514994176        0 514994176        1        0    34278    34278
 
 [1] https://github.com/lz4/lz4/issues/557
 
-Link: https://lkml.kernel.org/r/20240515071645.1788128-21-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20240712051850.484318-22-senozhatsky@chromium.org
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 Cc: Minchan Kim <minchan@kernel.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Nick Terrell <terrelln@fb.com>
+Cc: Nitin Gupta <ngupta@vflare.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/block/zram/backend_lz4hc.c |   54 ++++++++++++++++++++++++---
- 1 file changed, 48 insertions(+), 6 deletions(-)
+ drivers/block/zram/backend_lz4hc.c |   75 ++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 7 deletions(-)
 
 --- a/drivers/block/zram/backend_lz4hc.c~zram-add-dictionary-support-to-lz4hc
 +++ a/drivers/block/zram/backend_lz4hc.c
-@@ -8,6 +8,12 @@
- struct lz4hc_ctx {
- 	void *mem;
- 	s32 level;
+@@ -5,6 +5,13 @@
+ 
+ #include "backend_lz4hc.h"
+ 
++struct lz4hc_ctx {
++	void *mem;
++
 +	LZ4_streamDecode_t *dstrm;
 +	LZ4_streamHC_t *cstrm;
++};
 +
-+	/* Shared between C/D streams */
-+	void *dict;
-+	size_t dict_sz;
- };
- 
- static int lz4hc_init_config(struct zcomp_config *config)
-@@ -26,6 +32,8 @@ static void lz4hc_destroy(void *ctx)
+ static void lz4hc_release_params(struct zcomp_params *params)
  {
- 	struct lz4hc_ctx *zctx = ctx;
+ }
+@@ -19,25 +26,67 @@ static int lz4hc_setup_params(struct zco
  
+ static void lz4hc_destroy(struct zcomp_ctx *ctx)
+ {
+-	vfree(ctx->context);
++	struct lz4hc_ctx *zctx = ctx->context;
++
++	if (!zctx)
++		return;
++
 +	kfree(zctx->dstrm);
 +	kfree(zctx->cstrm);
- 	vfree(zctx->mem);
- 	kfree(zctx);
++	vfree(zctx->mem);
++	kfree(zctx);
  }
-@@ -39,9 +47,22 @@ static void *lz4hc_create(struct zcomp_c
- 		return NULL;
  
- 	ctx->level = config->level;
--	ctx->mem = vmalloc(LZ4HC_MEM_COMPRESS);
--	if (!ctx->mem)
--		goto error;
-+	if (!config->dict) {
-+		ctx->mem = vmalloc(LZ4HC_MEM_COMPRESS);
-+		if (!ctx->mem)
+ static int lz4hc_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
+ {
+-	ctx->context = vmalloc(LZ4HC_MEM_COMPRESS);
+-	if (!ctx->context)
++	struct lz4hc_ctx *zctx;
++
++	zctx = kzalloc(sizeof(*zctx), GFP_KERNEL);
++	if (!zctx)
+ 		return -ENOMEM;
+ 
++	ctx->context = zctx;
++	if (params->dict_sz == 0) {
++		zctx->mem = vmalloc(LZ4HC_MEM_COMPRESS);
++		if (!zctx->mem)
 +			goto error;
 +	} else {
-+		ctx->dstrm = kzalloc(sizeof(*ctx->dstrm), GFP_KERNEL);
-+		if (!ctx->dstrm)
++		zctx->dstrm = kzalloc(sizeof(*zctx->dstrm), GFP_KERNEL);
++		if (!zctx->dstrm)
 +			goto error;
 +
-+		ctx->cstrm = kzalloc(sizeof(*ctx->cstrm), GFP_KERNEL);
-+		if (!ctx->cstrm)
++		zctx->cstrm = kzalloc(sizeof(*zctx->cstrm), GFP_KERNEL);
++		if (!zctx->cstrm)
 +			goto error;
-+
-+		ctx->dict = config->dict;
-+		ctx->dict_sz = config->dict_sz;
 +	}
++
+ 	return 0;
++
++error:
++	lz4hc_destroy(ctx);
++	return -EINVAL;
+ }
  
- 	return ctx;
- error:
-@@ -55,8 +76,18 @@ static int lz4hc_compress(void *ctx, con
- 	struct lz4hc_ctx *zctx = ctx;
+ static int lz4hc_compress(struct zcomp_params *params, struct zcomp_ctx *ctx,
+ 			  struct zcomp_req *req)
+ {
++	struct lz4hc_ctx *zctx = ctx->context;
  	int ret;
  
--	ret = LZ4_compress_HC(src, dst, PAGE_SIZE, *dst_len,
--			      zctx->level, zctx->mem);
+-	ret = LZ4_compress_HC(req->src, req->dst, req->src_len, req->dst_len,
+-			      params->level, ctx->context);
 +	if (!zctx->cstrm) {
-+		ret = LZ4_compress_HC(src, dst, PAGE_SIZE, *dst_len,
-+				      zctx->level, zctx->mem);
++		ret = LZ4_compress_HC(req->src, req->dst, req->src_len,
++				      req->dst_len, params->level,
++				      zctx->mem);
 +	} else {
 +		/* Cstrm needs to be reset */
-+		LZ4_resetStreamHC(zctx->cstrm, zctx->level);
-+		ret = LZ4_loadDictHC(zctx->cstrm, zctx->dict, zctx->dict_sz);
-+		if (ret != zctx->dict_sz)
++		LZ4_resetStreamHC(zctx->cstrm, params->level);
++		ret = LZ4_loadDictHC(zctx->cstrm, params->dict,
++				     params->dict_sz);
++		if (ret != params->dict_sz)
 +			return -EINVAL;
-+		ret = LZ4_compress_HC_continue(zctx->cstrm, src, dst,
-+					       PAGE_SIZE, *dst_len);
++		ret = LZ4_compress_HC_continue(zctx->cstrm, req->src, req->dst,
++					       req->src_len, req->dst_len);
 +	}
  	if (!ret)
  		return -EINVAL;
- 	*dst_len = ret;
-@@ -66,10 +97,21 @@ static int lz4hc_compress(void *ctx, con
- static int lz4hc_decompress(void *ctx, const unsigned char *src,
- 			    size_t src_len, unsigned char *dst)
+ 	req->dst_len = ret;
+@@ -47,10 +96,22 @@ static int lz4hc_compress(struct zcomp_p
+ static int lz4hc_decompress(struct zcomp_params *params, struct zcomp_ctx *ctx,
+ 			    struct zcomp_req *req)
  {
-+	struct lz4hc_ctx *zctx = ctx;
- 	int dst_len = PAGE_SIZE;
++	struct lz4hc_ctx *zctx = ctx->context;
  	int ret;
  
--	ret = LZ4_decompress_safe(src, dst, src_len, dst_len);
+-	ret = LZ4_decompress_safe(req->src, req->dst, req->src_len,
+-				  req->dst_len);
 +	if (!zctx->dstrm) {
-+		ret = LZ4_decompress_safe(src, dst, src_len, dst_len);
++		ret = LZ4_decompress_safe(req->src, req->dst, req->src_len,
++					  req->dst_len);
 +	} else {
 +		/* Dstrm needs to be reset */
-+		ret = LZ4_setStreamDecode(zctx->dstrm, zctx->dict,
-+					  zctx->dict_sz);
++		ret = LZ4_setStreamDecode(zctx->dstrm, params->dict,
++					  params->dict_sz);
 +		if (!ret)
 +			return -EINVAL;
-+		ret = LZ4_decompress_safe_continue(zctx->dstrm, src, dst,
-+						   src_len, dst_len);
++		ret = LZ4_decompress_safe_continue(zctx->dstrm, req->src,
++						   req->dst, req->src_len,
++						   req->dst_len);
 +	}
  	if (ret < 0)
  		return -EINVAL;
