@@ -17,6 +17,10 @@ See Documentation/admin-guide/mm/transhuge.rst for more details.
 Configuring the defaults at boot time is useful to allow early user space
 to take advantage of mTHP before its been configured through sysfs.
 
+[v-songbaohua@oppo.com: use get_oder() and check size is is_power_of_2]
+  Link: https://lkml.kernel.org/r/20240814224635.43272-1-21cnbao@gmail.com
+[ryan.roberts@arm.com: some minor cleanup according to David's comments]
+  Link: https://lkml.kernel.org/r/20240820105244.62703-1-21cnbao@gmail.com
 Link: https://lkml.kernel.org/r/20240814020247.67297-1-21cnbao@gmail.com
 Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
 Co-developed-by: Barry Song <v-songbaohua@oppo.com>
@@ -30,21 +34,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/admin-guide/kernel-parameters.txt |    9 +
- Documentation/admin-guide/mm/transhuge.rst      |   35 ++++-
- mm/huge_memory.c                                |   96 +++++++++++++-
- 3 files changed, 133 insertions(+), 7 deletions(-)
+ Documentation/admin-guide/mm/transhuge.rst      |   36 ++++-
+ mm/huge_memory.c                                |   98 +++++++++++++-
+ 3 files changed, 136 insertions(+), 7 deletions(-)
 
 --- a/Documentation/admin-guide/kernel-parameters.txt~mm-override-mthp-enabled-defaults-at-kernel-cmdline
 +++ a/Documentation/admin-guide/kernel-parameters.txt
-@@ -6629,6 +6629,15 @@
+@@ -6614,6 +6614,15 @@
  			<deci-seconds>: poll all this frequency
  			0: no polling (default)
  
 +	thp_anon=	[KNL]
 +			Format: <size>,<size>[KMG]:<state>;<size>-<size>[KMG]:<state>
 +			state is one of "always", "madvise", "never" or "inherit".
-+			Can be used to control the default behavior of the
-+			system with respect to anonymous transparent hugepages.
++			Control the default behavior of the system with respect
++			to anonymous transparent hugepages.
 +			Can be used multiple times for multiple anon THP sizes.
 +			See Documentation/admin-guide/mm/transhuge.rst for more
 +			details.
@@ -54,7 +58,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			marked explicitly IRQF_NO_THREAD.
 --- a/Documentation/admin-guide/mm/transhuge.rst~mm-override-mthp-enabled-defaults-at-kernel-cmdline
 +++ a/Documentation/admin-guide/mm/transhuge.rst
-@@ -284,13 +284,36 @@ that THP is shared. Exceeding the number
+@@ -284,13 +284,37 @@ that THP is shared. Exceeding the number
  
  A higher value may increase memory footprint for some workloads.
  
@@ -74,8 +78,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +Alternatively, each supported anonymous THP size can be controlled by
 +passing ``thp_anon=<size>,<size>[KMG]:<state>;<size>-<size>[KMG]:<state>``,
-+where ``<size>`` is the THP size and ``<state>`` is one of ``always``,
-+``madvise``, ``never`` or ``inherit``.
++where ``<size>`` is the THP size (must be a power of 2 of PAGE_SIZE and
++supported anonymous THP)  and ``<state>`` is one of ``always``, ``madvise``,
++``never`` or ``inherit``.
 +
 +For example, the following will set 16K, 32K, 64K THP to ``always``,
 +set 128K, 512K to ``inherit``, set 256K to ``madvise`` and 1M, 2M
@@ -103,23 +108,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  unsigned long huge_anon_orders_always __read_mostly;
  unsigned long huge_anon_orders_madvise __read_mostly;
  unsigned long huge_anon_orders_inherit __read_mostly;
-+static bool anon_orders_configured;
++static bool anon_orders_configured __initdata;
  
  unsigned long __thp_vma_allowable_orders(struct vm_area_struct *vma,
  					 unsigned long vm_flags,
-@@ -733,7 +734,10 @@ static int __init hugepage_init_sysfs(st
+@@ -649,7 +650,8 @@ static int __init hugepage_init_sysfs(st
  	 * disable all other sizes. powerpc's PMD_ORDER isn't a compile-time
  	 * constant so we have to do this here.
  	 */
 -	huge_anon_orders_inherit = BIT(PMD_ORDER);
-+	if (!anon_orders_configured) {
++	if (!anon_orders_configured)
 +		huge_anon_orders_inherit = BIT(PMD_ORDER);
-+		anon_orders_configured = true;
-+	}
  
  	*hugepage_kobj = kobject_create_and_add("transparent_hugepage", mm_kobj);
  	if (unlikely(!*hugepage_kobj)) {
-@@ -918,6 +922,96 @@ out:
+@@ -834,6 +836,100 @@ out:
  }
  __setup("transparent_hugepage=", setup_transparent_hugepage);
  
@@ -130,23 +133,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	int order;
 +
 +	size = memparse(size_str, &endptr);
-+	order = fls(size >> PAGE_SHIFT) - 1;
-+	if ((1 << order) & ~THP_ORDERS_ALL_ANON) {
-+		pr_err("invalid size %s(order %d) in thp_anon boot parameter\n",
-+			size_str, order);
-+		return -EINVAL;
-+	}
++
++	if (!is_power_of_2(size))
++		goto err;
++	order = get_order(size);
++	if (BIT(order) & ~THP_ORDERS_ALL_ANON)
++		goto err;
 +
 +	return order;
++err:
++	pr_err("invalid size %s in thp_anon boot parameter\n", size_str);
++	return -EINVAL;
 +}
 +
-+static char str_dup[PAGE_SIZE] __meminitdata;
++static char str_dup[PAGE_SIZE] __initdata;
 +static int __init setup_thp_anon(char *str)
 +{
 +	char *token, *range, *policy, *subtoken;
 +	unsigned long always, inherit, madvise;
 +	char *start_size, *end_size;
-+	int start, end;
++	int start, end, nr;
 +	char *p;
 +
 +	if (!str || strlen(str) + 1 > PAGE_SIZE)
@@ -178,22 +184,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (start < 0 || end < 0 || start > end)
 +				goto err;
 +
++			nr = end - start + 1;
 +			if (!strcmp(policy, "always")) {
-+				bitmap_set(&always, start, end - start + 1);
-+				bitmap_clear(&inherit, start, end - start + 1);
-+				bitmap_clear(&madvise, start, end - start + 1);
++				bitmap_set(&always, start, nr);
++				bitmap_clear(&inherit, start, nr);
++				bitmap_clear(&madvise, start, nr);
 +			} else if (!strcmp(policy, "madvise")) {
-+				bitmap_set(&madvise, start, end - start + 1);
-+				bitmap_clear(&inherit, start, end - start + 1);
-+				bitmap_clear(&always, start, end - start + 1);
++				bitmap_set(&madvise, start, nr);
++				bitmap_clear(&inherit, start, nr);
++				bitmap_clear(&always, start, nr);
 +			} else if (!strcmp(policy, "inherit")) {
-+				bitmap_set(&inherit, start, end - start + 1);
-+				bitmap_clear(&madvise, start, end - start + 1);
-+				bitmap_clear(&always, start, end - start + 1);
++				bitmap_set(&inherit, start, nr);
++				bitmap_clear(&madvise, start, nr);
++				bitmap_clear(&always, start, nr);
 +			} else if (!strcmp(policy, "never")) {
-+				bitmap_clear(&inherit, start, end - start + 1);
-+				bitmap_clear(&madvise, start, end - start + 1);
-+				bitmap_clear(&always, start, end - start + 1);
++				bitmap_clear(&inherit, start, nr);
++				bitmap_clear(&madvise, start, nr);
++				bitmap_clear(&always, start, nr);
 +			} else {
 +				pr_err("invalid policy %s in thp_anon boot parameter\n", policy);
 +				goto err;
@@ -208,7 +215,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return 1;
 +
 +err:
-+	pr_warn("thp_anon=%s: cannot parse, ignored\n", str);
++	pr_warn("thp_anon=%s: error parsing string, ignoring setting\n", str);
 +	return 0;
 +}
 +__setup("thp_anon=", setup_thp_anon);
