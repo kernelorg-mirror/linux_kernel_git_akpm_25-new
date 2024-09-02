@@ -6,6 +6,8 @@ Let's remove yet another follow_page() user.  Note that we have to do the
 split without holding the PTL, after folio_walk_end().  We don't care
 about losing the secretmem check in follow_page().
 
+[david@redhat.com: teach can_split_folio() that we are not holding an additional reference]
+  Link: https://lkml.kernel.org/r/c75d1c6c-8ea6-424f-853c-1ccda6c77ba2@redhat.com
 Link: https://lkml.kernel.org/r/20240802155524.517137-8-david@redhat.com
 Signed-off-by: David Hildenbrand <david@redhat.com>
 Reviewed-by: Zi Yan <ziy@nvidia.com>
@@ -23,9 +25,31 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |   18 +++++++++++-------
- 1 file changed, 11 insertions(+), 7 deletions(-)
+ include/linux/huge_mm.h |    4 ++--
+ mm/huge_memory.c        |   27 ++++++++++++++++-----------
+ mm/vmscan.c             |    2 +-
+ 3 files changed, 19 insertions(+), 14 deletions(-)
 
+--- a/include/linux/huge_mm.h~mm-huge_memory-convert-split_huge_pages_pid-from-follow_page-to-folio_walk
++++ a/include/linux/huge_mm.h
+@@ -314,7 +314,7 @@ unsigned long thp_get_unmapped_area_vmfl
+ 		unsigned long len, unsigned long pgoff, unsigned long flags,
+ 		vm_flags_t vm_flags);
+ 
+-bool can_split_folio(struct folio *folio, int *pextra_pins);
++bool can_split_folio(struct folio *folio, int caller_pins, int *pextra_pins);
+ int split_huge_page_to_list_to_order(struct page *page, struct list_head *list,
+ 		unsigned int new_order);
+ static inline int split_huge_page(struct page *page)
+@@ -470,7 +470,7 @@ thp_get_unmapped_area_vmflags(struct fil
+ }
+ 
+ static inline bool
+-can_split_folio(struct folio *folio, int *pextra_pins)
++can_split_folio(struct folio *folio, int caller_pins, int *pextra_pins)
+ {
+ 	return false;
+ }
 --- a/mm/huge_memory.c~mm-huge_memory-convert-split_huge_pages_pid-from-follow_page-to-folio_walk
 +++ a/mm/huge_memory.c
 @@ -40,6 +40,7 @@
@@ -36,7 +60,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include <asm/tlb.h>
  #include <asm/pgalloc.h>
-@@ -3504,7 +3505,7 @@ static int split_huge_pages_pid(int pid,
+@@ -3017,7 +3018,7 @@ static void __split_huge_page(struct pag
+ }
+ 
+ /* Racy check whether the huge page can be split */
+-bool can_split_folio(struct folio *folio, int *pextra_pins)
++bool can_split_folio(struct folio *folio, int caller_pins, int *pextra_pins)
+ {
+ 	int extra_pins;
+ 
+@@ -3029,7 +3030,8 @@ bool can_split_folio(struct folio *folio
+ 		extra_pins = folio_nr_pages(folio);
+ 	if (pextra_pins)
+ 		*pextra_pins = extra_pins;
+-	return folio_mapcount(folio) == folio_ref_count(folio) - extra_pins - 1;
++	return folio_mapcount(folio) == folio_ref_count(folio) - extra_pins -
++					caller_pins;
+ }
+ 
+ /*
+@@ -3197,7 +3199,7 @@ int split_huge_page_to_list_to_order(str
+ 	 * Racy check if we can split the page, before unmap_folio() will
+ 	 * split PMDs
+ 	 */
+-	if (!can_split_folio(folio, &extra_pins)) {
++	if (!can_split_folio(folio, 1, &extra_pins)) {
+ 		ret = -EAGAIN;
+ 		goto out_unlock;
+ 	}
+@@ -3504,7 +3506,7 @@ static int split_huge_pages_pid(int pid,
  	 */
  	for (addr = vaddr_start; addr < vaddr_end; addr += PAGE_SIZE) {
  		struct vm_area_struct *vma = vma_lookup(mm, addr);
@@ -45,7 +97,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		struct folio *folio;
  
  		if (!vma)
-@@ -3516,13 +3517,10 @@ static int split_huge_pages_pid(int pid,
+@@ -3516,13 +3518,10 @@ static int split_huge_pages_pid(int pid,
  			continue;
  		}
  
@@ -61,7 +113,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!is_transparent_hugepage(folio))
  			goto next;
  
-@@ -3541,13 +3539,19 @@ static int split_huge_pages_pid(int pid,
+@@ -3536,18 +3535,24 @@ static int split_huge_pages_pid(int pid,
+ 		 * can be split or not. So skip the check here.
+ 		 */
+ 		if (!folio_test_private(folio) &&
+-		    !can_split_folio(folio, NULL))
++		    !can_split_folio(folio, 0, NULL))
+ 			goto next;
  
  		if (!folio_trylock(folio))
  			goto next;
@@ -82,4 +140,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		cond_resched();
  	}
  	mmap_read_unlock(mm);
+--- a/mm/vmscan.c~mm-huge_memory-convert-split_huge_pages_pid-from-follow_page-to-folio_walk
++++ a/mm/vmscan.c
+@@ -1227,7 +1227,7 @@ retry:
+ 					goto keep_locked;
+ 				if (folio_test_large(folio)) {
+ 					/* cannot split folio, skip it */
+-					if (!can_split_folio(folio, NULL))
++					if (!can_split_folio(folio, 1, NULL))
+ 						goto activate_locked;
+ 					/*
+ 					 * Split partially mapped folios right away.
 _
