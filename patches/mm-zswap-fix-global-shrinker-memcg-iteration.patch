@@ -32,10 +32,13 @@ When the next memcg of the offlined memcg is also offline, the refcount
 stored in the iteration cursor was held until the next shrink_worker()
 run.  The cleaner must release the offline memcg recursively.
 
+[yosryahmed@google.com: make critical section more obvious, unify comments]
+  Link: https://lkml.kernel.org/r/CAJD7tkaScz+SbB90Q1d5mMD70UfM2a-J2zhXDT9sePR7Qap45Q@mail.gmail.com
 Link: https://lkml.kernel.org/r/20240731004918.33182-1-flintglass@gmail.com
 Link: https://lkml.kernel.org/r/20240731004918.33182-2-flintglass@gmail.com
 Fixes: a65b0e7607cc ("zswap: make shrinking memcg-aware")
 Signed-off-by: Takero Funaki <flintglass@gmail.com>
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
 Acked-by: Yosry Ahmed <yosryahmed@google.com>
 Reviewed-by: Chengming Zhou <chengming.zhou@linux.dev>
 Reviewed-by: Nhat Pham <nphamcs@gmail.com>
@@ -44,8 +47,8 @@ Cc: Johannes Weiner <hannes@cmpxchg.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zswap.c |   68 +++++++++++++++++++++++++++++++++------------------
- 1 file changed, 44 insertions(+), 24 deletions(-)
+ mm/zswap.c |   76 +++++++++++++++++++++++++++++++--------------------
+ 1 file changed, 47 insertions(+), 29 deletions(-)
 
 --- a/mm/zswap.c~mm-zswap-fix-global-shrinker-memcg-iteration
 +++ a/mm/zswap.c
@@ -77,7 +80,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	spin_unlock(&zswap_shrink_lock);
  }
  
-@@ -1304,43 +1317,50 @@ static void shrink_worker(struct work_st
+@@ -1304,43 +1317,48 @@ static void shrink_worker(struct work_st
  	/* Reclaim down to the accept threshold */
  	thr = zswap_accept_thr_pages();
  
@@ -100,30 +103,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * until the next run of shrink_worker().
 +	 */
  	do {
- 		spin_lock(&zswap_shrink_lock);
+-		spin_lock(&zswap_shrink_lock);
 -		zswap_next_shrink = mem_cgroup_iter(NULL, zswap_next_shrink, NULL);
 -		memcg = zswap_next_shrink;
- 
+-
  		/*
 -		 * We need to retry if we have gone through a full round trip, or if we
 -		 * got an offline memcg (or else we risk undoing the effect of the
 -		 * zswap memcg offlining cleanup callback). This is not catastrophic
 -		 * per se, but it will keep the now offlined memcg hostage for a while.
--		 *
 +		 * Start shrinking from the next memcg after zswap_next_shrink.
 +		 * When the offline cleaner has already advanced the cursor,
 +		 * advancing the cursor here overlooks one memcg, but this
 +		 * should be negligibly rare.
-+		 */
-+		do {
-+			memcg = mem_cgroup_iter(NULL, zswap_next_shrink, NULL);
-+			zswap_next_shrink = memcg;
-+		} while (memcg && !mem_cgroup_tryget_online(memcg));
-+		/*
- 		 * Note that if we got an online memcg, we will keep the extra
- 		 * reference in case the original reference obtained by mem_cgroup_iter
- 		 * is dropped by the zswap memcg offlining callback, ensuring that the
- 		 * memcg is not killed when we are reclaiming.
+ 		 *
+-		 * Note that if we got an online memcg, we will keep the extra
+-		 * reference in case the original reference obtained by mem_cgroup_iter
+-		 * is dropped by the zswap memcg offlining callback, ensuring that the
+-		 * memcg is not killed when we are reclaiming.
++		 * If we get an online memcg, keep the extra reference in case
++		 * the original one obtained by mem_cgroup_iter() is dropped by
++		 * zswap_memcg_offline_cleanup() while we are shrinking the
++		 * memcg.
  		 */
 -		if (!memcg) {
 -			spin_unlock(&zswap_shrink_lock);
@@ -138,6 +139,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			mem_cgroup_iter_break(NULL, memcg);
 -			zswap_next_shrink = NULL;
 -			spin_unlock(&zswap_shrink_lock);
++		spin_lock(&zswap_shrink_lock);
++		do {
++			memcg = mem_cgroup_iter(NULL, zswap_next_shrink, NULL);
++			zswap_next_shrink = memcg;
++		} while (memcg && !mem_cgroup_tryget_online(memcg));
 +		spin_unlock(&zswap_shrink_lock);
  
 +		if (!memcg) {
