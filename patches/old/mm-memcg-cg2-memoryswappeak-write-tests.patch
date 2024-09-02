@@ -1,6 +1,6 @@
 From: David Finkel <davidf@vimeo.com>
 Subject: mm, memcg: cg2 memory{.swap,}.peak write tests
-Date: Wed, 24 Jul 2024 12:19:42 -0400
+Date: Mon, 29 Jul 2024 10:37:43 -0400
 
 Extend two existing tests to cover extracting memory usage through the
 newly mutable memory.peak and memory.swap.peak handlers.
@@ -8,16 +8,23 @@ newly mutable memory.peak and memory.swap.peak handlers.
 In particular, make sure to exercise adding and removing watchers with
 overlapping lifetimes so the less-trivial logic gets tested.
 
-Link: https://lkml.kernel.org/r/20240724161942.3448841-3-davidf@vimeo.com
+The new/updated tests attempt to detect a lack of the write handler by
+fstat'ing the memory.peak and memory.swap.peak files and skip the tests if
+that's the case.  Additionally, skip if the file doesn't exist at all.
+
+[davidf@vimeo.com: update tests]
+  Link: https://lkml.kernel.org/r/20240730231304.761942-3-davidf@vimeo.com
+Link: https://lkml.kernel.org/r/20240729143743.34236-3-davidf@vimeo.com
 Signed-off-by: David Finkel <davidf@vimeo.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutný <mkoutny@suse.com>
 Cc: Muchun Song <muchun.song@linux.dev>
-Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Shuah Khan <shuah@kernel.org>
-Cc: Tejun Heo <tj@kernel.org>
 Cc: Waiman Long <longman@redhat.com>
 Cc: Zefan Li <lizefan.x@bytedance.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -25,8 +32,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  tools/testing/selftests/cgroup/cgroup_util.c     |   22 +
  tools/testing/selftests/cgroup/cgroup_util.h     |    2 
- tools/testing/selftests/cgroup/test_memcontrol.c |  226 ++++++++++++-
- 3 files changed, 242 insertions(+), 8 deletions(-)
+ tools/testing/selftests/cgroup/test_memcontrol.c |  264 ++++++++++++-
+ 3 files changed, 280 insertions(+), 8 deletions(-)
 
 --- a/tools/testing/selftests/cgroup/cgroup_util.c~mm-memcg-cg2-memoryswappeak-write-tests
 +++ a/tools/testing/selftests/cgroup/cgroup_util.c
@@ -82,7 +89,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		  int (*fn)(const char *cgroup, void *arg),
 --- a/tools/testing/selftests/cgroup/test_memcontrol.c~mm-memcg-cg2-memoryswappeak-write-tests
 +++ a/tools/testing/selftests/cgroup/test_memcontrol.c
-@@ -161,12 +161,12 @@ cleanup:
+@@ -161,13 +161,16 @@ cleanup:
  /*
   * This test create a memory cgroup, allocates
   * some anonymous memory and some pagecache
@@ -96,9 +103,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	long current;
 +	long current, peak, peak_reset;
  	char *memcg;
++	bool fd2_closed = false, fd3_closed = false, fd4_closed = false;
++	int peak_fd = -1, peak_fd2 = -1, peak_fd3 = -1, peak_fd4 = -1;
++	struct stat ss;
  
  	memcg = cg_name(root, "memcg_test");
-@@ -180,15 +180,108 @@ static int test_memcg_current(const char
+ 	if (!memcg)
+@@ -180,15 +183,124 @@ static int test_memcg_current(const char
  	if (current != 0)
  		goto cleanup;
  
@@ -118,22 +129,38 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * We need at least three to be closed in a different order than writes occurred to test
 +	 * the linked-list handling.
 +	 */
-+	int peak_fd = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
++	peak_fd = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
 +
-+	if (peak_fd == -1)
++	if (peak_fd == -1) {
++		if (errno == ENOENT)
++			ret = KSFT_SKIP;
++		goto cleanup;
++	}
++
++	/*
++	 * Before we try to use memory.peak's fd, try to figure out whether
++	 * this kernel supports writing to that file in the first place. (by
++	 * checking the writable bit on the file's st_mode)
++	 */
++	if (fstat(peak_fd, &ss))
 +		goto cleanup;
 +
-+	bool fd2_closed = false, fd3_closed = false, fd4_closed = false;
-+	int peak_fd2 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
++	if ((ss.st_mode & S_IWUSR) == 0) {
++		ret = KSFT_SKIP;
++		goto cleanup;
++	}
++
++	peak_fd2 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
 +
 +	if (peak_fd2 == -1)
 +		goto cleanup;
 +
-+	int peak_fd3 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
++	peak_fd3 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
 +
 +	if (peak_fd3 == -1)
 +		goto cleanup;
 +
++	/* any non-empty string resets, but make it clear */
 +	static const char reset_string[] = "reset\n";
 +
 +	peak_reset = write(peak_fd, reset_string, sizeof(reset_string));
@@ -157,7 +184,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (close(peak_fd2))
 +		goto cleanup;
 +
-+	int peak_fd4 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
++	peak_fd4 = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
 +
 +	if (peak_fd4 == -1)
 +		goto cleanup;
@@ -207,7 +234,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	cg_destroy(memcg);
  	free(memcg);
  
-@@ -817,13 +910,16 @@ cleanup:
+@@ -817,13 +929,19 @@ cleanup:
  
  /*
   * This test checks that memory.swap.max limits the amount of
@@ -222,22 +249,41 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	char *memcg;
 -	long max;
 +	long max, peak;
++	struct stat ss;
++	int swap_peak_fd = -1, mem_peak_fd = -1;
 +
-+	static const char reset_string[] = "reset\n";
++	/* any non-empty string resets */
++	static const char reset_string[] = "foobarbaz";
  
  	if (!is_swap_enabled())
  		return KSFT_SKIP;
-@@ -840,6 +936,45 @@ static int test_memcg_swap_max(const cha
+@@ -840,6 +958,61 @@ static int test_memcg_swap_max(const cha
  		goto cleanup;
  	}
  
-+	int swap_peak_fd = cg_open(memcg, "memory.swap.peak",
-+				   O_RDWR | O_APPEND | O_CLOEXEC);
++	swap_peak_fd = cg_open(memcg, "memory.swap.peak",
++			       O_RDWR | O_APPEND | O_CLOEXEC);
 +
-+	if (swap_peak_fd == -1)
++	if (swap_peak_fd == -1) {
++		if (errno == ENOENT)
++			ret = KSFT_SKIP;
++		goto cleanup;
++	}
++
++	/*
++	 * Before we try to use memory.swap.peak's fd, try to figure out
++	 * whether this kernel supports writing to that file in the first
++	 * place. (by checking the writable bit on the file's st_mode)
++	 */
++	if (fstat(swap_peak_fd, &ss))
 +		goto cleanup;
 +
-+	int mem_peak_fd = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
++	if ((ss.st_mode & S_IWUSR) == 0) {
++		ret = KSFT_SKIP;
++		goto cleanup;
++	}
++
++	mem_peak_fd = cg_open(memcg, "memory.peak", O_RDWR | O_APPEND | O_CLOEXEC);
 +
 +	if (mem_peak_fd == -1)
 +		goto cleanup;
@@ -273,7 +319,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (cg_read_strcmp(memcg, "memory.max", "max\n"))
  		goto cleanup;
  
-@@ -862,6 +997,61 @@ static int test_memcg_swap_max(const cha
+@@ -862,6 +1035,61 @@ static int test_memcg_swap_max(const cha
  	if (cg_read_key_long(memcg, "memory.events", "oom_kill ") != 1)
  		goto cleanup;
  
@@ -335,7 +381,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (cg_run(memcg, alloc_anon_50M_check_swap, (void *)MB(30)))
  		goto cleanup;
  
-@@ -869,9 +1059,29 @@ static int test_memcg_swap_max(const cha
+@@ -869,9 +1097,29 @@ static int test_memcg_swap_max(const cha
  	if (max <= 0)
  		goto cleanup;
  
@@ -358,14 +404,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	ret = KSFT_PASS;
  
  cleanup:
-+	if (close(mem_peak_fd))
++	if (mem_peak_fd != -1 && close(mem_peak_fd))
 +		ret = KSFT_FAIL;
-+	if (close(swap_peak_fd))
++	if (swap_peak_fd != -1 && close(swap_peak_fd))
 +		ret = KSFT_FAIL;
  	cg_destroy(memcg);
  	free(memcg);
  
-@@ -1295,7 +1505,7 @@ struct memcg_test {
+@@ -1295,7 +1543,7 @@ struct memcg_test {
  	const char *name;
  } tests[] = {
  	T(test_memcg_subtree_control),
@@ -374,7 +420,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	T(test_memcg_min),
  	T(test_memcg_low),
  	T(test_memcg_high),
-@@ -1303,7 +1513,7 @@ struct memcg_test {
+@@ -1303,7 +1551,7 @@ struct memcg_test {
  	T(test_memcg_max),
  	T(test_memcg_reclaim),
  	T(test_memcg_oom_events),

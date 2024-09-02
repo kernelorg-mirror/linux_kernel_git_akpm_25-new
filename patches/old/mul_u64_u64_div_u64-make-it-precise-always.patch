@@ -1,24 +1,12 @@
 From: Nicolas Pitre <npitre@baylibre.com>
 Subject: mul_u64_u64_div_u64: make it precise always
-Date: Tue, 2 Jul 2024 23:34:08 -0400
+Date: Sun, 7 Jul 2024 15:05:19 -0400
 
-Patch series "mul_u64_u64_div_u64: new implementation", v2.
+Patch series "mul_u64_u64_div_u64: new implementation", v3.
 
 This provides an implementation for mul_u64_u64_div_u64() that always
 produces exact results.
 
-Uwe said:
-
-: I became aware of mul_u64_u64_div_u64() being only an approximation while
-: reviewing a pwm driver by Biju Das:
-: 
-: https://lore.kernel.org/linux-pwm/TYCPR01MB1126992DD51F714AEDADF0A4F868DA@TYCPR01MB11269.jpnprd01.prod.outlook.com
-: 
-: mul_u64_u64_div_u64 is used in various pwm drivers, but in practice the
-: periods used are small enough to not be problematic for the status quo
-: implementation since commit 8c86fb68ffcb ("mul_u64_u64_div_u64: increase
-: precision by conditionally swapping a and b").  At least I think Biju only
-: hit this problem during testing, and not in a real world application.
 
 This patch (of 2):
 
@@ -26,8 +14,8 @@ Library facilities must always return exact results.  If the caller may be
 contented with approximations then it should do the approximation on its
 own.
 
-In this particular case the comment in the code says "the algorithm ... 
-below might lose some precision".  Well, if you try it with e.g.:
+In this particular case the comment in the code says "the algorithm
+... below might lose some precision". Well, if you try it with e.g.:
 
 	a = 18446462598732840960
 	b = 18446462598732840960
@@ -40,19 +28,36 @@ Let's reimplement this function so it always produces the exact result
 regardless of its inputs while preserving existing fast paths when
 possible.
 
-Link: https://lkml.kernel.org/r/20240703033552.906852-2-nico@fluxnic.net
+Uwe said:
+
+: My personal interest is to get the calculations in pwm drivers right. 
+: This function is used in several drivers below drivers/pwm/ .  With the
+: errors in mul_u64_u64_div_u64(), pwm consumers might not get the
+: settings they request.  Although I have to admit that I'm not aware it
+: breaks real use cases (because typically the periods used are too short
+: to make the involved multiplications overflow), but I pretty sure am
+: not aware of all usages and it breaks testing.
+: 
+: Another justification is commits like
+: https://git.kernel.org/tip/77baa5bafcbe1b2a15ef9c37232c21279c95481c,
+: where people start to work around the precision shortcomings of
+: mul_u64_u64_div_u64().
+
+Link: https://lkml.kernel.org/r/20240707190648.1982714-1-nico@fluxnic.net
+Link: https://lkml.kernel.org/r/20240707190648.1982714-2-nico@fluxnic.net
 Signed-off-by: Nicolas Pitre <npitre@baylibre.com>
-Tested-by: Biju Das <biju.das.jz@bp.renesas.com>
 Tested-by: Uwe Kleine-König <u.kleine-koenig@baylibre.com>
+Reviewed-by: Uwe Kleine-König <u.kleine-koenig@baylibre.com>
+Tested-by: Biju Das <biju.das.jz@bp.renesas.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- lib/math/div64.c |  123 +++++++++++++++++++++++++++++----------------
- 1 file changed, 80 insertions(+), 43 deletions(-)
+ lib/math/div64.c |  108 +++++++++++++++++++++++++++------------------
+ 1 file changed, 65 insertions(+), 43 deletions(-)
 
 --- a/lib/math/div64.c~mul_u64_u64_div_u64-make-it-precise-always
 +++ a/lib/math/div64.c
-@@ -186,55 +186,92 @@ EXPORT_SYMBOL(iter_div_u64_rem);
+@@ -186,55 +186,77 @@ EXPORT_SYMBOL(iter_div_u64_rem);
  #ifndef mul_u64_u64_div_u64
  u64 mul_u64_u64_div_u64(u64 a, u64 b, u64 c)
  {
@@ -85,37 +90,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#else
 +
 +	/* perform a 64x64=128 bits multiplication manually */
-+	union {
-+		u64 v;
-+		struct {
-+#if defined(CONFIG_CPU_LITTLE_ENDIAN)
-+			u32 l;
-+			u32 h;
-+#elif defined(CONFIG_CPU_BIG_ENDIAN)
-+			u32 h;
-+			u32 l;
-+#else
-+#error "unknown endianness"
-+#endif
-+		};
-+	} A, B, X, Y, Z;
++	u32 a_lo = a, a_hi = a >> 32, b_lo = b, b_hi = b >> 32;
++	u64 x, y, z;
 +
-+	A.v = a;
-+	B.v = b;
++	x = (u64)a_lo * b_lo;
++	y = (u64)a_lo * b_hi + (u32)(x >> 32);
++	z = (u64)a_hi * b_hi + (u32)(y >> 32);
++	y = (u64)a_hi * b_lo + (u32)y;
++	z += (u32)(y >> 32);
++	x = (y << 32) + (u32)x;
 +
-+	X.v = (u64)A.l * B.l;
-+	Y.v = (u64)A.l * B.h + X.h;
-+	Z.v = (u64)A.h * B.h + Y.h;
-+	Y.v = (u64)A.h * B.l + Y.l;
-+	X.h = Y.l;
-+	Z.v += Y.h;
-+
-+	u64 n_lo = X.v, n_hi = Z.v;
++	u64 n_lo = x, n_hi = z;
 +
 +#endif
- 
++
 +	int shift = __builtin_ctzll(c);
-+
+ 
 +	/* try reducing the fraction in case the dividend becomes <= 64 bits */
 +	if ((n_hi >> shift) == 0) {
 +		u64 n = (n_lo >> shift) | (n_hi << (64 - shift));

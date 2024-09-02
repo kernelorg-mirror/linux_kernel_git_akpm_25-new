@@ -1,0 +1,125 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: Re: mm: filemap: use xa_get_order() to get the swap entry order
+Date: Thu, 29 Aug 2024 01:07:17 -0700 (PDT)
+
+find_lock_entries(), used in the first pass of shmem_undo_range() and
+truncate_inode_pages_range() before partial folios are dealt with, has to
+be careful to avoid those partial folios: as its doc helpfully says,
+"Folios which are partially outside the range are not returned".  Of
+course, the same must be true of any value entries returned, otherwise
+truncation and hole-punch risk erasing swapped areas - as has been seen.
+
+Rewrite find_lock_entries() to emphasize that, following the same pattern
+for folios and for value entries.
+
+Adjust find_get_entries() slightly, to get order while still holding
+rcu_read_lock(), and to round down the updated start: good changes, like
+find_lock_entries() now does, but it's unclear if either is ever
+important.
+
+Link: https://lkml.kernel.org/r/c336e6e4-da7f-b714-c0f1-12df715f2611@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Daniel Gomez <da.gomez@samsung.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Pankaj Raghav <p.raghav@samsung.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c |   41 +++++++++++++++++++++++++----------------
+ 1 file changed, 25 insertions(+), 16 deletions(-)
+
+--- a/mm/filemap.c~mm-filemap-use-xa_get_order-to-get-the-swap-entry-order-fix
++++ a/mm/filemap.c
+@@ -2046,10 +2046,9 @@ unsigned find_get_entries(struct address
+ 		if (!folio_batch_add(fbatch, folio))
+ 			break;
+ 	}
+-	rcu_read_unlock();
+ 
+ 	if (folio_batch_count(fbatch)) {
+-		unsigned long nr = 1;
++		unsigned long nr;
+ 		int idx = folio_batch_count(fbatch) - 1;
+ 
+ 		folio = fbatch->folios[idx];
+@@ -2057,8 +2056,10 @@ unsigned find_get_entries(struct address
+ 			nr = folio_nr_pages(folio);
+ 		else
+ 			nr = 1 << xa_get_order(&mapping->i_pages, indices[idx]);
+-		*start = indices[idx] + nr;
++		*start = round_down(indices[idx] + nr, nr);
+ 	}
++	rcu_read_unlock();
++
+ 	return folio_batch_count(fbatch);
+ }
+ 
+@@ -2090,10 +2091,17 @@ unsigned find_lock_entries(struct addres
+ 
+ 	rcu_read_lock();
+ 	while ((folio = find_get_entry(&xas, end, XA_PRESENT))) {
++		unsigned long base;
++		unsigned long nr;
++
+ 		if (!xa_is_value(folio)) {
+-			if (folio->index < *start)
++			nr = folio_nr_pages(folio);
++			base = folio->index;
++			/* Omit large folio which begins before the start */
++			if (base < *start)
+ 				goto put;
+-			if (folio_next_index(folio) - 1 > end)
++			/* Omit large folio which extends beyond the end */
++			if (base + nr - 1 > end)
+ 				goto put;
+ 			if (!folio_trylock(folio))
+ 				goto put;
+@@ -2102,7 +2110,19 @@ unsigned find_lock_entries(struct addres
+ 				goto unlock;
+ 			VM_BUG_ON_FOLIO(!folio_contains(folio, xas.xa_index),
+ 					folio);
++		} else {
++			nr = 1 << xa_get_order(&mapping->i_pages, xas.xa_index);
++			base = xas.xa_index & ~(nr - 1);
++			/* Omit order>0 value which begins before the start */
++			if (base < *start)
++				continue;
++			/* Omit order>0 value which extends beyond the end */
++			if (base + nr - 1 > end)
++				break;
+ 		}
++
++		/* Update start now so that last update is correct on return */
++		*start = base + nr;
+ 		indices[fbatch->nr] = xas.xa_index;
+ 		if (!folio_batch_add(fbatch, folio))
+ 			break;
+@@ -2114,17 +2134,6 @@ put:
+ 	}
+ 	rcu_read_unlock();
+ 
+-	if (folio_batch_count(fbatch)) {
+-		unsigned long nr = 1;
+-		int idx = folio_batch_count(fbatch) - 1;
+-
+-		folio = fbatch->folios[idx];
+-		if (!xa_is_value(folio))
+-			nr = folio_nr_pages(folio);
+-		else
+-			nr = 1 << xa_get_order(&mapping->i_pages, indices[idx]);
+-		*start = indices[idx] + nr;
+-	}
+ 	return folio_batch_count(fbatch);
+ }
+ 
+_
