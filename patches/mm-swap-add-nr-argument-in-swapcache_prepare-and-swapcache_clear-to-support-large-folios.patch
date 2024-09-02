@@ -11,6 +11,8 @@ the modifications to the entries.
 
 Currently, we're using nr=1 for the existing users.
 
+[v-songbaohua@oppo.com: clarify swap_count_continued and improve readability for  __swap_duplicate]
+  Link: https://lkml.kernel.org/r/20240802071817.47081-1-21cnbao@gmail.com
 Link: https://lkml.kernel.org/r/20240730071339.107447-2-21cnbao@gmail.com
 Signed-off-by: Barry Song <v-songbaohua@oppo.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -40,8 +42,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  mm/memory.c          |    6 +-
  mm/swap.h            |    5 +-
  mm/swap_state.c      |    2 
- mm/swapfile.c        |  101 +++++++++++++++++++++++------------------
- 5 files changed, 68 insertions(+), 50 deletions(-)
+ mm/swapfile.c        |   95 +++++++++++++++++++++++------------------
+ 5 files changed, 63 insertions(+), 49 deletions(-)
 
 --- a/include/linux/swap.h~mm-swap-add-nr-argument-in-swapcache_prepare-and-swapcache_clear-to-support-large-folios
 +++ a/include/linux/swap.h
@@ -103,7 +105,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
   * Returns error code in following case.
   * - success -> 0
-@@ -3373,60 +3373,77 @@ void si_swapinfo(struct sysinfo *val)
+@@ -3373,60 +3373,73 @@ void si_swapinfo(struct sysinfo *val)
   * - swap-cache reference is requested but the entry is not used. -> ENOENT
   * - swap-mapped reference requested but needs continued swap count. -> ENOMEM
   */
@@ -122,13 +124,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	offset = swp_offset(entry);
 +	VM_WARN_ON(nr > SWAPFILE_CLUSTER - offset % SWAPFILE_CLUSTER);
++	VM_WARN_ON(usage == 1 && nr > 1);
  	ci = lock_cluster_or_swap_info(p, offset);
  
 -	count = p->swap_map[offset];
-+	err = 0;
-+	for (i = 0; i < nr; i++) {
-+		count = p->swap_map[offset + i];
- 
+-
 -	/*
 -	 * swapin_readahead() doesn't check if a swap entry is valid, so the
 -	 * swap entry could be SWAP_MAP_BAD. Check here with lock held.
@@ -137,6 +137,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		err = -ENOENT;
 -		goto unlock_out;
 -	}
+-
+-	has_cache = count & SWAP_HAS_CACHE;
+-	count &= ~SWAP_HAS_CACHE;
+ 	err = 0;
++	for (i = 0; i < nr; i++) {
++		count = p->swap_map[offset + i];
+ 
+-	if (usage == SWAP_HAS_CACHE) {
 +		/*
 +		 * swapin_readahead() doesn't check if a swap entry is valid, so the
 +		 * swap entry could be SWAP_MAP_BAD. Check here with lock held.
@@ -146,42 +154,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			goto unlock_out;
 +		}
  
--	has_cache = count & SWAP_HAS_CACHE;
--	count &= ~SWAP_HAS_CACHE;
--	err = 0;
-+		has_cache = count & SWAP_HAS_CACHE;
-+		count &= ~SWAP_HAS_CACHE;
- 
--	if (usage == SWAP_HAS_CACHE) {
-+		if (usage == SWAP_HAS_CACHE) {
-+			/* set SWAP_HAS_CACHE if there is no cache and entry is used */
-+			if (!has_cache && count)
-+				continue;
-+			else if (has_cache)		/* someone else added cache */
-+				err = -EEXIST;
-+			else				/* no users remaining */
-+				err = -ENOENT;
-+
-+		} else if (count || has_cache) {
-+
-+			if ((count & ~COUNT_CONTINUED) < SWAP_MAP_MAX)
-+				continue;
-+			else if ((count & ~COUNT_CONTINUED) > SWAP_MAP_MAX)
-+				err = -EINVAL;
-+			else if (swap_count_continued(p, offset + i, count))
-+				continue;
-+			else
-+				err = -ENOMEM;
-+		} else
-+			err = -ENOENT;			/* unused swap entry */
- 
 -		/* set SWAP_HAS_CACHE if there is no cache and entry is used */
 -		if (!has_cache && count)
 -			has_cache = SWAP_HAS_CACHE;
 -		else if (has_cache)		/* someone else added cache */
 -			err = -EEXIST;
 -		else				/* no users remaining */
--			err = -ENOENT;
++		has_cache = count & SWAP_HAS_CACHE;
++		count &= ~SWAP_HAS_CACHE;
++
++		if (!count && !has_cache) {
+ 			err = -ENOENT;
++		} else if (usage == SWAP_HAS_CACHE) {
++			if (has_cache)
++				err = -EEXIST;
++		} else if ((count & ~COUNT_CONTINUED) > SWAP_MAP_MAX) {
++			err = -EINVAL;
++		}
++
 +		if (err)
 +			goto unlock_out;
 +	}
@@ -200,12 +190,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		else if ((count & ~COUNT_CONTINUED) > SWAP_MAP_MAX)
 -			err = -EINVAL;
 -		else if (swap_count_continued(p, offset, count))
--			count = COUNT_CONTINUED;
- 		else
--			err = -ENOMEM;
++		else if (swap_count_continued(p, offset + i, count))
+ 			count = COUNT_CONTINUED;
+-		else
++		else {
++			/*
++			 * Don't need to rollback changes, because if
++			 * usage == 1, there must be nr == 1.
++			 */
+ 			err = -ENOMEM;
 -	} else
 -		err = -ENOENT;			/* unused swap entry */
-+			count = COUNT_CONTINUED;
++			goto unlock_out;
++		}
  
 -	if (!err)
 -		WRITE_ONCE(p->swap_map[offset], count | has_cache);
@@ -214,7 +211,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  unlock_out:
  	unlock_cluster_or_swap_info(p, ci);
-@@ -3439,7 +3456,7 @@ unlock_out:
+@@ -3439,7 +3452,7 @@ unlock_out:
   */
  void swap_shmem_alloc(swp_entry_t entry)
  {
@@ -223,7 +220,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -3453,29 +3470,29 @@ int swap_duplicate(swp_entry_t entry)
+@@ -3453,29 +3466,29 @@ int swap_duplicate(swp_entry_t entry)
  {
  	int err = 0;
  
