@@ -1,6 +1,6 @@
 From: "Liam R. Howlett" <Liam.Howlett@Oracle.com>
 Subject: mm/mmap: avoid zeroing vma tree in mmap_region()
-Date: Thu, 22 Aug 2024 15:25:36 -0400
+Date: Fri, 30 Aug 2024 00:00:54 -0400
 
 Instead of zeroing the vma tree and then overwriting the area, let the
 area be overwritten and then clean up the gathered vmas using
@@ -28,16 +28,18 @@ is necessary to drop the validate as it would fail since the mm map_count
 would be incorrect during a vma expansion, prior to the cleanup from
 vms_complete_munmap_vmas().
 
-Clean up the error handing of the vms_gather_munmap_vmas() by calling
-the verification within the function.
+Clean up the error handing of the vms_gather_munmap_vmas() by calling the
+verification within the function.
 
-Link: https://lkml.kernel.org/r/20240822192543.3359552-15-Liam.Howlett@oracle.com
+Link: https://lkml.kernel.org/r/20240830040101.822209-15-Liam.Howlett@oracle.com
 Signed-off-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Bert Karwatzki <spasswolf@web.de>
+Cc: Jeff Xu <jeffxu@chromium.org>
 Cc: Jiri Olsa <olsajiri@gmail.com>
 Cc: Kees Cook <kees@kernel.org>
 Cc: Lorenzo Stoakes <lstoakes@gmail.com>
+Cc: Mark Brown <broonie@kernel.org>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Paul Moore <paul@paul-moore.com>
@@ -47,10 +49,10 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mmap.c |   62 ++++++++++++++++++++++++----------------------------
- mm/vma.c  |   54 +++++++++++++++++++++++++++++++++++----------
- mm/vma.h  |   22 +++++++++++++-----
- 3 files changed, 87 insertions(+), 51 deletions(-)
+ mm/mmap.c |   57 ++++++++++++++++++++++++----------------------------
+ mm/vma.c  |   54 ++++++++++++++++++++++++++++++++++++++-----------
+ mm/vma.h  |   22 ++++++++++++++------
+ 3 files changed, 85 insertions(+), 48 deletions(-)
 
 --- a/mm/mmap.c~mm-mmap-avoid-zeroing-vma-tree-in-mmap_region
 +++ a/mm/mmap.c
@@ -88,23 +90,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Find the first overlapping VMA */
  	vma = vma_find(&vmi, end);
-@@ -1400,14 +1396,8 @@ unsigned long mmap_region(struct file *f
- 		mas_init(&mas_detach, &mt_detach, /* addr = */ 0);
- 		/* Prepare to unmap any existing mapping in the area */
- 		if (vms_gather_munmap_vmas(&vms, &mas_detach))
--			goto gather_failed;
--
--		/* Remove any existing mappings from the vma tree */
--		if (vma_iter_clear_gfp(&vmi, addr, end, GFP_KERNEL))
--			goto clear_tree_failed;
-+			return -ENOMEM;
+@@ -1403,13 +1399,6 @@ unsigned long mmap_region(struct file *f
+ 		if (error)
+ 			goto gather_failed;
  
+-		/* Remove any existing mappings from the vma tree */
+-		error = vma_iter_clear_gfp(&vmi, addr, end, GFP_KERNEL);
+-		if (error)
+-			goto clear_tree_failed;
+-
 -		/* Unmap any existing mapping in the area */
 -		vms_complete_munmap_vmas(&vms, &mas_detach);
  		next = vms.next;
  		prev = vms.prev;
  		vma = NULL;
-@@ -1423,8 +1413,10 @@ unsigned long mmap_region(struct file *f
+@@ -1425,8 +1414,10 @@ unsigned long mmap_region(struct file *f
  	 */
  	if (accountable_mapping(file, vm_flags)) {
  		charged = len >> PAGE_SHIFT;
@@ -116,7 +116,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		vm_flags |= VM_ACCOUNT;
  	}
  
-@@ -1473,10 +1465,8 @@ cannot_expand:
+@@ -1475,10 +1466,8 @@ cannot_expand:
  	 * not unmapped, but the maps are removed from the list.
  	 */
  	vma = vm_area_alloc(mm);
@@ -128,7 +128,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	vma_iter_config(&vmi, addr, end);
  	vma_set_range(vma, addr, end, pgoff);
-@@ -1485,6 +1475,11 @@ cannot_expand:
+@@ -1487,6 +1476,11 @@ cannot_expand:
  
  	if (file) {
  		vma->vm_file = get_file(file);
@@ -140,7 +140,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		error = call_mmap(file, vma);
  		if (error)
  			goto unmap_and_free_vma;
-@@ -1575,6 +1570,9 @@ unmap_writable:
+@@ -1577,6 +1571,9 @@ unmap_writable:
  expanded:
  	perf_event_mmap(vma);
  
@@ -150,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
  	if (vm_flags & VM_LOCKED) {
  		if ((vm_flags & VM_SPECIAL) || vma_is_dax(vma) ||
-@@ -1603,7 +1601,7 @@ expanded:
+@@ -1605,7 +1602,7 @@ expanded:
  	return addr;
  
  close_and_free_vma:
@@ -159,26 +159,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		vma->vm_ops->close(vma);
  
  	if (file || vma->vm_file) {
-@@ -1622,14 +1620,12 @@ free_vma:
- unacct_error:
+@@ -1625,9 +1622,9 @@ unacct_error:
  	if (charged)
  		vm_unacct_memory(charged);
--	validate_mm(mm);
--	return error;
  
 -clear_tree_failed:
--	abort_munmap_vmas(&mas_detach);
--gather_failed:
+-	if (vms.vma_count)
+-		abort_munmap_vmas(&mas_detach);
 +abort_munmap:
 +	if (vms.nr_pages)
 +		abort_munmap_vmas(&mas_detach, vms.closed_vm_ops);
+ gather_failed:
  	validate_mm(mm);
--	return -ENOMEM;
-+	return error;
- }
- 
- static int __vm_munmap(unsigned long start, size_t len, bool unlock)
-@@ -1959,7 +1955,7 @@ void exit_mmap(struct mm_struct *mm)
+ 	return error;
+@@ -1960,7 +1957,7 @@ void exit_mmap(struct mm_struct *mm)
  	do {
  		if (vma->vm_flags & VM_ACCOUNT)
  			nr_accounted += vma_pages(vma);
@@ -282,7 +276,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	vm_unacct_memory(vms->nr_accounted);
  	validate_mm(mm);
-@@ -851,13 +876,14 @@ int vms_gather_munmap_vmas(struct vma_mu
+@@ -846,13 +871,14 @@ int vms_gather_munmap_vmas(struct vma_mu
  	while (vma_iter_addr(vms->vmi) > vms->start)
  		vma_iter_prev_range(vms->vmi);
  
@@ -298,7 +292,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  start_split_failed:
  map_count_exceeded:
  	return error;
-@@ -902,7 +928,7 @@ int do_vmi_align_munmap(struct vma_itera
+@@ -897,7 +923,7 @@ int do_vmi_align_munmap(struct vma_itera
  	return 0;
  
  clear_tree_failed:
@@ -307,7 +301,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  gather_failed:
  	validate_mm(mm);
  	return error;
-@@ -1620,17 +1646,21 @@ bool vma_wants_writenotify(struct vm_are
+@@ -1615,17 +1641,21 @@ bool vma_wants_writenotify(struct vm_are
  }
  
  unsigned long count_vma_pages_range(struct mm_struct *mm,

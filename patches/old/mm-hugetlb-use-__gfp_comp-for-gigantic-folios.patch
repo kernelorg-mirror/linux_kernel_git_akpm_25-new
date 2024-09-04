@@ -1,11 +1,11 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm/hugetlb: use __GFP_COMP for gigantic folios
-Date: Sun, 11 Aug 2024 15:21:29 -0600
+Date: Tue, 13 Aug 2024 21:54:51 -0600
 
-Use __GFP_COMP for gigantic folios to greatly reduce not only the code
-but also the allocation and free time.
+Use __GFP_COMP for gigantic folios to greatly reduce not only the amount
+of code but also the allocation and free time.
 
-LOC (approximately): -200, +50
+LOC (approximately): +60, -240
 
 Allocate and free 500 1GB hugeTLB memory without HVO by:
   time echo 500 >/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
@@ -15,20 +15,20 @@ Allocate and free 500 1GB hugeTLB memory without HVO by:
 Alloc  ~13s    ~10s
 Free   ~15s    <1s
 
-The above magnitude generally holds for multiple x86 and arm64 CPU
-models.
+The above magnitude generally holds for multiple x86 and arm64 CPU models.
 
-Link: https://lkml.kernel.org/r/20240811212129.3074314-4-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20240814035451.773331-4-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
-Cc: Matthew Wilcox <willy@infradead.org>
+Reported-by: Frank van der Linden <fvdl@google.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Muchun Song <muchun.song@linux.dev>
-Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/hugetlb.h |    9 -
- mm/hugetlb.c            |  239 ++++++--------------------------------
- 2 files changed, 48 insertions(+), 200 deletions(-)
+ mm/hugetlb.c            |  290 +++++++-------------------------------
+ 2 files changed, 61 insertions(+), 238 deletions(-)
 
 --- a/include/linux/hugetlb.h~mm-hugetlb-use-__gfp_comp-for-gigantic-folios
 +++ a/include/linux/hugetlb.h
@@ -50,7 +50,42 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline gfp_t htlb_modify_alloc_mask(struct hstate *h, gfp_t gfp_mask)
 --- a/mm/hugetlb.c~mm-hugetlb-use-__gfp_comp-for-gigantic-folios
 +++ a/mm/hugetlb.c
-@@ -1512,43 +1512,7 @@ static int hstate_next_node_to_free(stru
+@@ -56,16 +56,6 @@ struct hstate hstates[HUGE_MAX_HSTATE];
+ #ifdef CONFIG_CMA
+ static struct cma *hugetlb_cma[MAX_NUMNODES];
+ static unsigned long hugetlb_cma_size_in_node[MAX_NUMNODES] __initdata;
+-static bool hugetlb_cma_folio(struct folio *folio, unsigned int order)
+-{
+-	return cma_pages_valid(hugetlb_cma[folio_nid(folio)], &folio->page,
+-				1 << order);
+-}
+-#else
+-static bool hugetlb_cma_folio(struct folio *folio, unsigned int order)
+-{
+-	return false;
+-}
+ #endif
+ static unsigned long hugetlb_cma_size __initdata;
+ 
+@@ -100,6 +90,17 @@ static void hugetlb_unshare_pmds(struct
+ 		unsigned long start, unsigned long end);
+ static struct resv_map *vma_resv_map(struct vm_area_struct *vma);
+ 
++static void hugetlb_free_folio(struct folio *folio)
++{
++#ifdef CONFIG_CMA
++	int nid = folio_nid(folio);
++
++	if (cma_free_folio(hugetlb_cma[nid], folio))
++		return;
++#endif
++	folio_put(folio);
++}
++
+ static inline bool subpool_is_free(struct hugepage_subpool *spool)
+ {
+ 	if (spool->count)
+@@ -1512,95 +1513,54 @@ static int hstate_next_node_to_free(stru
  		((node = hstate_next_node_to_free(hs, mask)) || 1);	\
  		nr_nodes--)
  
@@ -91,10 +126,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	__destroy_compound_gigantic_folio(folio, order, false);
 -}
 -
- static void free_gigantic_folio(struct folio *folio, unsigned int order)
- {
- 	/*
-@@ -1569,38 +1533,52 @@ static void free_gigantic_folio(struct f
+-static void free_gigantic_folio(struct folio *folio, unsigned int order)
+-{
+-	/*
+-	 * If the page isn't allocated using the cma allocator,
+-	 * cma_release() returns false.
+-	 */
+-#ifdef CONFIG_CMA
+-	int nid = folio_nid(folio);
+-
+-	if (cma_release(hugetlb_cma[nid], &folio->page, 1 << order))
+-		return;
+-#endif
+-
+-	free_contig_range(folio_pfn(folio), 1 << order);
+-}
+-
+ #ifdef CONFIG_CONTIG_ALLOC
  static struct folio *alloc_gigantic_folio(struct hstate *h, gfp_t gfp_mask,
  		int nid, nodemask_t *nodemask)
  {
@@ -102,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	unsigned long nr_pages = pages_per_huge_page(h);
 +	struct folio *folio;
 +	int order = huge_page_order(h);
-+	bool retry = false;
++	bool retried = false;
 +
  	if (nid == NUMA_NO_NODE)
  		nid = numa_mem_id();
@@ -140,58 +188,59 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  #endif
 +	if (!folio) {
-+		struct page *page = alloc_contig_pages(1 << order, gfp_mask, nid, nodemask);
-+
-+		if (!page)
++		folio = folio_alloc_gigantic(order, gfp_mask, nid, nodemask);
++		if (!folio)
 +			return NULL;
- 
--	page = alloc_contig_pages(nr_pages, gfp_mask, nid, nodemask);
--	return page ? page_folio(page) : NULL;
-+		folio = page_folio(page);
 +	}
 +
 +	if (folio_ref_freeze(folio, 1))
 +		return folio;
-+
+ 
+-	page = alloc_contig_pages(nr_pages, gfp_mask, nid, nodemask);
+-	return page ? page_folio(page) : NULL;
 +	pr_warn("HugeTLB: unexpected refcount on PFN %lu\n", folio_pfn(folio));
-+	free_gigantic_folio(folio, order);
-+	if (!retry) {
-+		retry = true;
++	hugetlb_free_folio(folio);
++	if (!retried) {
++		retried = true;
 +		goto retry;
 +	}
 +	return NULL;
  }
  
  #else /* !CONFIG_CONTIG_ALLOC */
-@@ -1619,8 +1597,6 @@ static struct folio *alloc_gigantic_foli
+@@ -1617,10 +1577,6 @@ static struct folio *alloc_gigantic_foli
+ {
+ 	return NULL;
  }
- static inline void free_gigantic_folio(struct folio *folio,
- 						unsigned int order) { }
+-static inline void free_gigantic_folio(struct folio *folio,
+-						unsigned int order) { }
 -static inline void destroy_compound_gigantic_folio(struct folio *folio,
 -						unsigned int order) { }
  #endif
  
  /*
-@@ -1747,6 +1723,7 @@ static void __update_and_free_hugetlb_fo
- 		folio_clear_hugetlb_hwpoison(folio);
+@@ -1748,18 +1704,8 @@ static void __update_and_free_hugetlb_fo
  
  	folio_ref_unfreeze(folio, 1);
-+	INIT_LIST_HEAD(&folio->_deferred_list);
  
- 	/*
- 	 * Non-gigantic pages demoted from CMA allocated gigantic pages
-@@ -1754,10 +1731,8 @@ static void __update_and_free_hugetlb_fo
- 	 */
- 	if (hstate_is_gigantic(h) ||
- 	    hugetlb_cma_folio(folio, huge_page_order(h))) {
+-	/*
+-	 * Non-gigantic pages demoted from CMA allocated gigantic pages
+-	 * need to be given back to CMA in free_gigantic_folio.
+-	 */
+-	if (hstate_is_gigantic(h) ||
+-	    hugetlb_cma_folio(folio, huge_page_order(h))) {
 -		destroy_compound_gigantic_folio(folio, huge_page_order(h));
- 		free_gigantic_folio(folio, huge_page_order(h));
- 	} else {
+-		free_gigantic_folio(folio, huge_page_order(h));
+-	} else {
 -		INIT_LIST_HEAD(&folio->_deferred_list);
- 		folio_clear_partially_mapped(folio);
- 		folio_put(folio);
- 	}
-@@ -2033,95 +2008,6 @@ static void prep_new_hugetlb_folio(struc
+-		folio_put(folio);
+-	}
++	INIT_LIST_HEAD(&folio->_deferred_list);
++	hugetlb_free_folio(folio);
+ }
+ 
+ /*
+@@ -2032,95 +1978,6 @@ static void prep_new_hugetlb_folio(struc
  	spin_unlock_irq(&hugetlb_lock);
  }
  
@@ -287,7 +336,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Find and lock address space (mapping) in write mode.
   *
-@@ -2160,7 +2046,6 @@ static struct folio *alloc_buddy_hugetlb
+@@ -2159,7 +2016,6 @@ static struct folio *alloc_buddy_hugetlb
  	 */
  	if (node_alloc_noretry && node_isset(nid, *node_alloc_noretry))
  		alloc_try_hard = false;
@@ -295,7 +344,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (alloc_try_hard)
  		gfp_mask |= __GFP_RETRY_MAYFAIL;
  	if (nid == NUMA_NO_NODE)
-@@ -2207,48 +2092,14 @@ retry:
+@@ -2206,48 +2062,16 @@ retry:
  	return folio;
  }
  
@@ -341,22 +390,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -	folio = __alloc_fresh_hugetlb_folio(h, gfp_mask, nid, nmask,
 -						node_alloc_noretry);
-+	folio = hstate_is_gigantic(h) ? alloc_gigantic_folio(h, gfp_mask, nid, nmask) :
-+		alloc_buddy_hugetlb_folio(h, gfp_mask, nid, nmask, node_alloc_noretry);
++	if (hstate_is_gigantic(h))
++		folio = alloc_gigantic_folio(h, gfp_mask, nid, nmask);
++	else
++		folio = alloc_buddy_hugetlb_folio(h, gfp_mask, nid, nmask, node_alloc_noretry);
  	if (folio)
  		init_new_hugetlb_folio(h, folio);
  	return folio;
-@@ -2266,7 +2117,8 @@ static struct folio *alloc_fresh_hugetlb
+@@ -2265,7 +2089,10 @@ static struct folio *alloc_fresh_hugetlb
  {
  	struct folio *folio;
  
 -	folio = __alloc_fresh_hugetlb_folio(h, gfp_mask, nid, nmask, NULL);
-+	folio = hstate_is_gigantic(h) ? alloc_gigantic_folio(h, gfp_mask, nid, nmask) :
-+		alloc_buddy_hugetlb_folio(h, gfp_mask, nid, nmask, NULL);
++	if (hstate_is_gigantic(h))
++		folio = alloc_gigantic_folio(h, gfp_mask, nid, nmask);
++	else
++		folio = alloc_buddy_hugetlb_folio(h, gfp_mask, nid, nmask, NULL);
  	if (!folio)
  		return NULL;
  
-@@ -2550,9 +2402,8 @@ struct folio *alloc_buddy_hugetlb_folio_
+@@ -2549,9 +2376,8 @@ struct folio *alloc_buddy_hugetlb_folio_
  
  	nid = huge_node(vma, addr, gfp_mask, &mpol, &nodemask);
  	if (mpol_is_preferred_many(mpol)) {
@@ -367,7 +420,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		folio = alloc_surplus_hugetlb_folio(h, gfp, nid, nodemask);
  
  		/* Fallback to all nodes if page==NULL */
-@@ -3334,6 +3185,7 @@ static void __init hugetlb_folio_init_ta
+@@ -3333,6 +3159,7 @@ static void __init hugetlb_folio_init_ta
  	for (pfn = head_pfn + start_page_number; pfn < end_pfn; pfn++) {
  		struct page *page = pfn_to_page(pfn);
  
@@ -375,7 +428,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		__init_single_page(page, pfn, zone, nid);
  		prep_compound_tail((struct page *)folio, pfn - head_pfn);
  		ret = page_ref_freeze(page, 1);
-@@ -3950,21 +3802,16 @@ static long demote_free_hugetlb_folios(s
+@@ -3949,21 +3776,16 @@ static long demote_free_hugetlb_folios(s
  			continue;
  
  		list_del(&folio->lru);

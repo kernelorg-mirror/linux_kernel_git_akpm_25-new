@@ -1,45 +1,47 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: refactor vma_merge() into modify-only vma_merge_existing_range()
-Date: Fri, 23 Aug 2024 21:07:04 +0100
+Date: Fri, 30 Aug 2024 19:10:21 +0100
 
-The existing vma_merge() function is no longer required to handle what were
-previously referred to as cases 1-3 (i.e. the merging of a new VMA), as
-this is now handled by vma_merge_new_vma().
+The existing vma_merge() function is no longer required to handle what
+were previously referred to as cases 1-3 (i.e.  the merging of a new VMA),
+as this is now handled by vma_merge_new_vma().
 
 Additionally, simplify the convoluted control flow of the original,
-maintaining identical logic only expressed more clearly and doing away with
-a complicated set of cases, rather logically examining each possible
+maintaining identical logic only expressed more clearly and doing away
+with a complicated set of cases, rather logically examining each possible
 outcome - merging of both the previous and subsequent VMA, merging of the
 previous VMA and merging of the subsequent VMA alone.
 
 We now utilise the previously implemented commit_merge() function to share
-logic with vma_expand() de-duplicating code and providing less surface area
-for bugs and confusion. In order to do so, we adjust this function to
-accept parameters specific to merging existing ranges.
+logic with vma_expand() de-duplicating code and providing less surface
+area for bugs and confusion.  In order to do so, we adjust this function
+to accept parameters specific to merging existing ranges.
 
-Link: https://lkml.kernel.org/r/16da4f8c7f1b84093a2588cbafa936e1c98b2575.1724441678.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/2cf6016b7bfcc4965fc3cde10827560c42e4f12c.1725040657.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Bert Karwatzki <spasswolf@web.de>
+Cc: Jeff Xu <jeffxu@chromium.org>
 Cc: Jiri Olsa <olsajiri@gmail.com>
 Cc: Kees Cook <kees@kernel.org>
-Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Lorenzo Stoakes <lstoakes@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Paul Moore <paul@paul-moore.com>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vma.c                |  527 +++++++++++++++++++-------------------
+ mm/vma.c                |  508 +++++++++++++++++++-------------------
  tools/testing/vma/vma.c |    9 
- 2 files changed, 283 insertions(+), 253 deletions(-)
+ 2 files changed, 264 insertions(+), 253 deletions(-)
 
 --- a/mm/vma.c~mm-refactor-vma_merge-into-modify-only-vma_merge_existing_range
 +++ a/mm/vma.c
-@@ -542,23 +542,45 @@ void validate_mm(struct mm_struct *mm)
+@@ -587,23 +587,45 @@ void validate_mm(struct mm_struct *mm)
  
  /* Actually perform the VMA merge operation. */
  static int commit_merge(struct vma_merge_struct *vmg,
@@ -91,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	vma_complete(&vp, vmg->vmi, vmg->vma->vm_mm);
  
-@@ -566,6 +588,252 @@ static int commit_merge(struct vma_merge
+@@ -611,6 +633,233 @@ static int commit_merge(struct vma_merge
  }
  
  /*
@@ -133,11 +135,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long end = vmg->end;
 +	bool left_side = vma && start == vma->vm_start;
 +	bool right_side = vma && end == vma->vm_end;
-+	bool merge_both = false;
 +	int err = 0;
 +	long adj_start = 0;
 +	bool merge_will_delete_vma, merge_will_delete_next;
-+	bool merge_left, merge_right;
++	bool merge_left, merge_right, merge_both;
 +	bool expanded;
 +
 +	mmap_assert_write_locked(vmg->mm);
@@ -158,52 +159,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	vmg->state = VMA_MERGE_NOMERGE;
 +
 +	/*
-+	 * If a special mapping or neither at the furthermost left or right side
-+	 * of the VMA, then we have no chance of merging and should abort.
-+	 *
-+	 * We later require that vma->vm_flags == vm_flags, so this tests
-+	 * vma->vm_flags & VM_SPECIAL, too.
++	 * If a special mapping or if the range being modified is neither at the
++	 * furthermost left or right side of the VMA, then we have no chance of
++	 * merging and should abort.
 +	 */
 +	if (vmg->flags & VM_SPECIAL || (!left_side && !right_side))
 +		return NULL;
 +
-+	if (left_side && prev && prev->vm_end == start && can_vma_merge_after(vmg)) {
-+		merge_left = true;
-+		vma_prev(vmg->vmi);
-+	} else {
++	if (left_side)
++		merge_left = can_vma_merge_left(vmg);
++	else
 +		merge_left = false;
-+	}
 +
 +	if (right_side) {
-+		next = vmg->next = vma_lookup(vma->vm_mm, end);
++		next = vmg->next = vma_iter_next_range(vmg->vmi);
++		vma_iter_prev_range(vmg->vmi);
 +
-+		/*
-+		 * We can merge right if there is a subsequent VMA, if it is
-+		 * immediately adjacent, and if it is compatible with vma.
-+		 */
-+		merge_right = next && end == next->vm_start &&
-+			can_vma_merge_before(vmg);
-+
-+		/*
-+		 * We can only merge both if the anonymous VMA of the previous
-+		 * VMA is compatible with the anonymous VMA of the subsequent
-+		 * VMA.
-+		 *
-+		 * Otherwise, we default to merging only the left.
-+		 */
-+		if (merge_left && merge_right)
-+			merge_right = merge_both =
-+				is_mergeable_anon_vma(prev->anon_vma,
-+						      next->anon_vma, NULL);
++		merge_right = can_vma_merge_right(vmg, merge_left);
 +	} else {
 +		merge_right = false;
 +		next = NULL;
 +	}
 +
-+	/* If we have nothing to merge, abort. */
-+	if (!merge_left && !merge_right)
++	if (merge_left)		/* If merging prev, position iterator there. */
++		vma_prev(vmg->vmi);
++	else if (!merge_right)	/* If we have nothing to merge, abort. */
 +		return NULL;
 +
++	merge_both = merge_left && merge_right;
 +	/* If we span the entire VMA, a merge implies it will be deleted. */
 +	merge_will_delete_vma = left_side && right_side;
 +	/*
@@ -344,7 +327,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * vma_merge_new_range - Attempt to merge a new VMA into address space
   *
   * @vmg: Describes the VMA we are adding, in the range @vmg->start to @vmg->end
-@@ -717,7 +985,7 @@ int vma_expand(struct vma_merge_struct *
+@@ -757,7 +1006,7 @@ int vma_expand(struct vma_merge_struct *
  	/* Only handles expanding */
  	VM_WARN_ON(vma->vm_start < vmg->start || vma->vm_end > vmg->end);
  
@@ -353,7 +336,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto nomem;
  
  	return 0;
-@@ -1093,249 +1361,6 @@ int do_vmi_munmap(struct vma_iterator *v
+@@ -1128,249 +1377,6 @@ int do_vmi_munmap(struct vma_iterator *v
  }
  
  /*
@@ -509,7 +492,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -				remove = curr;
 -			} else {			/* case 5 */
 -				adjust = curr;
--				adj_start = end - curr->vm_start;
+-				adj_start = (end - curr->vm_start);
 -			}
 -			if (!err)
 -				err = dup_anon_vma(prev, curr, &anon_dup);
@@ -603,7 +586,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * We are about to modify one or multiple of a VMA's flags, policy, userfaultfd
   * context and anonymous VMA name within the range [start, end).
   *
-@@ -1354,7 +1379,7 @@ static struct vm_area_struct *vma_modify
+@@ -1389,7 +1395,7 @@ static struct vm_area_struct *vma_modify
  	struct vm_area_struct *merged;
  
  	/* First, try to merge. */

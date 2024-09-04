@@ -1,16 +1,16 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: avoid using vma_merge() for new VMAs
-Date: Fri, 23 Aug 2024 21:07:01 +0100
+Date: Fri, 30 Aug 2024 19:10:18 +0100
 
 Abstract vma_merge_new_vma() to use vma_merge_struct and rename the
 resultant function vma_merge_new_range() to be clear what the purpose of
-this function is - a new VMA is desired in the specified range, and we wish
-to see if it is possible to 'merge' surrounding VMAs into this range rather
-than having to allocate a new VMA.
+this function is - a new VMA is desired in the specified range, and we
+wish to see if it is possible to 'merge' surrounding VMAs into this range
+rather than having to allocate a new VMA.
 
 Note that this function uses vma_extend() exclusively, so adopts its
-requirement that the iterator point at or before the gap. We add an assert
-to this effect.
+requirement that the iterator point at or before the gap.  We add an
+assert to this effect.
 
 This is as opposed to vma_merge_existing_range(), which will be introduced
 in a subsequent commit, and provide the same functionality for cases in
@@ -27,36 +27,48 @@ Doing so removes duplication and simplifies VMA merging in all such cases,
 laying the ground for us to eliminate the merging of new VMAs in
 vma_merge() altogether.
 
-Also add the ability for the vmg to track state, and able to report errors,
-allowing for us to differentiate a failed merge from an inability to
-allocate memory in callers.
+Also add the ability for the vmg to track state, and able to report
+errors, allowing for us to differentiate a failed merge from an inability
+to allocate memory in callers.
 
 This makes it far easier to understand what is happening in these cases
 avoiding confusion, bugs and allowing for future optimisation.
 
-Link: https://lkml.kernel.org/r/57f55a1473586a88211e04b44c6b128332d4272c.1724441678.git.lorenzo.stoakes@oracle.com
+Also introduce vma_iter_next_rewind() to allow for retrieval of the next,
+and (optionally) the prev VMA, rewinding to the start of the previous gap.
+
+Introduce are_anon_vmas_compatible() to abstract individual VMA anon_vma
+comparison for the case of merging on both sides where the anon_vma of the
+VMA being merged maybe compatible with prev and next, but prev and next's
+anon_vma's may not be compatible with each other.
+
+Finally also introduce can_vma_merge_left() / can_vma_merge_right() to
+check adjacent VMA compatibility and that they are indeed adjacent.
+
+Link: https://lkml.kernel.org/r/49d37c0769b6b9dc03b27fe4d059173832556392.1725040657.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Tested-by: Mark Brown <broonie@kernel.org>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Bert Karwatzki <spasswolf@web.de>
+Cc: Jeff Xu <jeffxu@chromium.org>
 Cc: Jiri Olsa <olsajiri@gmail.com>
 Cc: Kees Cook <kees@kernel.org>
-Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Lorenzo Stoakes <lstoakes@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Paul Moore <paul@paul-moore.com>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: kernel test robot <oliver.sang@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mmap.c                        |   93 ++++------------
- mm/vma.c                         |  162 +++++++++++++++++++++++++----
- mm/vma.h                         |   20 ++-
- tools/testing/vma/vma.c          |   33 +++++
- tools/testing/vma/vma_internal.h |    6 +
- 5 files changed, 216 insertions(+), 98 deletions(-)
+ mm/mmap.c                        |   92 ++-----------
+ mm/vma.c                         |  200 +++++++++++++++++++++++++----
+ mm/vma.h                         |   48 ++++++
+ tools/testing/vma/vma.c          |   33 ++++
+ tools/testing/vma/vma_internal.h |    6 
+ 5 files changed, 279 insertions(+), 100 deletions(-)
 
 --- a/mm/mmap.c~mm-avoid-using-vma_merge-for-new-vmas
 +++ a/mm/mmap.c
@@ -70,9 +82,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned long charged = 0;
  	struct vma_munmap_struct vms;
  	struct ma_state mas_detach;
-@@ -1389,13 +1389,13 @@ unsigned long mmap_region(struct file *f
- 		if (vms_gather_munmap_vmas(&vms, &mas_detach))
- 			return -ENOMEM;
+@@ -1389,14 +1389,11 @@ unsigned long mmap_region(struct file *f
+ 		if (error)
+ 			goto gather_failed;
  
 -		next = vmg.next = vms.next;
 -		prev = vmg.prev = vms.prev;
@@ -83,13 +95,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		next = vmg.next = vma_next(&vmi);
 -		prev = vmg.prev = vma_prev(&vmi);
 -		if (prev)
-+		vmg.next = vma_next(&vmi);
-+		vmg.prev = vma_prev(&vmi);
-+		if (vmg.prev)
- 			vma_iter_next_range(&vmi);
+-			vma_iter_next_range(&vmi);
++		vmg.next = vma_iter_next_rewind(&vmi, &vmg.prev);
  	}
  
-@@ -1417,45 +1417,9 @@ unsigned long mmap_region(struct file *f
+ 	/* Check against address space limit. */
+@@ -1417,46 +1414,9 @@ unsigned long mmap_region(struct file *f
  		vmg.flags = vm_flags;
  	}
  
@@ -132,13 +143,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	}
 -
 -cannot_expand:
+-
 +	vma = vma_merge_new_range(&vmg);
 +	if (vma)
 +		goto expanded;
- 
  	/*
  	 * Determine the object being mapped and call the appropriate
-@@ -1503,10 +1467,11 @@ cannot_expand:
+ 	 * specific mapper. the address has already been validated, but
+@@ -1503,10 +1463,11 @@ cannot_expand:
  		 * If vm_flags changed after call_mmap(), we should try merge
  		 * vma again as we may succeed this time.
  		 */
@@ -154,16 +166,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (merge) {
  				/*
  				 * ->mmap() can change vma->vm_file and fput
-@@ -1521,6 +1486,8 @@ cannot_expand:
- 				/* Update vm_flags to pick up the change. */
+@@ -1522,6 +1483,7 @@ cannot_expand:
  				vm_flags = vma->vm_flags;
  				goto unmap_writable;
-+			} else {
-+				vma_iter_config(&vmi, addr, end);
  			}
++			vma_iter_config(&vmi, addr, end);
  		}
  
-@@ -1554,7 +1521,7 @@ cannot_expand:
+ 		vm_flags = vma->vm_flags;
+@@ -1554,7 +1516,7 @@ cannot_expand:
  	vma_link_file(vma);
  
  	/*
@@ -172,7 +183,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * call covers the non-merge case.
  	 */
  	khugepaged_enter_vma(vma, vma->vm_flags);
-@@ -1609,7 +1576,7 @@ unmap_and_free_vma:
+@@ -1609,7 +1571,7 @@ unmap_and_free_vma:
  
  		vma_iter_set(&vmi, vma->vm_end);
  		/* Undo any partial mapping done by a device driver. */
@@ -181,7 +192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	if (writable_file_mapping)
  		mapping_unmap_writable(file->f_mapping);
-@@ -1755,7 +1722,6 @@ static int do_brk_flags(struct vma_itera
+@@ -1756,7 +1718,6 @@ static int do_brk_flags(struct vma_itera
  		unsigned long addr, unsigned long len, unsigned long flags)
  {
  	struct mm_struct *mm = current->mm;
@@ -189,7 +200,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Check against address space limits by the changed size
-@@ -1779,25 +1745,12 @@ static int do_brk_flags(struct vma_itera
+@@ -1780,25 +1741,12 @@ static int do_brk_flags(struct vma_itera
  		VMG_STATE(vmg, mm, vmi, addr, addr + len, flags, PHYS_PFN(addr));
  
  		vmg.prev = vma;
@@ -222,7 +233,66 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (vma)
 --- a/mm/vma.c~mm-avoid-using-vma_merge-for-new-vmas
 +++ a/mm/vma.c
-@@ -465,6 +465,116 @@ void validate_mm(struct mm_struct *mm)
+@@ -55,6 +55,13 @@ static inline bool is_mergeable_anon_vma
+ 	return anon_vma1 == anon_vma2;
+ }
+ 
++/* Are the anon_vma's belonging to each VMA compatible with one another? */
++static inline bool are_anon_vmas_compatible(struct vm_area_struct *vma1,
++					    struct vm_area_struct *vma2)
++{
++	return is_mergeable_anon_vma(vma1->anon_vma, vma2->anon_vma, NULL);
++}
++
+ /*
+  * init_multi_vma_prep() - Initializer for struct vma_prepare
+  * @vp: The vma_prepare struct
+@@ -131,6 +138,44 @@ bool can_vma_merge_after(struct vma_merg
+ }
+ 
+ /*
++ * Can the proposed VMA be merged with the left (previous) VMA taking into
++ * account the start position of the proposed range.
++ */
++static bool can_vma_merge_left(struct vma_merge_struct *vmg)
++
++{
++	return vmg->prev && vmg->prev->vm_end == vmg->start &&
++		can_vma_merge_after(vmg);
++}
++
++/*
++ * Can the proposed VMA be merged with the right (next) VMA taking into
++ * account the end position of the proposed range.
++ *
++ * In addition, if we can merge with the left VMA, ensure that left and right
++ * anon_vma's are also compatible.
++ */
++static bool can_vma_merge_right(struct vma_merge_struct *vmg,
++				bool can_merge_left)
++{
++	if (!vmg->next || vmg->end != vmg->next->vm_start ||
++	    !can_vma_merge_before(vmg))
++		return false;
++
++	if (!can_merge_left)
++		return true;
++
++	/*
++	 * If we can merge with prev (left) and next (right), indicating that
++	 * each VMA's anon_vma is compatible with the proposed anon_vma, this
++	 * does not mean prev and next are compatible with EACH OTHER.
++	 *
++	 * We therefore check this in addition to mergeability to either side.
++	 */
++	return are_anon_vmas_compatible(vmg->prev, vmg->next);
++}
++
++/*
+  * Close a vm structure and free it.
+  */
+ void remove_vma(struct vm_area_struct *vma, bool unreachable, bool closed)
+@@ -465,6 +510,111 @@ void validate_mm(struct mm_struct *mm)
  #endif /* CONFIG_DEBUG_VM_MAPLE_TREE */
  
  /*
@@ -277,7 +347,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long end = vmg->end;
 +	pgoff_t pgoff = vmg->pgoff;
 +	pgoff_t pglen = PHYS_PFN(end - start);
-+	bool can_merge_before, can_merge_after;
++	bool can_merge_left, can_merge_right;
 +
 +	mmap_assert_write_locked(vmg->mm);
 +	VM_WARN_ON(vmg->vma);
@@ -290,22 +360,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if ((vmg->flags & VM_SPECIAL) || (!prev && !next))
 +		return NULL;
 +
-+	can_merge_before = next && next->vm_start == end &&
-+		can_vma_merge_before(vmg);
-+	can_merge_after = prev && prev->vm_end == start &&
-+		can_vma_merge_after(vmg);
++	can_merge_left = can_vma_merge_left(vmg);
++	can_merge_right = can_vma_merge_right(vmg, can_merge_left);
 +
 +	/* If we can merge with the next VMA, adjust vmg accordingly. */
-+	if (can_merge_before &&
-+	    (!can_merge_after || is_mergeable_anon_vma(prev->anon_vma,
-+						       next->anon_vma, NULL))) {
++	if (can_merge_right) {
 +		vmg->end = next->vm_end;
 +		vmg->vma = next;
 +		vmg->pgoff = next->vm_pgoff - pglen;
 +	}
 +
 +	/* If we can merge with the previous VMA, adjust vmg accordingly. */
-+	if (can_merge_after) {
++	if (can_merge_left) {
 +		vmg->start = prev->vm_start;
 +		vmg->vma = prev;
 +		vmg->pgoff = prev->vm_pgoff;
@@ -319,7 +385,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 */
 +	if (vmg->vma && !vma_expand(vmg)) {
 +		khugepaged_enter_vma(vmg->vma, vmg->flags);
-+
 +		vmg->state = VMA_MERGE_SUCCESS;
 +		return vmg->vma;
 +	}
@@ -339,7 +404,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * vma_expand - Expand an existing VMA
   *
   * @vmg: Describes a VMA expansion operation.
-@@ -474,7 +584,11 @@ void validate_mm(struct mm_struct *mm)
+@@ -474,7 +624,11 @@ void validate_mm(struct mm_struct *mm)
   * vmg->next->vm_end.  Checking if the vmg->vma can expand and merge with
   * vmg->next needs to be handled by the caller.
   *
@@ -352,7 +417,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  int vma_expand(struct vma_merge_struct *vmg)
  {
-@@ -484,6 +598,8 @@ int vma_expand(struct vma_merge_struct *
+@@ -484,6 +638,8 @@ int vma_expand(struct vma_merge_struct *
  	struct vm_area_struct *next = vmg->next;
  	struct vma_prepare vp;
  
@@ -361,7 +426,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	vma_start_write(vma);
  	if (next && (vma != next) && (vmg->end == next->vm_end)) {
  		int ret;
-@@ -516,6 +632,7 @@ int vma_expand(struct vma_merge_struct *
+@@ -516,6 +672,7 @@ int vma_expand(struct vma_merge_struct *
  	return 0;
  
  nomem:
@@ -369,7 +434,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (anon_dup)
  		unlink_anon_vmas(anon_dup);
  	return -ENOMEM;
-@@ -1034,6 +1151,8 @@ static struct vm_area_struct *vma_merge(
+@@ -1029,6 +1186,8 @@ static struct vm_area_struct *vma_merge(
  	pgoff_t pglen = PHYS_PFN(end - addr);
  	long adj_start = 0;
  
@@ -378,7 +443,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * We later require that vma->vm_flags == vm_flags,
  	 * so this tests vma->vm_flags & VM_SPECIAL, too.
-@@ -1185,13 +1304,19 @@ static struct vm_area_struct *vma_merge(
+@@ -1180,13 +1339,19 @@ static struct vm_area_struct *vma_merge(
  	vma_complete(&vp, vmg->vmi, mm);
  	validate_mm(mm);
  	khugepaged_enter_vma(res, vmg->flags);
@@ -398,7 +463,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	vma_iter_set(vmg->vmi, addr);
  	vma_iter_load(vmg->vmi);
  	return NULL;
-@@ -1299,22 +1424,6 @@ struct vm_area_struct
+@@ -1294,22 +1459,6 @@ struct vm_area_struct
  }
  
  /*
@@ -421,19 +486,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * Expand vma by delta bytes, potentially merging with an immediately adjacent
   * VMA with identical properties.
   */
-@@ -1324,8 +1433,9 @@ struct vm_area_struct *vma_merge_extend(
+@@ -1319,8 +1468,10 @@ struct vm_area_struct *vma_merge_extend(
  {
  	VMG_VMA_STATE(vmg, vmi, vma, vma, vma->vm_end, vma->vm_end + delta);
  
 -	/* vma is specified as prev, so case 1 or 2 will apply. */
 -	return vma_merge(&vmg);
-+	/* We use the VMA to populate VMG fields only. */
-+	vmg.vma = NULL;
++	vmg.next = vma_iter_next_rewind(vmi, NULL);
++	vmg.vma = NULL; /* We use the VMA to populate VMG fields only. */
++
 +	return vma_merge_new_range(&vmg);
  }
  
  void unlink_file_vma_batch_init(struct unlink_vma_file_batch *vb)
-@@ -1426,9 +1536,10 @@ struct vm_area_struct *copy_vma(struct v
+@@ -1421,9 +1572,10 @@ struct vm_area_struct *copy_vma(struct v
  	struct vm_area_struct *vma = *vmap;
  	unsigned long vma_start = vma->vm_start;
  	struct mm_struct *mm = vma->vm_mm;
@@ -445,7 +511,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * If anonymous vma has not yet been faulted, update new pgoff
-@@ -1439,11 +1550,18 @@ struct vm_area_struct *copy_vma(struct v
+@@ -1434,11 +1586,15 @@ struct vm_area_struct *copy_vma(struct v
  		faulted_in_anon_vma = false;
  	}
  
@@ -457,10 +523,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	new_vma = vma_merge_new_vma(&vmi, prev, vma, addr, addr + len, pgoff);
 +	vmg.vma = NULL; /* New VMA range. */
 +	vmg.pgoff = pgoff;
-+	vmg.next = vma_next(&vmi);
-+	vma_prev(&vmi);
-+	vma_iter_next_range(&vmi);
-+
++	vmg.next = vma_iter_next_rewind(&vmi, NULL);
 +	new_vma = vma_merge_new_range(&vmg);
 +
  	if (new_vma) {
@@ -513,7 +576,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  #ifdef CONFIG_DEBUG_VM_MAPLE_TREE
-@@ -294,10 +309,7 @@ struct vm_area_struct
+@@ -309,10 +324,7 @@ struct vm_area_struct
  		       unsigned long new_flags,
  		       struct vm_userfaultfd_ctx new_ctx);
  
@@ -525,6 +588,41 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  struct vm_area_struct *vma_merge_extend(struct vma_iterator *vmi,
  					struct vm_area_struct *vma,
+@@ -505,6 +517,34 @@ struct vm_area_struct *vma_iter_prev_ran
+ 	return mas_prev_range(&vmi->mas, 0);
+ }
+ 
++/*
++ * Retrieve the next VMA and rewind the iterator to end of the previous VMA, or
++ * if no previous VMA, to index 0.
++ */
++static inline
++struct vm_area_struct *vma_iter_next_rewind(struct vma_iterator *vmi,
++		struct vm_area_struct **pprev)
++{
++	struct vm_area_struct *next = vma_next(vmi);
++	struct vm_area_struct *prev = vma_prev(vmi);
++
++	/*
++	 * Consider the case where no previous VMA exists. We advance to the
++	 * next VMA, skipping any gap, then rewind to the start of the range.
++	 *
++	 * If we were to unconditionally advance to the next range we'd wind up
++	 * at the next VMA again, so we check to ensure there is a previous VMA
++	 * to skip over.
++	 */
++	if (prev)
++		vma_iter_next_range(vmi);
++
++	if (pprev)
++		*pprev = prev;
++
++	return next;
++}
++
+ #ifdef CONFIG_64BIT
+ 
+ static inline bool vma_is_sealed(struct vm_area_struct *vma)
 --- a/tools/testing/vma/vma.c~mm-avoid-using-vma_merge-for-new-vmas
 +++ a/tools/testing/vma/vma.c
 @@ -101,9 +101,9 @@ static struct vm_area_struct *merge_new(
