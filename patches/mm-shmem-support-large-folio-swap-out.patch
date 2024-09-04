@@ -18,13 +18,18 @@ spliting the large folio.
 
 [1] https://lore.kernel.org/all/cover.1717495894.git.baolin.wang@linux.alibaba.com/
 [2] https://lore.kernel.org/all/20240515055719.32577-1-da.gomez@samsung.com/
+
+[hughd@google.com: shmem_writepage() split folio at EOF before swapout]
+  Link: https://lkml.kernel.org/r/aef55f8d-6040-692d-65e3-16150cce4440@google.com
+[baolin.wang@linux.alibaba.com: remove the wbc->split_large_folio per Hugh]
+  Link: https://lkml.kernel.org/r/1236a002daa301b3b9ba73d6c0fab348427cf295.1724833399.git.baolin.wang@linux.alibaba.com
 Link: https://lkml.kernel.org/r/d80c21abd20e1b0f5ca66b330f074060fb2f082d.1723434324.git.baolin.wang@linux.alibaba.com
 Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Signed-off-by: Hugh Dickins <hughd@google.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Chris Li <chrisl@kernel.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: "Huang, Ying" <ying.huang@intel.com>
-Cc: Hugh Dickins <hughd@google.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Lance Yang <ioworker0@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
@@ -35,33 +40,14 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/gpu/drm/i915/gem/i915_gem_shmem.c |    1 
- include/linux/writeback.h                 |    4 ++
- mm/shmem.c                                |   12 +++++--
- mm/vmscan.c                               |   32 +++++++++++++++-----
- 4 files changed, 38 insertions(+), 11 deletions(-)
+ include/linux/writeback.h |    3 +++
+ mm/shmem.c                |   28 ++++++++++++++++++++++------
+ mm/vmscan.c               |   30 +++++++++++++++++++++++-------
+ 3 files changed, 48 insertions(+), 13 deletions(-)
 
---- a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c~mm-shmem-support-large-folio-swap-out
-+++ a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
-@@ -308,6 +308,7 @@ void __shmem_writeback(size_t size, stru
- 		.range_start = 0,
- 		.range_end = LLONG_MAX,
- 		.for_reclaim = 1,
-+		.split_large_folio = 1,
- 	};
- 	unsigned long i;
- 
 --- a/include/linux/writeback.h~mm-shmem-support-large-folio-swap-out
 +++ a/include/linux/writeback.h
-@@ -63,6 +63,7 @@ struct writeback_control {
- 	unsigned range_cyclic:1;	/* range_start is cyclic */
- 	unsigned for_sync:1;		/* sync(2) WB_SYNC_ALL writeback */
- 	unsigned unpinned_netfs_wb:1;	/* Cleared I_PINNING_NETFS_WB */
-+	unsigned split_large_folio:1;	/* Split large folio for shmem writeback */
- 
- 	/*
- 	 * When writeback IOs are bounced through async layers, only the
-@@ -79,6 +80,9 @@ struct writeback_control {
+@@ -79,6 +79,9 @@ struct writeback_control {
  	 */
  	struct swap_iocb **swap_plug;
  
@@ -81,12 +67,37 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	folio_ref_add(folio, nr);
  	folio->mapping = mapping;
-@@ -1482,10 +1481,11 @@ static int shmem_writepage(struct page *
- 	 * "force", drivers/gpu/drm/i915/gem/i915_gem_shmem.c gets huge pages,
- 	 * and its shmem_writeback() needs them to be split when swapping.
+@@ -1460,6 +1459,7 @@ static int shmem_writepage(struct page *
+ 	swp_entry_t swap;
+ 	pgoff_t index;
+ 	int nr_pages;
++	bool split = false;
+ 
+ 	/*
+ 	 * Our capabilities prevent regular writeback or sync from ever calling
+@@ -1478,14 +1478,26 @@ static int shmem_writepage(struct page *
+ 		goto redirty;
+ 
+ 	/*
+-	 * If /sys/kernel/mm/transparent_hugepage/shmem_enabled is "always" or
+-	 * "force", drivers/gpu/drm/i915/gem/i915_gem_shmem.c gets huge pages,
+-	 * and its shmem_writeback() needs them to be split when swapping.
++	 * If CONFIG_THP_SWAP is not enabled, the large folio should be
++	 * split when swapping.
++	 *
++	 * And shrinkage of pages beyond i_size does not split swap, so
++	 * swapout of a large folio crossing i_size needs to split too
++	 * (unless fallocate has been used to preallocate beyond EOF).
  	 */
--	if (folio_test_large(folio)) {
-+	if (wbc->split_large_folio && folio_test_large(folio)) {
+ 	if (folio_test_large(folio)) {
++		index = shmem_fallocend(inode,
++			DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE));
++		if ((index > folio->index && index < folio_next_index(folio)) ||
++		    !IS_ENABLED(CONFIG_THP_SWAP))
++			split = true;
++	}
++
++	if (split) {
 +try_split:
  		/* Ensure the subpages are still dirty */
  		folio_test_set_dirty(folio);
@@ -95,7 +106,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto redirty;
  		folio = page_folio(page);
  		folio_clear_dirty(folio);
-@@ -1527,8 +1527,12 @@ static int shmem_writepage(struct page *
+@@ -1527,8 +1539,12 @@ static int shmem_writepage(struct page *
  	}
  
  	swap = folio_alloc_swap(folio);
@@ -120,7 +131,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	/*
  	 * If the folio is dirty, only perform writeback if that write
-@@ -676,6 +676,16 @@ static pageout_t pageout(struct folio *f
+@@ -676,6 +676,14 @@ static pageout_t pageout(struct folio *f
  			.swap_plug = plug,
  		};
  
@@ -129,15 +140,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * not enabled or contiguous swap entries are failed to
 +		 * allocate.
 +		 */
-+		if (shmem_mapping(mapping) && folio_test_large(folio)) {
++		if (shmem_mapping(mapping) && folio_test_large(folio))
 +			wbc.list = folio_list;
-+			wbc.split_large_folio = !IS_ENABLED(CONFIG_THP_SWAP);
-+		}
 +
  		folio_set_reclaim(folio);
  		res = mapping->a_ops->writepage(&folio->page, &wbc);
  		if (res < 0)
-@@ -1257,11 +1267,6 @@ retry:
+@@ -1257,11 +1265,6 @@ retry:
  						goto activate_locked_split;
  				}
  			}
@@ -149,7 +158,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  
  		/*
-@@ -1362,12 +1367,25 @@ retry:
+@@ -1362,12 +1365,25 @@ retry:
  			 * starts and then write it out here.
  			 */
  			try_to_unmap_flush_dirty();
