@@ -2,6 +2,70 @@ From: Yu Zhao <yuzhao@google.com>
 Subject: mm: remap unused subpages to shared zeropage when splitting isolated thp
 Date: Fri, 30 Aug 2024 11:03:36 +0100
 
+Patch series "mm: split underused THPs", v5.
+
+The current upstream default policy for THP is always.  However, Meta uses
+madvise in production as the current THP=always policy vastly
+overprovisions THPs in sparsely accessed memory areas, resulting in
+excessive memory pressure and premature OOM killing.  Using madvise +
+relying on khugepaged has certain drawbacks over THP=always.  Using
+madvise hints mean THPs aren't "transparent" and require userspace
+changes.  Waiting for khugepaged to scan memory and collapse pages into
+THP can be slow and unpredictable in terms of performance (i.e.  you dont
+know when the collapse will happen), while production environments require
+predictable performance.  If there is enough memory available, its better
+for both performance and predictability to have a THP from fault time,
+i.e.  THP=always rather than wait for khugepaged to collapse it, and deal
+with sparsely populated THPs when the system is running out of memory.
+
+This patch series is an attempt to mitigate the issue of running out of
+memory when THP is always enabled.  During runtime whenever a THP is being
+faulted in or collapsed by khugepaged, the THP is added to a list. 
+Whenever memory reclaim happens, the kernel runs the deferred_split
+shrinker which goes through the list and checks if the THP was underused,
+i.e.  how many of the base 4K pages of the entire THP were zero-filled. 
+If this number goes above a certain threshold, the shrinker will attempt
+to split that THP.  Then at remap time, the pages that were zero-filled
+are mapped to the shared zeropage, hence saving memory.  This method
+avoids the downside of wasting memory in areas where THP is sparsely
+filled when THP is always enabled, while still providing the upside THPs
+like reduced TLB misses without having to use madvise.
+
+Meta production workloads that were CPU bound (>99% CPU utilzation) were
+tested with THP shrinker.  The results after 2 hours are as follows:
+
+                            | THP=madvise |  THP=always   | THP=always
+                            |             |               | + shrinker series
+                            |             |               | + max_ptes_none=409
+-----------------------------------------------------------------------------
+Performance improvement     |      -      |    +1.8%      |     +1.7%
+(over THP=madvise)          |             |               |
+-----------------------------------------------------------------------------
+Memory usage                |    54.6G    | 58.8G (+7.7%) |   55.9G (+2.4%)
+-----------------------------------------------------------------------------
+max_ptes_none=409 means that any THP that has more than 409 out of 512
+(80%) zero filled filled pages will be split.
+
+To test out the patches, the below commands without the shrinker will
+invoke OOM killer immediately and kill stress, but will not fail with the
+shrinker:
+
+echo 450 > /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none
+mkdir /sys/fs/cgroup/test
+echo $$ > /sys/fs/cgroup/test/cgroup.procs
+echo 20M > /sys/fs/cgroup/test/memory.max
+echo 0 > /sys/fs/cgroup/test/memory.swap.max
+# allocate twice memory.max for each stress worker and touch 40/512 of
+# each THP, i.e. vm-stride 50K.
+# With the shrinker, max_ptes_none of 470 and below won't invoke OOM
+# killer.
+# Without the shrinker, OOM killer is invoked immediately irrespective
+# of max_ptes_none value and kills stress.
+stress --vm 1 --vm-bytes 40M --vm-stride 50K
+
+
+This patch (of 5):
+
 Here being unused means containing only zeros and inaccessible to
 userspace.  When splitting an isolated thp under reclaim or migration, the
 unused subpages can be mapped to the shared zeropage, hence saving memory.
@@ -12,6 +76,7 @@ This is also a prerequisite for THP low utilization shrinker which will be
 introduced in later patches, where underutilized THPs are split, and the
 zero-filled pages are freed saving memory.
 
+Link: https://lkml.kernel.org/r/20240830100438.3623486-1-usamaarif642@gmail.com
 Link: https://lkml.kernel.org/r/20240830100438.3623486-3-usamaarif642@gmail.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Usama Arif <usamaarif642@gmail.com>
@@ -31,3 +96,4 @@ Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Shuang Zhai <szhai2@cs.rochester.edu>
+Cc: Hugh Dickins <hughd@google.com>
