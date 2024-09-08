@@ -1,0 +1,127 @@
+From: Yu Zhao <yuzhao@google.com>
+Subject: mm/codetag: add pgalloc_tag_copy()
+Date: Thu, 5 Sep 2024 22:21:08 -0600
+
+Add pgalloc_tag_copy() to transfer the codetag from the old folio to the
+new one during migration.  This makes original allocation sites persist
+cross migration rather than lump into the get_new_folio callbacks passed
+into migrate_pages(), e.g., compaction_alloc():
+
+  # echo 1 >/proc/sys/vm/compact_memory
+  # grep compaction_alloc /proc/allocinfo
+
+Before this patch:
+  132968448  32463  mm/compaction.c:1880 func:compaction_alloc
+
+After this patch:
+          0      0  mm/compaction.c:1880 func:compaction_alloc
+
+Link: https://lkml.kernel.org/r/20240906042108.1150526-3-yuzhao@google.com
+Fixes: dcfe378c81f7 ("lib: introduce support for page allocation tagging")
+Signed-off-by: Yu Zhao <yuzhao@google.com>
+Acked-by: Suren Baghdasaryan <surenb@google.com>
+Cc: <stable@vger.kernel.org>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/alloc_tag.h |   24 ++++++++++--------------
+ include/linux/mm.h        |   27 +++++++++++++++++++++++++++
+ mm/migrate.c              |    1 +
+ 3 files changed, 38 insertions(+), 14 deletions(-)
+
+--- a/include/linux/alloc_tag.h~mm-codetag-add-pgalloc_tag_copy
++++ a/include/linux/alloc_tag.h
+@@ -137,7 +137,16 @@ static inline void alloc_tag_sub_check(u
+ /* Caller should verify both ref and tag to be valid */
+ static inline void __alloc_tag_ref_set(union codetag_ref *ref, struct alloc_tag *tag)
+ {
++	alloc_tag_add_check(ref, tag);
++	if (!ref || !tag)
++		return;
++
+ 	ref->ct = &tag->ct;
++}
++
++static inline void alloc_tag_ref_set(union codetag_ref *ref, struct alloc_tag *tag)
++{
++	__alloc_tag_ref_set(ref, tag);
+ 	/*
+ 	 * We need in increment the call counter every time we have a new
+ 	 * allocation or when we split a large allocation into smaller ones.
+@@ -147,22 +156,9 @@ static inline void __alloc_tag_ref_set(u
+ 	this_cpu_inc(tag->counters->calls);
+ }
+ 
+-static inline void alloc_tag_ref_set(union codetag_ref *ref, struct alloc_tag *tag)
+-{
+-	alloc_tag_add_check(ref, tag);
+-	if (!ref || !tag)
+-		return;
+-
+-	__alloc_tag_ref_set(ref, tag);
+-}
+-
+ static inline void alloc_tag_add(union codetag_ref *ref, struct alloc_tag *tag, size_t bytes)
+ {
+-	alloc_tag_add_check(ref, tag);
+-	if (!ref || !tag)
+-		return;
+-
+-	__alloc_tag_ref_set(ref, tag);
++	alloc_tag_ref_set(ref, tag);
+ 	this_cpu_add(tag->counters->bytes, bytes);
+ }
+ 
+--- a/include/linux/mm.h~mm-codetag-add-pgalloc_tag_copy
++++ a/include/linux/mm.h
+@@ -4161,10 +4161,37 @@ static inline void pgalloc_tag_split(str
+ 		}
+ 	}
+ }
++
++static inline void pgalloc_tag_copy(struct folio *new, struct folio *old)
++{
++	struct alloc_tag *tag;
++	union codetag_ref *ref;
++
++	tag = pgalloc_tag_get(&old->page);
++	if (!tag)
++		return;
++
++	ref = get_page_tag_ref(&new->page);
++	if (!ref)
++		return;
++
++	/* Clear the old ref to the original allocation tag. */
++	clear_page_tag_ref(&old->page);
++	/* Decrement the counters of the tag on get_new_folio. */
++	alloc_tag_sub(ref, folio_nr_pages(new));
++
++	__alloc_tag_ref_set(ref, tag);
++
++	put_page_tag_ref(ref);
++}
+ #else /* !CONFIG_MEM_ALLOC_PROFILING */
+ static inline void pgalloc_tag_split(struct folio *folio, int old_order, int new_order)
+ {
+ }
++
++static inline void pgalloc_tag_copy(struct folio *new, struct folio *old)
++{
++}
+ #endif /* CONFIG_MEM_ALLOC_PROFILING */
+ 
+ #endif /* _LINUX_MM_H */
+--- a/mm/migrate.c~mm-codetag-add-pgalloc_tag_copy
++++ a/mm/migrate.c
+@@ -743,6 +743,7 @@ void folio_migrate_flags(struct folio *n
+ 		folio_set_readahead(newfolio);
+ 
+ 	folio_copy_owner(newfolio, folio);
++	pgalloc_tag_copy(newfolio, folio);
+ 
+ 	mem_cgroup_migrate(folio, newfolio);
+ }
+_
