@@ -1,0 +1,203 @@
+From: Michal Hocko <mhocko@suse.com>
+Subject: bcachefs: do not use PF_MEMALLOC_NORECLAIM
+Date: Mon, 2 Sep 2024 11:51:49 +0200
+
+Patch series "remove PF_MEMALLOC_NORECLAIM", v2.
+
+
+This patch (of 2):
+
+bch2_new_inode relies on PF_MEMALLOC_NORECLAIM to try to allocate a new
+inode to achieve GFP_NOWAIT semantic while holding locks.  If this
+allocation fails it will drop locks and use GFP_NOFS allocation context.
+
+We would like to drop PF_MEMALLOC_NORECLAIM because it is really dangerous
+to use if the caller doesn't control the full call chain with this flag
+set.  E.g.  if any of the function down the chain needed GFP_NOFAIL
+request the PF_MEMALLOC_NORECLAIM would override this and cause unexpected
+failure.
+
+While this is not the case in this particular case using the scoped gfp
+semantic is not really needed bacause we can easily pus the allocation
+context down the chain without too much clutter.
+
+Link: https://lkml.kernel.org/r/20240902095203.1559361-1-mhocko@kernel.org
+Link: https://lkml.kernel.org/r/20240902095203.1559361-2-mhocko@kernel.org
+Signed-off-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Reviewed-by: Jan Kara <jack@suse.cz> # For vfs changes
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: James Morris <jmorris@namei.org>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Paul Moore <paul@paul-moore.com>
+Cc: Serge E. Hallyn <serge@hallyn.com>
+Cc: "Theodore Ts'o" <tytso@mit.edu>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yafang Shao <laoar.shao@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/bcachefs/fs.c          |   14 ++++++--------
+ fs/inode.c                |    6 +++---
+ include/linux/fs.h        |    7 ++++++-
+ include/linux/lsm_hooks.h |    2 +-
+ include/linux/security.h  |    4 ++--
+ security/security.c       |    8 ++++----
+ 6 files changed, 22 insertions(+), 19 deletions(-)
+
+--- a/fs/bcachefs/fs.c~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/fs/bcachefs/fs.c
+@@ -231,9 +231,9 @@ static struct inode *bch2_alloc_inode(st
+ 	BUG();
+ }
+ 
+-static struct bch_inode_info *__bch2_new_inode(struct bch_fs *c)
++static struct bch_inode_info *__bch2_new_inode(struct bch_fs *c, gfp_t gfp)
+ {
+-	struct bch_inode_info *inode = kmem_cache_alloc(bch2_inode_cache, GFP_NOFS);
++	struct bch_inode_info *inode = kmem_cache_alloc(bch2_inode_cache, gfp);
+ 	if (!inode)
+ 		return NULL;
+ 
+@@ -245,7 +245,7 @@ static struct bch_inode_info *__bch2_new
+ 	mutex_init(&inode->ei_quota_lock);
+ 	memset(&inode->ei_devs_need_flush, 0, sizeof(inode->ei_devs_need_flush));
+ 
+-	if (unlikely(inode_init_always(c->vfs_sb, &inode->v))) {
++	if (unlikely(inode_init_always_gfp(c->vfs_sb, &inode->v, gfp))) {
+ 		kmem_cache_free(bch2_inode_cache, inode);
+ 		return NULL;
+ 	}
+@@ -258,12 +258,10 @@ static struct bch_inode_info *__bch2_new
+  */
+ static struct bch_inode_info *bch2_new_inode(struct btree_trans *trans)
+ {
+-	struct bch_inode_info *inode =
+-		memalloc_flags_do(PF_MEMALLOC_NORECLAIM|PF_MEMALLOC_NOWARN,
+-				  __bch2_new_inode(trans->c));
++	struct bch_inode_info *inode = __bch2_new_inode(trans->c, GFP_NOWAIT);
+ 
+ 	if (unlikely(!inode)) {
+-		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c)) ? 0 : -ENOMEM);
++		int ret = drop_locks_do(trans, (inode = __bch2_new_inode(trans->c, GFP_NOFS)) ? 0 : -ENOMEM);
+ 		if (ret && inode) {
+ 			__destroy_inode(&inode->v);
+ 			kmem_cache_free(bch2_inode_cache, inode);
+@@ -328,7 +326,7 @@ __bch2_create(struct mnt_idmap *idmap,
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ #endif
+-	inode = __bch2_new_inode(c);
++	inode = __bch2_new_inode(c, GFP_NOFS);
+ 	if (unlikely(!inode)) {
+ 		inode = ERR_PTR(-ENOMEM);
+ 		goto err;
+--- a/fs/inode.c~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/fs/inode.c
+@@ -153,7 +153,7 @@ static int no_open(struct inode *inode,
+  * These are initializations that need to be done on every inode
+  * allocation as the fields are not initialised by slab allocation.
+  */
+-int inode_init_always(struct super_block *sb, struct inode *inode)
++int inode_init_always_gfp(struct super_block *sb, struct inode *inode, gfp_t gfp)
+ {
+ 	static const struct inode_operations empty_iops;
+ 	static const struct file_operations no_open_fops = {.open = no_open};
+@@ -230,14 +230,14 @@ int inode_init_always(struct super_block
+ #endif
+ 	inode->i_flctx = NULL;
+ 
+-	if (unlikely(security_inode_alloc(inode)))
++	if (unlikely(security_inode_alloc(inode, gfp)))
+ 		return -ENOMEM;
+ 
+ 	this_cpu_inc(nr_inodes);
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(inode_init_always);
++EXPORT_SYMBOL(inode_init_always_gfp);
+ 
+ void free_inode_nonrcu(struct inode *inode)
+ {
+--- a/include/linux/fs.h~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/include/linux/fs.h
+@@ -3033,7 +3033,12 @@ extern loff_t default_llseek(struct file
+ 
+ extern loff_t vfs_llseek(struct file *file, loff_t offset, int whence);
+ 
+-extern int inode_init_always(struct super_block *, struct inode *);
++extern int inode_init_always_gfp(struct super_block *, struct inode *, gfp_t);
++static inline int inode_init_always(struct super_block *sb, struct inode *inode)
++{
++	return inode_init_always_gfp(sb, inode, GFP_NOFS);
++}
++
+ extern void inode_init_once(struct inode *);
+ extern void address_space_init_once(struct address_space *mapping);
+ extern struct inode * igrab(struct inode *);
+--- a/include/linux/lsm_hooks.h~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/include/linux/lsm_hooks.h
+@@ -150,6 +150,6 @@ extern struct lsm_info __start_early_lsm
+ 		__used __section(".early_lsm_info.init")		\
+ 		__aligned(sizeof(unsigned long))
+ 
+-extern int lsm_inode_alloc(struct inode *inode);
++extern int lsm_inode_alloc(struct inode *inode, gfp_t gfp);
+ 
+ #endif /* ! __LINUX_LSM_HOOKS_H */
+--- a/include/linux/security.h~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/include/linux/security.h
+@@ -336,7 +336,7 @@ int security_dentry_create_files_as(stru
+ 					struct cred *new);
+ int security_path_notify(const struct path *path, u64 mask,
+ 					unsigned int obj_type);
+-int security_inode_alloc(struct inode *inode);
++int security_inode_alloc(struct inode *inode, gfp_t gfp);
+ void security_inode_free(struct inode *inode);
+ int security_inode_init_security(struct inode *inode, struct inode *dir,
+ 				 const struct qstr *qstr,
+@@ -769,7 +769,7 @@ static inline int security_path_notify(c
+ 	return 0;
+ }
+ 
+-static inline int security_inode_alloc(struct inode *inode)
++static inline int security_inode_alloc(struct inode *inode, gfp_t gfp)
+ {
+ 	return 0;
+ }
+--- a/security/security.c~bcachefs-do-not-use-pf_memalloc_noreclaim
++++ a/security/security.c
+@@ -660,14 +660,14 @@ static int lsm_file_alloc(struct file *f
+  *
+  * Returns 0, or -ENOMEM if memory can't be allocated.
+  */
+-int lsm_inode_alloc(struct inode *inode)
++int lsm_inode_alloc(struct inode *inode, gfp_t gfp)
+ {
+ 	if (!lsm_inode_cache) {
+ 		inode->i_security = NULL;
+ 		return 0;
+ 	}
+ 
+-	inode->i_security = kmem_cache_zalloc(lsm_inode_cache, GFP_NOFS);
++	inode->i_security = kmem_cache_zalloc(lsm_inode_cache, gfp);
+ 	if (inode->i_security == NULL)
+ 		return -ENOMEM;
+ 	return 0;
+@@ -1582,9 +1582,9 @@ int security_path_notify(const struct pa
+  *
+  * Return: Return 0 if operation was successful.
+  */
+-int security_inode_alloc(struct inode *inode)
++int security_inode_alloc(struct inode *inode, gfp_t gfp)
+ {
+-	int rc = lsm_inode_alloc(inode);
++	int rc = lsm_inode_alloc(inode, gfp);
+ 
+ 	if (unlikely(rc))
+ 		return rc;
+_
