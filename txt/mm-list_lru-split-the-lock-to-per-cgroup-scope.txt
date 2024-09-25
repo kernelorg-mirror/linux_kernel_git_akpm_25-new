@@ -1,0 +1,98 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/list_lru: split the lock to per-cgroup scope
+Date: Thu, 26 Sep 2024 01:10:19 +0800
+
+Currently, every list_lru has a per-node lock that protects adding,
+deletion, isolation, and reparenting of all list_lru_one instances
+belonging to this list_lru on this node.  This lock contention is heavy
+when multiple cgroups modify the same list_lru.
+
+This lock can be split into per-cgroup scope to reduce contention.
+
+To achieve this, we need a stable list_lru_one for every cgroup.  This
+commit adds a lock to each list_lru_one and introduced a helper function
+lock_list_lru_of_memcg, making it possible to pin the list_lru of a memcg.
+Then reworked the reparenting process.
+
+Reparenting will switch the list_lru_one instances one by one.  By locking
+each instance and marking it dead using the nr_items counter, reparenting
+ensures that all items in the corresponding cgroup (on-list or not,
+because items have a stable cgroup, see below) will see the list_lru_one
+switch synchronously.
+
+Objcg reparent is also moved after list_lru reparent so items will have a
+stable mem cgroup until all list_lru_one instances are drained.
+
+The only caller that doesn't work the *_obj interfaces are direct calls to
+list_lru_{add,del}.  But it's only used by zswap and that's also based on
+objcg, so it's fine.
+
+This also changes the bahaviour of the isolation function when LRU_RETRY
+or LRU_REMOVED_RETRY is returned, because now releasing the lock could
+unblock reparenting and free the list_lru_one, isolation function will
+have to return withoug re-lock the lru.
+
+prepare() {
+    mkdir /tmp/test-fs
+    modprobe brd rd_nr=1 rd_size=33554432
+    mkfs.xfs -f /dev/ram0
+    mount -t xfs /dev/ram0 /tmp/test-fs
+    for i in $(seq 1 512); do
+        mkdir "/tmp/test-fs/$i"
+        for j in $(seq 1 10240); do
+            echo TEST-CONTENT > "/tmp/test-fs/$i/$j"
+        done &
+    done; wait
+}
+
+do_test() {
+    read_worker() {
+        sleep 1
+        tar -cv "$1" &>/dev/null
+    }
+    read_in_all() {
+        cd "/tmp/test-fs" && ls
+        for i in $(seq 1 512); do
+            (exec sh -c 'echo "$PPID"') > "/sys/fs/cgroup/benchmark/$i/cgroup.procs"
+            read_worker "$i" &
+        done; wait
+    }
+    for i in $(seq 1 512); do
+        mkdir -p "/sys/fs/cgroup/benchmark/$i"
+    done
+    echo +memory > /sys/fs/cgroup/benchmark/cgroup.subtree_control
+    echo 512M > /sys/fs/cgroup/benchmark/memory.max
+    echo 3 > /proc/sys/vm/drop_caches
+    time read_in_all
+}
+
+Above script simulates compression of small files in multiple cgroups
+with memory pressure. Run prepare() then do_test for 6 times:
+
+Before:
+real      0m7.762s user      0m11.340s sys       3m11.224s
+real      0m8.123s user      0m11.548s sys       3m2.549s
+real      0m7.736s user      0m11.515s sys       3m11.171s
+real      0m8.539s user      0m11.508s sys       3m7.618s
+real      0m7.928s user      0m11.349s sys       3m13.063s
+real      0m8.105s user      0m11.128s sys       3m14.313s
+
+After this commit (about ~15% faster):
+real      0m6.953s user      0m11.327s sys       2m42.912s
+real      0m7.453s user      0m11.343s sys       2m51.942s
+real      0m6.916s user      0m11.269s sys       2m43.957s
+real      0m6.894s user      0m11.528s sys       2m45.346s
+real      0m6.911s user      0m11.095s sys       2m43.168s
+real      0m6.773s user      0m11.518s sys       2m40.774s
+
+Link: https://lkml.kernel.org/r/20240925171020.32142-6-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Chengming Zhou <zhouchengming@bytedance.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Waiman Long <longman@redhat.com>

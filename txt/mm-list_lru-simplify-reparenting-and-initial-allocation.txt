@@ -1,0 +1,98 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/list_lru: simplify reparenting and initial allocation
+Date: Thu, 26 Sep 2024 01:10:18 +0800
+
+Currently, there is a lot of code for detecting reparent racing using
+kmemcg_id as the synchronization flag.  And an intermediate table is
+required to record and compare the kmemcg_id.
+
+We can simplify this by just checking the cgroup css status, skip if
+cgroup is being offlined.  On the reparenting side, ensure no more
+allocation is on going and no further allocation will occur by using the
+XArray lock as barrier.
+
+Combined with a O(n^2) top-down walk for the allocation, we get rid of the
+intermediate table allocation completely.  Despite being O(n^2), it should
+be actually faster because it's not practical to have a very deep cgroup
+level, and in most cases the parent cgroup should have been allocated
+already.
+
+This also avoided changing kmemcg_id before reparenting, making cgroups
+have a stable index for list_lru_memcg.  After this change it's possible
+that a dying cgroup will see a NULL value in XArray corresponding to the
+kmemcg_id, because the kmemcg_id will point to an empty slot.  In such
+case, just fallback to use its parent.
+
+As a result the code is simpler, following test also showed a very slight
+performance gain (12 test runs):
+
+prepare() {
+        mkdir /tmp/test-fs
+        modprobe brd rd_nr=1 rd_size=16777216
+        mkfs.xfs -f /dev/ram0
+        mount -t xfs /dev/ram0 /tmp/test-fs
+        for i in $(seq 10000); do
+                seq 8000 > "/tmp/test-fs/$i"
+        done
+        mkdir -p /sys/fs/cgroup/system.slice/bench/test/1
+        echo +memory > /sys/fs/cgroup/system.slice/bench/cgroup.subtree_control
+        echo +memory > /sys/fs/cgroup/system.slice/bench/test/cgroup.subtree_control
+        echo +memory > /sys/fs/cgroup/system.slice/bench/test/1/cgroup.subtree_control
+        echo 768M > /sys/fs/cgroup/system.slice/bench/memory.max
+}
+
+do_test() {
+        read_worker() {
+                mkdir -p "/sys/fs/cgroup/system.slice/bench/test/1/$1"
+                echo $BASHPID > "/sys/fs/cgroup/system.slice/bench/test/1/$1/cgroup.procs"
+                read -r __TMP < "/tmp/test-fs/$1";
+        }
+        read_in_all() {
+                for i in $(seq 10000); do
+                        read_worker "$i" &
+                done; wait
+        }
+        echo 3 > /proc/sys/vm/drop_caches
+        time read_in_all
+        for i in $(seq 1 10000); do
+                rmdir "/sys/fs/cgroup/system.slice/bench/test/1/$i" &>/dev/null
+        done
+}
+
+Before:
+real    0m3.498s   user    0m11.037s  sys     0m35.872s
+real    1m33.860s  user    0m11.593s  sys     3m1.169s
+real    1m31.883s  user    0m11.265s  sys     2m59.198s
+real    1m32.394s  user    0m11.294s  sys     3m1.616s
+real    1m31.017s  user    0m11.379s  sys     3m1.349s
+real    1m31.931s  user    0m11.295s  sys     2m59.863s
+real    1m32.758s  user    0m11.254s  sys     2m59.538s
+real    1m35.198s  user    0m11.145s  sys     3m1.123s
+real    1m30.531s  user    0m11.393s  sys     2m58.089s
+real    1m31.142s  user    0m11.333s  sys     3m0.549s
+
+After:
+real    0m3.489s   user    0m10.943s  sys     0m36.036s
+real    1m10.893s  user    0m11.495s  sys     2m38.545s
+real    1m29.129s  user    0m11.382s  sys     3m1.601s
+real    1m29.944s  user    0m11.494s  sys     3m1.575s
+real    1m31.208s  user    0m11.451s  sys     2m59.693s
+real    1m25.944s  user    0m11.327s  sys     2m56.394s
+real    1m28.599s  user    0m11.312s  sys     3m0.162s
+real    1m26.746s  user    0m11.538s  sys     2m55.462s
+real    1m30.668s  user    0m11.475s  sys     3m2.075s
+real    1m29.258s  user    0m11.292s  sys     3m0.780s
+
+Which is slightly faster in real time.
+
+Link: https://lkml.kernel.org/r/20240925171020.32142-5-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Chengming Zhou <zhouchengming@bytedance.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Waiman Long <longman@redhat.com>
