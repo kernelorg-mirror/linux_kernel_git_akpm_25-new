@@ -1,0 +1,136 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: mm: optimize truncation of shadow entries
+Date: Wed, 25 Sep 2024 15:47:15 -0700
+
+Patch series "mm: optimize shadow entries removal", v2.
+
+Some of our production workloads which processes a large amount of data
+spends considerable amount of CPUs on truncation and invalidation of large
+sized files (100s of GiBs of size).  Tracing the operations showed that
+most of the time is in shadow entries removal.  This patch series
+optimizes the truncation and invalidation operations.
+
+
+This patch (of 2):
+
+The kernel truncates the page cache in batches of PAGEVEC_SIZE.  For each
+batch, it traverses the page cache tree and collects the entries (folio
+and shadow entries) in the struct folio_batch.  For the shadow entries
+present in the folio_batch, it has to traverse the page cache tree for
+each individual entry to remove them.  This patch optimize this by
+removing them in a single tree traversal.
+
+On large machines in our production which run workloads manipulating large
+amount of data, we have observed that a large amount of CPUs are spent on
+truncation of very large files (100s of GiBs file sizes).  More
+specifically most of time was spent on shadow entries cleanup, so
+optimizing the shadow entries cleanup, even a little bit, has good impact.
+
+To evaluate the changes, we created 200GiB file on a fuse fs and in a
+memcg.  We created the shadow entries by triggering reclaim through
+memory.reclaim in that specific memcg and measure the simple truncation
+operation.
+
+ # time truncate -s 0 file
+
+              time (sec)
+Without       5.164 +- 0.059
+With-patch    4.21  +- 0.066 (18.47% decrease)
+
+Link: https://lkml.kernel.org/r/20240925224716.2904498-1-shakeel.butt@linux.dev
+Link: https://lkml.kernel.org/r/20240925224716.2904498-2-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Chris Mason <clm@fb.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Omar Sandoval <osandov@osandov.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/truncate.c |   53 +++++++++++++++++++++++-------------------------
+ 1 file changed, 26 insertions(+), 27 deletions(-)
+
+--- a/mm/truncate.c~mm-optimize-truncation-of-shadow-entries
++++ a/mm/truncate.c
+@@ -68,54 +68,53 @@ static void clear_shadow_entries(struct
+  * Unconditionally remove exceptional entries. Usually called from truncate
+  * path. Note that the folio_batch may be altered by this function by removing
+  * exceptional entries similar to what folio_batch_remove_exceptionals() does.
++ * Please note that indices[] has entries in ascending order as guaranteed by
++ * either find_get_entries() or find_lock_entries().
+  */
+ static void truncate_folio_batch_exceptionals(struct address_space *mapping,
+ 				struct folio_batch *fbatch, pgoff_t *indices)
+ {
++	XA_STATE(xas, &mapping->i_pages, indices[0]);
++	int nr = folio_batch_count(fbatch);
++	struct folio *folio;
+ 	int i, j;
+-	bool dax;
+ 
+ 	/* Handled by shmem itself */
+ 	if (shmem_mapping(mapping))
+ 		return;
+ 
+-	for (j = 0; j < folio_batch_count(fbatch); j++)
++	for (j = 0; j < nr; j++)
+ 		if (xa_is_value(fbatch->folios[j]))
+ 			break;
+ 
+-	if (j == folio_batch_count(fbatch))
++	if (j == nr)
+ 		return;
+ 
+-	dax = dax_mapping(mapping);
+-	if (!dax) {
+-		spin_lock(&mapping->host->i_lock);
+-		xa_lock_irq(&mapping->i_pages);
++	if (dax_mapping(mapping)) {
++		for (i = j; i < nr; i++) {
++			if (xa_is_value(fbatch->folios[i]))
++				dax_delete_mapping_entry(mapping, indices[i]);
++		}
++		goto out;
+ 	}
+ 
+-	for (i = j; i < folio_batch_count(fbatch); i++) {
+-		struct folio *folio = fbatch->folios[i];
+-		pgoff_t index = indices[i];
+-
+-		if (!xa_is_value(folio)) {
+-			fbatch->folios[j++] = folio;
+-			continue;
+-		}
++	xas_set(&xas, indices[j]);
++	xas_set_update(&xas, workingset_update_node);
+ 
+-		if (unlikely(dax)) {
+-			dax_delete_mapping_entry(mapping, index);
+-			continue;
+-		}
++	spin_lock(&mapping->host->i_lock);
++	xas_lock_irq(&xas);
+ 
+-		__clear_shadow_entry(mapping, index, folio);
++	xas_for_each(&xas, folio, indices[nr-1]) {
++		if (xa_is_value(folio))
++			xas_store(&xas, NULL);
+ 	}
+ 
+-	if (!dax) {
+-		xa_unlock_irq(&mapping->i_pages);
+-		if (mapping_shrinkable(mapping))
+-			inode_add_lru(mapping->host);
+-		spin_unlock(&mapping->host->i_lock);
+-	}
+-	fbatch->nr = j;
++	xas_unlock_irq(&xas);
++	if (mapping_shrinkable(mapping))
++		inode_add_lru(mapping->host);
++	spin_unlock(&mapping->host->i_lock);
++out:
++	folio_batch_remove_exceptionals(fbatch);
+ }
+ 
+ /**
+_
