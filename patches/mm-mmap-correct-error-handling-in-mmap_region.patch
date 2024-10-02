@@ -1,0 +1,125 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/mmap: correct error handling in mmap_region()
+Date: Wed, 2 Oct 2024 08:39:32 +0100
+
+Commit f8d112a4e657 ("mm/mmap: avoid zeroing vma tree in mmap_region()")
+changed how error handling is performed in mmap_region().
+
+The error value defaults to -ENOMEM, but then gets reassigned immediately
+to the result of vms_gather_munmap_vmas() if we are performing a MAP_FIXED
+mapping over existing VMAs (and thus unmapping them).
+
+This overwrites the error value, potentially clearing it.
+
+After this, we invoke may_expand_vm() and possibly vm_area_alloc(), and
+check to see if they failed. If they do so, then we perform error-handling
+logic, but importantly, we do NOT update the error code.
+
+This means that, if vms_gather_munmap_vmas() succeeds, but one of these
+calls does not, the function will return indicating no error, but rather an
+address value of zero, which is entirely incorrect.
+
+Correct this and avoid future confusion by strictly setting error on each
+and every occasion we jump to the error handling logic, and set the error
+code immediately prior to doing so.
+
+This way we can see at a glance that the error code is always correct.
+
+Many thanks to Vegard Nossum who spotted this issue in discussion around
+this problem.
+
+Link: https://lkml.kernel.org/r/20241002073932.13482-1-lorenzo.stoakes@oracle.com
+Fixes: f8d112a4e657 ("mm/mmap: avoid zeroing vma tree in mmap_region()")
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Suggested-by: Vegard Nossum <vegard.nossum@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mmap.c |   32 +++++++++++++++++++++-----------
+ 1 file changed, 21 insertions(+), 11 deletions(-)
+
+--- a/mm/mmap.c~mm-mmap-correct-error-handling-in-mmap_region
++++ a/mm/mmap.c
+@@ -1371,7 +1371,7 @@ unsigned long mmap_region(struct file *f
+ 	struct maple_tree mt_detach;
+ 	unsigned long end = addr + len;
+ 	bool writable_file_mapping = false;
+-	int error = -ENOMEM;
++	int error;
+ 	VMA_ITERATOR(vmi, mm, addr);
+ 	VMG_STATE(vmg, mm, &vmi, addr, end, vm_flags, pgoff);
+ 
+@@ -1396,8 +1396,10 @@ unsigned long mmap_region(struct file *f
+ 	}
+ 
+ 	/* Check against address space limit. */
+-	if (!may_expand_vm(mm, vm_flags, pglen - vms.nr_pages))
++	if (!may_expand_vm(mm, vm_flags, pglen - vms.nr_pages)) {
++		error = -ENOMEM;
+ 		goto abort_munmap;
++	}
+ 
+ 	/*
+ 	 * Private writable mapping: check memory availability
+@@ -1405,8 +1407,11 @@ unsigned long mmap_region(struct file *f
+ 	if (accountable_mapping(file, vm_flags)) {
+ 		charged = pglen;
+ 		charged -= vms.nr_accounted;
+-		if (charged && security_vm_enough_memory_mm(mm, charged))
+-			goto abort_munmap;
++		if (charged) {
++			error = security_vm_enough_memory_mm(mm, charged);
++			if (error)
++				goto abort_munmap;
++		}
+ 
+ 		vms.nr_accounted = 0;
+ 		vm_flags |= VM_ACCOUNT;
+@@ -1422,8 +1427,10 @@ unsigned long mmap_region(struct file *f
+ 	 * not unmapped, but the maps are removed from the list.
+ 	 */
+ 	vma = vm_area_alloc(mm);
+-	if (!vma)
++	if (!vma) {
++		error = -ENOMEM;
+ 		goto unacct_error;
++	}
+ 
+ 	vma_iter_config(&vmi, addr, end);
+ 	vma_set_range(vma, addr, end, pgoff);
+@@ -1453,9 +1460,10 @@ unsigned long mmap_region(struct file *f
+ 		 * Expansion is handled above, merging is handled below.
+ 		 * Drivers should not alter the address of the VMA.
+ 		 */
+-		error = -EINVAL;
+-		if (WARN_ON((addr != vma->vm_start)))
++		if (WARN_ON((addr != vma->vm_start))) {
++			error = -EINVAL;
+ 			goto close_and_free_vma;
++		}
+ 
+ 		vma_iter_config(&vmi, addr, end);
+ 		/*
+@@ -1500,13 +1508,15 @@ unsigned long mmap_region(struct file *f
+ 	}
+ 
+ 	/* Allow architectures to sanity-check the vm_flags */
+-	error = -EINVAL;
+-	if (!arch_validate_flags(vma->vm_flags))
++	if (!arch_validate_flags(vma->vm_flags)) {
++		error = -EINVAL;
+ 		goto close_and_free_vma;
++	}
+ 
+-	error = -ENOMEM;
+-	if (vma_iter_prealloc(&vmi, vma))
++	if (vma_iter_prealloc(&vmi, vma)) {
++		error = -ENOMEM;
+ 		goto close_and_free_vma;
++	}
+ 
+ 	/* Lock the VMA since it is modified after insertion into VMA tree */
+ 	vma_start_write(vma);
+_
