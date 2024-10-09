@@ -1,0 +1,53 @@
+From: Zhaoyang Huang <zhaoyang.huang@unisoc.com>
+Subject: mm: throttle and inc min_seq when both page types reach MIN_NR_GENS
+Date: Wed, 9 Oct 2024 15:49:53 +0800
+
+The test case of [1] leads to system hang which caused by a local watchdog
+thread starved over 20s on a 5.5GB RAM ANDROID15(v6.6) system.  This
+commit solve the issue by have the reclaimer be throttled and increase
+min_seq if both page types reach MIN_NR_GENS, which may introduce a
+livelock of switching type with holding lruvec->lru_lock.
+
+[1]
+launch below script 8 times simutanously which allocates 1GB virtual
+memory and access it from user space by each thread.
+$ costmem -c1024000 -b12800 -o0 &
+
+Link: https://lkml.kernel.org/r/20241009074953.608591-1-zhaoyang.huang@unisoc.com
+Signed-off-by: Zhaoyang Huang <zhaoyang.huang@unisoc.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmscan.c |   16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+--- a/mm/vmscan.c~mm-throttle-and-inc-min_seq-when-both-page-types-reach-min_nr_gens
++++ a/mm/vmscan.c
+@@ -4387,11 +4387,23 @@ static int scan_folios(struct lruvec *lr
+ 	int remaining = MAX_LRU_BATCH;
+ 	struct lru_gen_folio *lrugen = &lruvec->lrugen;
+ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+ 
+ 	VM_WARN_ON_ONCE(!list_empty(list));
+ 
+-	if (get_nr_gens(lruvec, type) == MIN_NR_GENS)
+-		return 0;
++	if (get_nr_gens(lruvec, type) == MIN_NR_GENS) {
++		/*
++		 * throttle for a while and then increase the min_seq since
++		 * both page types reach the limit.
++		 */
++		if (get_nr_gens(lruvec, !type) == MIN_NR_GENS) {
++			spin_unlock_irq(&lruvec->lru_lock);
++			reclaim_throttle(pgdat, VMSCAN_THROTTLE_ISOLATED);
++			spin_lock_irq(&lruvec->lru_lock);
++			try_to_inc_min_seq(lruvec, get_swappiness(lruvec, sc));
++		} else
++			return 0;
++	}
+ 
+ 	gen = lru_gen_from_seq(lrugen->min_seq[type]);
+ 
+_
