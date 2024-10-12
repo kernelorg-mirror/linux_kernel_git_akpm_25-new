@@ -1,0 +1,94 @@
+From: suhua <suhua1@kingsoft.com>
+Subject: mm/hugetlb: perform vmemmap optimization batchly for specific node allocation
+Date: Sat, 12 Oct 2024 15:08:02 +0800
+
+When HVO is enabled and huge page memory allocs are made, the freed memory
+can be aggregated into higher order memory in the following paths, which
+facilitates further allocs for higher order memory.
+
+echo 200000 > /proc/sys/vm/nr_hugepages
+echo 200000 > /sys/devices/system/node/node*/hugepages/hugepages-2048kB/nr_hugepages
+grub： default_hugepagesz=2M hugepagesz=2M hugepages=200000
+
+Currently not support for releasing aggregations to higher order in the
+following way, which will releasing to lower order.
+
+grub: default_hugepagesz=2M hugepagesz=2M hugepages=0:100000,1:100000
+
+This patch supports the release of huge page optimizations aggregates to
+higher order memory.
+
+eg:
+cat /proc/cmdline
+BOOT_IMAGE=/boot/vmlinuz-xxx ... default_hugepagesz=2M hugepagesz=2M hugepages=0:100000,1:100000
+
+Before:
+Free pages count per migrate type at order       0      1      2      3      4      5      6      7      8      9     10
+...
+Node    0, zone   Normal, type    Unmovable  55282  97039  99307      0      1      1      0      1      1      1      0
+Node    0, zone   Normal, type      Movable     25     11    345     87     48     21      2     20      9      3  75061
+Node    0, zone   Normal, type  Reclaimable      4      2      2      4      3      0      2      1      1      1      0
+Node    0, zone   Normal, type   HighAtomic      0      0      0      0      0      0      0      0      0      0      0
+...
+Free pages count per migrate type at order       0      1      2      3      4      5      6      7      8      9     10
+Node    1, zone   Normal, type    Unmovable  98888  99650  99679      2      3      1      2      2      2      0      0
+Node    1, zone   Normal, type      Movable      1      1      0      1      1      0      1      0      1      1  75937
+Node    1, zone   Normal, type  Reclaimable      0      0      0      0      0      0      0      0      0      0      0
+Node    1, zone   Normal, type   HighAtomic      0      0      0      0      0      0      0      0      0      0      0
+
+After:
+Free pages count per migrate type at order       0      1      2      3      4      5      6      7      8      9     10
+...
+Node    0, zone   Normal, type    Unmovable    152    158     37      2      2      0      3      4      2      6    717
+Node    0, zone   Normal, type      Movable      1     37     53      3     55     49     16      6      2      1  75000
+Node    0, zone   Normal, type  Reclaimable      1      4      3      1      2      1      1      1      1      1      0
+Node    0, zone   Normal, type   HighAtomic      0      0      0      0      0      0      0      0      0      0      0
+...
+Free pages count per migrate type at order       0      1      2      3      4      5      6      7      8      9     10
+Node    1, zone   Normal, type    Unmovable      5      3      2      1      3      4      2      2      2      0    779
+Node    1, zone   Normal, type      Movable      1      0      1      1      1      0      1      0      1      1  75849
+Node    1, zone   Normal, type  Reclaimable      0      0      0      0      0      0      0      0      0      0      0
+Node    1, zone   Normal, type   HighAtomic      0      0      0      0      0      0      0      0      0      0      0
+
+Link: https://lkml.kernel.org/r/20241012070802.1876-1-suhua1@kingsoft.com
+Signed-off-by: suhua <suhua1@kingsoft.com>
+Reviewed-by: Muchun Song <muchun.song@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/hugetlb.c |   11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+--- a/mm/hugetlb.c~mm-hugetlb-perform-vmemmap-optimization-batchly-for-specific-node-allocation
++++ a/mm/hugetlb.c
+@@ -3301,6 +3301,7 @@ static void __init hugetlb_hstate_alloc_
+ {
+ 	unsigned long i;
+ 	char buf[32];
++	LIST_HEAD(folio_list);
+ 
+ 	for (i = 0; i < h->max_huge_pages_node[nid]; ++i) {
+ 		if (hstate_is_gigantic(h)) {
+@@ -3310,14 +3311,18 @@ static void __init hugetlb_hstate_alloc_
+ 			struct folio *folio;
+ 			gfp_t gfp_mask = htlb_alloc_mask(h) | __GFP_THISNODE;
+ 
+-			folio = alloc_fresh_hugetlb_folio(h, gfp_mask, nid,
+-					&node_states[N_MEMORY]);
++			folio = only_alloc_fresh_hugetlb_folio(h, gfp_mask, nid,
++					&node_states[N_MEMORY], NULL);
+ 			if (!folio)
+ 				break;
+-			free_huge_folio(folio); /* free it into the hugepage allocator */
++			list_add(&folio->lru, &folio_list);
+ 		}
+ 		cond_resched();
+ 	}
++
++	if (!list_empty(&folio_list))
++		prep_and_add_allocated_folios(h, &folio_list);
++
+ 	if (i == h->max_huge_pages_node[nid])
+ 		return;
+ 
+_

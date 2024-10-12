@@ -1,0 +1,99 @@
+From: Zi Yan <ziy@nvidia.com>
+Subject: mm: avoid zeroing user movable page twice with init_on_alloc=1
+Date: Fri, 11 Oct 2024 11:03:04 -0400
+
+Commit 6471384af2a6 ("mm: security: introduce init_on_alloc=1 and
+init_on_free=1 boot options") forces allocated page to be zeroed in
+post_alloc_hook() when init_on_alloc=1.
+
+For order-0 folios, if arch does not define
+vma_alloc_zeroed_movable_folio(), the default implementation again zeros
+the page return from the buddy allocator.  So the page is zeroed twice. 
+Fix it by passing __GFP_ZERO instead to avoid double page zeroing.  At the
+moment, s390,arm64,x86,alpha,m68k are not impacted since they define their
+own vma_alloc_zeroed_movable_folio().
+
+For >0 order folios (mTHP and PMD THP), folio_zero_user() is called to
+zero the folio again.  Fix it by calling folio_zero_user() only if
+init_on_alloc is set.  All arch are impacted.
+
+Add alloc_zeroed() helper to encapsulate the init_on_alloc check.
+
+Link: https://lkml.kernel.org/r/20241011150304.709590-1-ziy@nvidia.com
+Signed-off-by: Zi Yan <ziy@nvidia.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/highmem.h |    8 +-------
+ mm/huge_memory.c        |    3 ++-
+ mm/internal.h           |    6 ++++++
+ mm/memory.c             |    3 ++-
+ 4 files changed, 11 insertions(+), 9 deletions(-)
+
+--- a/include/linux/highmem.h~mm-avoid-zeroing-user-movable-page-twice-with-init_on_alloc=1
++++ a/include/linux/highmem.h
+@@ -224,13 +224,7 @@ static inline
+ struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
+ 				   unsigned long vaddr)
+ {
+-	struct folio *folio;
+-
+-	folio = vma_alloc_folio(GFP_HIGHUSER_MOVABLE, 0, vma, vaddr);
+-	if (folio)
+-		clear_user_highpage(&folio->page, vaddr);
+-
+-	return folio;
++	return vma_alloc_folio(GFP_HIGHUSER_MOVABLE | __GFP_ZERO, 0, vma, vaddr);
+ }
+ #endif
+ 
+--- a/mm/huge_memory.c~mm-avoid-zeroing-user-movable-page-twice-with-init_on_alloc=1
++++ a/mm/huge_memory.c
+@@ -1176,7 +1176,8 @@ static struct folio *vma_alloc_anon_foli
+ 	}
+ 	folio_throttle_swaprate(folio, gfp);
+ 
+-	folio_zero_user(folio, addr);
++	if (!alloc_zeroed())
++		folio_zero_user(folio, addr);
+ 	/*
+ 	 * The memory barrier inside __folio_mark_uptodate makes sure that
+ 	 * folio_zero_user writes become visible before the set_pmd_at()
+--- a/mm/internal.h~mm-avoid-zeroing-user-movable-page-twice-with-init_on_alloc=1
++++ a/mm/internal.h
+@@ -1233,6 +1233,12 @@ void touch_pud(struct vm_area_struct *vm
+ void touch_pmd(struct vm_area_struct *vma, unsigned long addr,
+ 	       pmd_t *pmd, bool write);
+ 
++static inline bool alloc_zeroed(void)
++{
++	return static_branch_maybe(CONFIG_INIT_ON_ALLOC_DEFAULT_ON,
++			&init_on_alloc);
++}
++
+ enum {
+ 	/* mark page accessed */
+ 	FOLL_TOUCH = 1 << 16,
+--- a/mm/memory.c~mm-avoid-zeroing-user-movable-page-twice-with-init_on_alloc=1
++++ a/mm/memory.c
+@@ -4719,7 +4719,8 @@ static struct folio *alloc_anon_folio(st
+ 				goto next;
+ 			}
+ 			folio_throttle_swaprate(folio, gfp);
+-			folio_zero_user(folio, vmf->address);
++			if (!alloc_zeroed())
++				folio_zero_user(folio, vmf->address);
+ 			return folio;
+ 		}
+ next:
+_
