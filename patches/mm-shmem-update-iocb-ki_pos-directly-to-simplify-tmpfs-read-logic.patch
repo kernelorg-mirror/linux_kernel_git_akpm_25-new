@@ -1,0 +1,122 @@
+From: Baolin Wang <baolin.wang@linux.alibaba.com>
+Subject: mm: shmem: update iocb->ki_pos directly to simplify tmpfs read logic
+Date: Fri, 18 Oct 2024 11:00:27 +0800
+
+Patch series "Improve the tmpfs large folio read performance", v2.
+
+tmpfs already supports PMD-sized large folios, but the tmpfs read
+operation still performs copying at PAGE_SIZE granularity, which is not
+perfect.  This patchset changes tmpfs to copy data at the folio
+granularity, which can improve the read performance.
+
+Use 'fio bs=64k' to read a 1G tmpfs file populated with 2M THPs, and I can
+see about 20% performance improvement, and no regression with bs=4k.  I
+also did some functional testing with the xfstests suite, and I did not
+find any regressions with the following xfstests config:
+
+  FSTYP=tmpfs
+  export TEST_DIR=/mnt/tempfs_mnt
+  export TEST_DEV=/mnt/tempfs_mnt
+  export SCRATCH_MNT=/mnt/scratchdir
+  export SCRATCH_DEV=/mnt/scratchdir
+
+
+This patch (of 2):
+
+Using iocb->ki_pos to check if the read bytes exceeds the file size and to
+calculate the bytes to be read can help simplify the code logic. 
+Meanwhile, this is also a preparation for improving tmpfs large folios
+read performance in the following patch.
+
+Link: https://lkml.kernel.org/r/cover.1729218573.git.baolin.wang@linux.alibaba.com
+Link: https://lkml.kernel.org/r/e8863e289577e0dc1e365b5419bf2d1c9a24ae3d.1729218573.git.baolin.wang@linux.alibaba.com
+Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reviewed-by: Yang Shi <shy828301@gmail.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/shmem.c |   35 +++++++++++------------------------
+ 1 file changed, 11 insertions(+), 24 deletions(-)
+
+--- a/mm/shmem.c~mm-shmem-update-iocb-ki_pos-directly-to-simplify-tmpfs-read-logic
++++ a/mm/shmem.c
+@@ -3096,27 +3096,19 @@ static ssize_t shmem_file_read_iter(stru
+ 	unsigned long offset;
+ 	int error = 0;
+ 	ssize_t retval = 0;
+-	loff_t *ppos = &iocb->ki_pos;
+ 
+-	index = *ppos >> PAGE_SHIFT;
+-	offset = *ppos & ~PAGE_MASK;
++	offset = iocb->ki_pos & ~PAGE_MASK;
+ 
+ 	for (;;) {
+ 		struct folio *folio = NULL;
+ 		struct page *page = NULL;
+-		pgoff_t end_index;
+ 		unsigned long nr, ret;
+-		loff_t i_size = i_size_read(inode);
++		loff_t end_offset, i_size = i_size_read(inode);
+ 
+-		end_index = i_size >> PAGE_SHIFT;
+-		if (index > end_index)
++		if (unlikely(iocb->ki_pos >= i_size))
+ 			break;
+-		if (index == end_index) {
+-			nr = i_size & ~PAGE_MASK;
+-			if (nr <= offset)
+-				break;
+-		}
+ 
++		index = iocb->ki_pos >> PAGE_SHIFT;
+ 		error = shmem_get_folio(inode, index, 0, &folio, SGP_READ);
+ 		if (error) {
+ 			if (error == -EINVAL)
+@@ -3138,18 +3130,14 @@ static ssize_t shmem_file_read_iter(stru
+ 		 * We must evaluate after, since reads (unlike writes)
+ 		 * are called without i_rwsem protection against truncate
+ 		 */
+-		nr = PAGE_SIZE;
+ 		i_size = i_size_read(inode);
+-		end_index = i_size >> PAGE_SHIFT;
+-		if (index == end_index) {
+-			nr = i_size & ~PAGE_MASK;
+-			if (nr <= offset) {
+-				if (folio)
+-					folio_put(folio);
+-				break;
+-			}
++		if (unlikely(iocb->ki_pos >= i_size)) {
++			if (folio)
++				folio_put(folio);
++			break;
+ 		}
+-		nr -= offset;
++		end_offset = min_t(loff_t, i_size, iocb->ki_pos + to->count);
++		nr = min_t(loff_t, end_offset - iocb->ki_pos, PAGE_SIZE - offset);
+ 
+ 		if (folio) {
+ 			/*
+@@ -3189,8 +3177,8 @@ static ssize_t shmem_file_read_iter(stru
+ 
+ 		retval += ret;
+ 		offset += ret;
+-		index += offset >> PAGE_SHIFT;
+ 		offset &= ~PAGE_MASK;
++		iocb->ki_pos += ret;
+ 
+ 		if (!iov_iter_count(to))
+ 			break;
+@@ -3201,7 +3189,6 @@ static ssize_t shmem_file_read_iter(stru
+ 		cond_resched();
+ 	}
+ 
+-	*ppos = ((loff_t) index << PAGE_SHIFT) + offset;
+ 	file_accessed(file);
+ 	return retval ? retval : error;
+ }
+_
