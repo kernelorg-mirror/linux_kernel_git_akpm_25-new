@@ -1,0 +1,117 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm: do not attempt second merge for file-backed VMAs
+Date: Tue, 22 Oct 2024 21:40:59 +0100
+
+Previously, we'd always try to merge a file-backed VMA if its flags were
+changed by the driver.
+
+This however is rarely meaningful as typically the flags would be changed
+to VM_PFNMAP or other VM_SPECIAL flags which are inherently unmergable.
+
+In cases where it is meaningful (for instance DAX) it is doubtful that this
+optimisation is worth the effort and maintenance risk of having to unwind
+state and perform a merge.
+
+Since we've observed bugs and resource leaks due to complexity in this
+area, it is simply not acceptable to have a 'nice to have' optimisation
+like this complicating an already very complicated code path, so let's
+simply eliminate it.
+
+Link: https://lkml.kernel.org/r/7b6bf6165080505feb5e00b313d2c84c25015e45.1729628198.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: <stable@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vma.c |   39 ++-------------------------------------
+ 1 file changed, 2 insertions(+), 37 deletions(-)
+
+--- a/mm/vma.c~mm-do-not-attempt-second-merge-for-file-backed-vmas
++++ a/mm/vma.c
+@@ -2260,8 +2260,7 @@ static int __mmap_prepare(struct mmap_st
+ 	return 0;
+ }
+ 
+-static int __mmap_new_file_vma(struct mmap_state *map, struct vm_area_struct *vma,
+-			       struct vm_area_struct **mergep)
++static int __mmap_new_file_vma(struct mmap_state *map, struct vm_area_struct *vma)
+ {
+ 	struct vma_iterator *vmi = map->vmi;
+ 	struct vma_merge_struct *vmg = map->vmg;
+@@ -2291,34 +2290,6 @@ static int __mmap_new_file_vma(struct mm
+ 			(vma->vm_flags & VM_MAYWRITE));
+ 
+ 	vma_iter_config(vmi, vmg->start, vmg->end);
+-	/*
+-	 * If flags changed after mmap_file(), we should try merge
+-	 * vma again as we may succeed this time.
+-	 */
+-	if (unlikely(map->flags != vma->vm_flags && vmg->prev)) {
+-		struct vm_area_struct *merge;
+-
+-		vmg->flags = vma->vm_flags;
+-		/* If this fails, state is reset ready for a reattempt. */
+-		merge = vma_merge_new_range(vmg);
+-
+-		if (merge) {
+-			/*
+-			 * ->mmap() can change vma->vm_file and fput
+-			 * the original file. So fput the vma->vm_file
+-			 * here or we would add an extra fput for file
+-			 * and cause general protection fault
+-			 * ultimately.
+-			 */
+-			fput(vma->vm_file);
+-			vm_area_free(vma);
+-			vma_iter_free(vmi);
+-			*mergep = merge;
+-		} else {
+-			vma_iter_config(vmi, vmg->start, vmg->end);
+-		}
+-	}
+-
+ 	map->flags = vma->vm_flags;
+ 	return 0;
+ }
+@@ -2341,7 +2312,6 @@ static int __mmap_new_vma(struct mmap_st
+ {
+ 	struct vma_iterator *vmi = map->vmi;
+ 	struct vma_merge_struct *vmg = map->vmg;
+-	struct vm_area_struct *merge = NULL;
+ 	int error = 0;
+ 	struct vm_area_struct *vma;
+ 
+@@ -2365,7 +2335,7 @@ static int __mmap_new_vma(struct mmap_st
+ 	}
+ 
+ 	if (vmg->file)
+-		error = __mmap_new_file_vma(map, vma, &merge);
++		error = __mmap_new_file_vma(map, vma);
+ 	else if (map->flags & VM_SHARED)
+ 		error = shmem_zero_setup(vma);
+ 	else
+@@ -2374,9 +2344,6 @@ static int __mmap_new_vma(struct mmap_st
+ 	if (error)
+ 		goto free_iter_vma;
+ 
+-	if (merge)
+-		goto file_expanded;
+-
+ #ifdef CONFIG_SPARC64
+ 	/* TODO: Fix SPARC ADI! */
+ 	WARN_ON_ONCE(!arch_validate_flags(map->flags));
+@@ -2393,8 +2360,6 @@ static int __mmap_new_vma(struct mmap_st
+ 	 * call covers the non-merge case.
+ 	 */
+ 	khugepaged_enter_vma(vma, map->flags);
+-
+-file_expanded:
+ 	ksm_add_vma(vma);
+ 
+ 	*vmap = vma;
+_
