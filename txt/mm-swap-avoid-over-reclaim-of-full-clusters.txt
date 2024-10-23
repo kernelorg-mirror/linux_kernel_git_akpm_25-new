@@ -1,0 +1,73 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm, swap: avoid over reclaim of full clusters
+Date: Wed, 23 Oct 2024 01:55:12 +0800
+
+When running low on usable slots, cluster allocator will try to reclaim
+the full clusters aggressively to reclaim HAS_CACHE slots.  This
+guarantees that as long as there are any usable slots, HAS_CACHE or not,
+the swap device will be usable and workload won't go OOM early.
+
+Before the cluster allocator, swap allocator fails easily if device is
+filled up with reclaimable HAS_CACHE slots.  Which can be easily
+reproduced with following simple program:
+
+    #include <stdio.h>
+    #include <string.h>
+    #include <linux/mman.h>
+    #include <sys/mman.h>
+    #define SIZE 8192UL * 1024UL * 1024UL
+    int main(int argc, char **argv) {
+        long tmp;
+        char *p = mmap(NULL, SIZE, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        memset(p, 0, SIZE);
+        madvise(p, SIZE, MADV_PAGEOUT);
+        for (unsigned long i = 0; i < SIZE; ++i)
+            tmp += p[i];
+        getchar(); /* Pause */
+        return 0;
+    }
+
+Setup an 8G non ramdisk swap, the first run of the program will swapout 8G
+ram successfully.  But run same program again after the first run paused,
+the second run can't swapout all 8G memory as now half of the swap device
+is pinned by HAS_CACHE.  There was a random scan in the old allocator that
+may reclaim part of the HAS_CACHE by luck, but it's unreliable.
+
+The new allocator's added reclaim of full clusters when device is low on
+usable slots.  But when multiple CPUs are seeing the device is low on
+usable slots at the same time, they ran into a thundering herd problem.
+
+This is an observable problem on large machine with mass parallel
+workload, as full cluster reclaim is slower on large swap device and
+higher number of CPUs will also make things worse.
+
+Testing using a 128G ZRAM on a 48c96t system.  When the swap device is
+very close to full (eg.  124G / 128G), running build linux kernel with
+make -j96 in a 1G memory cgroup will hung (not a softlockup though)
+spinning in full cluster reclaim for about ~5min before go OOM.
+
+To solve this, split the full reclaim into two parts:
+
+- Instead of do a synchronous aggressively reclaim when device is low,
+  do only one aggressively reclaim when device is strictly full with a
+  kworker. This still ensures in worst case the device won't be unusable
+  because of HAS_CACHE slots.
+
+- To avoid allocation (especially higher order) suffer from HAS_CACHE
+  filling up clusters and kworker not responsive enough, do one synchronous
+  scan every time the free list is drained, and only scan one cluster. This
+  is kind of similar to the random reclaim before, keeps the full clusters
+  rotated and has a minimal latency. This should provide a fair reclaim
+  strategy suitable for most workloads.
+
+Link: https://lkml.kernel.org/r/20241022175512.10398-1-ryncsn@gmail.com
+Fixes: 2cacbdfdee65 ("mm: swap: add a adaptive full cluster cache reclaim")
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Barry Song <v-songbaohua@oppo.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>

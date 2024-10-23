@@ -1,0 +1,66 @@
+From: Jim Zhao <jimzhao.ai@gmail.com>
+Subject: mm/page-writeback: raise wb_thresh to prevent write blocking with strictlimit
+Date: Wed, 23 Oct 2024 18:00:32 +0800
+
+With the strictlimit flag, wb_thresh acts as a hard limit in
+balance_dirty_pages() and wb_position_ratio().  When device write
+operations are inactive, wb_thresh can drop to 0, causing writes to be
+blocked.  The issue occasionally occurs in fuse fs, particularly with
+network backends, the write thread is blocked frequently during a period. 
+To address it, this patch raises the minimum wb_thresh to a controllable
+level, similar to the non-strictlimit case.
+
+Link: https://lkml.kernel.org/r/20241023100032.62952-1-jimzhao.ai@gmail.com
+Signed-off-by: Jim Zhao <jimzhao.ai@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page-writeback.c |   25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+--- a/mm/page-writeback.c~mm-page-writeback-raise-wb_thresh-to-prevent-write-blocking-with-strictlimit
++++ a/mm/page-writeback.c
+@@ -917,7 +917,9 @@ static unsigned long __wb_calc_thresh(st
+ 				      unsigned long thresh)
+ {
+ 	struct wb_domain *dom = dtc_dom(dtc);
++	struct bdi_writeback *wb = dtc->wb;
+ 	u64 wb_thresh;
++	u64 wb_max_thresh;
+ 	unsigned long numerator, denominator;
+ 	unsigned long wb_min_ratio, wb_max_ratio;
+ 
+@@ -931,11 +933,28 @@ static unsigned long __wb_calc_thresh(st
+ 	wb_thresh *= numerator;
+ 	wb_thresh = div64_ul(wb_thresh, denominator);
+ 
+-	wb_min_max_ratio(dtc->wb, &wb_min_ratio, &wb_max_ratio);
++	wb_min_max_ratio(wb, &wb_min_ratio, &wb_max_ratio);
+ 
+ 	wb_thresh += (thresh * wb_min_ratio) / (100 * BDI_RATIO_SCALE);
+-	if (wb_thresh > (thresh * wb_max_ratio) / (100 * BDI_RATIO_SCALE))
+-		wb_thresh = thresh * wb_max_ratio / (100 * BDI_RATIO_SCALE);
++	wb_max_thresh = thresh * wb_max_ratio / (100 * BDI_RATIO_SCALE);
++	if (wb_thresh > wb_max_thresh)
++		wb_thresh = wb_max_thresh;
++
++	/*
++	 * With strictlimit flag, the wb_thresh is treated as
++	 * a hard limit in balance_dirty_pages() and wb_position_ratio().
++	 * It's possible that wb_thresh is close to zero, not because
++	 * the device is slow, but because it has been inactive.
++	 * To prevent occasional writes from being blocked, we raise wb_thresh.
++	 */
++	if (unlikely(wb->bdi->capabilities & BDI_CAP_STRICTLIMIT)) {
++		unsigned long limit = hard_dirty_limit(dom, dtc->thresh);
++		u64 wb_scale_thresh = 0;
++
++		if (limit > dtc->dirty)
++			wb_scale_thresh = (limit - dtc->dirty) / 100;
++		wb_thresh = max(wb_thresh, min(wb_scale_thresh, wb_max_thresh / 4));
++	}
+ 
+ 	return wb_thresh;
+ }
+_
