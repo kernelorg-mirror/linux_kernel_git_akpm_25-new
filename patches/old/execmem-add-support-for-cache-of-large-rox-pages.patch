@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: execmem: add support for cache of large ROX pages
-Date: Wed, 9 Oct 2024 21:08:15 +0300
+Date: Wed, 16 Oct 2024 15:24:23 +0300
 
 Using large pages to map text areas reduces iTLB pressure and improves
 performance.
@@ -12,26 +12,32 @@ To populate the cache, a writable large page is allocated from vmalloc
 with VM_ALLOW_HUGE_VMAP, filled with invalid instructions and then
 remapped as ROX.
 
+The direct map alias of that large page is exculded from the direct map.
+
 Portions of that large page are handed out to execmem_alloc() callers
 without any changes to the permissions.
 
 When the memory is freed with execmem_free() it is invalidated again so
 that it won't contain stale instructions.
 
-The cache is enabled when an architecture sets EXECMEM_ROX_CACHE flag in
-definition of an execmem_range.
+An architecture has to implement execmem_fill_trapping_insns() callback
+and select ARCH_HAS_EXECMEM_ROX configuration option to be able to use the
+ROX cache.
 
-Link: https://lkml.kernel.org/r/20241009180816.83591-8-rppt@kernel.org
+The cache is enabled on per-range basis when an architecture sets
+EXECMEM_ROX_CACHE flag in definition of an execmem_range.
+
+Link: https://lkml.kernel.org/r/20241016122424.1655560-8-rppt@kernel.org
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Cc: Andreas Larsson <andreas@gaisler.com>
 Cc: Andy Lutomirski <luto@kernel.org>
 Cc: Ard Biesheuvel <ardb@kernel.org>
 Cc: Arnd Bergmann <arnd@arndb.de>
-Cc: Borislav Petkov <bp@alien8.de>
+Cc: Borislav Petkov (AMD) <bp@alien8.de>
 Cc: Brian Cain <bcain@quicinc.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
-Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Christoph Hellwig <hch@lst.de>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Dinh Nguyen <dinguyen@kernel.org>
 Cc: Geert Uytterhoeven <geert@linux-m68k.org>
@@ -58,6 +64,7 @@ Cc: Russell King <linux@armlinux.org.uk>
 Cc: Song Liu <song@kernel.org>
 Cc: Stafford Horne <shorne@gmail.com>
 Cc: Steven Rostedt (Google) <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
 Cc: Thomas Gleixner <tglx@linutronix.de>
 Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
@@ -66,34 +73,61 @@ Cc: Will Deacon <will@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/execmem.h |    2 
- mm/execmem.c            |  317 +++++++++++++++++++++++++++++++++++++-
+ arch/Kconfig            |    8 
+ include/linux/execmem.h |   14 +
+ mm/execmem.c            |  325 +++++++++++++++++++++++++++++++++++++-
  mm/internal.h           |    1 
  mm/vmalloc.c            |    5 
- 4 files changed, 320 insertions(+), 5 deletions(-)
+ 5 files changed, 345 insertions(+), 8 deletions(-)
 
+--- a/arch/Kconfig~execmem-add-support-for-cache-of-large-rox-pages
++++ a/arch/Kconfig
+@@ -1026,6 +1026,14 @@ config ARCH_WANTS_EXECMEM_LATE
+ 	  enough entropy for module space randomization, for instance
+ 	  arm64.
+ 
++config ARCH_HAS_EXECMEM_ROX
++	bool
++	depends on MMU && !HIGHMEM
++	help
++	  For architectures that support allocations of executable memory
++	  with read-only execute permissions. Architecture must implement
++	  execmem_fill_trapping_insns() callback to enable this.
++
+ config HAVE_IRQ_EXIT_ON_IRQ_STACK
+ 	bool
+ 	help
 --- a/include/linux/execmem.h~execmem-add-support-for-cache-of-large-rox-pages
 +++ a/include/linux/execmem.h
-@@ -77,12 +77,14 @@ struct execmem_range {
- 
- /**
-  * struct execmem_info - architecture parameters for code allocations
-+ * @fill_trapping_insns: set memory to contain instructions that will trap
-  * @ranges: array of parameter sets defining architecture specific
-  * parameters for executable memory allocations. The ranges that are not
-  * explicitly initialized by an architecture use parameters defined for
-  * @EXECMEM_DEFAULT.
-  */
- struct execmem_info {
-+	void (*fill_trapping_insns)(void *ptr, size_t size, bool writable);
- 	struct execmem_range	ranges[EXECMEM_TYPE_MAX];
+@@ -53,6 +53,20 @@ enum execmem_range_flags {
+ 	EXECMEM_ROX_CACHE	= (1 << 1),
  };
  
++#ifdef CONFIG_ARCH_HAS_EXECMEM_ROX
++/**
++ * execmem_fill_trapping_insns - set memory to contain instructions that
++ *				 will trap
++ * @ptr:	pointer to memory to fill
++ * @size:	size of the range to fill
++ * @writable:	is the memory poited by @ptr is writable or ROX
++ *
++ * A hook for architecures to fill execmem ranges with invalid instructions.
++ * Architectures that use EXECMEM_ROX_CACHE must implement this.
++ */
++void execmem_fill_trapping_insns(void *ptr, size_t size, bool writable);
++#endif
++
+ /**
+  * struct execmem_range - definition of an address space suitable for code and
+  *			  related data allocations
 --- a/mm/execmem.c~execmem-add-support-for-cache-of-large-rox-pages
 +++ a/mm/execmem.c
-@@ -7,28 +7,109 @@
+@@ -6,29 +6,41 @@
+  * Copyright (C) 2024 Mike Rapoport IBM.
   */
  
++#define pr_fmt(fmt) "execmem: " fmt
++
  #include <linux/mm.h>
 +#include <linux/mutex.h>
  #include <linux/vmalloc.h>
@@ -112,6 +146,53 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -static void *__execmem_alloc(struct execmem_range *range, size_t size)
 +#ifdef CONFIG_MMU
++static void *execmem_vmalloc(struct execmem_range *range, size_t size,
++			     pgprot_t pgprot, unsigned long vm_flags)
+ {
+ 	bool kasan = range->flags & EXECMEM_KASAN_SHADOW;
+-	unsigned long vm_flags  = VM_FLUSH_RESET_PERMS;
+ 	gfp_t gfp_flags = GFP_KERNEL | __GFP_NOWARN;
++	unsigned int align = range->alignment;
+ 	unsigned long start = range->start;
+ 	unsigned long end = range->end;
+-	unsigned int align = range->alignment;
+-	pgprot_t pgprot = range->pgprot;
+ 	void *p;
+ 
+ 	if (kasan)
+ 		vm_flags |= VM_DEFER_KMEMLEAK;
+ 
++	if (vm_flags & VM_ALLOW_HUGE_VMAP)
++		align = PMD_SIZE;
++
+ 	p = __vmalloc_node_range(size, align, start, end, gfp_flags,
+ 				 pgprot, vm_flags, NUMA_NO_NODE,
+ 				 __builtin_return_address(0));
+@@ -41,7 +53,7 @@ static void *__execmem_alloc(struct exec
+ 	}
+ 
+ 	if (!p) {
+-		pr_warn_ratelimited("execmem: unable to allocate memory\n");
++		pr_warn_ratelimited("unable to allocate memory\n");
+ 		return NULL;
+ 	}
+ 
+@@ -50,14 +62,298 @@ static void *__execmem_alloc(struct exec
+ 		return NULL;
+ 	}
+ 
+-	return kasan_reset_tag(p);
++	return p;
++}
++#else
++static void *execmem_vmalloc(struct execmem_range *range, size_t size,
++			     pgprot_t pgprot, unsigned long vm_flags)
++{
++	return vmalloc(size);
++}
++#endif /* CONFIG_MMU */
++
++#ifdef CONFIG_ARCH_HAS_EXECMEM_ROX
 +struct execmem_cache {
 +	struct mutex mutex;
 +	struct maple_tree busy_areas;
@@ -162,12 +243,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	mutex_lock(mutex);
 +	mas_for_each(&mas, area, ULONG_MAX) {
-+		size_t size;
-+
-+		if (!area)
-+			continue;
-+
-+		size = mas_range_len(&mas);
++		size_t size = mas_range_len(&mas);
 +
 +		if (IS_ALIGNED(size, PMD_SIZE) &&
 +		    IS_ALIGNED(mas.index, PMD_SIZE)) {
@@ -182,35 +258,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +static DECLARE_WORK(execmem_cache_clean_work, execmem_cache_clean);
-+
-+static void *execmem_vmalloc(struct execmem_range *range, size_t size,
-+			     pgprot_t pgprot, unsigned long vm_flags)
- {
- 	bool kasan = range->flags & EXECMEM_KASAN_SHADOW;
--	unsigned long vm_flags  = VM_FLUSH_RESET_PERMS;
- 	gfp_t gfp_flags = GFP_KERNEL | __GFP_NOWARN;
-+	unsigned int align = range->alignment;
- 	unsigned long start = range->start;
- 	unsigned long end = range->end;
--	unsigned int align = range->alignment;
--	pgprot_t pgprot = range->pgprot;
- 	void *p;
- 
- 	if (kasan)
- 		vm_flags |= VM_DEFER_KMEMLEAK;
- 
-+	if (vm_flags & VM_ALLOW_HUGE_VMAP)
-+		align = PMD_SIZE;
-+
- 	p = __vmalloc_node_range(size, align, start, end, gfp_flags,
- 				 pgprot, vm_flags, NUMA_NO_NODE,
- 				 __builtin_return_address(0));
-@@ -50,8 +131,224 @@ static void *__execmem_alloc(struct exec
- 		return NULL;
- 	}
- 
-+	return p;
-+}
 +
 +static int execmem_cache_add(void *ptr, size_t size)
 +{
@@ -309,8 +356,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +out_unlock:
 +	mutex_unlock(mutex);
 +	return ptr;
-+}
-+
+ }
+ 
 +static int execmem_cache_populate(struct execmem_range *range, size_t size)
 +{
 +	unsigned long vm_flags = VM_ALLOW_HUGE_VMAP;
@@ -330,7 +377,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		goto err_free_mem;
 +
 +	/* fill memory with instructions that will trap */
-+	execmem_info->fill_trapping_insns(p, alloc_size, /* writable = */ true);
++	execmem_fill_trapping_insns(p, alloc_size, /* writable = */ true);
 +
 +	start = (unsigned long)p;
 +	end = start + alloc_size;
@@ -393,7 +440,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mas_store_gfp(&mas, NULL, GFP_KERNEL);
 +	mutex_unlock(mutex);
 +
-+	execmem_info->fill_trapping_insns(ptr, size, /* writable = */ false);
++	execmem_fill_trapping_insns(ptr, size, /* writable = */ false);
 +
 +	execmem_cache_add(ptr, size);
 +
@@ -401,36 +448,37 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	return true;
 +}
-+
-+static void *__execmem_alloc(struct execmem_range *range, size_t size)
++#else /* CONFIG_ARCH_HAS_EXECMEM_ROX */
++static void *execmem_cache_alloc(struct execmem_range *range, size_t size)
 +{
-+	bool use_cache = range->flags & EXECMEM_ROX_CACHE;
-+	unsigned long vm_flags = VM_FLUSH_RESET_PERMS;
-+	pgprot_t pgprot = range->pgprot;
-+	void *p;
-+
-+	if (use_cache)
-+		p = execmem_cache_alloc(range, size);
-+	else
-+		p = execmem_vmalloc(range, size, pgprot, vm_flags);
-+
- 	return kasan_reset_tag(p);
- }
-+#else
-+static void *__execmem_alloc(struct execmem_range *range, size_t size)
-+{
-+	return vmalloc(size);
++	return NULL;
 +}
 +
 +static bool execmem_cache_free(void *ptr)
 +{
 +	return false;
 +}
-+#endif
- 
++#endif /* CONFIG_ARCH_HAS_EXECMEM_ROX */
++
  void *execmem_alloc(enum execmem_type type, size_t size)
  {
-@@ -67,7 +364,9 @@ void execmem_free(void *ptr)
+ 	struct execmem_range *range = &execmem_info->ranges[type];
++	bool use_cache = range->flags & EXECMEM_ROX_CACHE;
++	unsigned long vm_flags = VM_FLUSH_RESET_PERMS;
++	pgprot_t pgprot = range->pgprot;
++	void *p;
+ 
+-	return __execmem_alloc(range, size);
++	if (use_cache)
++		p = execmem_cache_alloc(range, size);
++	else
++		p = execmem_vmalloc(range, size, pgprot, vm_flags);
++
++	return kasan_reset_tag(p);
+ }
+ 
+ void execmem_free(void *ptr)
+@@ -67,7 +363,9 @@ void execmem_free(void *ptr)
  	 * supported by vmalloc.
  	 */
  	WARN_ON(in_interrupt());
@@ -441,28 +489,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  void *execmem_update_copy(void *dst, const void *src, size_t size)
-@@ -92,6 +391,11 @@ static bool execmem_validate(struct exec
+@@ -89,6 +387,17 @@ static bool execmem_validate(struct exec
+ 		return false;
+ 	}
+ 
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_EXECMEM_ROX)) {
++		for (int i = EXECMEM_DEFAULT; i < EXECMEM_TYPE_MAX; i++) {
++			r = &info->ranges[i];
++
++			if (r->flags & EXECMEM_ROX_CACHE) {
++				pr_warn_once("ROX cache is not supported\n");
++				r->flags &= ~EXECMEM_ROX_CACHE;
++			}
++		}
++	}
++
  	return true;
  }
  
-+static void default_fill_trapping_insns(void *ptr, size_t size, bool writable)
-+{
-+	memset(ptr, 0, size);
-+}
-+
- static void execmem_init_missing(struct execmem_info *info)
- {
- 	struct execmem_range *default_range = &info->ranges[EXECMEM_DEFAULT];
-@@ -112,6 +416,9 @@ static void execmem_init_missing(struct
- 			r->fallback_end = default_range->fallback_end;
- 		}
- 	}
-+
-+	if (!info->fill_trapping_insns)
-+		info->fill_trapping_insns = default_fill_trapping_insns;
- }
- 
- struct execmem_info * __weak execmem_arch_setup(void)
 --- a/mm/internal.h~execmem-add-support-for-cache-of-large-rox-pages
 +++ a/mm/internal.h
 @@ -1190,6 +1190,7 @@ size_t splice_folio_into_pipe(struct pip
