@@ -1,0 +1,107 @@
+From: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Subject: nilfs2: convert common metadata file code to be folio-based
+Date: Thu, 24 Oct 2024 18:25:36 +0900
+
+In the common routines for metadata files, nilfs_mdt_insert_new_block(),
+which inserts a new block buffer into the cache, is still page-based, and
+there are two places where bh_offset() is used.  Convert these to
+page-based.
+
+Link: https://lkml.kernel.org/r/20241024092602.13395-3-konishi.ryusuke@gmail.com
+Signed-off-by: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/nilfs2/alloc.c  |    8 +++++---
+ fs/nilfs2/cpfile.c |    4 ++--
+ fs/nilfs2/mdt.c    |   21 +++++++++++++--------
+ 3 files changed, 20 insertions(+), 13 deletions(-)
+
+--- a/fs/nilfs2/alloc.c~nilfs2-convert-common-metadata-file-code-to-be-folio-based
++++ a/fs/nilfs2/alloc.c
+@@ -177,12 +177,14 @@ nilfs_palloc_entry_blkoff(const struct i
+  * nilfs_palloc_desc_block_init - initialize buffer of a group descriptor block
+  * @inode: inode of metadata file
+  * @bh: buffer head of the buffer to be initialized
+- * @kaddr: kernel address mapped for the page including the buffer
++ * @from: kernel address mapped for a chunk of the block
++ *
++ * This function does not yet support the case where block size > PAGE_SIZE.
+  */
+ static void nilfs_palloc_desc_block_init(struct inode *inode,
+-					 struct buffer_head *bh, void *kaddr)
++					 struct buffer_head *bh, void *from)
+ {
+-	struct nilfs_palloc_group_desc *desc = kaddr + bh_offset(bh);
++	struct nilfs_palloc_group_desc *desc = from;
+ 	unsigned long n = nilfs_palloc_groups_per_desc_block(inode);
+ 	__le32 nfrees;
+ 
+--- a/fs/nilfs2/cpfile.c~nilfs2-convert-common-metadata-file-code-to-be-folio-based
++++ a/fs/nilfs2/cpfile.c
+@@ -113,9 +113,9 @@ nilfs_cpfile_block_get_checkpoint(const
+ 
+ static void nilfs_cpfile_block_init(struct inode *cpfile,
+ 				    struct buffer_head *bh,
+-				    void *kaddr)
++				    void *from)
+ {
+-	struct nilfs_checkpoint *cp = kaddr + bh_offset(bh);
++	struct nilfs_checkpoint *cp = from;
+ 	size_t cpsz = NILFS_MDT(cpfile)->mi_entry_size;
+ 	int n = nilfs_cpfile_checkpoints_per_block(cpfile);
+ 
+--- a/fs/nilfs2/mdt.c~nilfs2-convert-common-metadata-file-code-to-be-folio-based
++++ a/fs/nilfs2/mdt.c
+@@ -33,7 +33,8 @@ nilfs_mdt_insert_new_block(struct inode
+ 					      struct buffer_head *, void *))
+ {
+ 	struct nilfs_inode_info *ii = NILFS_I(inode);
+-	void *kaddr;
++	struct folio *folio = bh->b_folio;
++	void *from;
+ 	int ret;
+ 
+ 	/* Caller exclude read accesses using page lock */
+@@ -47,12 +48,14 @@ nilfs_mdt_insert_new_block(struct inode
+ 
+ 	set_buffer_mapped(bh);
+ 
+-	kaddr = kmap_local_page(bh->b_page);
+-	memset(kaddr + bh_offset(bh), 0, i_blocksize(inode));
++	/* Initialize block (block size > PAGE_SIZE not yet supported) */
++	from = kmap_local_folio(folio, offset_in_folio(folio, bh->b_data));
++	memset(from, 0, bh->b_size);
+ 	if (init_block)
+-		init_block(inode, bh, kaddr);
+-	flush_dcache_page(bh->b_page);
+-	kunmap_local(kaddr);
++		init_block(inode, bh, from);
++	kunmap_local(from);
++
++	flush_dcache_folio(folio);
+ 
+ 	set_buffer_uptodate(bh);
+ 	mark_buffer_dirty(bh);
+@@ -571,7 +574,8 @@ int nilfs_mdt_freeze_buffer(struct inode
+ 	if (!bh_frozen)
+ 		bh_frozen = create_empty_buffers(folio, 1 << blkbits, 0);
+ 
+-	bh_frozen = get_nth_bh(bh_frozen, bh_offset(bh) >> blkbits);
++	bh_frozen = get_nth_bh(bh_frozen,
++			       offset_in_folio(folio, bh->b_data) >> blkbits);
+ 
+ 	if (!buffer_uptodate(bh_frozen))
+ 		nilfs_copy_buffer(bh_frozen, bh);
+@@ -601,7 +605,8 @@ nilfs_mdt_get_frozen_buffer(struct inode
+ 	if (!IS_ERR(folio)) {
+ 		bh_frozen = folio_buffers(folio);
+ 		if (bh_frozen) {
+-			n = bh_offset(bh) >> inode->i_blkbits;
++			n = offset_in_folio(folio, bh->b_data) >>
++				inode->i_blkbits;
+ 			bh_frozen = get_nth_bh(bh_frozen, n);
+ 		}
+ 		folio_unlock(folio);
+_
