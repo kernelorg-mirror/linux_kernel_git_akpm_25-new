@@ -1,0 +1,176 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm: pagewalk: add the ability to install PTEs
+Date: Mon, 28 Oct 2024 14:13:27 +0000
+
+Patch series "implement lightweight guard pages", v4.
+
+Userland library functions such as allocators and threading
+implementations often require regions of memory to act as 'guard pages' -
+mappings which, when accessed, result in a fatal signal being sent to the
+accessing process.
+
+The current means by which these are implemented is via a PROT_NONE mmap()
+mapping, which provides the required semantics however incur an overhead
+of a VMA for each such region.
+
+With a great many processes and threads, this can rapidly add up and incur
+a significant memory penalty.  It also has the added problem of preventing
+merges that might otherwise be permitted.
+
+This series takes a different approach - an idea suggested by Vlastimil
+Babka (and before him David Hildenbrand and Jann Horn - perhaps more - the
+provenance becomes a little tricky to ascertain after this - please
+forgive any omissions!) - rather than locating the guard pages at the VMA
+layer, instead placing them in page tables mapping the required ranges.
+
+Early testing of the prototype version of this code suggests a 5 times
+speed up in memory mapping invocations (in conjunction with use of
+process_madvise()) and a 13% reduction in VMAs on an entirely idle android
+system and unoptimised code.
+
+We expect with optimisation and a loaded system with a larger number of
+guard pages this could significantly increase, but in any case these
+numbers are encouraging.
+
+This way, rather than having separate VMAs specifying which parts of a
+range are guard pages, instead we have a VMA spanning the entire range of
+memory a user is permitted to access and including ranges which are to be
+'guarded'.
+
+After mapping this, a user can specify which parts of the range should
+result in a fatal signal when accessed.
+
+By restricting the ability to specify guard pages to memory mapped by
+existing VMAs, we can rely on the mappings being torn down when the
+mappings are ultimately unmapped and everything works simply as if the
+memory were not faulted in, from the point of view of the containing VMAs.
+
+This mechanism in effect poisons memory ranges similar to hardware memory
+poisoning, only it is an entirely software-controlled form of poisoning.
+
+The mechanism is implemented via madvise() behaviour - MADV_GUARD_INSTALL
+which installs page table-level guard page markers - and MADV_GUARD_REMOVE
+- which clears them.
+
+Guard markers can be installed across multiple VMAs and any existing
+mappings will be cleared, that is zapped, before installing the guard page
+markers in the page tables.
+
+There is no concept of 'nested' guard markers, multiple attempts to
+install guard markers in a range will, after the first attempt, have no
+effect.
+
+Importantly, removing guard markers over a range that contains both guard
+markers and ordinary backed memory has no effect on anything but the guard
+markers (including leaving huge pages un-split), so a user can safely
+remove guard markers over a range of memory leaving the rest intact.
+
+The actual mechanism by which the page table entries are specified makes
+use of existing logic - PTE markers, which are used for the userfaultfd
+UFFDIO_POISON mechanism.
+
+Unfortunately PTE_MARKER_POISONED is not suited for the guard page
+mechanism as it results in VM_FAULT_HWPOISON semantics in the fault
+handler, so we add our own specific PTE_MARKER_GUARD and adapt existing
+logic to handle it.
+
+We also extend the generic page walk mechanism to allow for installation
+of PTEs (carefully restricted to memory management logic only to prevent
+unwanted abuse).
+
+We ensure that zapping performed by MADV_DONTNEED and MADV_FREE do not
+remove guard markers, nor does forking (except when VM_WIPEONFORK is
+specified for a VMA which implies a total removal of memory
+characteristics).
+
+It's important to note that the guard page implementation is emphatically
+NOT a security feature, so a user can remove the markers if they wish.  We
+simply implement it in such a way as to provide the least surprising
+behaviour.
+
+An extensive set of self-tests are provided which ensure behaviour is as
+expected and additionally self-documents expected behaviour of guard
+ranges.
+
+
+This patch (of 5):
+
+The existing generic pagewalk logic permits the walking of page tables,
+invoking callbacks at individual page table levels via user-provided
+mm_walk_ops callbacks.
+
+This is useful for traversing existing page table entries, but precludes
+the ability to establish new ones.
+
+Existing mechanism for performing a walk which also installs page table
+entries if necessary are heavily duplicated throughout the kernel, each
+with semantic differences from one another and largely unavailable for use
+elsewhere.
+
+Rather than add yet another implementation, we extend the generic pagewalk
+logic to enable the installation of page table entries by adding a new
+install_pte() callback in mm_walk_ops.  If this is specified, then upon
+encountering a missing page table entry, we allocate and install a new one
+and continue the traversal.
+
+If a THP huge page is encountered at either the PMD or PUD level we split
+it only if there are ops->pte_entry() (or ops->pmd_entry at PUD level),
+otherwise if there is only an ops->install_pte(), we avoid the unnecessary
+split.
+
+We do not support hugetlb at this stage.
+
+If this function returns an error, or an allocation fails during the
+operation, we abort the operation altogether.  It is up to the caller to
+deal appropriately with partially populated page table ranges.
+
+If install_pte() is defined, the semantics of pte_entry() change - this
+callback is then only invoked if the entry already exists.  This is a
+useful property, as it allows a caller to handle existing PTEs while
+installing new ones where necessary in the specified range.
+
+If install_pte() is not defined, then there is no functional difference to
+this patch, so all existing logic will work precisely as it did before.
+
+As we only permit the installation of PTEs where a mapping does not
+already exist there is no need for TLB management, however we do invoke
+update_mmu_cache() for architectures which require manual maintenance of
+mappings for other CPUs.
+
+We explicitly do not allow the existing page walk API to expose this
+feature as it is dangerous and intended for internal mm use only. 
+Therefore we provide a new walk_page_range_mm() function exposed only to
+mm/internal.h.
+
+We take the opportunity to additionally clean up the page walker logic to
+be a little easier to follow.
+
+Link: https://lkml.kernel.org/r/cover.1730123433.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/51b432ebef013e3fdf9f92101533435de1bffadf.1730123433.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Jann Horn <jannh@google.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Suggested-by: Vlastimil Babka <vbabka@suse.cz>
+Suggested-by: Jann Horn <jannh@google.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
+Cc: Arnd Bergmann <arnd@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Chris Zankel <chris@zankel.net>
+Cc: Helge Deller <deller@gmx.de>
+Cc: James E.J. Bottomley <James.Bottomley@HansenPartnership.com>
+Cc: Jeff Xu <jeffxu@chromium.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Matt Turner <mattst88@gmail.com>
+Cc: Max Filippov <jcmvbkbc@gmail.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Richard Henderson <richard.henderson@linaro.org>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Vlastimil Babka <vbabkba@suse.cz>
