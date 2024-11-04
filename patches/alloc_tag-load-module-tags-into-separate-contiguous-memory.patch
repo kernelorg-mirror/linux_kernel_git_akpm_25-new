@@ -16,6 +16,9 @@ will allow simple allocation tag indexing later on in this patchset.  The
 size of this virtually contiguous memory is set to store up to 100000
 allocation tags.
 
+[surenb@google.com: fix empty codetag module section handling]
+  Link: https://lkml.kernel.org/r/20241101000017.3856204-1-surenb@google.com
+[akpm@linux-foundation.org: update comment, per Dan]
 Link: https://lkml.kernel.org/r/20241023170759.999909-4-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Reviewed-by: Pasha Tatashin <pasha.tatashin@soleen.com>
@@ -60,11 +63,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  include/asm-generic/codetag.lds.h |   19 ++
  include/linux/alloc_tag.h         |   13 +
  include/linux/codetag.h           |   37 +++-
- kernel/module/main.c              |   80 ++++++--
+ kernel/module/main.c              |   84 ++++++---
  lib/alloc_tag.c                   |  249 +++++++++++++++++++++++++---
  lib/codetag.c                     |  100 ++++++++++-
  scripts/module.lds.S              |    5 
- 7 files changed, 441 insertions(+), 62 deletions(-)
+ 7 files changed, 445 insertions(+), 62 deletions(-)
 
 --- a/include/asm-generic/codetag.lds.h~alloc_tag-load-module-tags-into-separate-contiguous-memory
 +++ a/include/asm-generic/codetag.lds.h
@@ -294,7 +297,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  	}
  
-@@ -2297,15 +2302,33 @@ static int move_module(struct module *mo
+@@ -2297,15 +2302,37 @@ static int move_module(struct module *mo
  	for (i = 0; i < info->hdr->e_shnum; i++) {
  		void *dest;
  		Elf_Shdr *shdr = &info->sechdrs[i];
@@ -316,6 +319,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (codetag_needs_module_section(mod, sname, shdr->sh_size)) {
 +			dest = codetag_alloc_module_section(mod, sname, shdr->sh_size,
 +					arch_mod_section_prepend(mod, i), shdr->sh_addralign);
++			if (WARN_ON(!dest)) {
++				ret = -EINVAL;
++				goto out_err;
++			}
 +			if (IS_ERR(dest)) {
 +				ret = PTR_ERR(dest);
 +				goto out_err;
@@ -332,7 +339,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		if (shdr->sh_type != SHT_NOBITS) {
  			/*
-@@ -2317,7 +2340,7 @@ static int move_module(struct module *mo
+@@ -2317,7 +2344,7 @@ static int move_module(struct module *mo
  			if (i == info->index.mod &&
  			   (WARN_ON_ONCE(shdr->sh_size != sizeof(struct module)))) {
  				ret = -ENOEXEC;
@@ -341,7 +348,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			}
  			memcpy(dest, (void *)shdr->sh_addr, shdr->sh_size);
  		}
-@@ -2333,9 +2356,12 @@ static int move_module(struct module *mo
+@@ -2333,9 +2360,12 @@ static int move_module(struct module *mo
  	}
  
  	return 0;
@@ -356,7 +363,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return ret;
  }
  
-@@ -2456,6 +2482,8 @@ static struct module *layout_and_allocat
+@@ -2456,6 +2486,8 @@ static struct module *layout_and_allocat
  	/* Module has been copied to its final place now: return it. */
  	mod = (void *)info->sechdrs[info->index.mod].sh_addr;
  	kmemleak_load_module(mod, info);
@@ -365,7 +372,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return mod;
  }
  
-@@ -2465,7 +2493,7 @@ static void module_deallocate(struct mod
+@@ -2465,7 +2497,7 @@ static void module_deallocate(struct mod
  	percpu_modfree(mod);
  	module_arch_freeing_init(mod);
  
@@ -421,9 +428,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	while (from <= to) {
 +		struct alloc_tag_counters counter;
- 
--	for (ct = codetag_next_ct(&iter); ct; ct = codetag_next_ct(&iter)) {
--		if (iter.cmod != cmod)
++
 +		counter = alloc_tag_read(from);
 +		if (counter.bytes)
 +			return from;
@@ -438,7 +443,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	MA_STATE(mas, &mod_area_mt, 0, module_tags.size);
 +	struct module *val;
-+
+ 
+-	for (ct = codetag_next_ct(&iter); ct; ct = codetag_next_ct(&iter)) {
+-		if (iter.cmod != cmod)
 +	mas_for_each(&mas, val, module_tags.size) {
 +		if (val != &unloaded_mod)
  			continue;
@@ -470,18 +477,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				    size + prepend + align - 1))
 +			return true;
 +	}
-+
+ 
+-		if (WARN(counter.bytes,
+-			 "%s:%u module %s func:%s has %llu allocated at module unload",
+-			 ct->filename, ct->lineno, ct->modname, ct->function, counter.bytes))
+-			module_unused = false;
 +	/* No free area, try cleanup stale data and repeat the search once */
 +	if (!cleanup_done) {
 +		clean_unused_module_areas_locked();
 +		cleanup_done = true;
 +		mas_reset(mas);
 +		goto repeat;
-+	}
-+
+ 	}
+ 
+-	return module_unused;
 +	return false;
-+}
-+
+ }
+ 
 +static void *reserve_module_tags(struct module *mod, unsigned long size,
 +				 unsigned int prepend, unsigned long align)
 +{
@@ -490,9 +502,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long offset;
 +	void *ret = NULL;
 +
-+	/* If no tags return NULL */
++	/* If no tags return error */
 +	if (size < sizeof(struct alloc_tag))
-+		return NULL;
++		return ERR_PTR(-EINVAL);
 +
 +	/*
 +	 * align is always power of 2, so we can use IS_ALIGNED and ALIGN.
@@ -545,11 +557,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	return (struct alloc_tag *)(module_tags.start_addr + offset);
 +}
- 
--		if (WARN(counter.bytes,
--			 "%s:%u module %s func:%s has %llu allocated at module unload",
--			 ct->filename, ct->lineno, ct->modname, ct->function, counter.bytes))
--			module_unused = false;
++
 +static void release_module_tags(struct module *mod, bool used)
 +{
 +	MA_STATE(mas, &mod_area_mt, module_tags.size, module_tags.size);
@@ -578,7 +586,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			tag->ct.function, counter.bytes);
 +	} else {
 +		used = false;
- 	}
++	}
 +release_area:
 +	mas_store(&mas, used ? &unloaded_mod : NULL);
 +	val = mas_prev_range(&mas, 0);
@@ -597,14 +605,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	mas_for_each(&mas, val, module_tags.size) {
 +		if (val != mod)
 +			continue;
- 
--	return module_unused;
++
 +		mas_store_gfp(&mas, new_mod, GFP_KERNEL);
 +		break;
 +	}
 +	mas_unlock(&mas);
- }
- 
++}
++
 +static int __init alloc_mod_tags_mem(void)
 +{
 +	/* Allocate space to copy allocation tags */
@@ -708,7 +715,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	const char *type_name = name + strlen(CODETAG_SECTION_PREFIX);
 +	struct codetag_type *cttype;
-+	void *ret = NULL;
++	void *ret = ERR_PTR(-EINVAL);
 +
 +	mutex_lock(&codetag_lock);
 +	list_for_each_entry(cttype, &codetag_types, link) {
