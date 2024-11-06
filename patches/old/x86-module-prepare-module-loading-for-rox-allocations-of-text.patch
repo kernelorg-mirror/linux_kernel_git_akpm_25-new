@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: x86/module: prepare module loading for ROX allocations of text
-Date: Wed, 16 Oct 2024 15:24:22 +0300
+Date: Wed, 23 Oct 2024 19:27:09 +0300
 
 When module text memory will be allocated with ROX permissions, the memory
 at the actual address where the module will live will contain invalid
@@ -9,8 +9,9 @@ module code.
 
 Update relocations and alternatives patching to deal with it.
 
-Link: https://lkml.kernel.org/r/20241016122424.1655560-7-rppt@kernel.org
+Link: https://lkml.kernel.org/r/20241023162711.2579610-7-rppt@kernel.org
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Tested-by: kdevops <kdevops@lists.linux.dev>
 Cc: Andreas Larsson <andreas@gaisler.com>
 Cc: Andy Lutomirski <luto@kernel.org>
 Cc: Ard Biesheuvel <ardb@kernel.org>
@@ -30,10 +31,10 @@ Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Johannes Berg <johannes@sipsolutions.net>
 Cc: John Paul Adrian Glaubitz <glaubitz@physik.fu-berlin.de>
 Cc: Kent Overstreet <kent.overstreet@linux.dev>
-Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Luis Chamberlain <mcgrof@kernel.org>
 Cc: Mark Rutland <mark.rutland@arm.com>
-Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Masami Hiramatsu (Google) <mhiramat@kernel.org>
 Cc: Matt Turner <mattst88@gmail.com>
 Cc: Max Filippov <jcmvbkbc@gmail.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
@@ -58,11 +59,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/um/kernel/um_arch.c           |   11 -
  arch/x86/entry/vdso/vma.c          |    3 
  arch/x86/include/asm/alternative.h |   14 +-
- arch/x86/kernel/alternative.c      |  175 +++++++++++++++------------
+ arch/x86/kernel/alternative.c      |  181 +++++++++++++++------------
  arch/x86/kernel/ftrace.c           |   30 ++--
  arch/x86/kernel/module.c           |   45 ++++--
- include/linux/module.h             |   16 +-
- 7 files changed, 171 insertions(+), 123 deletions(-)
+ 6 files changed, 167 insertions(+), 117 deletions(-)
 
 --- a/arch/um/kernel/um_arch.c~x86-module-prepare-module-loading-for-rox-allocations-of-text
 +++ a/arch/um/kernel/um_arch.c
@@ -415,7 +415,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	/*
  	 * Re-enable kCFI, undo what cfi_disable_callers() did.
-@@ -1154,26 +1174,29 @@ static int cfi_enable_callers(s32 *start
+@@ -1154,106 +1174,115 @@ static int cfi_enable_callers(s32 *start
  
  	for (s = start; s < end; s++) {
  		void *addr = (void *)s + *s;
@@ -447,8 +447,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		void *wr_addr = module_writable_address(mod, addr);
  		u32 hash;
  
- 		hash = decode_preamble_hash(addr);
-@@ -1182,18 +1205,19 @@ static int cfi_rand_preamble(s32 *start,
+-		hash = decode_preamble_hash(addr);
++		hash = decode_preamble_hash(wr_addr);
+ 		if (WARN(!hash, "no CFI hash found at: %pS %px %*ph\n",
+ 			 addr, addr, 5, addr))
  			return -EINVAL;
  
  		hash = cfi_rehash(hash);
@@ -469,15 +471,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		void *wr_addr = module_writable_address(mod, addr);
  		u32 hash;
  
- 		hash = decode_preamble_hash(addr);
-@@ -1201,59 +1225,64 @@ static int cfi_rewrite_preamble(s32 *sta
+-		hash = decode_preamble_hash(addr);
++		hash = decode_preamble_hash(wr_addr);
+ 		if (WARN(!hash, "no CFI hash found at: %pS %px %*ph\n",
  			 addr, addr, 5, addr))
  			return -EINVAL;
  
 -		text_poke_early(addr, fineibt_preamble_start, fineibt_preamble_size);
-+		text_poke_early(wr_addr, fineibt_preamble_start, fineibt_preamble_size);
- 		WARN_ON(*(u32 *)(addr + fineibt_preamble_hash) != 0x12345678);
+-		WARN_ON(*(u32 *)(addr + fineibt_preamble_hash) != 0x12345678);
 -		text_poke_early(addr + fineibt_preamble_hash, &hash, 4);
++		text_poke_early(wr_addr, fineibt_preamble_start, fineibt_preamble_size);
++		WARN_ON(*(u32 *)(wr_addr + fineibt_preamble_hash) != 0x12345678);
 +		text_poke_early(wr_addr + fineibt_preamble_hash, &hash, 4);
  	}
  
@@ -895,43 +899,4 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return 0;
  }
  
---- a/include/linux/module.h~x86-module-prepare-module-loading-for-rox-allocations-of-text
-+++ a/include/linux/module.h
-@@ -376,15 +376,6 @@ struct module_memory {
- #endif
- };
- 
--#ifdef CONFIG_MODULES
--void *module_writable_address(struct module *mod, void *loc);
--#else
--static inline void *module_writable_address(struct module *mod, void *loc)
--{
--	return loc;
--}
--#endif
--
- #ifdef CONFIG_MODULES_TREE_LOOKUP
- /* Only touch one cacheline for common rbtree-for-core-layout case. */
- #define __module_memory_align ____cacheline_aligned
-@@ -778,6 +769,8 @@ static inline bool is_livepatch_module(s
- 
- void set_module_sig_enforced(void);
- 
-+void *module_writable_address(struct module *mod, void *loc);
-+
- #else /* !CONFIG_MODULES... */
- 
- static inline struct module *__module_address(unsigned long addr)
-@@ -885,6 +878,11 @@ static inline bool module_is_coming(stru
- {
- 	return false;
- }
-+
-+static inline void *module_writable_address(struct module *mod, void *loc)
-+{
-+	return loc;
-+}
- #endif /* CONFIG_MODULES */
- 
- #ifdef CONFIG_SYSFS
 _

@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: module: prepare to handle ROX allocations for text
-Date: Wed, 16 Oct 2024 15:24:20 +0300
+Date: Wed, 23 Oct 2024 19:27:07 +0300
 
 In order to support ROX allocations for module text, it is necessary to
 handle modifications to the code, such as relocations and alternatives
@@ -19,8 +19,10 @@ patching in one go and the writable copy will be freed.
 Add support for that to module initialization code and provide necessary
 interfaces in execmem.
 
-Link: https://lkml.kernel.org/r/20241016122424.1655560-5-rppt@kernel.org
+Link: https://lkml.kernel.org/r/20241023162711.2579610-5-rppt@kernel.org
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Reviewd-by: Luis Chamberlain <mcgrof@kernel.org>
+Tested-by: kdevops <kdevops@lists.linux.dev>
 Cc: Andreas Larsson <andreas@gaisler.com>
 Cc: Andy Lutomirski <luto@kernel.org>
 Cc: Ard Biesheuvel <ardb@kernel.org>
@@ -40,10 +42,9 @@ Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Johannes Berg <johannes@sipsolutions.net>
 Cc: John Paul Adrian Glaubitz <glaubitz@physik.fu-berlin.de>
 Cc: Kent Overstreet <kent.overstreet@linux.dev>
-Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
-Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Mark Rutland <mark.rutland@arm.com>
-Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Masami Hiramatsu (Google) <mhiramat@kernel.org>
 Cc: Matt Turner <mattst88@gmail.com>
 Cc: Max Filippov <jcmvbkbc@gmail.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
@@ -66,13 +67,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/execmem.h        |   23 +++++++++
- include/linux/module.h         |   11 ++++
+ include/linux/module.h         |   16 ++++++
  include/linux/moduleloader.h   |    4 +
  kernel/module/debug_kmemleak.c |    3 -
- kernel/module/main.c           |   77 ++++++++++++++++++++++++++++---
+ kernel/module/main.c           |   74 ++++++++++++++++++++++++++++---
  kernel/module/strict_rwx.c     |    3 +
  mm/execmem.c                   |   11 ++++
- 7 files changed, 124 insertions(+), 8 deletions(-)
+ 7 files changed, 126 insertions(+), 8 deletions(-)
 
 --- a/include/linux/execmem.h~module-prepare-to-handle-rox-allocations-for-text
 +++ a/include/linux/execmem.h
@@ -127,22 +128,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned int size;
  
  #ifdef CONFIG_MODULES_TREE_LOOKUP
-@@ -374,6 +376,15 @@ struct module_memory {
- #endif
- };
+@@ -767,6 +769,15 @@ static inline bool is_livepatch_module(s
  
-+#ifdef CONFIG_MODULES
-+void *module_writable_address(struct module *mod, void *loc);
-+#else
+ void set_module_sig_enforced(void);
+ 
++void *__module_writable_address(struct module *mod, void *loc);
++
++static inline void *module_writable_address(struct module *mod, void *loc)
++{
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_EXECMEM_ROX) || !mod)
++		return loc;
++	return __module_writable_address(mod, loc);
++}
++
+ #else /* !CONFIG_MODULES... */
+ 
+ static inline struct module *__module_address(unsigned long addr)
+@@ -874,6 +885,11 @@ static inline bool module_is_coming(stru
+ {
+ 	return false;
+ }
++
 +static inline void *module_writable_address(struct module *mod, void *loc)
 +{
 +	return loc;
 +}
-+#endif
-+
- #ifdef CONFIG_MODULES_TREE_LOOKUP
- /* Only touch one cacheline for common rbtree-for-core-layout case. */
- #define __module_memory_align ____cacheline_aligned
+ #endif /* CONFIG_MODULES */
+ 
+ #ifdef CONFIG_SYSFS
 --- a/include/linux/moduleloader.h~module-prepare-to-handle-rox-allocations-for-text
 +++ a/include/linux/moduleloader.h
 @@ -108,6 +108,10 @@ int module_finalize(const Elf_Ehdr *hdr,
@@ -170,15 +183,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/kernel/module/main.c~module-prepare-to-handle-rox-allocations-for-text
 +++ a/kernel/module/main.c
-@@ -1189,6 +1189,21 @@ void __weak module_arch_freeing_init(str
+@@ -1189,6 +1189,18 @@ void __weak module_arch_freeing_init(str
  {
  }
  
-+void *module_writable_address(struct module *mod, void *loc)
++void *__module_writable_address(struct module *mod, void *loc)
 +{
-+	if (!mod)
-+		return loc;
-+
 +	for_class_mod_mem_type(type, text) {
 +		struct module_memory *mem = &mod->mem[type];
 +
@@ -192,7 +202,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int module_memory_alloc(struct module *mod, enum mod_mem_type type)
  {
  	unsigned int size = PAGE_ALIGN(mod->mem[type].size);
-@@ -1206,6 +1221,23 @@ static int module_memory_alloc(struct mo
+@@ -1206,6 +1218,23 @@ static int module_memory_alloc(struct mo
  	if (!ptr)
  		return -ENOMEM;
  
@@ -216,7 +226,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * The pointer to these blocks of memory are stored on the module
  	 * structure and we keep that around so long as the module is
-@@ -1219,16 +1251,17 @@ static int module_memory_alloc(struct mo
+@@ -1219,16 +1248,17 @@ static int module_memory_alloc(struct mo
  	 */
  	kmemleak_not_leak(ptr);
  
@@ -238,7 +248,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!unload_codetags && mod_mem_type_is_core_data(type))
  		return;
-@@ -2251,6 +2284,7 @@ static int move_module(struct module *mo
+@@ -2251,6 +2281,7 @@ static int move_module(struct module *mo
  	for_each_mod_mem_type(type) {
  		if (!mod->mem[type].size) {
  			mod->mem[type].base = NULL;
@@ -246,7 +256,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			continue;
  		}
  
-@@ -2267,11 +2301,14 @@ static int move_module(struct module *mo
+@@ -2267,11 +2298,14 @@ static int move_module(struct module *mo
  		void *dest;
  		Elf_Shdr *shdr = &info->sechdrs[i];
  		enum mod_mem_type type = shdr->sh_entsize >> SH_ENTSIZE_TYPE_SHIFT;
@@ -262,7 +272,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		if (shdr->sh_type != SHT_NOBITS) {
  			/*
-@@ -2293,7 +2330,7 @@ static int move_module(struct module *mo
+@@ -2293,7 +2327,7 @@ static int move_module(struct module *mo
  		 * users of info can keep taking advantage and using the newly
  		 * minted official memory area.
  		 */
@@ -271,7 +281,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pr_debug("\t0x%lx 0x%.8lx %s\n", (long)shdr->sh_addr,
  			 (long)shdr->sh_size, info->secstrings + shdr->sh_name);
  	}
-@@ -2441,8 +2478,17 @@ int __weak module_finalize(const Elf_Ehd
+@@ -2441,8 +2475,17 @@ int __weak module_finalize(const Elf_Ehd
  	return 0;
  }
  
@@ -289,7 +299,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Sort exception table now relocations are done. */
  	sort_extable(mod->extable, mod->extable + mod->num_exentries);
  
-@@ -2454,7 +2500,24 @@ static int post_relocation(struct module
+@@ -2454,7 +2497,24 @@ static int post_relocation(struct module
  	add_kallsyms(mod, info);
  
  	/* Arch-specific module finalizing. */

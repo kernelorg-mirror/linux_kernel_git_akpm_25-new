@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: defer second attempt at merge on mmap()
-Date: Wed, 23 Oct 2024 21:38:33 +0100
+Date: Fri, 25 Oct 2024 13:26:27 +0100
 
 Rather than trying to merge again when ostensibly allocating a new VMA,
 instead defer until the VMA is added and attempt to merge the existing
@@ -13,29 +13,24 @@ In addition this removes limitations on the VMA not being able to be the
 first in the virtual memory address space which was previously implicitly
 required.
 
-It also performs this merge after the final flag adjustments are
-performed, something that was not done previously and thus might have
-prevented possibly valid merges in the past.
-
 In theory, for this very same reason, we should unconditionally attempt
 merge here, however this is likely to have a performance impact so it is
 better to avoid this given the unlikely outcome of a merge.
 
-The vmg state will already have been reset by the first attempt at a merge
-so we only need to reset the iterator, set the vma and flags and try
-again.
-
-Link: https://lkml.kernel.org/r/e063d9d31a4dbd83c2d77a3f1e0114e6a0788724.1729715266.git.lorenzo.stoakes@oracle.com
+[lorenzo.stoakes@oracle.com: remove unnecessary indirection]
+  Link: https://lkml.kernel.org/r/5106696d-e625-4d8a-8545-9d1430301730@lucifer.local
+Link: https://lkml.kernel.org/r/d4f84502605d7651ac114587f507395c0fc76004.1729858176.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Jann Horn <jannh@google.com>
-Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Peter Xu <peterx@redhat.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vma.c |   75 ++++++++++++++++++-----------------------------------
- 1 file changed, 26 insertions(+), 49 deletions(-)
+ mm/vma.c |   56 +++++++++++++----------------------------------------
+ 1 file changed, 14 insertions(+), 42 deletions(-)
 
 --- a/mm/vma.c~mm-defer-second-attempt-at-merge-on-mmap
 +++ a/mm/vma.c
@@ -47,21 +42,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	struct vm_area_struct *prev;
  	struct vm_area_struct *next;
-@@ -2280,9 +2281,9 @@ static int __mmap_prepare(struct mmap_st
+@@ -2278,11 +2279,11 @@ static int __mmap_prepare(struct mmap_st
  	return 0;
  }
  
 +
  static int __mmap_new_file_vma(struct mmap_state *map,
--			       struct vma_merge_struct *vmg,
 -			       struct vm_area_struct **vmap, bool *mergedp)
-+			       struct vm_area_struct **vmap)
++			       struct vm_area_struct *vma)
  {
  	struct vma_iterator *vmi = map->vmi;
- 	struct vm_area_struct *vma = *vmap;
-@@ -2311,37 +2312,11 @@ static int __mmap_new_file_vma(struct mm
+-	struct vm_area_struct *vma = *vmap;
+ 	int error;
+ 
+ 	vma->vm_file = get_file(map->file);
+@@ -2308,37 +2309,10 @@ static int __mmap_new_file_vma(struct mm
  			!(map->flags & VM_MAYWRITE) &&
  			(vma->vm_flags & VM_MAYWRITE));
+ 
+-	/* mmap_file() might have changed VMA flags. */
++	/* If the flags change (and are mergeable), let's retry later. */
++	map->retry_merge = vma->vm_flags != map->flags && !(vma->vm_flags & VM_SPECIAL);
+ 	map->flags = vma->vm_flags;
  
 -	vma_iter_config(vmi, map->addr, map->end);
 -	/*
@@ -70,11 +72,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 */
 -	if (unlikely(map->flags != vma->vm_flags && map->prev)) {
 -		struct vm_area_struct *merge;
+-		VMG_MMAP_STATE(vmg, map, /* vma = */ NULL);
 -
--		vmg->flags = vma->vm_flags;
--		/* If this fails, state is reset ready for a reattempt. */
--		merge = vma_merge_new_range(vmg);
--
+-		merge = vma_merge_new_range(&vmg);
 -		if (merge) {
 -			/*
 -			 * ->mmap() can change vma->vm_file and fput
@@ -91,16 +91,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			vma_iter_config(vmi, map->addr, map->end);
 -		}
 -	}
-+	/* If the flags change (and are mergeable), let's retry later. */
-+	map->retry_merge = vma->vm_flags != map->flags && !(vma->vm_flags & VM_SPECIAL);
- 
-+	vma_iter_config(vmi, map->addr, map->end);
- 	map->flags = vma->vm_flags;
+-
 -	*vmap = vma;
  	return 0;
  }
  
-@@ -2349,22 +2324,15 @@ static int __mmap_new_file_vma(struct mm
+@@ -2346,10 +2320,6 @@ static int __mmap_new_file_vma(struct mm
   * __mmap_new_vma() - Allocate a new VMA for the region, as merging was not
   * possible.
   *
@@ -109,14 +105,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * which case the returned VMA is one that was merged on a second attempt.
 - *
   * @map:  Mapping state.
-- * @vmg:  VMA merge state.
   * @vmap: Output pointer for the new VMA.
   *
-  * Returns: Zero on success, or an error.
-  */
--static int __mmap_new_vma(struct mmap_state *map, struct vma_merge_struct *vmg,
--			  struct vm_area_struct **vmap)
-+static int __mmap_new_vma(struct mmap_state *map, struct vm_area_struct **vmap)
+@@ -2359,7 +2329,6 @@ static int __mmap_new_vma(struct mmap_st
  {
  	struct vma_iterator *vmi = map->vmi;
  	int error = 0;
@@ -124,16 +115,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct vm_area_struct *vma;
  
  	/*
-@@ -2387,7 +2355,7 @@ static int __mmap_new_vma(struct mmap_st
+@@ -2382,7 +2351,7 @@ static int __mmap_new_vma(struct mmap_st
  	}
  
  	if (map->file)
--		error = __mmap_new_file_vma(map, vmg, &vma, &merged);
-+		error = __mmap_new_file_vma(map, &vma);
+-		error = __mmap_new_file_vma(map, &vma, &merged);
++		error = __mmap_new_file_vma(map, vma);
  	else if (map->flags & VM_SHARED)
  		error = shmem_zero_setup(vma);
  	else
-@@ -2396,9 +2364,6 @@ static int __mmap_new_vma(struct mmap_st
+@@ -2391,9 +2360,6 @@ static int __mmap_new_vma(struct mmap_st
  	if (error)
  		goto free_iter_vma;
  
@@ -143,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_SPARC64
  	/* TODO: Fix SPARC ADI! */
  	WARN_ON_ONCE(!arch_validate_flags(map->flags));
-@@ -2415,8 +2380,6 @@ static int __mmap_new_vma(struct mmap_st
+@@ -2410,8 +2376,6 @@ static int __mmap_new_vma(struct mmap_st
  	 * call covers the non-merge case.
  	 */
  	khugepaged_enter_vma(vma, map->flags);
@@ -152,56 +143,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	ksm_add_vma(vma);
  	*vmap = vma;
  	return 0;
-@@ -2430,13 +2393,17 @@ free_vma:
- 
- /*
-  * __mmap_complete() - Unmap any VMAs we overlap, account memory mapping
-- *                     statistics, handle locking and finalise the VMA.
-+ *                     statistics, handle locking and finalise the VMA,
-+ *                     attempt a final merge if required.
-  *
-  * @map: Mapping state.
-  * @vma: Merged or newly allocated VMA for the mmap()'d region.
-+ * @vmg: VMA merge state.
-  */
--static void __mmap_complete(struct mmap_state *map, struct vm_area_struct *vma)
-+static void __mmap_complete(struct mmap_state *map, struct vm_area_struct *vma,
-+			    struct vma_merge_struct *vmg)
- {
-+
- 	struct mm_struct *mm = map->mm;
- 	unsigned long vm_flags = vma->vm_flags;
- 
-@@ -2468,6 +2435,16 @@ static void __mmap_complete(struct mmap_
- 	vm_flags_set(vma, VM_SOFTDIRTY);
- 
- 	vma_set_page_prot(vma);
-+
-+	/* OK VMA flags changed in __mmap_new_vma(), try a merge again. */
-+	if (map->retry_merge) {
-+		vma_iter_config(map->vmi, map->addr, map->end);
-+		vmg->vma = vma;
-+		vmg->flags = map->flags;
-+		vmg->next = NULL; /* Must be set by merge logic. */
-+
-+		vma_merge_existing_range(vmg);
-+	}
- }
- 
- unsigned long __mmap_region(struct file *file, unsigned long addr,
-@@ -2490,12 +2467,12 @@ unsigned long __mmap_region(struct file
- 	vma = vma_merge_new_range(&vmg);
- 	if (!vma) {
- 		/* ...but if we can't, allocate a new VMA. */
--		error = __mmap_new_vma(&map, &vmg, &vma);
-+		error = __mmap_new_vma(&map, &vma);
- 		if (error)
+@@ -2493,6 +2457,14 @@ unsigned long __mmap_region(struct file
  			goto unacct_error;
  	}
  
--	__mmap_complete(&map, vma);
-+	__mmap_complete(&map, vma, &vmg);
++	/* If flags changed, we might be able to merge, so try again. */
++	if (map.retry_merge) {
++		VMG_MMAP_STATE(vmg, &map, vma);
++
++		vma_iter_config(map.vmi, map.addr, map.end);
++		vma_merge_existing_range(&vmg);
++	}
++
+ 	__mmap_complete(&map, vma);
  
  	return addr;
- 
 _
