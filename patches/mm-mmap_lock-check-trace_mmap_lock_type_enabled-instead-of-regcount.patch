@@ -1,0 +1,150 @@
+From: Vlastimil Babka <vbabka@suse.cz>
+Subject: mm: mmap_lock: check trace_mmap_lock_$type_enabled() instead of regcount
+Date: Tue, 5 Nov 2024 12:34:57 +0100
+
+Since 7d6be67cfdd4 ("mm: mmap_lock: replace get_memcg_path_buf() with
+on-stack buffer") we use trace_mmap_lock_reg()/unreg() only to maintain an
+atomic reg_refcount which is checked to avoid performing
+get_mm_memcg_path() in case none of the tracepoints using it is enabled.
+
+This can be achieved directly by putting all the work needed for the
+tracepoint behind the trace_mmap_lock_##type##_enabled(), as suggested by
+Documentation/trace/tracepoints.rst and with the following advantages:
+
+- uses the tracepoint's static key instead of evaluating a branch
+
+- the check tracepoint specific, not shared by all of them
+
+- we can get rid of trace_mmap_lock_reg()/unreg() completely
+
+Thus use the trace_..._enabled() check and remove unnecessary code.
+
+Link: https://lkml.kernel.org/r/20241105113456.95066-2-vbabka@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/trace/events/mmap_lock.h |   14 ++--------
+ mm/mmap_lock.c                   |   39 +++++------------------------
+ 2 files changed, 12 insertions(+), 41 deletions(-)
+
+--- a/include/trace/events/mmap_lock.h~mm-mmap_lock-check-trace_mmap_lock_type_enabled-instead-of-regcount
++++ a/include/trace/events/mmap_lock.h
+@@ -10,9 +10,6 @@
+ 
+ struct mm_struct;
+ 
+-extern int trace_mmap_lock_reg(void);
+-extern void trace_mmap_lock_unreg(void);
+-
+ DECLARE_EVENT_CLASS(mmap_lock,
+ 
+ 	TP_PROTO(struct mm_struct *mm, const char *memcg_path, bool write),
+@@ -40,16 +37,15 @@ DECLARE_EVENT_CLASS(mmap_lock,
+ );
+ 
+ #define DEFINE_MMAP_LOCK_EVENT(name)                                    \
+-	DEFINE_EVENT_FN(mmap_lock, name,                                \
++	DEFINE_EVENT(mmap_lock, name,                                   \
+ 		TP_PROTO(struct mm_struct *mm, const char *memcg_path,  \
+ 			bool write),                                    \
+-		TP_ARGS(mm, memcg_path, write),                         \
+-		trace_mmap_lock_reg, trace_mmap_lock_unreg)
++		TP_ARGS(mm, memcg_path, write))
+ 
+ DEFINE_MMAP_LOCK_EVENT(mmap_lock_start_locking);
+ DEFINE_MMAP_LOCK_EVENT(mmap_lock_released);
+ 
+-TRACE_EVENT_FN(mmap_lock_acquire_returned,
++TRACE_EVENT(mmap_lock_acquire_returned,
+ 
+ 	TP_PROTO(struct mm_struct *mm, const char *memcg_path, bool write,
+ 		bool success),
+@@ -76,9 +72,7 @@ TRACE_EVENT_FN(mmap_lock_acquire_returne
+ 		__get_str(memcg_path),
+ 		__entry->write ? "true" : "false",
+ 		__entry->success ? "true" : "false"
+-	),
+-
+-	trace_mmap_lock_reg, trace_mmap_lock_unreg
++	)
+ );
+ 
+ #endif /* _TRACE_MMAP_LOCK_H */
+--- a/mm/mmap_lock.c~mm-mmap_lock-check-trace_mmap_lock_type_enabled-instead-of-regcount
++++ a/mm/mmap_lock.c
+@@ -19,43 +19,23 @@ EXPORT_TRACEPOINT_SYMBOL(mmap_lock_relea
+ 
+ #ifdef CONFIG_MEMCG
+ 
+-static atomic_t reg_refcount;
+-
+ /*
+  * Size of the buffer for memcg path names. Ignoring stack trace support,
+  * trace_events_hist.c uses MAX_FILTER_STR_VAL for this, so we also use it.
+  */
+ #define MEMCG_PATH_BUF_SIZE MAX_FILTER_STR_VAL
+ 
+-int trace_mmap_lock_reg(void)
+-{
+-	atomic_inc(&reg_refcount);
+-	return 0;
+-}
+-
+-void trace_mmap_lock_unreg(void)
+-{
+-	atomic_dec(&reg_refcount);
+-}
+-
+-#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                    \
+-	do {                                                    \
+-		char buf[MEMCG_PATH_BUF_SIZE];                  \
+-		get_mm_memcg_path(mm, buf, sizeof(buf));        \
+-		trace_mmap_lock_##type(mm, buf, ##__VA_ARGS__); \
++#define TRACE_MMAP_LOCK_EVENT(type, mm, ...)				\
++	do {								\
++		if (trace_mmap_lock_##type##_enabled()) {		\
++			char buf[MEMCG_PATH_BUF_SIZE];                  \
++			get_mm_memcg_path(mm, buf, sizeof(buf));        \
++			trace_mmap_lock_##type(mm, buf, ##__VA_ARGS__); \
++		}							\
+ 	} while (0)
+ 
+ #else /* !CONFIG_MEMCG */
+ 
+-int trace_mmap_lock_reg(void)
+-{
+-	return 0;
+-}
+-
+-void trace_mmap_lock_unreg(void)
+-{
+-}
+-
+ #define TRACE_MMAP_LOCK_EVENT(type, mm, ...)                                   \
+ 	trace_mmap_lock_##type(mm, "", ##__VA_ARGS__)
+ 
+@@ -65,16 +45,13 @@ void trace_mmap_lock_unreg(void)
+ #ifdef CONFIG_MEMCG
+ /*
+  * Write the given mm_struct's memcg path to a buffer. If the path cannot be
+- * determined or the trace event is being unregistered, empty string is written.
++ * determined, empty string is written.
+  */
+ static void get_mm_memcg_path(struct mm_struct *mm, char *buf, size_t buflen)
+ {
+ 	struct mem_cgroup *memcg;
+ 
+ 	buf[0] = '\0';
+-	/* No need to get path if no trace event is registered. */
+-	if (!atomic_read(&reg_refcount))
+-		return;
+ 	memcg = get_mem_cgroup_from_mm(mm);
+ 	if (memcg == NULL)
+ 		return;
+_
