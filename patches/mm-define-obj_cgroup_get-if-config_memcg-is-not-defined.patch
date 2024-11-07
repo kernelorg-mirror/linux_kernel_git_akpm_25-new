@@ -1,0 +1,419 @@
+From: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Subject: mm: define obj_cgroup_get() if CONFIG_MEMCG is not defined
+Date: Mon, 30 Sep 2024 22:32:16 -0700
+
+Patch series "mm: zswap swap-out of large folios", v10.
+
+This patch series enables zswap_store() to accept and store large folios. 
+The most significant contribution in this series is from the earlier RFC
+submitted by Ryan Roberts [1].  Ryan's original RFC has been migrated to
+mm-unstable as of 9-30-2024 in patch 6 of this series, and adapted based
+on code review comments received for the current patch-series.
+
+[1]: [RFC PATCH v1] mm: zswap: Store large folios without splitting
+     https://lore.kernel.org/linux-mm/20231019110543.3284654-1-ryan.roberts@arm.com/T/#u
+
+The first few patches do the prep work for supporting large folios in
+zswap_store.  Patch 6 provides the main functionality to swap-out large
+folios in zswap.  Patch 7 adds sysfs per-order hugepages "zswpout"
+counters that get incremented upon successful zswap_store of large folios,
+and also updates the documentation for this:
+
+/sys/kernel/mm/transparent_hugepage/hugepages-*kB/stats/zswpout
+
+This patch series is a prerequisite for zswap compress batching of large
+folio swap-out and decompress batching of swap-ins based on
+swapin_readahead(), using Intel IAA hardware acceleration, which we would
+like to submit in subsequent patch-series, with performance improvement
+data.
+
+Thanks to Ying Huang for pre-posting review feedback and suggestions!
+
+Thanks also to Nhat, Yosry, Johannes, Barry, Chengming, Usama, Ying and
+Matthew for their helpful feedback, code/data reviews and suggestions!
+
+Co-development signoff request:
+===============================
+I would like to thank Ryan Roberts for his original RFC [1] and request
+his co-developer signoff on patch 6 in this series. Thanks Ryan!
+
+
+System setup for testing:
+=========================
+Testing of this patch series was done with mm-unstable as of 9-27-2024,
+commit de2fbaa6d9c3576ec7133ed02a370ec9376bf000 (without this patch-series)
+and mm-unstable 9-30-2024 commit c121617e3606be6575cdacfdb63cc8d67b46a568
+(with this patch-series). Data was gathered on an Intel Sapphire Rapids
+server, dual-socket 56 cores per socket, 4 IAA devices per socket, 503 GiB
+RAM and 525G SSD disk partition swap. Core frequency was fixed at 2500MHz.
+
+The vm-scalability "usemem" test was run in a cgroup whose memory.high
+was fixed at 150G. The is no swap limit set for the cgroup. 30 usemem
+processes were run, each allocating and writing 10G of memory, and sleeping
+for 10 sec before exiting:
+
+usemem --init-time -w -O -s 10 -n 30 10g
+
+Other kernel configuration parameters:
+
+    zswap compressors : zstd, deflate-iaa
+    zswap allocator   : zsmalloc
+    vm.page-cluster   : 2
+
+In the experiments where "deflate-iaa" is used as the zswap compressor,
+IAA "compression verification" is enabled by default
+(cat /sys/bus/dsa/drivers/crypto/verify_compress). Hence each IAA
+compression will be decompressed internally by the "iaa_crypto" driver, the
+crc-s returned by the hardware will be compared and errors reported in case
+of mismatches. Thus "deflate-iaa" helps ensure better data integrity as
+compared to the software compressors, and the experimental data listed
+below is with verify_compress set to "1".
+
+
+Metrics reporting methodology:
+==============================
+Total and average throughput are derived from the individual 30 processes'
+throughputs reported by usemem. elapsed/sys times are measured with perf.
+
+All percentage changes are "new" vs. "old"; hence a positive value
+denotes an increase in the metric, whether it is throughput or latency,
+and a negative value denotes a reduction in the metric. Positive throughput
+change percentages and negative latency change percentages denote improvements.
+
+The vm stats and sysfs hugepages stats included with the performance data
+provide details on the swapout activity to zswap/swap device.
+
+
+Testing labels used in data summaries:
+======================================
+The data refers to these test configurations and the before/after
+comparisons that they do:
+
+ before-case1:
+ -------------
+ mm-unstable 9-27-2024, CONFIG_THP_SWAP=N (compares zswap 4K vs. zswap 64K)
+
+ In this scenario, CONFIG_THP_SWAP=N results in 64K/2M folios to be split
+ into 4K folios that get processed by zswap.
+
+ before-case2:
+ -------------
+ mm-unstable 9-27-2024, CONFIG_THP_SWAP=Y (compares SSD swap large folios vs. zswap large folios)
+
+ In this scenario, CONFIG_THP_SWAP=Y results in zswap rejecting large
+ folios, which will then be stored by the SSD swap device.
+
+ after:
+ ------
+ v10 of this patch-series, CONFIG_THP_SWAP=Y
+
+ The "after" is CONFIG_THP_SWAP=Y and v10 of this patch-series, that results
+ in 64K/2M folios to not be split, and to be processed by zswap_store.
+
+
+Regression Testing:
+===================
+I ran vm-scalability usemem without large folios, i.e., only 4K folios with
+mm-unstable and this patch-series. The main goal was to make sure that
+there is no functional or performance regression wrt the earlier zswap
+behavior for 4K folios, now that 4K folios will be processed by the new
+zswap_store() code.
+
+The data indicates there is no significant regression.
+
+ -------------------------------------------------------------------------------
+ 4K folios:
+ ==========
+
+ zswap compressor                zstd          zstd        zstd       zstd v10
+                         before-case1  before-case2       after      vs.     vs.
+                                                                   case1   case2
+ -------------------------------------------------------------------------------
+ Total throughput (KB/s)    4,793,363     4,880,978   4,853,074       1%     -1%
+ Average throughput (KB/s)    159,778       162,699     161,769       1%     -1%
+ elapsed time (sec)            130.14        123.17      126.29      -3%      3%
+ sys time (sec)              3,135.53      2,985.64    3,083.18      -2%      3%
+ memcg_high                   446,826       444,626     452,930        
+ memcg_swap_fail                    0             0           0              
+ zswpout                   48,932,107    48,931,971  48,931,820             
+ zswpin                           383           386         397            
+ pswpout                            0             0           0              
+ pswpin                             0             0           0              
+ thp_swpout                         0             0           0              
+ thp_swpout_fallback                0             0           0              
+ 64kB-mthp_swpout_fallback          0             0           0              
+ pgmajfault                     3,063         3,077       3,479          
+ swap_ra                           93            94          96             
+ swap_ra_hit                       47            47          50             
+ ZSWPOUT-64kB                     n/a           n/a           0              
+ SWPOUT-64kB                        0             0           0
+ -------------------------------------------------------------------------------
+
+
+Performance Testing:
+====================
+
+We list the data for 64K folios with before/after data per-compressor,
+followed by the same for 2M pmd-mappable folios.
+
+
+ -------------------------------------------------------------------------------
+ 64K folios: zstd:
+ =================
+
+ zswap compressor                zstd          zstd         zstd      zstd v10
+                         before-case1  before-case2        after     vs.    vs.
+                                                                    case1  case2
+ -------------------------------------------------------------------------------
+ Total throughput (KB/s)    5,222,213     1,076,611    6,159,776      18%   472% 
+ Average throughput (KB/s)    174,073        35,887      205,325      18%   472%
+ elapsed time (sec)            120.50        347.16       108.33     -10%   -69%
+ sys time (sec)              2,930.33        248.16     2,549.65     -13%   927%
+ memcg_high                   416,773       552,200      465,874                   
+ memcg_swap_fail            3,192,906         1,293        1,012                   
+ zswpout                   48,931,583        20,903   48,931,218                  
+ zswpin                           384           363          410                   
+ pswpout                            0    40,778,448            0                   
+ pswpin                             0            16            0                   
+ thp_swpout                         0             0            0                   
+ thp_swpout_fallback                0             0            0                   
+ 64kB-mthp_swpout_fallback  3,192,906         1,293        1,012                   
+ pgmajfault                     3,452         3,072        3,061                   
+ swap_ra                           90            87          107                   
+ swap_ra_hit                       42            43           57                   
+ ZSWPOUT-64kB                     n/a           n/a    3,057,173                   
+ SWPOUT-64kB                        0     2,548,653            0                   
+ -------------------------------------------------------------------------------
+
+
+ -------------------------------------------------------------------------------
+ 64K folios: deflate-iaa:
+ ========================
+
+ zswap compressor         deflate-iaa   deflate-iaa  deflate-iaa deflate-iaa v10
+                         before-case1  before-case2        after     vs.     vs.
+                                                                   case1   case2
+ -------------------------------------------------------------------------------
+ Total throughput (KB/s)    5,652,608     1,089,180    7,189,778     27%    560% 
+ Average throughput (KB/s)    188,420        36,306      239,659     27%    560%
+ elapsed time (sec)            102.90        343.35        87.05    -15%    -75%
+ sys time (sec)              2,246.86        213.53     1,864.16    -17%    773%
+ memcg_high                   576,104       502,907      642,083                    
+ memcg_swap_fail            4,016,117         1,407        1,478                    
+ zswpout                   61,163,423        22,444   57,798,716                    
+ zswpin                           401           368          454                    
+ pswpout                            0    40,862,080            0                    
+ pswpin                             0            20            0                    
+ thp_swpout                         0             0            0                    
+ thp_swpout_fallback                0             0            0                    
+ 64kB-mthp_swpout_fallback  4,016,117         1,407        1,478                    
+ pgmajfault                     3,063         3,153        3,122                    
+ swap_ra                           96            93          156                    
+ swap_ra_hit                       46            45           83                    
+ ZSWPOUT-64kB                     n/a           n/a    3,611,032                    
+ SWPOUT-64kB                        0     2,553,880            0                  
+ -------------------------------------------------------------------------------
+
+
+ -------------------------------------------------------------------------------
+ 2M folios: zstd:
+ ================
+
+ zswap compressor                zstd          zstd         zstd      zstd v10
+                         before-case1  before-case2        after     vs.    vs.
+                                                                   case1  case2
+ -------------------------------------------------------------------------------
+ Total throughput (KB/s)    5,895,500     1,109,694    6,484,224     10%    484%
+ Average throughput (KB/s)    196,516        36,989      216,140     10%    484%
+ elapsed time (sec)            108.77        334.28       106.33     -2%    -68%
+ sys time (sec)              2,657.14         94.88     2,376.13    -11%   2404%
+ memcg_high                    64,200        66,316       56,898                  
+ memcg_swap_fail              101,182            70           27                  
+ zswpout                   48,931,499        36,507   48,890,640                  
+ zswpin                           380           379          377                  
+ pswpout                            0    40,166,400            0                  
+ pswpin                             0             0            0                  
+ thp_swpout                         0        78,450            0                  
+ thp_swpout_fallback          101,182            70           27                  
+ 2MB-mthp_swpout_fallback           0             0           27                  
+ pgmajfault                     3,067         3,417        3,311                  
+ swap_ra                           91            90          854                  
+ swap_ra_hit                       45            45          810                  
+ ZSWPOUT-2MB                      n/a           n/a       95,459                  
+ SWPOUT-2MB                         0        78,450            0                 
+ -------------------------------------------------------------------------------
+
+
+ -------------------------------------------------------------------------------
+ 2M folios: deflate-iaa:
+ =======================
+
+ zswap compressor         deflate-iaa   deflate-iaa  deflate-iaa deflate-iaa v10
+                         before-case1  before-case2        after     vs.     vs.
+                                                                   case1   case2
+ -------------------------------------------------------------------------------
+ Total throughput (KB/s)   6,286,587      1,126,785    7,073,464     13%    528%
+ Average throughput (KB/s)   209,552         37,559      235,782     13%    528%
+ elapsed time (sec)            96.19         333.03        85.79    -11%    -74%
+ sys time (sec)             2,141.44          99.96     1,826.67    -15%   1727%
+ memcg_high                   99,253         64,666       79,718                    
+ memcg_swap_fail             129,074             53          165                    
+ zswpout                  61,312,794         28,321   56,045,120                    
+ zswpin                          383            406          403                    
+ pswpout                           0     40,048,128            0                    
+ pswpin                            0              0            0                    
+ thp_swpout                        0         78,219            0                    
+ thp_swpout_fallback         129,074             53          165                    
+ 2MB-mthp_swpout_fallback          0              0          165                    
+ pgmajfault                    3,430          3,077       31,468                    
+ swap_ra                          91            103       84,373                    
+ swap_ra_hit                      47             46       84,317                    
+ ZSWPOUT-2MB                     n/a            n/a      109,229                    
+ SWPOUT-2MB                        0         78,219            0                
+ -------------------------------------------------------------------------------
+
+
+And finally, this is a comparison of deflate-iaa vs. zstd with v10 of this
+patch-series:
+
+ ---------------------------------------------
+                  zswap_store large folios v10
+                  Impr w/ deflate-iaa vs. zstd
+
+                       64K folios    2M folios
+ ---------------------------------------------
+ Throughput (KB/s)            17%           9%
+ elapsed time (sec)          -20%         -19%
+ sys time (sec)              -27%         -23%
+ ---------------------------------------------
+
+
+Conclusions based on the performance results:
+=============================================
+
+ v10 wrt before-case1:
+ ---------------------
+ We see significant improvements in throughput, elapsed and sys time for
+ zstd and deflate-iaa, when comparing before-case1 (THP_SWAP=N) vs. after
+ (THP_SWAP=Y) with zswap_store large folios.
+
+ v10 wrt before-case2:
+ ---------------------
+ We see even more significant improvements in throughput and elapsed time
+ for zstd and deflate-iaa, when comparing before-case2 (large-folio-SSD)
+ vs. after (large-folio-zswap). The sys time increases with
+ large-folio-zswap as expected, due to the CPU compression time
+ vs. asynchronous disk write times, as pointed out by Ying and Yosry.
+ 
+ In before-case2, when zswap does not store large folios, only allocations
+ and cgroup charging due to 4K folio zswap stores count towards the cgroup
+ memory limit. However, in the after scenario, with the introduction of
+ zswap_store() of large folios, there is an added component of the zswap
+ compressed pool usage from large folio stores from potentially all 30
+ processes, that gets counted towards the memory limit. As a result, we see
+ higher swapout activity in the "after" data.
+
+
+Summary:
+========
+The v10 data presented above shows that zswap_store of large folios
+demonstrates good throughput/performance improvements compared to
+conventional SSD swap of large folios with a sufficiently large 525G SSD
+swap device. Hence, it seems reasonable for zswap_store to support large
+folios, so that further performance improvements can be implemented.
+
+In the experimental setup used in this patchset, we have enabled IAA
+compress verification to ensure additional hardware data integrity CRC
+checks not currently done by the software compressors. We see good
+throughput/latency improvements with deflate-iaa vs. zstd with zswap_store
+of large folios.
+
+Some of the ideas for further reducing latency that have shown promise in
+our experiments, are:
+
+1) IAA compress/decompress batching.
+2) Distributing compress jobs across all IAA devices on the socket.
+
+The tests run for this patchset are using only 1 IAA device per core, that
+avails of 2 compress engines on the device. In our experiments with IAA
+batching, we distribute compress jobs from all cores to the 8 compress
+engines available per socket. We further compress the pages in each folio
+in parallel in the accelerator. As a result, we improve compress latency
+and reclaim throughput.
+
+In decompress batching, we use swapin_readahead to generate a prefetch
+batch of 4K folios that we decompress in parallel in IAA.
+
+ ------------------------------------------------------------------------------
+                          IAA compress/decompress batching
+              Further improvements wrt v10 zswap_store Sequential
+                          subpage store using "deflate-iaa":
+                       
+                      "deflate-iaa" Batching  "deflate-iaa-canned" [2] Batching
+                          Additional Impr               Additional Impr   
+                     64K folios    2M folios     64K folios    2M folios
+ ------------------------------------------------------------------------------
+ Throughput (KB/s)          19%          43%           26%           55%
+ elapsed time (sec)         -5%         -14%          -10%          -21%
+ sys time (sec)              4%          -7%           -4%          -18%
+ ------------------------------------------------------------------------------
+
+
+With zswap IAA compress/decompress batching, we are able to demonstrate
+significant performance improvements and memory savings in server
+scalability experiments in highly contended system scenarios under
+significant memory pressure; as compared to software compressors. We hope
+to submit this work in subsequent patch series. The current patch-series is
+a prequisite for these future submissions.
+
+[1] https://lore.kernel.org/linux-mm/20231019110543.3284654-1-ryan.roberts@arm.com/T/#u
+[2] https://patchwork.kernel.org/project/linux-crypto/cover/cover.1710969449.git.andre.glover@linux.intel.com/
+
+
+This patch (of 6):
+
+This resolves an issue with obj_cgroup_get() not being defined if
+CONFIG_MEMCG is not defined.
+
+Before this patch, we would see build errors if obj_cgroup_get() is called
+from code that is agnostic of CONFIG_MEMCG.
+
+The zswap_store() changes for large folios in subsequent commits will
+require the use of obj_cgroup_get() in zswap code that falls into this
+category.
+
+Link: https://lkml.kernel.org/r/20241001053222.6944-1-kanchana.p.sridhar@intel.com
+Link: https://lkml.kernel.org/r/20241001053222.6944-2-kanchana.p.sridhar@intel.com
+Signed-off-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Reviewed-by: Yosry Ahmed <yosryahmed@google.com>
+Reviewed-by: Chengming Zhou <chengming.zhou@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Huang, Ying" <ying.huang@intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Usama Arif <usamaarif642@gmail.com>
+Cc: Wajdi Feghali <wajdi.k.feghali@intel.com>
+Cc: "Zou, Nanhai" <nanhai.zou@intel.com>
+Cc: Barry Song <21cnbao@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memcontrol.h |    4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/include/linux/memcontrol.h~mm-define-obj_cgroup_get-if-config_memcg-is-not-defined
++++ a/include/linux/memcontrol.h
+@@ -1233,6 +1233,10 @@ struct mem_cgroup *mem_cgroup_from_css(s
+ 	return NULL;
+ }
+ 
++static inline void obj_cgroup_get(struct obj_cgroup *objcg)
++{
++}
++
+ static inline void obj_cgroup_put(struct obj_cgroup *objcg)
+ {
+ }
+_
