@@ -1,6 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm/page_alloc: keep track of free highatomic
-Date: Fri, 25 Oct 2024 21:36:25 -0600
+Date: Mon, 28 Oct 2024 12:26:53 -0600
 
 OOM kills due to vastly overestimated free highatomic reserves were
 observed:
@@ -15,13 +15,12 @@ condition:
   free (1482936kB) - reserved_highatomic (1073152kB) = 409784KB < min (410416kB)
 
 And the third line shows there were no free pages in any
-MIGRATE_HIGHATOMIC pageblocks, which otherwise would show up as type
-'H'. Therefore __zone_watermark_unusable_free() underestimated the
-usable free memory by over 1GB, which resulted in the unnecessary OOM
-kill above.
+MIGRATE_HIGHATOMIC pageblocks, which otherwise would show up as type 'H'. 
+Therefore __zone_watermark_unusable_free() underestimated the usable free
+memory by over 1GB, which resulted in the unnecessary OOM kill above.
 
-The comments in __zone_watermark_unusable_free() warns about the
-potential risk, i.e.,
+The comments in __zone_watermark_unusable_free() warns about the potential
+risk, i.e.,
 
   If the caller does not have rights to reserves below the min
   watermark then subtract the high-atomic reserves. This will
@@ -33,21 +32,31 @@ zone lock, to avoid a search when calculating the usable free memory.  And
 the cost would be minimal, i.e., simple arithmetics in the highatomic
 alloc/free/move paths.
 
-Link: https://lkml.kernel.org/r/20241026033625.2237102-1-yuzhao@google.com
+Note that since nr_free_highatomic can be relatively small, using a
+per-cpu counter might cause too much drift and defeat its purpose, in
+addition to the extra memory overhead.
+
+Dependson e0932b6c1f94 ("mm: page_alloc: consolidate free page accounting") - see [1]
+
+[akpm@linux-foundation.org: s/if/else if/, per Johannes, stealth whitespace tweak]
+Link: https://lkml.kernel.org/r/20241028182653.3420139-1-yuzhao@google.com
+Link: https://lkml.kernel.org/r/0d0ddb33-fcdc-43e2-801f-0c1df2031afb@suse.cz [1]
+Fixes: 0aaa29a56e4f ("mm, page_alloc: reserve pageblocks for high-order atomic allocations on demand")
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Reported-by: Link Lin <linkl@google.com>
 Acked-by: David Rientjes <rientjes@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/mmzone.h |    1 +
- mm/page_alloc.c        |   23 ++++++++++++++++++++---
- 2 files changed, 21 insertions(+), 3 deletions(-)
+ mm/page_alloc.c        |   10 +++++++---
+ 2 files changed, 8 insertions(+), 3 deletions(-)
 
 --- a/include/linux/mmzone.h~mm-page_alloc-keep-track-of-free-highatomic
 +++ a/include/linux/mmzone.h
-@@ -825,6 +825,7 @@ struct zone {
+@@ -823,6 +823,7 @@ struct zone {
  	unsigned long watermark_boost;
  
  	unsigned long nr_reserved_highatomic;
@@ -57,53 +66,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * We don't know if the memory that we're going to allocate will be
 --- a/mm/page_alloc.c~mm-page_alloc-keep-track-of-free-highatomic
 +++ a/mm/page_alloc.c
-@@ -644,6 +644,18 @@ static inline void account_freepages(str
+@@ -635,6 +635,8 @@ compaction_capture(struct capture_contro
+ static inline void account_freepages(struct zone *zone, int nr_pages,
+ 				     int migratetype)
+ {
++	lockdep_assert_held(&zone->lock);
++
+ 	if (is_migrate_isolate(migratetype))
+ 		return;
+ 
+@@ -642,6 +644,9 @@ static inline void account_freepages(str
+ 
+ 	if (is_migrate_cma(migratetype))
  		__mod_zone_page_state(zone, NR_FREE_CMA_PAGES, nr_pages);
++	else if (is_migrate_highatomic(migratetype))
++		WRITE_ONCE(zone->nr_free_highatomic,
++			   zone->nr_free_highatomic + nr_pages);
  }
  
-+static void account_highatomic_freepages(struct zone *zone, unsigned int order,
-+					 int old_mt, int new_mt)
-+{
-+	int delta = 1 << order;
-+
-+	if (is_migrate_highatomic(old_mt))
-+		WRITE_ONCE(zone->nr_free_highatomic, zone->nr_free_highatomic - delta);
-+
-+	if (is_migrate_highatomic(new_mt))
-+		WRITE_ONCE(zone->nr_free_highatomic, zone->nr_free_highatomic + delta);
-+}
-+
  /* Used for pages not on another list */
- static inline void __add_to_free_list(struct page *page, struct zone *zone,
- 				      unsigned int order, int migratetype,
-@@ -660,6 +672,8 @@ static inline void __add_to_free_list(st
- 	else
- 		list_add(&page->buddy_list, &area->free_list[migratetype]);
- 	area->nr_free++;
-+
-+	account_highatomic_freepages(zone, order, -1, migratetype);
- }
- 
- /*
-@@ -681,6 +695,8 @@ static inline void move_to_free_list(str
- 
- 	account_freepages(zone, -(1 << order), old_mt);
- 	account_freepages(zone, 1 << order, new_mt);
-+
-+	account_highatomic_freepages(zone, order, old_mt, new_mt);
- }
- 
- static inline void __del_page_from_free_list(struct page *page, struct zone *zone,
-@@ -698,6 +714,8 @@ static inline void __del_page_from_free_
- 	__ClearPageBuddy(page);
- 	set_page_private(page, 0);
- 	zone->free_area[order].nr_free--;
-+
-+	account_highatomic_freepages(zone, order, migratetype, -1);
- }
- 
- static inline void del_page_from_free_list(struct page *page, struct zone *zone,
-@@ -3081,11 +3099,10 @@ static inline long __zone_watermark_unus
+@@ -3079,11 +3084,10 @@ static inline long __zone_watermark_unus
  
  	/*
  	 * If the caller does not have rights to reserves below the min
