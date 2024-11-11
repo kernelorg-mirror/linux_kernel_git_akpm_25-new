@@ -1,8 +1,8 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: pagewalk: add the ability to install PTEs
-Date: Wed, 23 Oct 2024 17:24:38 +0100
+Date: Mon, 28 Oct 2024 14:13:27 +0000
 
-Patch series "implement lightweight guard pages", v3.
+Patch series "implement lightweight guard pages", v4.
 
 Userland library functions such as allocators and threading
 implementations often require regions of memory to act as 'guard pages' -
@@ -17,7 +17,7 @@ With a great many processes and threads, this can rapidly add up and incur
 a significant memory penalty.  It also has the added problem of preventing
 merges that might otherwise be permitted.
 
-This series takes a different approach - an idea suggested by Vlasimil
+This series takes a different approach - an idea suggested by Vlastimil
 Babka (and before him David Hildenbrand and Jann Horn - perhaps more - the
 provenance becomes a little tricky to ascertain after this - please
 forgive any omissions!) - rather than locating the guard pages at the VMA
@@ -142,22 +142,27 @@ feature as it is dangerous and intended for internal mm use only.
 Therefore we provide a new walk_page_range_mm() function exposed only to
 mm/internal.h.
 
-Link: https://lkml.kernel.org/r/cover.1729699916.git.lorenzo.stoakes@oracle.com
-Link: https://lkml.kernel.org/r/9be732fd0e897453116b433fe2f468ef7795602e.1729699916.git.lorenzo.stoakes@oracle.com
+We take the opportunity to additionally clean up the page walker logic to
+be a little easier to follow.
+
+Link: https://lkml.kernel.org/r/cover.1730123433.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/51b432ebef013e3fdf9f92101533435de1bffadf.1730123433.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Reviewed-by: Jann Horn <jannh@google.com>
 Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Suggested-by: Vlastimil Babka <vbabka@suse.cz>
+Suggested-by: Jann Horn <jannh@google.com>
+Suggested-by: David Hildenbrand <david@redhat.com>
 Cc: Arnd Bergmann <arnd@kernel.org>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Christoph Hellwig <hch@infradead.org>
 Cc: Chris Zankel <chris@zankel.net>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: Helge Deller <deller@gmx.de>
 Cc: James E.J. Bottomley <James.Bottomley@HansenPartnership.com>
 Cc: Jeff Xu <jeffxu@chromium.org>
 Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
-Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Matt Turner <mattst88@gmail.com>
 Cc: Max Filippov <jcmvbkbc@gmail.com>
 Cc: Muchun Song <muchun.song@linux.dev>
@@ -168,13 +173,14 @@ Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
 Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Vlastimil Babka <vbabkba@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/pagewalk.h |   18 ++
  mm/internal.h            |    6 
- mm/pagewalk.c            |  227 ++++++++++++++++++++++++++-----------
- 3 files changed, 182 insertions(+), 69 deletions(-)
+ mm/pagewalk.c            |  246 +++++++++++++++++++++++++++----------
+ 3 files changed, 201 insertions(+), 69 deletions(-)
 
 --- a/include/linux/pagewalk.h~mm-pagewalk-add-the-ability-to-install-ptes
 +++ a/include/linux/pagewalk.h
@@ -284,24 +290,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (addr >= end - PAGE_SIZE)
  			break;
  		addr += PAGE_SIZE;
-@@ -89,11 +108,14 @@ static int walk_pmd_range(pud_t *pud, un
+@@ -81,6 +100,8 @@ static int walk_pmd_range(pud_t *pud, un
+ 	pmd_t *pmd;
+ 	unsigned long next;
+ 	const struct mm_walk_ops *ops = walk->ops;
++	bool has_handler = ops->pte_entry;
++	bool has_install = ops->install_pte;
+ 	int err = 0;
+ 	int depth = real_depth(3);
+ 
+@@ -89,11 +110,14 @@ static int walk_pmd_range(pud_t *pud, un
  again:
  		next = pmd_addr_end(addr, end);
  		if (pmd_none(*pmd)) {
 -			if (ops->pte_hole)
-+			if (ops->install_pte)
++			if (has_install)
 +				err = __pte_alloc(walk->mm, pmd);
 +			else if (ops->pte_hole)
  				err = ops->pte_hole(addr, next, depth, walk);
  			if (err)
  				break;
 -			continue;
-+			if (!ops->install_pte)
++			if (!has_install)
 +				continue;
  		}
  
  		walk->action = ACTION_SUBTREE;
-@@ -109,18 +131,19 @@ again:
+@@ -109,18 +133,25 @@ again:
  
  		if (walk->action == ACTION_AGAIN)
  			goto again;
@@ -315,13 +330,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		    !(ops->pte_entry))
 +		if (walk->action == ACTION_CONTINUE)
  			continue;
-+		if (!ops->install_pte && !ops->pte_entry)
-+			continue; /* Nothing to do. */
-+		if (!ops->pte_entry && ops->install_pte &&
-+		    pmd_present(*pmd) &&
-+		    (pmd_trans_huge(*pmd) || pmd_devmap(*pmd)))
-+			continue; /* Avoid unnecessary split. */
  
++		if (!has_handler) { /* No handlers for lower page tables. */
++			if (!has_install)
++				continue; /* Nothing to do. */
++			/*
++			 * We are ONLY installing, so avoid unnecessarily
++			 * splitting a present huge page.
++			 */
++			if (pmd_present(*pmd) &&
++			    (pmd_trans_huge(*pmd) || pmd_devmap(*pmd)))
++				continue;
++		}
++
  		if (walk->vma)
  			split_huge_pmd(walk->vma, pmd, addr);
 +		else if (pmd_leaf(*pmd) || !pmd_present(*pmd))
@@ -329,24 +350,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		err = walk_pte_range(pmd, addr, next, walk);
  		if (err)
-@@ -148,11 +171,14 @@ static int walk_pud_range(p4d_t *p4d, un
+@@ -140,6 +171,8 @@ static int walk_pud_range(p4d_t *p4d, un
+ 	pud_t *pud;
+ 	unsigned long next;
+ 	const struct mm_walk_ops *ops = walk->ops;
++	bool has_handler = ops->pmd_entry || ops->pte_entry;
++	bool has_install = ops->install_pte;
+ 	int err = 0;
+ 	int depth = real_depth(2);
+ 
+@@ -148,11 +181,14 @@ static int walk_pud_range(p4d_t *p4d, un
   again:
  		next = pud_addr_end(addr, end);
  		if (pud_none(*pud)) {
 -			if (ops->pte_hole)
-+			if (ops->install_pte)
++			if (has_install)
 +				err = __pmd_alloc(walk->mm, pud, addr);
 +			else if (ops->pte_hole)
  				err = ops->pte_hole(addr, next, depth, walk);
  			if (err)
  				break;
 -			continue;
-+			if (!ops->install_pte)
++			if (!has_install)
 +				continue;
  		}
  
  		walk->action = ACTION_SUBTREE;
-@@ -164,14 +190,20 @@ static int walk_pud_range(p4d_t *p4d, un
+@@ -164,14 +200,26 @@ static int walk_pud_range(p4d_t *p4d, un
  
  		if (walk->action == ACTION_AGAIN)
  			goto again;
@@ -356,13 +386,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		    !(ops->pmd_entry || ops->pte_entry))
 +		if (walk->action == ACTION_CONTINUE)
  			continue;
-+		if (!ops->install_pte && !ops->pte_entry && !ops->pmd_entry)
-+			continue;  /* Nothing to do. */
-+		if (!ops->pmd_entry && !ops->pte_entry && ops->install_pte &&
-+		    pud_present(*pud) &&
-+		    (pud_trans_huge(*pud) || pud_devmap(*pud)))
-+			continue; /* Avoid unnecessary split. */
  
++		if (!has_handler) { /* No handlers for lower page tables. */
++			if (!has_install)
++				continue; /* Nothing to do. */
++			/*
++			 * We are ONLY installing, so avoid unnecessarily
++			 * splitting a present huge page.
++			 */
++			if (pud_present(*pud) &&
++			    (pud_trans_huge(*pud) || pud_devmap(*pud)))
++				continue;
++		}
++
  		if (walk->vma)
  			split_huge_pud(walk->vma, pud, addr);
 +		else if (pud_leaf(*pud) || !pud_present(*pud))
@@ -371,19 +407,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (pud_none(*pud))
  			goto again;
  
-@@ -196,18 +228,22 @@ static int walk_p4d_range(pgd_t *pgd, un
+@@ -189,6 +237,8 @@ static int walk_p4d_range(pgd_t *pgd, un
+ 	p4d_t *p4d;
+ 	unsigned long next;
+ 	const struct mm_walk_ops *ops = walk->ops;
++	bool has_handler = ops->pud_entry || ops->pmd_entry || ops->pte_entry;
++	bool has_install = ops->install_pte;
+ 	int err = 0;
+ 	int depth = real_depth(1);
+ 
+@@ -196,18 +246,21 @@ static int walk_p4d_range(pgd_t *pgd, un
  	do {
  		next = p4d_addr_end(addr, end);
  		if (p4d_none_or_clear_bad(p4d)) {
 -			if (ops->pte_hole)
-+			if (ops->install_pte)
++			if (has_install)
 +				err = __pud_alloc(walk->mm, p4d, addr);
 +			else if (ops->pte_hole)
  				err = ops->pte_hole(addr, next, depth, walk);
  			if (err)
  				break;
 -			continue;
-+			if (!ops->install_pte)
++			if (!has_install)
 +				continue;
  		}
  		if (ops->p4d_entry) {
@@ -392,24 +437,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				break;
  		}
 -		if (ops->pud_entry || ops->pmd_entry || ops->pte_entry)
-+		if (ops->pud_entry || ops->pmd_entry || ops->pte_entry ||
-+		    ops->install_pte)
++		if (has_handler || has_install)
  			err = walk_pud_range(p4d, addr, next, walk);
  		if (err)
  			break;
-@@ -231,18 +267,22 @@ static int walk_pgd_range(unsigned long
+@@ -222,6 +275,9 @@ static int walk_pgd_range(unsigned long
+ 	pgd_t *pgd;
+ 	unsigned long next;
+ 	const struct mm_walk_ops *ops = walk->ops;
++	bool has_handler = ops->p4d_entry || ops->pud_entry || ops->pmd_entry ||
++		ops->pte_entry;
++	bool has_install = ops->install_pte;
+ 	int err = 0;
+ 
+ 	if (walk->pgd)
+@@ -231,18 +287,21 @@ static int walk_pgd_range(unsigned long
  	do {
  		next = pgd_addr_end(addr, end);
  		if (pgd_none_or_clear_bad(pgd)) {
 -			if (ops->pte_hole)
-+			if (ops->install_pte)
++			if (has_install)
 +				err = __p4d_alloc(walk->mm, pgd, addr);
 +			else if (ops->pte_hole)
  				err = ops->pte_hole(addr, next, 0, walk);
  			if (err)
  				break;
 -			continue;
-+			if (!ops->install_pte)
++			if (!has_install)
 +				continue;
  		}
  		if (ops->pgd_entry) {
@@ -418,12 +472,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				break;
  		}
 -		if (ops->p4d_entry || ops->pud_entry || ops->pmd_entry || ops->pte_entry)
-+		if (ops->p4d_entry || ops->pud_entry || ops->pmd_entry ||
-+		    ops->pte_entry || ops->install_pte)
++		if (has_handler || has_install)
  			err = walk_p4d_range(pgd, addr, next, walk);
  		if (err)
  			break;
-@@ -334,6 +374,11 @@ static int __walk_page_range(unsigned lo
+@@ -334,6 +393,11 @@ static int __walk_page_range(unsigned lo
  	int err = 0;
  	struct vm_area_struct *vma = walk->vma;
  	const struct mm_walk_ops *ops = walk->ops;
@@ -435,7 +488,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (ops->pre_vma) {
  		err = ops->pre_vma(start, end, walk);
-@@ -341,7 +386,7 @@ static int __walk_page_range(unsigned lo
+@@ -341,7 +405,7 @@ static int __walk_page_range(unsigned lo
  			return err;
  	}
  
@@ -444,7 +497,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (ops->hugetlb_entry)
  			err = walk_hugetlb_range(start, end, walk);
  	} else
-@@ -380,47 +425,14 @@ static inline void process_vma_walk_lock
+@@ -380,47 +444,14 @@ static inline void process_vma_walk_lock
  #endif
  }
  
@@ -498,7 +551,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		unsigned long end, const struct mm_walk_ops *ops,
  		void *private)
  {
-@@ -479,6 +491,80 @@ int walk_page_range(struct mm_struct *mm
+@@ -479,6 +510,80 @@ int walk_page_range(struct mm_struct *mm
  	return err;
  }
  
@@ -579,7 +632,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * walk_page_range_novma - walk a range of pagetables not backed by a vma
   * @mm:		mm_struct representing the target process of page table walk
-@@ -494,7 +580,7 @@ int walk_page_range(struct mm_struct *mm
+@@ -494,7 +599,7 @@ int walk_page_range(struct mm_struct *mm
   * walking the kernel pages tables or page tables for firmware.
   *
   * Note: Be careful to walk the kernel pages tables, the caller may be need to
@@ -588,7 +641,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * the intermediate kernel page tables belonging to the specified address range
   * from being freed (e.g. memory hot-remove).
   */
-@@ -513,6 +599,8 @@ int walk_page_range_novma(struct mm_stru
+@@ -513,6 +618,8 @@ int walk_page_range_novma(struct mm_stru
  
  	if (start >= end || !walk.mm)
  		return -EINVAL;
@@ -597,7 +650,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * 1) For walking the user virtual address space:
-@@ -556,6 +644,8 @@ int walk_page_range_vma(struct vm_area_s
+@@ -556,6 +663,8 @@ int walk_page_range_vma(struct vm_area_s
  		return -EINVAL;
  	if (start < vma->vm_start || end > vma->vm_end)
  		return -EINVAL;
@@ -606,7 +659,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	process_mm_walk_lock(walk.mm, ops->walk_lock);
  	process_vma_walk_lock(vma, ops->walk_lock);
-@@ -574,6 +664,8 @@ int walk_page_vma(struct vm_area_struct
+@@ -574,6 +683,8 @@ int walk_page_vma(struct vm_area_struct
  
  	if (!walk.mm)
  		return -EINVAL;
@@ -615,7 +668,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	process_mm_walk_lock(walk.mm, ops->walk_lock);
  	process_vma_walk_lock(vma, ops->walk_lock);
-@@ -623,6 +715,9 @@ int walk_page_mapping(struct address_spa
+@@ -623,6 +734,9 @@ int walk_page_mapping(struct address_spa
  	unsigned long start_addr, end_addr;
  	int err = 0;
  
