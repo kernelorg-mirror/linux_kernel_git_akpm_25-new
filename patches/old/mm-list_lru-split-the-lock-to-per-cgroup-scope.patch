@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm/list_lru: split the lock to per-cgroup scope
-Date: Thu, 26 Sep 2024 01:10:19 +0800
+Date: Tue, 5 Nov 2024 01:52:56 +0800
 
 Currently, every list_lru has a per-node lock that protects adding,
 deletion, isolation, and reparenting of all list_lru_one instances
@@ -85,20 +85,17 @@ real      0m6.894s user      0m11.528s sys       2m45.346s
 real      0m6.911s user      0m11.095s sys       2m43.168s
 real      0m6.773s user      0m11.518s sys       2m40.774s
 
-[kasong@tencent.com: shrink_memcg_cg in zswap.c can return LRU_STOP]
-  Link: https://lkml.kernel.org/r/CAMgjq7D_OA=vYf5SnNnKXjppPFhDqsbYF--6=cOayKiadxuwrQ@mail.gmail.com
-Link: https://lkml.kernel.org/r/20240925171020.32142-6-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20241104175257.60853-6-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Cc: Chengming Zhou <zhouchengming@bytedance.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Qi Zheng <zhengqi.arch@bytedance.com>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Waiman Long <longman@redhat.com>
-Cc: Usama Arif <usamaarif642@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
@@ -106,11 +103,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  fs/inode.c                     |    1 
  fs/xfs/xfs_qm.c                |    1 
  include/linux/list_lru.h       |    6 
- mm/list_lru.c                  |  214 +++++++++++++++++--------------
+ mm/list_lru.c                  |  216 +++++++++++++++++--------------
  mm/memcontrol.c                |    7 -
  mm/workingset.c                |    1 
  mm/zswap.c                     |    5 
- 8 files changed, 133 insertions(+), 103 deletions(-)
+ 8 files changed, 135 insertions(+), 103 deletions(-)
 
 --- a/drivers/android/binder_alloc.c~mm-list_lru-split-the-lock-to-per-cgroup-scope
 +++ a/drivers/android/binder_alloc.c
@@ -168,7 +165,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct list_lru {
 --- a/mm/list_lru.c~mm-list_lru-split-the-lock-to-per-cgroup-scope
 +++ a/mm/list_lru.c
-@@ -61,18 +61,48 @@ list_lru_from_memcg_idx(struct list_lru
+@@ -61,18 +61,51 @@ list_lru_from_memcg_idx(struct list_lru
  }
  
  static inline struct list_lru_one *
@@ -177,6 +174,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		       bool irq, bool skip_empty)
  {
  	struct list_lru_one *l;
++	long nr_items;
++
 +	rcu_read_lock();
  again:
  	l = list_lru_from_memcg_idx(lru, nid, memcg_kmem_id(memcg));
@@ -189,8 +188,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			spin_lock_irq(&l->lock);
 +		else
 +			spin_lock(&l->lock);
-+		if (likely(READ_ONCE(l->nr_items) != LONG_MIN)) {
-+			WARN_ON(l->nr_items < 0);
++		nr_items = READ_ONCE(l->nr_items);
++		if (likely(nr_items != LONG_MIN)) {
++			WARN_ON(nr_items < 0);
 +			rcu_read_unlock();
 +			return l;
 +		}
@@ -222,7 +222,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #else
  static void list_lru_register(struct list_lru *lru)
  {
-@@ -99,31 +129,48 @@ list_lru_from_memcg_idx(struct list_lru
+@@ -99,31 +132,48 @@ list_lru_from_memcg_idx(struct list_lru
  }
  
  static inline struct list_lru_one *
@@ -279,7 +279,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return false;
  }
  
-@@ -146,24 +193,23 @@ EXPORT_SYMBOL_GPL(list_lru_add_obj);
+@@ -146,24 +196,23 @@ EXPORT_SYMBOL_GPL(list_lru_add_obj);
  
  /* The caller must ensure the memcg lifetime. */
  bool list_lru_del(struct list_lru *lru, struct list_head *item, int nid,
@@ -311,7 +311,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  bool list_lru_del_obj(struct list_lru *lru, struct list_head *item)
  {
-@@ -220,25 +266,24 @@ unsigned long list_lru_count_node(struct
+@@ -220,25 +269,24 @@ unsigned long list_lru_count_node(struct
  	struct list_lru_node *nlru;
  
  	nlru = &lru->node[nid];
@@ -343,7 +343,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	list_for_each_safe(item, n, &l->list) {
  		enum lru_status ret;
  
-@@ -250,19 +295,20 @@ restart:
+@@ -250,19 +298,19 @@ restart:
  			break;
  		--*nr_to_walk;
  
@@ -352,8 +352,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		switch (ret) {
 +		/*
 +		 * LRU_RETRY, LRU_REMOVED_RETRY and LRU_STOP will drop the lru
-+		 * lock, the list traversal will be invalid and have to restart
-+		 * from scratch.
++		 * lock. List traversal will have to restart from scratch.
 +		 */
 +		case LRU_RETRY:
 +			goto restart;
@@ -372,7 +371,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (ret == LRU_REMOVED_RETRY)
  				goto restart;
  			break;
-@@ -271,20 +317,13 @@ restart:
+@@ -271,20 +319,13 @@ restart:
  			break;
  		case LRU_SKIP:
  			break;
@@ -394,7 +393,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  out:
  	return isolated;
  }
-@@ -294,14 +333,8 @@ list_lru_walk_one(struct list_lru *lru,
+@@ -294,14 +335,8 @@ list_lru_walk_one(struct list_lru *lru,
  		  list_lru_walk_cb isolate, void *cb_arg,
  		  unsigned long *nr_to_walk)
  {
@@ -411,7 +410,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  EXPORT_SYMBOL_GPL(list_lru_walk_one);
  
-@@ -310,14 +343,8 @@ list_lru_walk_one_irq(struct list_lru *l
+@@ -310,14 +345,8 @@ list_lru_walk_one_irq(struct list_lru *l
  		      list_lru_walk_cb isolate, void *cb_arg,
  		      unsigned long *nr_to_walk)
  {
@@ -428,7 +427,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  unsigned long list_lru_walk_node(struct list_lru *lru, int nid,
-@@ -332,16 +359,21 @@ unsigned long list_lru_walk_node(struct
+@@ -332,16 +361,21 @@ unsigned long list_lru_walk_node(struct
  #ifdef CONFIG_MEMCG
  	if (*nr_to_walk > 0 && list_lru_memcg_aware(lru)) {
  		struct list_lru_memcg *mlru;
@@ -456,7 +455,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  			if (*nr_to_walk <= 0)
  				break;
-@@ -353,14 +385,19 @@ unsigned long list_lru_walk_node(struct
+@@ -353,14 +387,19 @@ unsigned long list_lru_walk_node(struct
  }
  EXPORT_SYMBOL_GPL(list_lru_walk_node);
  
@@ -478,7 +477,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int nid;
  	struct list_lru_memcg *mlru;
-@@ -370,7 +407,7 @@ static struct list_lru_memcg *memcg_init
+@@ -370,7 +409,7 @@ static struct list_lru_memcg *memcg_init
  		return NULL;
  
  	for_each_node(nid)
@@ -487,7 +486,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return mlru;
  }
-@@ -398,28 +435,27 @@ static void memcg_destroy_list_lru(struc
+@@ -398,28 +437,27 @@ static void memcg_destroy_list_lru(struc
  	xas_unlock_irq(&xas);
  }
  
@@ -528,7 +527,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  void memcg_reparent_list_lrus(struct mem_cgroup *memcg, struct mem_cgroup *parent)
-@@ -448,7 +484,7 @@ void memcg_reparent_list_lrus(struct mem
+@@ -448,7 +486,7 @@ void memcg_reparent_list_lrus(struct mem
  		 * safe to reparent.
  		 */
  		for_each_node(i)
@@ -537,7 +536,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		/*
  		 * Here all list_lrus corresponding to the cgroup are guaranteed
-@@ -497,7 +533,7 @@ int memcg_list_lru_alloc(struct mem_cgro
+@@ -497,7 +535,7 @@ int memcg_list_lru_alloc(struct mem_cgro
  			parent = parent_mem_cgroup(pos);
  		}
  
@@ -546,7 +545,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!mlru)
  			return -ENOMEM;
  		xas_set(&xas, pos->kmemcg_id);
-@@ -544,14 +580,8 @@ int __list_lru_init(struct list_lru *lru
+@@ -544,14 +582,8 @@ int __list_lru_init(struct list_lru *lru
  	if (!lru->node)
  		return -ENOMEM;
  
@@ -565,7 +564,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	list_lru_register(lru);
 --- a/mm/memcontrol.c~mm-list_lru-split-the-lock-to-per-cgroup-scope
 +++ a/mm/memcontrol.c
-@@ -3100,8 +3100,13 @@ static void memcg_offline_kmem(struct me
+@@ -3110,8 +3110,13 @@ static void memcg_offline_kmem(struct me
  	if (!parent)
  		parent = root_mem_cgroup;
  
@@ -582,7 +581,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_CGROUP_WRITEBACK
 --- a/mm/workingset.c~mm-list_lru-split-the-lock-to-per-cgroup-scope
 +++ a/mm/workingset.c
-@@ -777,7 +777,6 @@ out_invalid:
+@@ -767,7 +767,6 @@ out_invalid:
  	ret = LRU_REMOVED_RETRY;
  out:
  	cond_resched();
@@ -592,7 +591,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/zswap.c~mm-list_lru-split-the-lock-to-per-cgroup-scope
 +++ a/mm/zswap.c
-@@ -705,9 +705,9 @@ static void zswap_lru_add(struct list_lr
+@@ -711,9 +711,9 @@ static void zswap_lru_add(struct list_lr
  	 * Note that it is safe to use rcu_read_lock() here, even in the face of
  	 * concurrent memcg offlining:
  	 *
@@ -604,7 +603,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 *    new entry will be added directly to memcg's parent's list_lru.
  	 *
  	 * Similar reasoning holds for list_lru_del().
-@@ -1172,7 +1172,6 @@ static enum lru_status shrink_memcg_cb(s
+@@ -1179,7 +1179,6 @@ static enum lru_status shrink_memcg_cb(s
  		zswap_written_back_pages++;
  	}
  
