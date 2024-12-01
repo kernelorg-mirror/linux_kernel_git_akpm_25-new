@@ -4,6 +4,7 @@ Date: Thu, 14 Nov 2024 20:54:01 +0000
 
 Link: https://lkml.kernel.org/r/20241114205402.859737-1-lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Signed-off-by: Jann Horn <jannh@google.com>
 Acked-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Acked-by: Qi Zheng <zhengqi.arch@bytedance.com> (for page table locks part)
 Reviewed-by: Bagas Sanjaya <bagasdotme@gmail.com>
@@ -17,11 +18,31 @@ Cc: Matthew Wilcox <willy@infradead.org>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
+[lorenzo.stoakes@oracle.com: docs/mm: minor corrections]
+  Link: https://lkml.kernel.org/r/d3de735a-25ae-4eb2-866c-a9624fe6f795@lucifer.local
+[jannh@google.com: docs/mm: add more warnings around page table access]
+  Link: https://lkml.kernel.org/r/20241118-vma-docs-addition1-onv3-v2-1-c9d5395b72ee@google.com
+Cc: Vlastimil Babka <vbabka@suse.cz>
+From: Wei Yang <richard.weiyang@gmail.com>
+Subject: maple_tree: use mas_next_slot() directly
+Date: Mon, 25 Nov 2024 02:41:56 +0000
+
+The loop condition makes sure (mas.last < max), so we can directly use
+mas_next_slot() here.
+
+Since no other use of mas_next_entry(), it is removed.
+
+Link: https://lkml.kernel.org/r/20241125024156.26093-1-richard.weiyang@gmail.com
+Signed-off-by: Wei Yang <richard.weiyang@gmail.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- Documentation/mm/process_addrs.rst |   99 +++++++++++++++------------
- 1 file changed, 55 insertions(+), 44 deletions(-)
+ Documentation/mm/process_addrs.rst |  161 ++++++++++++++++-----------
+ lib/maple_tree.c                   |   25 ----
+ 2 files changed, 100 insertions(+), 86 deletions(-)
 
 --- a/Documentation/mm/process_addrs.rst~docs-mm-add-vma-locks-documentation-v3
 +++ a/Documentation/mm/process_addrs.rst
@@ -34,6 +55,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
    :c:func:`!anon_vma_[try]lock_read` or :c:func:`!anon_vma_[try]lock_write` for
    anonymous memory and :c:func:`!i_mmap_[try]lock_read` or
    :c:func:`!i_mmap_[try]lock_write` for file-backed memory. We refer to these
+@@ -68,8 +68,8 @@ described below).
+ 
+ Stabilising a VMA also keeps the address space described by it around.
+ 
+-Using address space locks
+--------------------------
++Lock usage
++----------
+ 
+ If you want to **read** VMA metadata fields or just keep the VMA stable, you
+ must do one of the following:
 @@ -101,6 +101,9 @@ in order to obtain a VMA **write** lock.
  obtained without any other lock (:c:func:`!lock_vma_under_rcu` will acquire then
  release an RCU lock to lookup the VMA for you).
@@ -64,7 +96,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
     :c:member:`!numab_state`          CONFIG_NUMA_BALANCING :c:type:`!vma_numab_state` object which  mmap read,
                                                             describes the current state of           numab-specific
                                                             NUMA balancing in relation to this VMA.  lock.
-@@ -287,7 +294,7 @@ typically refer to the leaf level as the
+@@ -287,26 +294,27 @@ typically refer to the leaf level as the
  .. note:: In instances where the architecture supports fewer page tables than
  	  five the kernel cleverly 'folds' page table levels, that is stubbing
  	  out functions related to the skipped levels. This allows us to
@@ -73,7 +105,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	  compiler might, in practice, eliminate any code relating to missing
  	  ones.
  
-@@ -298,15 +305,16 @@ There are free key operations typically
+-There are free key operations typically performed on page tables:
++There are four key operations typically performed on page tables:
+ 
+ 1. **Traversing** page tables - Simply reading page tables in order to traverse
+    them. This only requires that the VMA is kept stable, so a lock which
     establishes this suffices for traversal (there are also lockless variants
     which eliminate even this requirement, such as :c:func:`!gup_fast`).
  2. **Installing** page table mappings - Whether creating a new mapping or
@@ -105,7 +141,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  **Traversing** and **zapping** ranges can be performed holding any one of the
  locks described in the terminology section above - that is the mmap lock, the
  VMA lock or either of the reverse mapping locks.
-@@ -323,9 +335,9 @@ ahead and perform these operations on pa
+@@ -323,9 +335,14 @@ ahead and perform these operations on pa
  operations that perform writes also acquire internal page table locks to
  serialise - see the page table implementation detail section for more details).
  
@@ -115,10 +151,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +When **installing** page table entries, the mmap or VMA lock must be held to
 +keep the VMA stable. We explore why this is in the page table locking details
 +section below.
++
++.. warning:: Page tables are normally only traversed in regions covered by VMAs.
++             If you want to traverse page tables in areas that might not be
++             covered by VMAs, heavier locking is required.
++             See :c:func:`!walk_page_range_novma` for details.
  
  **Freeing** page tables is an entirely internal memory management operation and
  has special requirements (see the page freeing section below for more details).
-@@ -386,50 +398,50 @@ There is also a file-system specific loc
+@@ -386,50 +403,50 @@ There is also a file-system specific loc
  
  .. code-block::
  
@@ -194,7 +235,93 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  Please check the current state of these comments which may have changed since
  the time of writing of this document.
-@@ -592,7 +604,7 @@ or zapping).
+@@ -438,6 +455,9 @@ the time of writing of this document.
+ Locking Implementation Details
+ ------------------------------
+ 
++.. warning:: Locking rules for PTE-level page tables are very different from
++             locking rules for page tables at other levels.
++
+ Page table locking details
+ --------------------------
+ 
+@@ -458,8 +478,12 @@ additional locks dedicated to page table
+ These locks represent the minimum required to interact with each page table
+ level, but there are further requirements.
+ 
+-Importantly, note that on a **traversal** of page tables, no such locks are
+-taken. Whether care is taken on reading the page table entries depends on the
++Importantly, note that on a **traversal** of page tables, sometimes no such
++locks are taken. However, at the PTE level, at least concurrent page table
++deletion must be prevented (using RCU) and the page table must be mapped into
++high memory, see below.
++
++Whether care is taken on reading the page table entries depends on the
+ architecture, see the section on atomicity below.
+ 
+ Locking rules
+@@ -477,12 +501,6 @@ We establish basic locking rules when in
+   the warning below).
+ * As mentioned previously, zapping can be performed while simply keeping the VMA
+   stable, that is holding any one of the mmap, VMA or rmap locks.
+-* Special care is required for PTEs, as on 32-bit architectures these must be
+-  mapped into high memory and additionally, careful consideration must be
+-  applied to racing with THP, migration or other concurrent kernel operations
+-  that might steal the entire PTE table from under us. All this is handled by
+-  :c:func:`!pte_offset_map_lock` (see the section on page table installation
+-  below for more details).
+ 
+ .. warning:: Populating previously empty entries is dangerous as, when unmapping
+              VMAs, :c:func:`!vms_clear_ptes` has a window of time between
+@@ -497,8 +515,28 @@ We establish basic locking rules when in
+ There are additional rules applicable when moving page tables, which we discuss
+ in the section on this topic below.
+ 
+-.. note:: Interestingly, :c:func:`!pte_offset_map_lock` holds an RCU read lock
+-          while the PTE page table lock is held.
++PTE-level page tables are different from page tables at other levels, and there
++are extra requirements for accessing them:
++
++* On 32-bit architectures, they may be in high memory (meaning they need to be
++  mapped into kernel memory to be accessible).
++* When empty, they can be unlinked and RCU-freed while holding an mmap lock or
++  rmap lock for reading in combination with the PTE and PMD page table locks.
++  In particular, this happens in :c:func:`!retract_page_tables` when handling
++  :c:macro:`!MADV_COLLAPSE`.
++  So accessing PTE-level page tables requires at least holding an RCU read lock;
++  but that only suffices for readers that can tolerate racing with concurrent
++  page table updates such that an empty PTE is observed (in a page table that
++  has actually already been detached and marked for RCU freeing) while another
++  new page table has been installed in the same location and filled with
++  entries. Writers normally need to take the PTE lock and revalidate that the
++  PMD entry still refers to the same PTE-level page table.
++
++To access PTE-level page tables, a helper like :c:func:`!pte_offset_map_lock` or
++:c:func:`!pte_offset_map` can be used depending on stability requirements.
++These map the page table into kernel memory if required, take the RCU lock, and
++depending on variant, may also look up or acquire the PTE lock.
++See the comment on :c:func:`!__pte_offset_map_lock`.
+ 
+ Atomicity
+ ^^^^^^^^^
+@@ -513,11 +551,11 @@ When performing a page table traversal a
+ read must be performed once and only once or not depends on the architecture
+ (for instance x86-64 does not require any special precautions).
+ 
+-It is on the write side, or if a read informs whether a write takes place (on an
+-installation of a page table entry say, for instance in
+-:c:func:`!__pud_install`), where special care must always be taken. In these
+-cases we can never assume that page table locks give us entirely exclusive
+-access, and must retrieve page table entries once and only once.
++If a write is being performed, or if a read informs whether a write takes place
++(on an installation of a page table entry say, for instance in
++:c:func:`!__pud_install`), special care must always be taken. In these cases we
++can never assume that page table locks give us entirely exclusive access, and
++must retrieve page table entries once and only once.
+ 
+ If we are reading page table entries, then we need only ensure that the compiler
+ does not rearrange our loads. This is achieved via :c:func:`!pXXp_get`
+@@ -592,7 +630,7 @@ or zapping).
  A typical pattern taken when traversing page table entries to install a new
  mapping is to optimistically determine whether the page table entry in the table
  above is empty, if so, only then acquiring the page table lock and checking
@@ -203,7 +330,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  This allows for a traversal with page table locks only being taken when
  required. An example of this is :c:func:`!__pud_alloc`.
-@@ -603,7 +615,7 @@ eliminated the PMD entry as well as the
+@@ -603,7 +641,7 @@ eliminated the PMD entry as well as the
  
  This is why :c:func:`!__pte_offset_map_lock` locklessly retrieves the PMD entry
  for the PTE, carefully checking it is as expected, before acquiring the
@@ -212,7 +339,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  If a THP collapse (or similar) were to occur then the lock on both pages would
  be acquired, so we can ensure this is prevented while the PTE lock is held.
-@@ -654,7 +666,7 @@ page tables). Most notable of these is :
+@@ -654,7 +692,7 @@ page tables). Most notable of these is :
  moving higher level page tables.
  
  In these instances, it is required that **all** locks are taken, that is
@@ -221,7 +348,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  You can observe this in the :c:func:`!mremap` implementation in the functions
  :c:func:`!take_rmap_locks` and :c:func:`!drop_rmap_locks` which perform the rmap
-@@ -669,11 +681,10 @@ Overview
+@@ -669,11 +707,10 @@ Overview
  VMA read locking is entirely optimistic - if the lock is contended or a competing
  write has started, then we do not obtain a read lock.
  
@@ -237,4 +364,45 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  VMA read locks hold the read lock on the :c:member:`!vma->vm_lock` semaphore for
  their duration and the caller of :c:func:`!lock_vma_under_rcu` must release it
+--- a/lib/maple_tree.c~docs-mm-add-vma-locks-documentation-v3
++++ a/lib/maple_tree.c
+@@ -4745,29 +4745,6 @@ again:
+ }
+ 
+ /*
+- * mas_next_entry() - Internal function to get the next entry.
+- * @mas: The maple state
+- * @limit: The maximum range start.
+- *
+- * Set the @mas->node to the next entry and the range_start to
+- * the beginning value for the entry.  Does not check beyond @limit.
+- * Sets @mas->index and @mas->last to the range, Does not update @mas->index and
+- * @mas->last on overflow.
+- * Restarts on dead nodes.
+- *
+- * Return: the next entry or %NULL.
+- */
+-static inline void *mas_next_entry(struct ma_state *mas, unsigned long limit)
+-{
+-	if (mas->last >= limit) {
+-		mas->status = ma_overflow;
+-		return NULL;
+-	}
+-
+-	return mas_next_slot(mas, limit, false);
+-}
+-
+-/*
+  * mas_rev_awalk() - Internal function.  Reverse allocation walk.  Find the
+  * highest gap address of a given size in a given node and descend.
+  * @mas: The maple state
+@@ -6937,7 +6914,7 @@ retry:
+ 		goto unlock;
+ 
+ 	while (mas_is_active(&mas) && (mas.last < max)) {
+-		entry = mas_next_entry(&mas, max);
++		entry = mas_next_slot(&mas, max, false);
+ 		if (likely(entry && !xa_is_zero(entry)))
+ 			break;
+ 	}
 _
