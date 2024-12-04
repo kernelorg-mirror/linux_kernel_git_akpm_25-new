@@ -1,0 +1,66 @@
+From: Qi Zheng <zhengqi.arch@bytedance.com>
+Subject: x86: mm: free page table pages by RCU instead of semi RCU
+Date: Wed, 4 Dec 2024 19:09:50 +0800
+
+Now, if CONFIG_MMU_GATHER_RCU_TABLE_FREE is selected, the page table pages
+will be freed by semi RCU, that is:
+
+ - batch table freeing: asynchronous free by RCU
+ - single table freeing: IPI + synchronous free
+
+In this way, the page table can be lockless traversed by disabling IRQ in
+paths such as fast GUP.  But this is not enough to free the empty PTE page
+table pages in paths other that munmap and exit_mmap path, because IPI
+cannot be synchronized with rcu_read_lock() in pte_offset_map{_lock}().
+
+In preparation for supporting empty PTE page table pages reclaimation, let
+single table also be freed by RCU like batch table freeing.  Then we can
+also use pte_offset_map() etc to prevent PTE page from being freed.
+
+Like pte_free_defer(), we can also safely use ptdesc->pt_rcu_head to free
+the page table pages:
+
+ - The pt_rcu_head is unioned with pt_list and pmd_huge_pte.
+
+ - For pt_list, it is used to manage the PGD page in x86. Fortunately
+   tlb_remove_table() will not be used for free PGD pages, so it is safe
+   to use pt_rcu_head.
+
+ - For pmd_huge_pte, it is used for THPs, so it is safe.
+
+After applying this patch, if CONFIG_PT_RECLAIM is enabled, the function
+call of free_pte() is as follows:
+
+free_pte
+  pte_free_tlb
+    __pte_free_tlb
+      ___pte_free_tlb
+        paravirt_tlb_remove_table
+          tlb_remove_table [!CONFIG_PARAVIRT, Xen PV, Hyper-V, KVM]
+            [no-free-memory slowpath:]
+              tlb_table_invalidate
+              tlb_remove_table_one
+                __tlb_remove_table_one [frees via RCU]
+            [fastpath:]
+              tlb_table_flush
+                tlb_remove_table_free [frees via RCU]
+          native_tlb_remove_table [CONFIG_PARAVIRT on native]
+            tlb_remove_table [see above]
+
+Link: https://lkml.kernel.org/r/0287d442a973150b0e1019cc406e6322d148277a.1733305182.git.zhengqi.arch@bytedance.com
+Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zach O'Keefe <zokeefe@google.com>
