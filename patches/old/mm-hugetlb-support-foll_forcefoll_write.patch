@@ -1,38 +1,52 @@
 From: Guillaume Morin <guillaume@morinfr.org>
 Subject: mm/hugetlb: support FOLL_FORCE|FOLL_WRITE
-Date: Wed, 4 Dec 2024 21:18:23 +0100
+Date: Thu, 5 Dec 2024 03:02:26 +0100
 
-Eric reported that PTRACE_POKETEXT fails when applications use hugetlb for
-mapping text using huge pages.  Before commit 1d8d14641fd9 ("mm/hugetlb:
-support write-faults in shared mappings"), PTRACE_POKETEXT worked by
-accident, but it was buggy and silently ended up mapping pages writable
-into the page tables even though VM_WRITE was not set.
+Eric reported that PTRACE_POKETEXT fails when applications use hugetlb
+for mapping text using huge pages. Before commit 1d8d14641fd9
+("mm/hugetlb: support write-faults in shared mappings"), PTRACE_POKETEXT
+worked by accident, but it was buggy and silently ended up mapping pages
+writable into the page tables even though VM_WRITE was not set.
 
-In general, FOLL_FORCE|FOLL_WRITE does currently not work with hugetlb. 
-Let's implement FOLL_FORCE|FOLL_WRITE properly for hugetlb, such that what
-used to work in the past by accident now properly works, allowing
-applications using hugetlb for text etc.  to get properly debugged.
+In general, FOLL_FORCE|FOLL_WRITE does currently not work with hugetlb.
+Let's implement FOLL_FORCE|FOLL_WRITE properly for hugetlb, such that
+what used to work in the past by accident now properly works, allowing
+applications using hugetlb for text etc. to get properly debugged.
 
 This change might also be required to implement uprobes support for
 hugetlb [1].
 
 [1] https://lore.kernel.org/lkml/ZiK50qob9yl5e0Xz@bender.morinfr.org/
 
-Link: https://lkml.kernel.org/r/Z1C5D1D3NJFnADPz@bender.morinfr.org
-Signed-off-by: Guillaume Morin <guillaume@morinfr.org>
+Link: https://lkml.kernel.org/r/Z1EJssqd93w2erMZ@bender.morinfr.org
 Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Andrew Morton <akpm@linux-foundation.org>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Eric Hagberg <ehagberg@janestreet.com>
-Cc: Jason Gunthorpe <jgg@nvidia.com>
-Cc: John Hubbard <jhubbard@nvidia.com>
+Signed-off-by: Guillaume Morin <guillaume@morinfr.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/gup.c     |   93 ++++++++++++++++++++++++-------------------------
- mm/hugetlb.c |   20 +++++-----
- 2 files changed, 58 insertions(+), 55 deletions(-)
+ include/linux/pgtable.h |    5 +
+ mm/gup.c                |   99 +++++++++++++++++++-------------------
+ mm/hugetlb.c            |   20 ++++---
+ 3 files changed, 66 insertions(+), 58 deletions(-)
 
+--- a/include/linux/pgtable.h~mm-hugetlb-support-foll_forcefoll_write
++++ a/include/linux/pgtable.h
+@@ -1429,6 +1429,11 @@ static inline int pmd_soft_dirty(pmd_t p
+ 	return 0;
+ }
+ 
++static inline int pud_soft_dirty(pud_t pud)
++{
++	return 0;
++}
++
+ static inline pte_t pte_mksoft_dirty(pte_t pte)
+ {
+ 	return pte;
 --- a/mm/gup.c~mm-hugetlb-support-foll_forcefoll_write
 +++ a/mm/gup.c
 @@ -596,6 +596,33 @@ static struct folio *try_grab_folio_fast
@@ -92,16 +106,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static struct page *follow_huge_pud(struct vm_area_struct *vma,
  				    unsigned long addr, pud_t *pudp,
  				    int flags, struct follow_page_context *ctx)
-@@ -634,7 +677,8 @@ static struct page *follow_huge_pud(stru
+@@ -634,13 +677,16 @@ static struct page *follow_huge_pud(stru
  
  	assert_spin_locked(pud_lockptr(mm, pudp));
  
 -	if ((flags & FOLL_WRITE) && !pud_write(pud))
++	pfn += (addr & ~PUD_MASK) >> PAGE_SHIFT;
++	page = pfn_to_page(pfn);
++
 +	if ((flags & FOLL_WRITE) &&
 +	    !can_follow_write_pud(pud, page, vma, flags))
  		return NULL;
  
  	if (!pud_present(pud))
+ 		return NULL;
+ 
+-	pfn += (addr & ~PUD_MASK) >> PAGE_SHIFT;
+ 
+ 	if (IS_ENABLED(CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD) &&
+ 	    pud_devmap(pud)) {
+@@ -662,8 +708,6 @@ static struct page *follow_huge_pud(stru
+ 			return ERR_PTR(-EFAULT);
+ 	}
+ 
+-	page = pfn_to_page(pfn);
+-
+ 	if (!pud_devmap(pud) && !pud_write(pud) &&
+ 	    gup_must_unshare(vma, flags, page))
+ 		return ERR_PTR(-EMLINK);
 @@ -686,27 +730,7 @@ static inline bool can_follow_write_pmd(
  	if (pmd_write(pmd))
  		return true;
@@ -172,7 +204,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			 * VM_MAYWRITE VM_SHARED !VM_WRITE vma, so ptrace could
 --- a/mm/hugetlb.c~mm-hugetlb-support-foll_forcefoll_write
 +++ a/mm/hugetlb.c
-@@ -5169,6 +5169,13 @@ static void set_huge_ptep_writable(struc
+@@ -5183,6 +5183,13 @@ static void set_huge_ptep_writable(struc
  		update_mmu_cache(vma, address, ptep);
  }
  
@@ -186,7 +218,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  bool is_hugetlb_entry_migration(pte_t pte)
  {
  	swp_entry_t swp;
-@@ -5802,13 +5809,6 @@ static vm_fault_t hugetlb_wp(struct foli
+@@ -5816,13 +5823,6 @@ static vm_fault_t hugetlb_wp(struct foli
  	if (!unshare && huge_pte_uffd_wp(pte))
  		return 0;
  
@@ -200,7 +232,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Let's take out MAP_SHARED mappings first. */
  	if (vma->vm_flags & VM_MAYSHARE) {
  		set_huge_ptep_writable(vma, vmf->address, vmf->pte);
-@@ -5837,7 +5837,8 @@ retry_avoidcopy:
+@@ -5851,7 +5851,8 @@ retry_avoidcopy:
  			SetPageAnonExclusive(&old_folio->page);
  		}
  		if (likely(!unshare))
@@ -210,7 +242,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		delayacct_wpcopy_end();
  		return 0;
-@@ -5943,7 +5944,8 @@ retry_avoidcopy:
+@@ -5957,7 +5958,8 @@ retry_avoidcopy:
  	spin_lock(vmf->ptl);
  	vmf->pte = hugetlb_walk(vma, vmf->address, huge_page_size(h));
  	if (likely(vmf->pte && pte_same(huge_ptep_get(mm, vmf->address, vmf->pte), pte))) {
