@@ -1,6 +1,6 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: mm: convert mm_lock_seq to a proper seqcount
-Date: Thu, 24 Oct 2024 13:52:30 -0700
+Date: Fri, 22 Nov 2024 09:44:15 -0800
 
 Convert mm_lock_seq to be seqcount_t and change all mmap_write_lock
 variants to increment it, in-line with the usual seqcount usage pattern.
@@ -10,24 +10,31 @@ used when implementing mmap_lock speculation functions.
 As a result vm_lock_seq is also change to be unsigned to match the type
 of mm_lock_seq.sequence.
 
-Link: https://lkml.kernel.org/r/20241024205231.1944747-1-surenb@google.com
-Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Link: https://lkml.kernel.org/r/20241122174416.1367052-2-surenb@google.com
 Suggested-by: Peter Zijlstra <peterz@infradead.org>
-Cc: Alexander Viro <viro@zeniv.linux.org.uk>
-Cc: Andrii Nakryiko <andrii@kernel.org>
-Cc: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: David Hildenbrand <david@redhat.com>
-Cc: <hca@linux.ibm.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: Jann Horn <jannh@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
-Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@google.com>
 Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Sourav Panda <souravpanda@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Wei Yang <richard.weiyang@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -35,16 +42,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  include/linux/mm.h               |   12 +++---
  include/linux/mm_types.h         |    7 ++-
- include/linux/mmap_lock.h        |   58 +++++++++++++++++++----------
+ include/linux/mmap_lock.h        |   55 ++++++++++++++++++-----------
  kernel/fork.c                    |    5 --
  mm/init-mm.c                     |    2 -
  tools/testing/vma/vma.c          |    4 +-
  tools/testing/vma/vma_internal.h |    4 +-
- 7 files changed, 56 insertions(+), 36 deletions(-)
+ 7 files changed, 53 insertions(+), 36 deletions(-)
 
 --- a/include/linux/mmap_lock.h~mm-convert-mm_lock_seq-to-a-proper-seqcount
 +++ a/include/linux/mmap_lock.h
-@@ -71,39 +71,38 @@ static inline void mmap_assert_write_loc
+@@ -71,39 +71,39 @@ static inline void mmap_assert_write_loc
  }
  
  #ifdef CONFIG_PER_VMA_LOCK
@@ -78,6 +85,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline void mm_lock_seqcount_end(struct mm_struct *mm)
 +{
++	ASSERT_EXCLUSIVE_WRITER(mm->mm_lock_seq);
 +	do_raw_write_seqcount_end(&mm->mm_lock_seq);
  }
 +
@@ -102,7 +110,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	__mmap_lock_trace_acquire_returned(mm, true, true);
  }
  
-@@ -111,6 +110,7 @@ static inline void mmap_write_lock_neste
+@@ -111,6 +111,7 @@ static inline void mmap_write_lock_neste
  {
  	__mmap_lock_trace_start_locking(mm, true);
  	down_write_nested(&mm->mmap_lock, subclass);
@@ -110,7 +118,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	__mmap_lock_trace_acquire_returned(mm, true, true);
  }
  
-@@ -120,10 +120,30 @@ static inline int mmap_write_lock_killab
+@@ -120,10 +121,26 @@ static inline int mmap_write_lock_killab
  
  	__mmap_lock_trace_start_locking(mm, true);
  	ret = down_write_killable(&mm->mmap_lock);
@@ -131,10 +139,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static inline void vma_end_write_all(struct mm_struct *mm)
 +{
 +	mmap_assert_write_locked(mm);
-+	/*
-+	 * Nobody can concurrently modify mm->mm_lock_seq due to exclusive
-+	 * mmap_lock being held.
-+	 */
 +	mm_lock_seqcount_end(mm);
 +}
 +
@@ -199,7 +203,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/include/linux/mm_types.h~mm-convert-mm_lock_seq-to-a-proper-seqcount
 +++ a/include/linux/mm_types.h
-@@ -697,7 +697,7 @@ struct vm_area_struct {
+@@ -699,7 +699,7 @@ struct vm_area_struct {
  	 * counter reuse can only lead to occasional unnecessary use of the
  	 * slowpath.
  	 */
@@ -208,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Unstable RCU readers are allowed to read this. */
  	struct vma_lock *vm_lock;
  #endif
-@@ -891,6 +891,9 @@ struct mm_struct {
+@@ -893,6 +893,9 @@ struct mm_struct {
  		 * Roughly speaking, incrementing the sequence number is
  		 * equivalent to releasing locks on VMAs; reading the sequence
  		 * number can be part of taking a read lock on a VMA.
@@ -218,7 +222,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		 *
  		 * Can be modified under write mmap_lock using RELEASE
  		 * semantics.
-@@ -899,7 +902,7 @@ struct mm_struct {
+@@ -901,7 +904,7 @@ struct mm_struct {
  		 * Can be read with ACQUIRE semantics if not holding write
  		 * mmap_lock.
  		 */
@@ -261,7 +265,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	.cpu_bitmap	= CPU_BITS_NONE,
 --- a/tools/testing/vma/vma.c~mm-convert-mm_lock_seq-to-a-proper-seqcount
 +++ a/tools/testing/vma/vma.c
-@@ -89,7 +89,7 @@ static struct vm_area_struct *alloc_and_
+@@ -100,7 +100,7 @@ static struct vm_area_struct *alloc_and_
  	 * begun. Linking to the tree will have caused this to be incremented,
  	 * which means we will get a false positive otherwise.
  	 */
@@ -270,7 +274,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return vma;
  }
-@@ -214,7 +214,7 @@ static bool vma_write_started(struct vm_
+@@ -225,7 +225,7 @@ static bool vma_write_started(struct vm_
  	int seq = vma->vm_lock_seq;
  
  	/* We reset after each check. */
@@ -281,7 +285,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return seq > -1;
 --- a/tools/testing/vma/vma_internal.h~mm-convert-mm_lock_seq-to-a-proper-seqcount
 +++ a/tools/testing/vma/vma_internal.h
-@@ -241,7 +241,7 @@ struct vm_area_struct {
+@@ -281,7 +281,7 @@ struct vm_area_struct {
  	 * counter reuse can only lead to occasional unnecessary use of the
  	 * slowpath.
  	 */
@@ -290,7 +294,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct vma_lock *vm_lock;
  #endif
  
-@@ -416,7 +416,7 @@ static inline bool vma_lock_alloc(struct
+@@ -467,7 +467,7 @@ static inline bool vma_lock_alloc(struct
  		return false;
  
  	init_rwsem(&vma->vm_lock->lock);

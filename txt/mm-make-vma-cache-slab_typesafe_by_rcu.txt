@@ -1,0 +1,75 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: make vma cache SLAB_TYPESAFE_BY_RCU
+Date: Fri, 6 Dec 2024 14:52:01 -0800
+
+To enable SLAB_TYPESAFE_BY_RCU for vma cache we need to ensure that object
+reuse before RCU grace period is over will be detected inside
+lock_vma_under_rcu().
+
+lock_vma_under_rcu() enters RCU read section, finds the vma at the given
+address, locks the vma and checks if it got detached or remapped to cover
+a different address range.  These last checks are there to ensure that the
+vma was not modified after we found it but before locking it.
+
+vma reuse introduces several new possibilities:
+
+1. vma can be reused after it was found but before it is locked;
+
+2. vma can be reused and reinitialized (including changing its vm_mm)
+   while being locked in vma_start_read();
+
+3. vma can be reused and reinitialized after it was found but before
+   it is locked, then attached at a new address or to a new mm while
+   read-locked;
+
+For case #1 current checks will help detecting cases when:
+
+- vma was reused but not yet added into the tree (detached check)
+
+- vma was reused at a different address range (address check);
+
+We are missing the check for vm_mm to ensure the reused vma was not
+attached to a different mm.  This patch adds the missing check.  For case
+#2, we pass mm to vma_start_read() to prevent access to unstable
+vma->vm_mm.  This might lead to vma_start_read() returning a false locked
+result but that's not critical if it's rare because it will only lead to a
+retry under mmap_lock.
+
+For case #3, we ensure the order in which vma->detached flag and
+vm_start/vm_end/vm_mm are set and checked.  vma gets attached after
+vm_start/vm_end/vm_mm were set and lock_vma_under_rcu() should check
+vma->detached before checking vm_start/vm_end/vm_mm.  This is required
+because attaching vma happens without vma write-lock, as opposed to vma
+detaching, which requires vma write-lock.  This patch adds memory barriers
+inside is_vma_detached() and vma_mark_attached() needed to order reads and
+writes to vma->detached vs vm_start/vm_end/vm_mm.  After these provisions,
+SLAB_TYPESAFE_BY_RCU is added to vm_area_cachep.  This will facilitate
+vm_area_struct reuse and will minimize the number of call_rcu() calls.
+
+Link: https://lkml.kernel.org/r/20241206225204.4008261-5-surenb@google.com
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Sourav Panda <souravpanda@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
