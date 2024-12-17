@@ -1,6 +1,6 @@
 From: yangge <yangge1116@126.com>
 Subject: mm, compaction: don't use ALLOC_CMA in long term GUP flow
-Date: Sun, 15 Dec 2024 18:01:07 +0800
+Date: Mon, 16 Dec 2024 19:54:04 +0800
 
 Since commit 984fdba6a32e ("mm, compaction: use proper alloc_flags in
 __compaction_suitable()") allow compaction to proceed when free pages
@@ -22,10 +22,9 @@ always be met for compaction, so __compaction_suitable() always returns
 true, even if the node is unable to allocate non-CMA memory for the
 virtual machine.
 
-For costly allocations, because __compaction_suitable() always returns
-true, __alloc_pages_slowpath() can't exit at the appropriate place,
-resulting in excessively long virtual machine startup times.
-
+For costly allocations, because __compaction_suitable() always
+returns true, __alloc_pages_slowpath() can't exit at the appropriate
+place, resulting in excessively long virtual machine startup times.
 Call trace:
 __alloc_pages_slowpath
     if (compact_result == COMPACT_SKIPPED ||
@@ -37,7 +36,7 @@ both in __compaction_suitable() and __isolate_free_page() in long term GUP
 flow.  After this fix, starting a 32GB virtual machine with device
 passthrough takes only a few seconds.
 
-Link: https://lkml.kernel.org/r/1734256867-19614-1-git-send-email-yangge1116@126.com
+Link: https://lkml.kernel.org/r/1734350044-12928-1-git-send-email-yangge1116@126.com
 Fixes: 984fdba6a32e ("mm, compaction: use proper alloc_flags in __compaction_suitable()")
 Signed-off-by: yangge <yangge1116@126.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -48,10 +47,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/compaction.h |    6 ++++--
- mm/compaction.c            |   18 +++++++++++-------
- mm/page_alloc.c            |    4 +++-
+ mm/compaction.c            |   20 +++++++++++---------
+ mm/internal.h              |    3 ++-
+ mm/page_alloc.c            |    6 ++++--
+ mm/page_isolation.c        |    3 ++-
+ mm/page_reporting.c        |    2 +-
  mm/vmscan.c                |    4 ++--
- 4 files changed, 20 insertions(+), 12 deletions(-)
+ 7 files changed, 26 insertions(+), 18 deletions(-)
 
 --- a/include/linux/compaction.h~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
 +++ a/include/linux/compaction.h
@@ -77,7 +79,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/mm/compaction.c~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
 +++ a/mm/compaction.c
-@@ -2379,9 +2379,11 @@ static enum compact_result compact_finis
+@@ -654,7 +654,7 @@ static unsigned long isolate_freepages_b
+ 
+ 		/* Found a free page, will break it into order-0 pages */
+ 		order = buddy_order(page);
+-		isolated = __isolate_free_page(page, order);
++		isolated = __isolate_free_page(page, order, cc->alloc_flags);
+ 		if (!isolated)
+ 			break;
+ 		set_page_private(page, order);
+@@ -1633,7 +1633,7 @@ static void fast_isolate_freepages(struc
+ 
+ 		/* Isolate the page if available */
+ 		if (page) {
+-			if (__isolate_free_page(page, order)) {
++			if (__isolate_free_page(page, order, cc->alloc_flags)) {
+ 				set_page_private(page, order);
+ 				nr_isolated = 1 << order;
+ 				nr_scanned += nr_isolated - 1;
+@@ -2379,6 +2379,7 @@ static enum compact_result compact_finis
  
  static bool __compaction_suitable(struct zone *zone, int order,
  				  int highest_zoneidx,
@@ -85,11 +105,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				  unsigned long wmark_target)
  {
  	unsigned long watermark;
-+	bool use_cma;
- 	/*
- 	 * Watermarks for order-0 must be met for compaction to be able to
- 	 * isolate free pages for migration targets. This means that the
-@@ -2393,25 +2395,27 @@ static bool __compaction_suitable(struct
+@@ -2393,25 +2394,26 @@ static bool __compaction_suitable(struct
  	 * even if compaction succeeds.
  	 * For costly orders, we require low watermark instead of min for
  	 * compaction to proceed to increase its chances.
@@ -101,10 +117,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	watermark = (order > PAGE_ALLOC_COSTLY_ORDER) ?
  				low_wmark_pages(zone) : min_wmark_pages(zone);
  	watermark += compact_gap(order);
-+	use_cma = !!(alloc_flags & ALLOC_CMA);
  	return __zone_watermark_ok(zone, 0, watermark, highest_zoneidx,
 -				   ALLOC_CMA, wmark_target);
-+				   use_cma ? ALLOC_CMA : 0, wmark_target);
++				   alloc_flags & ALLOC_CMA, wmark_target);
  }
  
  /*
@@ -122,7 +137,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  					 zone_page_state(zone, NR_FREE_PAGES));
  	/*
  	 * fragmentation index determines if allocation failures are due to
-@@ -2472,7 +2476,7 @@ bool compaction_zonelist_suitable(struct
+@@ -2472,7 +2474,7 @@ bool compaction_zonelist_suitable(struct
  		available = zone_reclaimable_pages(zone) / order;
  		available += zone_page_state_snapshot(zone, NR_FREE_PAGES);
  		if (__compaction_suitable(zone, order, ac->highest_zoneidx,
@@ -131,7 +146,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			return true;
  	}
  
-@@ -2497,7 +2501,7 @@ compaction_suit_allocation_order(struct
+@@ -2497,7 +2499,7 @@ compaction_suit_allocation_order(struct
  			      alloc_flags))
  		return COMPACT_SUCCESS;
  
@@ -140,26 +155,63 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return COMPACT_SKIPPED;
  
  	return COMPACT_CONTINUE;
+--- a/mm/internal.h~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
++++ a/mm/internal.h
+@@ -662,7 +662,8 @@ static inline void clear_zone_contiguous
+ 	zone->contiguous = false;
+ }
+ 
+-extern int __isolate_free_page(struct page *page, unsigned int order);
++extern int __isolate_free_page(struct page *page, unsigned int order,
++				    unsigned int alloc_flags);
+ extern void __putback_isolated_page(struct page *page, unsigned int order,
+ 				    int mt);
+ extern void memblock_free_pages(struct page *page, unsigned long pfn,
 --- a/mm/page_alloc.c~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
 +++ a/mm/page_alloc.c
-@@ -2812,6 +2812,7 @@ int __isolate_free_page(struct page *pag
+@@ -2808,7 +2808,8 @@ void split_page(struct page *page, unsig
+ }
+ EXPORT_SYMBOL_GPL(split_page);
+ 
+-int __isolate_free_page(struct page *page, unsigned int order)
++int __isolate_free_page(struct page *page, unsigned int order,
++				   unsigned int alloc_flags)
  {
  	struct zone *zone = page_zone(page);
  	int mt = get_pageblock_migratetype(page);
-+	bool pin;
- 
- 	if (!is_migrate_isolate(mt)) {
- 		unsigned long watermark;
 @@ -2822,7 +2823,8 @@ int __isolate_free_page(struct page *pag
  		 * exists.
  		 */
  		watermark = zone->_watermark[WMARK_MIN] + (1UL << order);
 -		if (!zone_watermark_ok(zone, 0, watermark, 0, ALLOC_CMA))
-+		pin = !!(current->flags & PF_MEMALLOC_PIN);
-+		if (!zone_watermark_ok(zone, 0, watermark, 0, pin ? 0 : ALLOC_CMA))
++		if (!zone_watermark_ok(zone, 0, watermark, 0,
++			    alloc_flags & ALLOC_CMA))
  			return 0;
  	}
  
+--- a/mm/page_isolation.c~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
++++ a/mm/page_isolation.c
+@@ -229,7 +229,8 @@ static void unset_migratetype_isolate(st
+ 			buddy = find_buddy_page_pfn(page, page_to_pfn(page),
+ 						    order, NULL);
+ 			if (buddy && !is_migrate_isolate_page(buddy)) {
+-				isolated_page = !!__isolate_free_page(page, order);
++				isolated_page = !!__isolate_free_page(page, order,
++						    ALLOC_CMA);
+ 				/*
+ 				 * Isolating a free page in an isolated pageblock
+ 				 * is expected to always work as watermarks don't
+--- a/mm/page_reporting.c~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
++++ a/mm/page_reporting.c
+@@ -198,7 +198,7 @@ page_reporting_cycle(struct page_reporti
+ 
+ 		/* Attempt to pull page from list and place in scatterlist */
+ 		if (*offset) {
+-			if (!__isolate_free_page(page, order)) {
++			if (!__isolate_free_page(page, order, ALLOC_CMA)) {
+ 				next = page;
+ 				break;
+ 			}
 --- a/mm/vmscan.c~mm-compaction-dont-use-alloc_cma-in-long-term-gup-flow
 +++ a/mm/vmscan.c
 @@ -5861,7 +5861,7 @@ static inline bool should_continue_recla
