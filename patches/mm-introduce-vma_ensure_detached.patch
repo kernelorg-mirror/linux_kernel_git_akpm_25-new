@@ -1,0 +1,185 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: introduce vma_ensure_detached()
+Date: Mon, 16 Dec 2024 11:24:16 -0800
+
+vma_start_read() can temporarily raise vm_refcnt of a write-locked and
+detached vma:
+
+// vm_refcnt==1 (attached)
+vma_start_write()
+    vma->vm_lock_seq = mm->mm_lock_seq
+
+                    vma_start_read()
+                       vm_refcnt++; // vm_refcnt==2
+
+vma_mark_detached()
+    vm_refcnt--; // vm_refcnt==1
+
+// vma is detached but vm_refcnt!=0 temporarily
+
+                       if (vma->vm_lock_seq == mm->mm_lock_seq)
+                           vma_refcount_put()
+                               vm_refcnt--; // vm_refcnt==0
+
+This is currently not a problem when freeing the vma because RCU grace
+period should pass before kmem_cache_free(vma) gets called and by that
+time vma_start_read() should be done and vm_refcnt is 0.  However once we
+introduce possibility of vma reuse before RCU grace period is over, this
+will become a problem (reused vma might be in non-detached state). 
+Introduce vma_ensure_detached() for the writer to wait for readers until
+they exit vma_start_read().
+
+Link: https://lkml.kernel.org/r/20241216192419.2970941-14-surenb@google.com
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Klara Modin <klarasmodin@gmail.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Sourav Panda <souravpanda@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h               |    9 ++++
+ mm/memory.c                      |   55 +++++++++++++++++++++--------
+ tools/testing/vma/vma_internal.h |    8 ++++
+ 3 files changed, 57 insertions(+), 15 deletions(-)
+
+--- a/include/linux/mm.h~mm-introduce-vma_ensure_detached
++++ a/include/linux/mm.h
+@@ -863,6 +863,15 @@ static inline bool is_vma_detached(struc
+ 	return refcount_read(&vma->vm_refcnt) == VMA_STATE_DETACHED;
+ }
+ 
++/*
++ * WARNING: to avoid racing with vma_mark_attached(), should be called either
++ * under mmap_write_lock or when the object has been isolated under
++ * mmap_write_lock, ensuring no competing writers.
++ * Should be called after marking vma as detached to wait for possible
++ * readers which temporarily raised vm_refcnt to drop it back and exit.
++ */
++void vma_ensure_detached(struct vm_area_struct *vma);
++
+ static inline void vma_mark_attached(struct vm_area_struct *vma)
+ {
+ 	vma_assert_write_locked(vma);
+--- a/mm/memory.c~mm-introduce-vma_ensure_detached
++++ a/mm/memory.c
+@@ -6329,18 +6329,10 @@ fail:
+ #endif
+ 
+ #ifdef CONFIG_PER_VMA_LOCK
+-void __vma_start_write(struct vm_area_struct *vma, unsigned int mm_lock_seq)
++static inline bool __vma_enter_locked(struct vm_area_struct *vma)
+ {
+-	bool detached;
+-
+-	/*
+-	 * If vma is detached then only vma_mark_attached() can raise the
+-	 * vm_refcnt. mmap_write_lock prevents racing with vma_mark_attached().
+-	 */
+-	if (!refcount_inc_not_zero(&vma->vm_refcnt)) {
+-		WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
+-		return;
+-	}
++	if (!refcount_inc_not_zero(&vma->vm_refcnt))
++		return false;
+ 
+ 	rwsem_acquire(&vma->vmlock_dep_map, 0, 0, _RET_IP_);
+ 	/* vma is attached, set the writer present bit */
+@@ -6350,6 +6342,22 @@ void __vma_start_write(struct vm_area_st
+ 		   refcount_read(&vma->vm_refcnt) == VMA_STATE_ATTACHED + (VMA_STATE_LOCKED + 1),
+ 		   TASK_UNINTERRUPTIBLE);
+ 	lock_acquired(&vma->vmlock_dep_map, _RET_IP_);
++
++	return true;
++}
++
++static inline void __vma_exit_locked(struct vm_area_struct *vma, bool *is_detached)
++{
++	*is_detached = refcount_sub_and_test(VMA_STATE_LOCKED + 1,
++					     &vma->vm_refcnt);
++	rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
++}
++
++void __vma_start_write(struct vm_area_struct *vma, unsigned int mm_lock_seq)
++{
++	bool locked;
++
++	locked = __vma_enter_locked(vma);
+ 	/*
+ 	 * We should use WRITE_ONCE() here because we can have concurrent reads
+ 	 * from the early lockless pessimistic check in vma_start_read().
+@@ -6357,13 +6365,30 @@ void __vma_start_write(struct vm_area_st
+ 	 * we should use WRITE_ONCE() for cleanliness and to keep KCSAN happy.
+ 	 */
+ 	WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
+-	detached = refcount_sub_and_test(VMA_STATE_LOCKED + 1,
+-					 &vma->vm_refcnt);
+-	rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
+-	VM_BUG_ON_VMA(detached, vma); /* vma should remain attached */
++	if (locked) {
++		bool detached;
++
++		__vma_exit_locked(vma, &detached);
++		/* vma was originally attached and should remain so */
++		VM_BUG_ON_VMA(detached, vma);
++	}
+ }
+ EXPORT_SYMBOL_GPL(__vma_start_write);
+ 
++void vma_ensure_detached(struct vm_area_struct *vma)
++{
++	if (is_vma_detached(vma))
++		return;
++
++	if (__vma_enter_locked(vma)) {
++		bool detached;
++
++		/* Wait for temporary readers to drop the vm_refcnt */
++		__vma_exit_locked(vma, &detached);
++		VM_BUG_ON_VMA(!detached, vma);
++	}
++}
++
+ /*
+  * Lookup and lock a VMA under RCU protection. Returned VMA is guaranteed to be
+  * stable and not isolated. If the VMA is not found or is being modified the
+--- a/tools/testing/vma/vma_internal.h~mm-introduce-vma_ensure_detached
++++ a/tools/testing/vma/vma_internal.h
+@@ -465,6 +465,14 @@ static inline bool is_vma_detached(struc
+ 	return refcount_read(&vma->vm_refcnt) == VMA_STATE_DETACHED;
+ }
+ 
++static inline void vma_ensure_detached(struct vm_area_struct *vma)
++{
++	if (is_vma_detached(vma))
++		return;
++
++	refcount_set(&vma->vm_refcnt, VMA_STATE_DETACHED);
++}
++
+ static inline void vma_assert_write_locked(struct vm_area_struct *);
+ static inline void vma_mark_attached(struct vm_area_struct *vma)
+ {
+_
