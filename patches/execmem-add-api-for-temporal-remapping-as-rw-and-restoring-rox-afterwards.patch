@@ -1,0 +1,345 @@
+From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
+Subject: execmem: add API for temporal remapping as RW and restoring ROX afterwards
+Date: Fri, 27 Dec 2024 09:28:21 +0200
+
+Using a writable copy for ROX memory is cumbersome and error prone.
+
+Add API that allow temporarily remapping of ranges in the ROX cache as
+writable and then restoring their read-only-execute permissions.
+
+This API will be later used in modules code and will allow removing nasty
+games with writable copy in alternatives patching on x86.
+
+The restoring of the ROX permissions relies on the ability of architecture
+to reconstruct large pages in its set_memory_rox() method.
+
+Link: https://lkml.kernel.org/r/20241227072825.1288491-5-rppt@kernel.org
+Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Brendan Higgins <brendan.higgins@linux.dev>
+Cc: Daniel Gomez <da.gomez@samsung.com>
+Cc: Daniel Thompson <danielt@kernel.org>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Gow <davidgow@google.com>
+Cc: Douglas Anderson <dianders@chromium.org>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jason Wessel <jason.wessel@windriver.com>
+Cc: Jiri Kosina <jikos@kernel.org>
+Cc: Joe Lawrence <joe.lawrence@redhat.com>
+Cc: Johannes Berg <johannes@sipsolutions.net>
+Cc: Josh Poimboeuf <jpoimboe@kernel.org>
+Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Cc: Luis Chamberlain <mcgrof@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Miroslav Benes <mbenes@suse.cz>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Petr Pavlu <petr.pavlu@suse.com>
+Cc: Rae Moar <rmoar@google.com>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Sami Tolvanen <samitolvanen@google.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/execmem.h |   31 +++++++++
+ mm/execmem.c            |  118 +++++++++++++++++++++++++++++++-------
+ 2 files changed, 130 insertions(+), 19 deletions(-)
+
+--- a/include/linux/execmem.h~execmem-add-api-for-temporal-remapping-as-rw-and-restoring-rox-afterwards
++++ a/include/linux/execmem.h
+@@ -65,6 +65,37 @@ enum execmem_range_flags {
+  * Architectures that use EXECMEM_ROX_CACHE must implement this.
+  */
+ void execmem_fill_trapping_insns(void *ptr, size_t size, bool writable);
++
++/**
++ * execmem_make_temp_rw - temporarily remap region with read-write
++ *			  permissions
++ * @ptr:	address of the region to remap
++ * @size:	size of the region to remap
++ *
++ * Remaps a part of the cached large page in the ROX cache in the range
++ * [@ptr, @ptr + @size) as writable and not executable. The caller must
++ * have exclusive ownership of this range and ensure nothing will try to
++ * execute code in this range.
++ *
++ * Return: 0 on success or negative error code on failure.
++ */
++int execmem_make_temp_rw(void *ptr, size_t size);
++
++/**
++ * execmem_restore_rox - restore read-only-execute permissions
++ * @ptr:	address of the region to remap
++ * @size:	size of the region to remap
++ *
++ * Restores read-only-execute permissions on a range [@ptr, @ptr + @size)
++ * after it was temporarily remapped as writable. Relies on architecture
++ * implementation of set_memory_rox() to restore mapping using large pages.
++ *
++ * Return: 0 on success or negative error code on failure.
++ */
++int execmem_restore_rox(void *ptr, size_t size);
++#else
++static inline int execmem_make_temp_rw(void *ptr, size_t size) { return 0; }
++static inline int execmem_restore_rox(void *ptr, size_t size) { return 0; }
+ #endif
+ 
+ /**
+--- a/mm/execmem.c~execmem-add-api-for-temporal-remapping-as-rw-and-restoring-rox-afterwards
++++ a/mm/execmem.c
+@@ -89,6 +89,12 @@ static void *execmem_vmalloc(struct exec
+ #endif /* CONFIG_MMU */
+ 
+ #ifdef CONFIG_ARCH_HAS_EXECMEM_ROX
++struct execmem_area {
++	struct vm_struct *vm;
++	unsigned int rw_mappings;
++	size_t size;
++};
++
+ struct execmem_cache {
+ 	struct mutex mutex;
+ 	struct maple_tree busy_areas;
+@@ -135,7 +141,7 @@ static void execmem_cache_clean(struct w
+ 	struct maple_tree *free_areas = &execmem_cache.free_areas;
+ 	struct mutex *mutex = &execmem_cache.mutex;
+ 	MA_STATE(mas, free_areas, 0, ULONG_MAX);
+-	void *area;
++	struct execmem_area *area;
+ 
+ 	mutex_lock(mutex);
+ 	mas_for_each(&mas, area, ULONG_MAX) {
+@@ -143,11 +149,12 @@ static void execmem_cache_clean(struct w
+ 
+ 		if (IS_ALIGNED(size, PMD_SIZE) &&
+ 		    IS_ALIGNED(mas.index, PMD_SIZE)) {
+-			struct vm_struct *vm = find_vm_area(area);
++			struct vm_struct *vm = area->vm;
+ 
+ 			execmem_set_direct_map_valid(vm, true);
+ 			mas_store_gfp(&mas, NULL, GFP_KERNEL);
+-			vfree(area);
++			vfree(vm->addr);
++			kfree(area);
+ 		}
+ 	}
+ 	mutex_unlock(mutex);
+@@ -155,30 +162,31 @@ static void execmem_cache_clean(struct w
+ 
+ static DECLARE_WORK(execmem_cache_clean_work, execmem_cache_clean);
+ 
+-static int execmem_cache_add(void *ptr, size_t size)
++static int execmem_cache_add(void *ptr, size_t size, struct execmem_area *area)
+ {
+ 	struct maple_tree *free_areas = &execmem_cache.free_areas;
+ 	struct mutex *mutex = &execmem_cache.mutex;
+ 	unsigned long addr = (unsigned long)ptr;
+ 	MA_STATE(mas, free_areas, addr - 1, addr + 1);
++	struct execmem_area *lower_area = NULL;
++	struct execmem_area *upper_area = NULL;
+ 	unsigned long lower, upper;
+-	void *area = NULL;
+ 	int err;
+ 
+ 	lower = addr;
+ 	upper = addr + size - 1;
+ 
+ 	mutex_lock(mutex);
+-	area = mas_walk(&mas);
+-	if (area && mas.last == addr - 1)
++	lower_area = mas_walk(&mas);
++	if (lower_area && lower_area == area && mas.last == addr - 1)
+ 		lower = mas.index;
+ 
+-	area = mas_next(&mas, ULONG_MAX);
+-	if (area && mas.index == addr + size)
++	upper_area = mas_next(&mas, ULONG_MAX);
++	if (upper_area && upper_area == area && mas.index == addr + size)
+ 		upper = mas.last;
+ 
+ 	mas_set_range(&mas, lower, upper);
+-	err = mas_store_gfp(&mas, (void *)lower, GFP_KERNEL);
++	err = mas_store_gfp(&mas, area, GFP_KERNEL);
+ 	mutex_unlock(mutex);
+ 	if (err)
+ 		return err;
+@@ -209,7 +217,8 @@ static void *__execmem_cache_alloc(struc
+ 	MA_STATE(mas_busy, busy_areas, 0, ULONG_MAX);
+ 	struct mutex *mutex = &execmem_cache.mutex;
+ 	unsigned long addr, last, area_size = 0;
+-	void *area, *ptr = NULL;
++	struct execmem_area *area;
++	void *ptr = NULL;
+ 	int err;
+ 
+ 	mutex_lock(mutex);
+@@ -228,20 +237,18 @@ static void *__execmem_cache_alloc(struc
+ 
+ 	/* insert allocated size to busy_areas at range [addr, addr + size) */
+ 	mas_set_range(&mas_busy, addr, addr + size - 1);
+-	err = mas_store_gfp(&mas_busy, (void *)addr, GFP_KERNEL);
++	err = mas_store_gfp(&mas_busy, area, GFP_KERNEL);
+ 	if (err)
+ 		goto out_unlock;
+ 
+ 	mas_store_gfp(&mas_free, NULL, GFP_KERNEL);
+ 	if (area_size > size) {
+-		void *ptr = (void *)(addr + size);
+-
+ 		/*
+ 		 * re-insert remaining free size to free_areas at range
+ 		 * [addr + size, last]
+ 		 */
+ 		mas_set_range(&mas_free, addr + size, last);
+-		err = mas_store_gfp(&mas_free, ptr, GFP_KERNEL);
++		err = mas_store_gfp(&mas_free, area, GFP_KERNEL);
+ 		if (err) {
+ 			mas_store_gfp(&mas_busy, NULL, GFP_KERNEL);
+ 			goto out_unlock;
+@@ -257,16 +264,21 @@ out_unlock:
+ static int execmem_cache_populate(struct execmem_range *range, size_t size)
+ {
+ 	unsigned long vm_flags = VM_ALLOW_HUGE_VMAP;
++	struct execmem_area *area;
+ 	unsigned long start, end;
+ 	struct vm_struct *vm;
+ 	size_t alloc_size;
+ 	int err = -ENOMEM;
+ 	void *p;
+ 
++	area = kzalloc(sizeof(*area), GFP_KERNEL);
++	if (!area)
++		return err;
++
+ 	alloc_size = round_up(size, PMD_SIZE);
+ 	p = execmem_vmalloc(range, alloc_size, PAGE_KERNEL, vm_flags);
+ 	if (!p)
+-		return err;
++		goto err_free_area;
+ 
+ 	vm = find_vm_area(p);
+ 	if (!vm)
+@@ -289,7 +301,9 @@ static int execmem_cache_populate(struct
+ 	if (err)
+ 		goto err_free_mem;
+ 
+-	err = execmem_cache_add(p, alloc_size);
++	area->size = alloc_size;
++	area->vm = vm;
++	err = execmem_cache_add(p, alloc_size, area);
+ 	if (err)
+ 		goto err_free_mem;
+ 
+@@ -297,6 +311,8 @@ static int execmem_cache_populate(struct
+ 
+ err_free_mem:
+ 	vfree(p);
++err_free_area:
++	kfree(area);
+ 	return err;
+ }
+ 
+@@ -305,6 +321,9 @@ static void *execmem_cache_alloc(struct
+ 	void *p;
+ 	int err;
+ 
++	/* make sure everything in the cache is page aligned */
++	size = PAGE_ALIGN(size);
++
+ 	p = __execmem_cache_alloc(range, size);
+ 	if (p)
+ 		return p;
+@@ -322,8 +341,8 @@ static bool execmem_cache_free(void *ptr
+ 	struct mutex *mutex = &execmem_cache.mutex;
+ 	unsigned long addr = (unsigned long)ptr;
+ 	MA_STATE(mas, busy_areas, addr, addr);
++	struct execmem_area *area;
+ 	size_t size;
+-	void *area;
+ 
+ 	mutex_lock(mutex);
+ 	area = mas_walk(&mas);
+@@ -338,12 +357,73 @@ static bool execmem_cache_free(void *ptr
+ 
+ 	execmem_fill_trapping_insns(ptr, size, /* writable = */ false);
+ 
+-	execmem_cache_add(ptr, size);
++	execmem_cache_add(ptr, size, area);
+ 
+ 	schedule_work(&execmem_cache_clean_work);
+ 
+ 	return true;
+ }
++
++int execmem_make_temp_rw(void *ptr, size_t size)
++{
++	struct maple_tree *busy_areas = &execmem_cache.busy_areas;
++	unsigned int nr = PAGE_ALIGN(size) >> PAGE_SHIFT;
++	struct mutex *mutex = &execmem_cache.mutex;
++	unsigned long addr = (unsigned long)ptr;
++	MA_STATE(mas, busy_areas, addr, addr);
++	struct execmem_area *area;
++	int ret = -ENOMEM;
++
++	mutex_lock(mutex);
++	area = mas_walk(&mas);
++	if (!area)
++		goto out;
++
++	ret = set_memory_nx(addr, nr);
++	if (ret)
++		goto out;
++
++	/*
++	 * If a split of large page was required, it already happened when
++	 * we marked the pages NX which guarantees that this call won't
++	 * fail
++	 */
++	set_memory_rw(addr, nr);
++	area->rw_mappings++;
++
++out:
++	mutex_unlock(mutex);
++	return ret;
++}
++
++int execmem_restore_rox(void *ptr, size_t size)
++{
++	struct maple_tree *busy_areas = &execmem_cache.busy_areas;
++	struct mutex *mutex = &execmem_cache.mutex;
++	unsigned long addr = (unsigned long)ptr;
++	MA_STATE(mas, busy_areas, addr, addr);
++	struct execmem_area *area;
++	int err = 0;
++
++	size = PAGE_ALIGN(size);
++
++	mutex_lock(mutex);
++	mas_for_each(&mas, area, addr + size - 1) {
++		area->rw_mappings--;
++		if (!area->rw_mappings) {
++			unsigned int nr = area->size >> PAGE_SHIFT;
++
++			addr = (unsigned long)area->vm->addr;
++			err = set_memory_rox(addr, nr);
++			if (err)
++				break;
++		}
++	}
++	mutex_unlock(mutex);
++
++	return err;
++}
++
+ #else /* CONFIG_ARCH_HAS_EXECMEM_ROX */
+ static void *execmem_cache_alloc(struct execmem_range *range, size_t size)
+ {
+_
