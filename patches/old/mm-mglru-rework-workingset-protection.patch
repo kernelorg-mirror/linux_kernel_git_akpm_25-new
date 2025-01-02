@@ -1,6 +1,6 @@
 From: Yu Zhao <yuzhao@google.com>
 Subject: mm/mglru: rework workingset protection
-Date: Thu, 5 Dec 2024 17:31:26 -0700
+Date: Sat, 7 Dec 2024 15:15:22 -0700
 
 With the aging feedback no longer considering the distribution of folios
 in each generation, rework workingset protection to better distribute
@@ -56,7 +56,7 @@ refault distances, showed a significant decrease in total refaults:
 
 [1] https://lore.kernel.org/20230920190244.16839-1-ryncsn@gmail.com/
 
-Link: https://lkml.kernel.org/r/20241206003126.1338283-7-yuzhao@google.com
+Link: https://lkml.kernel.org/r/20241207221522.2250311-7-yuzhao@google.com
 Signed-off-by: Yu Zhao <yuzhao@google.com>
 Reported-by: Kairui Song <kasong@tencent.com>
 Closes: https://lore.kernel.org/CAOUHufahuWcKf5f1Sg3emnqX+cODuR=2TQo7T4Gr-QYLujn4RA@mail.gmail.com/
@@ -66,12 +66,12 @@ Cc: David Stevens <stevensd@chromium.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mm_inline.h |   94 +++++++++++++-----------
+ include/linux/mm_inline.h |   94 ++++++++++++------------
  include/linux/mmzone.h    |   84 +++++++++++++--------
- mm/swap.c                 |   23 ++----
- mm/vmscan.c               |  138 +++++++++++++++++++++---------------
+ mm/swap.c                 |   23 ++---
+ mm/vmscan.c               |  141 +++++++++++++++++++++---------------
  mm/workingset.c           |   29 +++----
- 5 files changed, 208 insertions(+), 160 deletions(-)
+ 5 files changed, 207 insertions(+), 164 deletions(-)
 
 --- a/include/linux/mm_inline.h~mm-mglru-rework-workingset-protection
 +++ a/include/linux/mm_inline.h
@@ -343,7 +343,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 --- a/mm/swap.c~mm-mglru-rework-workingset-protection
 +++ a/mm/swap.c
 @@ -387,24 +387,19 @@ static void lru_gen_inc_refs(struct foli
- 	if (folio_test_unevictable(folio))
+ 	if (!folio_test_lru(folio) || folio_test_unevictable(folio))
  		return;
  
 +	/* see the comment on LRU_REFS_FLAGS */
@@ -374,16 +374,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
  }
  
-@@ -414,7 +409,7 @@ static bool lru_gen_clear_refs(struct fo
- 	int type = folio_is_file_lru(folio);
- 	struct lru_gen_folio *lrugen = &folio_lruvec(folio)->lrugen;
+@@ -416,7 +411,7 @@ static bool lru_gen_clear_refs(struct fo
+ 	if (!folio_test_lru(folio) || folio_test_unevictable(folio))
+ 		return true;
  
 -	set_mask_bits(&folio->flags, LRU_REFS_MASK | LRU_REFS_FLAGS, 0);
 +	set_mask_bits(&folio->flags, LRU_REFS_FLAGS | BIT(PG_workingset), 0);
  
+ 	lrugen = &folio_lruvec(folio)->lrugen;
  	/* whether can do without shuffling under the LRU lock */
- 	return gen == lru_gen_from_seq(READ_ONCE(lrugen->min_seq[type]));
-@@ -495,7 +490,7 @@ void folio_add_lru(struct folio *folio)
+@@ -498,7 +493,7 @@ void folio_add_lru(struct folio *folio)
  			folio_test_unevictable(folio), folio);
  	VM_BUG_ON_FOLIO(folio_test_lru(folio), folio);
  
@@ -434,7 +434,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * The supposedly reclaimable folio was found to be in a VM_LOCKED vma.
-@@ -888,6 +912,16 @@ static enum folio_references folio_check
+@@ -888,6 +912,15 @@ static enum folio_references folio_check
  	if (referenced_ptes == -1)
  		return FOLIOREF_KEEP;
  
@@ -442,8 +442,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (!referenced_ptes)
 +			return FOLIOREF_RECLAIM;
 +
-+		lru_gen_set_refs(folio);
-+		return FOLIOREF_ACTIVATE;
++		return lru_gen_set_refs(folio) ? FOLIOREF_ACTIVATE : FOLIOREF_KEEP;
 +	}
 +
 +	referenced_folio = folio_test_clear_referenced(folio);
@@ -451,7 +450,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (referenced_ptes) {
  		/*
  		 * All mapped folios start out with page table
-@@ -1092,11 +1126,6 @@ retry:
+@@ -1092,11 +1125,6 @@ retry:
  		if (!sc->may_unmap && folio_mapped(folio))
  			goto keep_locked;
  
@@ -463,7 +462,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * The number of dirty pages determines if a node is marked
  		 * reclaim_congested. kswapd will stall and start writing
-@@ -3163,16 +3192,19 @@ static int folio_update_gen(struct folio
+@@ -3163,16 +3191,19 @@ static int folio_update_gen(struct folio
  
  	VM_WARN_ON_ONCE(gen >= MAX_NR_GENS);
  
@@ -490,7 +489,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} while (!try_cmpxchg(&folio->flags, &old_flags, new_flags));
  
  	return ((old_flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
-@@ -3196,7 +3228,7 @@ static int folio_inc_gen(struct lruvec *
+@@ -3196,7 +3227,7 @@ static int folio_inc_gen(struct lruvec *
  
  		new_gen = (old_gen + 1) % MAX_NR_GENS;
  
@@ -499,7 +498,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		new_flags |= (new_gen + 1UL) << LRU_GEN_PGOFF;
  		/* for folio_end_writeback() */
  		if (reclaiming)
-@@ -3374,9 +3406,11 @@ static unsigned long get_pmd_pfn(pmd_t p
+@@ -3374,9 +3405,11 @@ static unsigned long get_pmd_pfn(pmd_t p
  static struct folio *get_pfn_folio(unsigned long pfn, struct mem_cgroup *memcg,
  				   struct pglist_data *pgdat)
  {
@@ -513,7 +512,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (folio_nid(folio) != pgdat->node_id)
  		return NULL;
  
-@@ -3753,8 +3787,7 @@ static bool inc_min_seq(struct lruvec *l
+@@ -3753,8 +3786,7 @@ static bool inc_min_seq(struct lruvec *l
  		while (!list_empty(head)) {
  			struct folio *folio = lru_to_folio(head);
  			int refs = folio_lru_refs(folio);
@@ -523,7 +522,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  			VM_WARN_ON_ONCE_FOLIO(folio_test_unevictable(folio), folio);
  			VM_WARN_ON_ONCE_FOLIO(folio_test_active(folio), folio);
-@@ -3764,8 +3797,14 @@ static bool inc_min_seq(struct lruvec *l
+@@ -3764,8 +3796,14 @@ static bool inc_min_seq(struct lruvec *l
  			new_gen = folio_inc_gen(lruvec, folio, false);
  			list_move_tail(&folio->lru, &lrugen->folios[new_gen][type][zone]);
  
@@ -540,24 +539,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  			if (!--remaining)
  				return false;
-@@ -4138,12 +4177,10 @@ bool lru_gen_look_around(struct page_vma
- 			continue;
- 		}
- 
+@@ -4134,16 +4172,10 @@ bool lru_gen_look_around(struct page_vma
+ 			old_gen = folio_update_gen(folio, new_gen);
+ 			if (old_gen >= 0 && old_gen != new_gen)
+ 				update_batch_size(walk, folio, old_gen, new_gen);
+-
+-			continue;
+-		}
+-
 -		old_gen = folio_lru_gen(folio);
 -		if (old_gen < 0)
 -			folio_set_referenced(folio);
 -		else if (old_gen != new_gen) {
 -			folio_clear_lru_refs(folio);
 -			folio_activate(folio);
-+		if (lru_gen_set_refs(folio)) {
++		} else if (lru_gen_set_refs(folio)) {
 +			old_gen = folio_lru_gen(folio);
 +			if (old_gen >= 0 && old_gen != new_gen)
 +				folio_activate(folio);
  		}
  	}
  
-@@ -4304,7 +4341,8 @@ static bool sort_folio(struct lruvec *lr
+@@ -4304,7 +4336,8 @@ static bool sort_folio(struct lruvec *lr
  	int zone = folio_zonenum(folio);
  	int delta = folio_nr_pages(folio);
  	int refs = folio_lru_refs(folio);
@@ -567,7 +570,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct lru_gen_folio *lrugen = &lruvec->lrugen;
  
  	VM_WARN_ON_ONCE_FOLIO(gen >= MAX_NR_GENS, folio);
-@@ -4326,14 +4364,17 @@ static bool sort_folio(struct lruvec *lr
+@@ -4326,14 +4359,17 @@ static bool sort_folio(struct lruvec *lr
  	}
  
  	/* protected */
@@ -591,7 +594,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return true;
  	}
  
-@@ -4353,8 +4394,7 @@ static bool sort_folio(struct lruvec *lr
+@@ -4353,8 +4389,7 @@ static bool sort_folio(struct lruvec *lr
  	}
  
  	/* waiting for writeback */
@@ -601,7 +604,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		gen = folio_inc_gen(lruvec, folio, true);
  		list_move(&folio->lru, &lrugen->folios[gen][type][zone]);
  		return true;
-@@ -4383,13 +4423,12 @@ static bool isolate_folio(struct lruvec
+@@ -4383,13 +4418,12 @@ static bool isolate_folio(struct lruvec
  		return false;
  	}
  
@@ -617,7 +620,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	success = lru_gen_del_folio(lruvec, folio, true);
  	VM_WARN_ON_ONCE_FOLIO(!success, folio);
-@@ -4585,25 +4624,16 @@ retry:
+@@ -4585,25 +4619,16 @@ retry:
  			continue;
  		}
  
