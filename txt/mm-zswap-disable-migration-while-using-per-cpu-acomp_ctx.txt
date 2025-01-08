@@ -1,0 +1,55 @@
+From: Yosry Ahmed <yosryahmed@google.com>
+Subject: mm: zswap: disable migration while using per-CPU acomp_ctx
+Date: Tue, 7 Jan 2025 22:22:35 +0000
+
+In zswap_compress() and zswap_decompress(), the per-CPU acomp_ctx of the
+current CPU at the beginning of the operation is retrieved and used
+throughout.  However, since neither preemption nor migration are disabled,
+it is possible that the operation continues on a different CPU.
+
+If the original CPU is hotunplugged while the acomp_ctx is still in use,
+we run into a UAF bug as the resources attached to the acomp_ctx are freed
+during hotunplug in zswap_cpu_comp_dead().
+
+The problem was introduced in commit 1ec3b5fe6eec ("mm/zswap: move to use
+crypto_acomp API for hardware acceleration") when the switch to the
+crypto_acomp API was made.  Prior to that, the per-CPU crypto_comp was
+retrieved using get_cpu_ptr() which disables preemption and makes sure the
+CPU cannot go away from under us.  Preemption cannot be disabled with the
+crypto_acomp API as a sleepable context is needed.
+
+Commit 8ba2f844f050 ("mm/zswap: change per-cpu mutex and buffer to
+per-acomp_ctx") increased the UAF surface area by making the per-CPU
+buffers dynamic, adding yet another resource that can be freed from under
+zswap compression/decompression by CPU hotunplug.
+
+This cannot be fixed by holding cpus_read_lock(), as it is possible for
+code already holding the lock to fall into reclaim and enter zswap
+(causing a deadlock).  It also cannot be fixed by wrapping the usage of
+acomp_ctx in an SRCU critical section and using synchronize_srcu() in
+zswap_cpu_comp_dead(), because synchronize_srcu() is not allowed in
+CPU-hotplug notifiers (see
+Documentation/RCU/Design/Requirements/Requirements.rst).
+
+This can be fixed by refcounting the acomp_ctx, but it involves complexity
+in handling the race between the refcount dropping to zero in
+zswap_[de]compress() and the refcount being re-initialized when the CPU is
+onlined.
+
+Keep things simple for now and just disable migration while using the
+per-CPU acomp_ctx to block CPU hotunplug until the usage is over.
+
+Link: https://lkml.kernel.org/r/20250107222236.2715883-2-yosryahmed@google.com
+Fixes: 1ec3b5fe6eec ("mm/zswap: move to use crypto_acomp API for hardware acceleration")
+Signed-off-by: Yosry Ahmed <yosryahmed@google.com>
+Reported-by: Johannes Weiner <hannes@cmpxchg.org>
+Closes: https://lore.kernel.org/lkml/20241113213007.GB1564047@cmpxchg.org/
+Reported-by: Sam Sun <samsun1006219@gmail.com>
+Closes: https://lore.kernel.org/lkml/CAEkJfYMtSdM5HceNsXUDf5haghD5+o2e7Qv4OcuruL4tPg6OaQ@mail.gmail.com/
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: syzbot <syzkaller@googlegroups.com>
+Cc: Vitaly Wool <vitalywool@gmail.com>
+Cc: <stable@vger.kernel.org>
