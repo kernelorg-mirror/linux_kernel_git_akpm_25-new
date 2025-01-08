@@ -1,0 +1,135 @@
+From: Alistair Popple <apopple@nvidia.com>
+Subject: fs/dax: always remove DAX page-cache entries when breaking layouts
+Date: Tue, 7 Jan 2025 14:42:22 +1100
+
+Prior to any truncation operations file systems call dax_break_mapping()
+to ensure pages in the range are not under going DMA.  Later DAX
+page-cache entries will be removed by truncate_folio_batch_exceptionals()
+in the generic page-cache code.
+
+However this makes it possible for folios to be removed from the
+page-cache even though they are still DMA busy if the file-system hasn't
+called dax_break_mapping().  It also means they can never be waited on in
+future because FS DAX will lose track of them once the page-cache entry
+has been deleted.
+
+Instead it is better to delete the FS DAX entry when the file-system calls
+dax_break_mapping() as part of it's truncate operation.  This ensures only
+idle pages can be removed from the FS DAX page-cache and makes it easy to
+detect if a file-system hasn't called dax_break_mapping() prior to a
+truncate operation.
+
+Link: https://lkml.kernel.org/r/fc4ce7ac0815bc33d00ca6626925a1012473ff7a.1736221254.git-series.apopple@nvidia.com
+Signed-off-by: Alistair Popple <apopple@nvidia.com>
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c            |   33 +++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_inode.c  |    6 ++++++
+ include/linux/dax.h |    2 ++
+ mm/truncate.c       |   16 +++++++++++++++-
+ 4 files changed, 56 insertions(+), 1 deletion(-)
+
+--- a/fs/dax.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
++++ a/fs/dax.c
+@@ -845,6 +845,36 @@ int dax_delete_mapping_entry(struct addr
+ 	return ret;
+ }
+ 
++void dax_delete_mapping_range(struct address_space *mapping,
++				loff_t start, loff_t end)
++{
++	void *entry;
++	pgoff_t start_idx = start >> PAGE_SHIFT;
++	pgoff_t end_idx;
++	XA_STATE(xas, &mapping->i_pages, start_idx);
++
++	/* If end == LLONG_MAX, all pages from start to till end of file */
++	if (end == LLONG_MAX)
++		end_idx = ULONG_MAX;
++	else
++		end_idx = end >> PAGE_SHIFT;
++
++	xas_lock_irq(&xas);
++	xas_for_each(&xas, entry, end_idx) {
++		if (!xa_is_value(entry))
++			continue;
++		entry = wait_entry_unlocked_exclusive(&xas, entry);
++		if (!entry)
++			continue;
++		dax_disassociate_entry(entry, mapping, true);
++		xas_store(&xas, NULL);
++		mapping->nrpages -= 1UL << dax_entry_order(entry);
++		put_unlocked_entry(&xas, entry, WAKE_ALL);
++	}
++	xas_unlock_irq(&xas);
++}
++EXPORT_SYMBOL_GPL(dax_delete_mapping_range);
++
+ static int wait_page_idle(struct page *page,
+ 			void (cb)(struct inode *),
+ 			struct inode *inode)
+@@ -874,6 +904,9 @@ int dax_break_mapping(struct inode *inod
+ 		error = wait_page_idle(page, cb, inode);
+ 	} while (error == 0);
+ 
++	if (!page)
++		dax_delete_mapping_range(inode->i_mapping, start, end);
++
+ 	return error;
+ }
+ EXPORT_SYMBOL_GPL(dax_break_mapping);
+--- a/fs/xfs/xfs_inode.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
++++ a/fs/xfs/xfs_inode.c
+@@ -2746,6 +2746,12 @@ again:
+ 		goto again;
+ 	}
+ 
++	/*
++	 * Normally xfs_break_dax_layouts() would delete the mapping entries as well so
++	 * do that here.
++	 */
++	dax_delete_mapping_range(VFS_I(ip2)->i_mapping, 0, LLONG_MAX);
++
+ 	return 0;
+ }
+ 
+--- a/include/linux/dax.h~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
++++ a/include/linux/dax.h
+@@ -263,6 +263,8 @@ vm_fault_t dax_iomap_fault(struct vm_fau
+ vm_fault_t dax_finish_sync_fault(struct vm_fault *vmf,
+ 		unsigned int order, pfn_t pfn);
+ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
++void dax_delete_mapping_range(struct address_space *mapping,
++				loff_t start, loff_t end);
+ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ 				      pgoff_t index);
+ int __must_check dax_break_mapping(struct inode *inode, loff_t start,
+--- a/mm/truncate.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
++++ a/mm/truncate.c
+@@ -78,8 +78,22 @@ static void truncate_folio_batch_excepti
+ 
+ 	if (dax_mapping(mapping)) {
+ 		for (i = j; i < nr; i++) {
+-			if (xa_is_value(fbatch->folios[i]))
++			if (xa_is_value(fbatch->folios[i])) {
++				/*
++				 * File systems should already have called
++				 * dax_break_mapping_entry() to remove all DAX
++				 * entries while holding a lock to prevent
++				 * establishing new entries. Therefore we
++				 * shouldn't find any here.
++				 */
++				WARN_ON_ONCE(1);
++
++				/*
++				 * Delete the mapping so truncate_pagecache()
++				 * doesn't loop forever.
++				 */
+ 				dax_delete_mapping_entry(mapping, indices[i]);
++			}
+ 		}
+ 		goto out;
+ 	}
+_

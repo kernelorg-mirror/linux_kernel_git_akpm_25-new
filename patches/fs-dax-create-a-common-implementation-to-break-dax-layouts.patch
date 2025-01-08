@@ -1,0 +1,281 @@
+From: Alistair Popple <apopple@nvidia.com>
+Subject: fs/dax: create a common implementation to break DAX layouts
+Date: Tue, 7 Jan 2025 14:42:21 +1100
+
+Prior to freeing a block file systems supporting FS DAX must check that
+the associated pages are both unmapped from user-space and not undergoing
+DMA or other access from eg.  get_user_pages().  This is achieved by
+unmapping the file range and scanning the FS DAX page-cache to see if any
+pages within the mapping have an elevated refcount.
+
+This is done using two functions - dax_layout_busy_page_range() which
+returns a page to wait for the refcount to become idle on.  Rather than
+open-code this introduce a common implementation to both unmap and wait
+for the page to become idle.
+
+Link: https://lkml.kernel.org/r/e8f1302aa676169ef5a10e2e06397e78794d5bb4.1736221254.git-series.apopple@nvidia.com
+Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c            |   33 +++++++++++++++++++++++++++++++++
+ fs/ext4/inode.c     |   10 +---------
+ fs/fuse/dax.c       |   29 +++++------------------------
+ fs/xfs/xfs_inode.c  |   23 +++++------------------
+ fs/xfs/xfs_inode.h  |    2 +-
+ include/linux/dax.h |   21 +++++++++++++++++++++
+ mm/madvise.c        |    8 ++++----
+ 7 files changed, 70 insertions(+), 56 deletions(-)
+
+--- a/fs/dax.c~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/fs/dax.c
+@@ -845,6 +845,39 @@ int dax_delete_mapping_entry(struct addr
+ 	return ret;
+ }
+ 
++static int wait_page_idle(struct page *page,
++			void (cb)(struct inode *),
++			struct inode *inode)
++{
++	return ___wait_var_event(page, page_ref_count(page) == 1,
++				TASK_INTERRUPTIBLE, 0, 0, cb(inode));
++}
++
++/*
++ * Unmaps the inode and waits for any DMA to complete prior to deleting the
++ * DAX mapping entries for the range.
++ */
++int dax_break_mapping(struct inode *inode, loff_t start, loff_t end,
++		void (cb)(struct inode *))
++{
++	struct page *page;
++	int error;
++
++	if (!dax_mapping(inode->i_mapping))
++		return 0;
++
++	do {
++		page = dax_layout_busy_page_range(inode->i_mapping, start, end);
++		if (!page)
++			break;
++
++		error = wait_page_idle(page, cb, inode);
++	} while (error == 0);
++
++	return error;
++}
++EXPORT_SYMBOL_GPL(dax_break_mapping);
++
+ /*
+  * Invalidate DAX entry if it is clean.
+  */
+--- a/fs/ext4/inode.c~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/fs/ext4/inode.c
+@@ -3917,15 +3917,7 @@ int ext4_break_layouts(struct inode *ino
+ 	if (WARN_ON_ONCE(!rwsem_is_locked(&inode->i_mapping->invalidate_lock)))
+ 		return -EINVAL;
+ 
+-	do {
+-		page = dax_layout_busy_page(inode->i_mapping);
+-		if (!page)
+-			return 0;
+-
+-		error = dax_wait_page_idle(page, ext4_wait_dax_page, inode);
+-	} while (error == 0);
+-
+-	return error;
++	return dax_break_mapping_inode(inode, ext4_wait_dax_page);
+ }
+ 
+ /*
+--- a/fs/fuse/dax.c~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/fs/fuse/dax.c
+@@ -665,38 +665,19 @@ static void fuse_wait_dax_page(struct in
+ 	filemap_invalidate_lock(inode->i_mapping);
+ }
+ 
+-/* Should be called with mapping->invalidate_lock held exclusively */
+-static int __fuse_dax_break_layouts(struct inode *inode, bool *retry,
+-				    loff_t start, loff_t end)
+-{
+-	struct page *page;
+-
+-	page = dax_layout_busy_page_range(inode->i_mapping, start, end);
+-	if (!page)
+-		return 0;
+-
+-	*retry = true;
+-	return dax_wait_page_idle(page, fuse_wait_dax_page, inode);
+-}
+-
+-/* dmap_end == 0 leads to unmapping of whole file */
++/* Should be called with mapping->invalidate_lock held exclusively.
++ * dmap_end == 0 leads to unmapping of whole file.
++ */
+ int fuse_dax_break_layouts(struct inode *inode, u64 dmap_start,
+ 				  u64 dmap_end)
+ {
+-	bool	retry;
+-	int	ret;
+-
+-	do {
+-		retry = false;
+-		ret = __fuse_dax_break_layouts(inode, &retry, dmap_start,
+-					       dmap_end);
+-	} while (ret == 0 && retry);
+ 	if (!dmap_end) {
+ 		dmap_start = 0;
+ 		dmap_end = LLONG_MAX;
+ 	}
+ 
+-	return ret;
++	return dax_break_mapping(inode, dmap_start, dmap_end,
++				fuse_wait_dax_page);
+ }
+ 
+ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to)
+--- a/fs/xfs/xfs_inode.c~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/fs/xfs/xfs_inode.c
+@@ -2715,21 +2715,17 @@ xfs_mmaplock_two_inodes_and_break_dax_la
+ 	struct xfs_inode	*ip2)
+ {
+ 	int			error;
+-	bool			retry;
+ 	struct page		*page;
+ 
+ 	if (ip1->i_ino > ip2->i_ino)
+ 		swap(ip1, ip2);
+ 
+ again:
+-	retry = false;
+ 	/* Lock the first inode */
+ 	xfs_ilock(ip1, XFS_MMAPLOCK_EXCL);
+-	error = xfs_break_dax_layouts(VFS_I(ip1), &retry);
+-	if (error || retry) {
++	error = xfs_break_dax_layouts(VFS_I(ip1));
++	if (error) {
+ 		xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
+-		if (error == 0 && retry)
+-			goto again;
+ 		return error;
+ 	}
+ 
+@@ -2988,19 +2984,11 @@ xfs_wait_dax_page(
+ 
+ int
+ xfs_break_dax_layouts(
+-	struct inode		*inode,
+-	bool			*retry)
++	struct inode		*inode)
+ {
+-	struct page		*page;
+-
+ 	xfs_assert_ilocked(XFS_I(inode), XFS_MMAPLOCK_EXCL);
+ 
+-	page = dax_layout_busy_page(inode->i_mapping);
+-	if (!page)
+-		return 0;
+-
+-	*retry = true;
+-	return dax_wait_page_idle(page, xfs_wait_dax_page, inode);
++	return dax_break_mapping_inode(inode, xfs_wait_dax_page);
+ }
+ 
+ int
+@@ -3018,8 +3006,7 @@ xfs_break_layouts(
+ 		retry = false;
+ 		switch (reason) {
+ 		case BREAK_UNMAP:
+-			error = xfs_break_dax_layouts(inode, &retry);
+-			if (error || retry)
++			if (xfs_break_dax_layouts(inode))
+ 				break;
+ 			fallthrough;
+ 		case BREAK_WRITE:
+--- a/fs/xfs/xfs_inode.h~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/fs/xfs/xfs_inode.h
+@@ -593,7 +593,7 @@ xfs_itruncate_extents(
+ 	return xfs_itruncate_extents_flags(tpp, ip, whichfork, new_size, 0);
+ }
+ 
+-int	xfs_break_dax_layouts(struct inode *inode, bool *retry);
++int	xfs_break_dax_layouts(struct inode *inode);
+ int	xfs_break_layouts(struct inode *inode, uint *iolock,
+ 		enum layout_break_reason reason);
+ 
+--- a/include/linux/dax.h~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/include/linux/dax.h
+@@ -228,6 +228,20 @@ static inline void dax_read_unlock(int i
+ {
+ }
+ #endif /* CONFIG_DAX */
++
++#if !IS_ENABLED(CONFIG_FS_DAX)
++static inline int __must_check dax_break_mapping(struct inode *inode,
++			    loff_t start, loff_t end, void (cb)(struct inode *))
++{
++	return 0;
++}
++
++static inline void dax_break_mapping_uninterruptible(struct inode *inode,
++						void (cb)(struct inode *))
++{
++}
++#endif
++
+ bool dax_alive(struct dax_device *dax_dev);
+ void *dax_get_private(struct dax_device *dax_dev);
+ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+@@ -251,6 +265,13 @@ vm_fault_t dax_finish_sync_fault(struct
+ int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
+ int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
+ 				      pgoff_t index);
++int __must_check dax_break_mapping(struct inode *inode, loff_t start,
++				loff_t end, void (cb)(struct inode *));
++static inline int __must_check dax_break_mapping_inode(struct inode *inode,
++						void (cb)(struct inode *))
++{
++	return dax_break_mapping(inode, 0, LLONG_MAX, cb);
++}
+ int dax_dedupe_file_range_compare(struct inode *src, loff_t srcoff,
+ 				  struct inode *dest, loff_t destoff,
+ 				  loff_t len, bool *is_same,
+--- a/mm/madvise.c~fs-dax-create-a-common-implementation-to-break-dax-layouts
++++ a/mm/madvise.c
+@@ -1063,7 +1063,7 @@ static int guard_install_pud_entry(pud_t
+ 	pud_t pudval = pudp_get(pud);
+ 
+ 	/* If huge return >0 so we abort the operation + zap. */
+-	return pud_trans_huge(pudval) || pud_devmap(pudval);
++	return pud_trans_huge(pudval);
+ }
+ 
+ static int guard_install_pmd_entry(pmd_t *pmd, unsigned long addr,
+@@ -1072,7 +1072,7 @@ static int guard_install_pmd_entry(pmd_t
+ 	pmd_t pmdval = pmdp_get(pmd);
+ 
+ 	/* If huge return >0 so we abort the operation + zap. */
+-	return pmd_trans_huge(pmdval) || pmd_devmap(pmdval);
++	return pmd_trans_huge(pmdval);
+ }
+ 
+ static int guard_install_pte_entry(pte_t *pte, unsigned long addr,
+@@ -1183,7 +1183,7 @@ static int guard_remove_pud_entry(pud_t
+ 	pud_t pudval = pudp_get(pud);
+ 
+ 	/* If huge, cannot have guard pages present, so no-op - skip. */
+-	if (pud_trans_huge(pudval) || pud_devmap(pudval))
++	if (pud_trans_huge(pudval))
+ 		walk->action = ACTION_CONTINUE;
+ 
+ 	return 0;
+@@ -1195,7 +1195,7 @@ static int guard_remove_pmd_entry(pmd_t
+ 	pmd_t pmdval = pmdp_get(pmd);
+ 
+ 	/* If huge, cannot have guard pages present, so no-op - skip. */
+-	if (pmd_trans_huge(pmdval) || pmd_devmap(pmdval))
++	if (pmd_trans_huge(pmdval))
+ 		walk->action = ACTION_CONTINUE;
+ 
+ 	return 0;
+_
