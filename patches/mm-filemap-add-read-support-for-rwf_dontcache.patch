@@ -1,0 +1,193 @@
+From: Jens Axboe <axboe@kernel.dk>
+Subject: mm/filemap: add read support for RWF_DONTCACHE
+Date: Fri, 20 Dec 2024 08:47:46 -0700
+
+Add RWF_DONTCACHE as a read operation flag, which means that any data read
+wil be removed from the page cache upon completion.  Uses the page cache
+to synchronize, and simply prunes folios that were instantiated when the
+operation completes.  While it would be possible to use private pages for
+this, using the page cache as synchronization is handy for a variety of
+reasons:
+
+1) No special truncate magic is needed
+2) Async buffered reads need some place to serialize, using the page
+   cache is a lot easier than writing extra code for this
+3) The pruning cost is pretty reasonable
+
+and the code to support this is much simpler as a result.
+
+You can think of uncached buffered IO as being the much more attractive
+cousin of O_DIRECT - it has none of the restrictions of O_DIRECT.  Yes, it
+will copy the data, but unlike regular buffered IO, it doesn't run into
+the unpredictability of the page cache in terms of reclaim.  As an
+example, on a test box with 32 drives, reading them with buffered IO looks
+as follows:
+
+Reading bs 65536, uncached 0
+  1s: 145945MB/sec
+  2s: 158067MB/sec
+  3s: 157007MB/sec
+  4s: 148622MB/sec
+  5s: 118824MB/sec
+  6s: 70494MB/sec
+  7s: 41754MB/sec
+  8s: 90811MB/sec
+  9s: 92204MB/sec
+ 10s: 95178MB/sec
+ 11s: 95488MB/sec
+ 12s: 95552MB/sec
+ 13s: 96275MB/sec
+
+where it's quite easy to see where the page cache filled up, and
+performance went from good to erratic, and finally settles at a much
+lower rate. Looking at top while this is ongoing, we see:
+
+ PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+7535 root      20   0  267004      0      0 S  3199   0.0   8:40.65 uncached
+3326 root      20   0       0      0      0 R 100.0   0.0   0:16.40 kswapd4
+3327 root      20   0       0      0      0 R 100.0   0.0   0:17.22 kswapd5
+3328 root      20   0       0      0      0 R 100.0   0.0   0:13.29 kswapd6
+3332 root      20   0       0      0      0 R 100.0   0.0   0:11.11 kswapd10
+3339 root      20   0       0      0      0 R 100.0   0.0   0:16.25 kswapd17
+3348 root      20   0       0      0      0 R 100.0   0.0   0:16.40 kswapd26
+3343 root      20   0       0      0      0 R 100.0   0.0   0:16.30 kswapd21
+3344 root      20   0       0      0      0 R 100.0   0.0   0:11.92 kswapd22
+3349 root      20   0       0      0      0 R 100.0   0.0   0:16.28 kswapd27
+3352 root      20   0       0      0      0 R  99.7   0.0   0:11.89 kswapd30
+3353 root      20   0       0      0      0 R  96.7   0.0   0:16.04 kswapd31
+3329 root      20   0       0      0      0 R  96.4   0.0   0:11.41 kswapd7
+3345 root      20   0       0      0      0 R  96.4   0.0   0:13.40 kswapd23
+3330 root      20   0       0      0      0 S  91.1   0.0   0:08.28 kswapd8
+3350 root      20   0       0      0      0 S  86.8   0.0   0:11.13 kswapd28
+3325 root      20   0       0      0      0 S  76.3   0.0   0:07.43 kswapd3
+3341 root      20   0       0      0      0 S  74.7   0.0   0:08.85 kswapd19
+3334 root      20   0       0      0      0 S  71.7   0.0   0:10.04 kswapd12
+3351 root      20   0       0      0      0 R  60.5   0.0   0:09.59 kswapd29
+3323 root      20   0       0      0      0 R  57.6   0.0   0:11.50 kswapd1
+[...]
+
+which is just showing a partial list of the 32 kswapd threads that are
+running mostly full tilt, burning ~28 full CPU cores.
+
+If the same test case is run with RWF_DONTCACHE set for the buffered read,
+the output looks as follows:
+
+Reading bs 65536, uncached 0
+  1s: 153144MB/sec
+  2s: 156760MB/sec
+  3s: 158110MB/sec
+  4s: 158009MB/sec
+  5s: 158043MB/sec
+  6s: 157638MB/sec
+  7s: 157999MB/sec
+  8s: 158024MB/sec
+  9s: 157764MB/sec
+ 10s: 157477MB/sec
+ 11s: 157417MB/sec
+ 12s: 157455MB/sec
+ 13s: 157233MB/sec
+ 14s: 156692MB/sec
+
+which is just chugging along at ~155GB/sec of read performance. Looking
+at top, we see:
+
+ PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+7961 root      20   0  267004      0      0 S  3180   0.0   5:37.95 uncached
+8024 axboe     20   0   14292   4096      0 R   1.0   0.0   0:00.13 top
+
+where just the test app is using CPU, no reclaim is taking place outside
+of the main thread.  Not only is performance 65% better, it's also using
+half the CPU to do it.
+
+Link: https://lkml.kernel.org/r/20241220154831.1086649-9-axboe@kernel.dk
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Cc: Brian Foster <bfoster@redhat.com>
+Cc: Chris Mason <clm@meta.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c |   28 ++++++++++++++++++++++++++--
+ mm/swap.c    |    2 ++
+ 2 files changed, 28 insertions(+), 2 deletions(-)
+
+--- a/mm/filemap.c~mm-filemap-add-read-support-for-rwf_dontcache
++++ a/mm/filemap.c
+@@ -2445,6 +2445,8 @@ static int filemap_create_folio(struct k
+ 	folio = filemap_alloc_folio(mapping_gfp_mask(mapping), min_order);
+ 	if (!folio)
+ 		return -ENOMEM;
++	if (iocb->ki_flags & IOCB_DONTCACHE)
++		__folio_set_dropbehind(folio);
+ 
+ 	/*
+ 	 * Protect against truncate / hole punch. Grabbing invalidate_lock
+@@ -2490,6 +2492,8 @@ static int filemap_readahead(struct kioc
+ 
+ 	if (iocb->ki_flags & IOCB_NOIO)
+ 		return -EAGAIN;
++	if (iocb->ki_flags & IOCB_DONTCACHE)
++		ractl.dropbehind = 1;
+ 	page_cache_async_ra(&ractl, folio, last_index - folio->index);
+ 	return 0;
+ }
+@@ -2519,6 +2523,8 @@ retry:
+ 			return -EAGAIN;
+ 		if (iocb->ki_flags & IOCB_NOWAIT)
+ 			flags = memalloc_noio_save();
++		if (iocb->ki_flags & IOCB_DONTCACHE)
++			ractl.dropbehind = 1;
+ 		page_cache_sync_ra(&ractl, last_index - index);
+ 		if (iocb->ki_flags & IOCB_NOWAIT)
+ 			memalloc_noio_restore(flags);
+@@ -2566,6 +2572,20 @@ static inline bool pos_same_folio(loff_t
+ 	return (pos1 >> shift == pos2 >> shift);
+ }
+ 
++static void filemap_end_dropbehind_read(struct address_space *mapping,
++					struct folio *folio)
++{
++	if (!folio_test_dropbehind(folio))
++		return;
++	if (folio_test_writeback(folio) || folio_test_dirty(folio))
++		return;
++	if (folio_trylock(folio)) {
++		if (folio_test_clear_dropbehind(folio))
++			folio_unmap_invalidate(mapping, folio, 0);
++		folio_unlock(folio);
++	}
++}
++
+ /**
+  * filemap_read - Read data from the page cache.
+  * @iocb: The iocb to read.
+@@ -2679,8 +2699,12 @@ ssize_t filemap_read(struct kiocb *iocb,
+ 			}
+ 		}
+ put_folios:
+-		for (i = 0; i < folio_batch_count(&fbatch); i++)
+-			folio_put(fbatch.folios[i]);
++		for (i = 0; i < folio_batch_count(&fbatch); i++) {
++			struct folio *folio = fbatch.folios[i];
++
++			filemap_end_dropbehind_read(mapping, folio);
++			folio_put(folio);
++		}
+ 		folio_batch_init(&fbatch);
+ 	} while (iov_iter_count(iter) && iocb->ki_pos < isize && !error);
+ 
+--- a/mm/swap.c~mm-filemap-add-read-support-for-rwf_dontcache
++++ a/mm/swap.c
+@@ -448,6 +448,8 @@ static bool lru_gen_clear_refs(struct fo
+  */
+ void folio_mark_accessed(struct folio *folio)
+ {
++	if (folio_test_dropbehind(folio))
++		return;
+ 	if (lru_gen_enabled()) {
+ 		lru_gen_inc_refs(folio);
+ 		return;
+_

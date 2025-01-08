@@ -1,0 +1,119 @@
+From: Jens Axboe <axboe@kernel.dk>
+Subject: mm/filemap: change filemap_create_folio() to take a struct kiocb
+Date: Fri, 20 Dec 2024 08:47:39 -0700
+
+Patch series "Uncached buffered IO", v8.
+
+5 years ago I posted patches adding support for RWF_UNCACHED, as a way to
+do buffered IO that isn't page cache persistent.  The approach back then
+was to have private pages for IO, and then get rid of them once IO was
+done.  But that then runs into all the issues that O_DIRECT has, in terms
+of synchronizing with the page cache.
+
+So here's a new approach to the same concent, but using the page cache as
+synchronization.  Due to excessive bike shedding on the naming, this is
+now named RWF_DONTCACHE, and is less special in that it's just page cache
+IO, except it prunes the ranges once IO is completed.
+
+Why do this, you may ask?  The tldr is that device speeds are only getting
+faster, while reclaim is not.  Doing normal buffered IO can be very
+unpredictable, and suck up a lot of resources on the reclaim side.  This
+leads people to use O_DIRECT as a work-around, which has its own set of
+restrictions in terms of size, offset, and length of IO.  It's also
+inherently synchronous, and now you need async IO as well.  While the
+latter isn't necessarily a big problem as we have good options available
+there, it also should not be a requirement when all you want to do is read
+or write some data without caching.
+
+Even on desktop type systems, a normal NVMe device can fill the entire
+page cache in seconds.  On the big system I used for testing, there's a
+lot more RAM, but also a lot more devices.  As can be seen in some of the
+results in the following patches, you can still fill RAM in seconds even
+when there's 1TB of it.  Hence this problem isn't solely a "big
+hyperscaler system" issue, it's common across the board.
+
+Common for both reads and writes with RWF_DONTCACHE is that they use the
+page cache for IO.  Reads work just like a normal buffered read would,
+with the only exception being that the touched ranges will get pruned
+after data has been copied.  For writes, the ranges will get writeback
+kicked off before the syscall returns, and then writeback completion will
+prune the range.  Hence writes aren't synchronous, and it's easy to
+pipeline writes using RWF_DONTCACHE.  Folios that aren't instantiated by
+RWF_DONTCACHE IO are left untouched.  This means you that uncached IO will
+take advantage of the page cache for uptodate data, but not leave anything
+it instantiated/created in cache.
+
+File systems need to support this.  This patchset adds support for the
+generic read path, which covers file systems like ext4.  Patches exist to
+add support for iomap/XFS and btrfs as well, which sit on top of this
+series.  If RWF_DONTCACHE IO is attempted on a file system that doesn't
+support it, -EOPNOTSUPP is returned.  Hence the user can rely on it either
+working as designed, or flagging and error if that's not the case.  The
+intent here is to give the application a sensible fallback path - eg, it
+may fall back to O_DIRECT if appropriate, or just live with the fact that
+uncached IO isn't available and do normal buffered IO.
+
+Adding "support" to other file systems should be trivial, most of the time
+just a one-liner adding FOP_DONTCACHE to the fop_flags in the
+file_operations struct, if the file system is using either iomap or the
+generic filemap helpers for reading and writing.
+
+Performance results are in patch 8 for reads, and you can find the write
+side results in the XFS patch adding support for DONTCACHE writes for XFS:
+
+https://git.kernel.dk/cgit/linux/commit/?h=buffered-uncached-fs.10&id=257e92de795fdff7d7e256501e024fac6da6a7f4
+
+with the tldr being that I see about a 65% improvement in performance for
+both, with fully predictable IO times.  CPU reduction is substantial as
+well, with no kswapd activity at all for reclaim when using uncached IO.
+
+Using it from applications is trivial - just set RWF_DONTCACHE for the
+read or write, using pwritev2(2) or preadv2(2).  For io_uring, same thing,
+just set RWF_DONTCACHE in sqe->rw_flags for a buffered read/write
+operation.  And that's it.
+
+Patches 1..7 are just prep patches, and should have no functional changes
+at all.  Patch 8 adds support for the filemap path for RWF_DONTCACHE
+reads, and patches 9..12 are just prep patches for supporting the write
+side of uncached writes.  In the below mentioned branch, there are then
+patches to adopt uncached reads and writes for xfs, btrfs, and ext4.  The
+latter currently relies on bit of a hack for passing whether this is an
+uncached write or not through ->write_begin(), which can hopefully go away
+once ext4 adopts iomap for buffered writes.  I say this is a hack as it's
+not the prettiest way to do it, however it is fully solid and will work
+just fine.
+
+Passes full xfstests and fsx overnight runs, no issues observed.  That
+includes the vm running the testing also using RWF_DONTCACHE on the host. 
+I'll post fsstress and fsx patches for RWF_DONTCACHE separately.  As far
+as I'm concerned, no further work needs doing here.
+
+And git tree for the patches is here:
+
+https://git.kernel.dk/cgit/linux/log/?h=buffered-uncached.10
+
+with the file system patches on top adding support for xfs/btrfs/ext4
+here:
+
+https://git.kernel.dk/cgit/linux/log/?h=buffered-uncached-fs.10
+
+
+This patch (of 12):
+
+Rather than pass in both the file and position directly from the kiocb,
+just take a struct kiocb instead.  With the kiocb being passed in, skip
+passing in the address_space separately as well.  While doing so, move the
+ki_flags checking into filemap_create_folio() as well.  In preparation for
+actually needing the kiocb in the function.
+
+No functional changes in this patch.
+
+Link: https://lkml.kernel.org/r/20241220154831.1086649-1-axboe@kernel.dk
+Link: https://lkml.kernel.org/r/20241220154831.1086649-2-axboe@kernel.dk
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Reviewed-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Brian Foster <bfoster@redhat.com>
+Cc: Chris Mason <clm@meta.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Christoph Hellwig <hch@lst.de>

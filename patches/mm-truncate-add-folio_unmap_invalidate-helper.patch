@@ -1,0 +1,129 @@
+From: Jens Axboe <axboe@kernel.dk>
+Subject: mm/truncate: add folio_unmap_invalidate() helper
+Date: Fri, 20 Dec 2024 08:47:44 -0700
+
+Add a folio_unmap_invalidate() helper, which unmaps and invalidates a
+given folio.  The caller must already have locked the folio.  Embed the
+old invalidate_complete_folio2() helper in there as well, as nobody else
+calls it.
+
+Use this new helper in invalidate_inode_pages2_range(), rather than
+duplicate the code there.
+
+In preparation for using this elsewhere as well, have it take a gfp_t mask
+rather than assume GFP_KERNEL is the right choice.  This bubbles back to
+invalidate_complete_folio2() as well.
+
+Link: https://lkml.kernel.org/r/20241220154831.1086649-7-axboe@kernel.dk
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Cc: Brian Foster <bfoster@redhat.com>
+Cc: Chris Mason <clm@meta.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/internal.h |    2 +
+ mm/truncate.c |   53 +++++++++++++++++++++++++-----------------------
+ 2 files changed, 30 insertions(+), 25 deletions(-)
+
+--- a/mm/internal.h~mm-truncate-add-folio_unmap_invalidate-helper
++++ a/mm/internal.h
+@@ -392,6 +392,8 @@ void unmap_page_range(struct mmu_gather
+ 			     struct vm_area_struct *vma,
+ 			     unsigned long addr, unsigned long end,
+ 			     struct zap_details *details);
++int folio_unmap_invalidate(struct address_space *mapping, struct folio *folio,
++			   gfp_t gfp);
+ 
+ void page_cache_ra_order(struct readahead_control *, struct file_ra_state *,
+ 		unsigned int order);
+--- a/mm/truncate.c~mm-truncate-add-folio_unmap_invalidate-helper
++++ a/mm/truncate.c
+@@ -525,6 +525,15 @@ unsigned long invalidate_mapping_pages(s
+ }
+ EXPORT_SYMBOL(invalidate_mapping_pages);
+ 
++static int folio_launder(struct address_space *mapping, struct folio *folio)
++{
++	if (!folio_test_dirty(folio))
++		return 0;
++	if (folio->mapping != mapping || mapping->a_ops->launder_folio == NULL)
++		return 0;
++	return mapping->a_ops->launder_folio(folio);
++}
++
+ /*
+  * This is like mapping_evict_folio(), except it ignores the folio's
+  * refcount.  We do this because invalidate_inode_pages2() needs stronger
+@@ -532,14 +541,26 @@ EXPORT_SYMBOL(invalidate_mapping_pages);
+  * shrink_folio_list() has a temp ref on them, or because they're transiently
+  * sitting in the folio_add_lru() caches.
+  */
+-static int invalidate_complete_folio2(struct address_space *mapping,
+-					struct folio *folio)
++int folio_unmap_invalidate(struct address_space *mapping, struct folio *folio,
++			   gfp_t gfp)
+ {
+-	if (folio->mapping != mapping)
+-		return 0;
++	int ret;
++
++	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
+ 
+-	if (!filemap_release_folio(folio, GFP_KERNEL))
++	if (folio_test_dirty(folio))
+ 		return 0;
++	if (folio_mapped(folio))
++		unmap_mapping_folio(folio);
++	BUG_ON(folio_mapped(folio));
++
++	ret = folio_launder(mapping, folio);
++	if (ret)
++		return ret;
++	if (folio->mapping != mapping)
++		return -EBUSY;
++	if (!filemap_release_folio(folio, gfp))
++		return -EBUSY;
+ 
+ 	spin_lock(&mapping->host->i_lock);
+ 	xa_lock_irq(&mapping->i_pages);
+@@ -558,16 +579,7 @@ static int invalidate_complete_folio2(st
+ failed:
+ 	xa_unlock_irq(&mapping->i_pages);
+ 	spin_unlock(&mapping->host->i_lock);
+-	return 0;
+-}
+-
+-static int folio_launder(struct address_space *mapping, struct folio *folio)
+-{
+-	if (!folio_test_dirty(folio))
+-		return 0;
+-	if (folio->mapping != mapping || mapping->a_ops->launder_folio == NULL)
+-		return 0;
+-	return mapping->a_ops->launder_folio(folio);
++	return -EBUSY;
+ }
+ 
+ /**
+@@ -631,16 +643,7 @@ int invalidate_inode_pages2_range(struct
+ 			}
+ 			VM_BUG_ON_FOLIO(!folio_contains(folio, indices[i]), folio);
+ 			folio_wait_writeback(folio);
+-
+-			if (folio_mapped(folio))
+-				unmap_mapping_folio(folio);
+-			BUG_ON(folio_mapped(folio));
+-
+-			ret2 = folio_launder(mapping, folio);
+-			if (ret2 == 0) {
+-				if (!invalidate_complete_folio2(mapping, folio))
+-					ret2 = -EBUSY;
+-			}
++			ret2 = folio_unmap_invalidate(mapping, folio, GFP_KERNEL);
+ 			if (ret2 < 0)
+ 				ret = ret2;
+ 			folio_unlock(folio);
+_
