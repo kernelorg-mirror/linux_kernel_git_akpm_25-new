@@ -1,0 +1,190 @@
+From: xu xin <xu.xin16@zte.com.cn>
+Subject: ksm: add ksm involvement information for each process
+Date: Fri, 10 Jan 2025 17:40:34 +0800 (CST)
+
+In /proc/<pid>/ksm_stat, add two extra ksm involvement items including
+KSM_mergeable and KSM_merge_any.  It helps administrators to better know
+the system's KSM behavior at process level.
+
+ksm_merge_any: yes/no
+	whether the process'mm is added by prctl() into the candidate list
+	of KSM or not, and fully enabled at process level.
+
+ksm_mergeable: yes/no
+    whether any VMAs of the process'mm are currently applicable to KSM.
+
+Purpose
+=======
+These two items are just to improve the observability of KSM at process
+level, so that users can know if a certain process has enable KSM.
+
+For example, if without these two items, when we look at
+/proc/<pid>/ksm_stat and there's no merging pages found, We are not sure
+whether it is because KSM was not enabled or because KSM did not
+successfully merge any pages.
+
+Althrough "mg" in /proc/<pid>/smaps indicate VM_MERGEABLE, it's opaque and
+not very obvious for non professionals.
+
+Link: https://lkml.kernel.org/r/20250110174034304QOb8eDoqtFkp3_t8mqnqc@zte.com.cn
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+Cc: Wang Yaxin <wang.yaxin@zte.com.cn>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Yang Yang <yang.yang29@zte.com.cn>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/filesystems/proc.rst |   66 +++++++++++++++++++++++++++
+ fs/proc/base.c                     |   11 ++++
+ include/linux/ksm.h                |    1 
+ mm/ksm.c                           |   19 +++++++
+ 4 files changed, 97 insertions(+)
+
+--- a/Documentation/filesystems/proc.rst~ksm-add-ksm-involvement-information-for-each-process
++++ a/Documentation/filesystems/proc.rst
+@@ -48,6 +48,7 @@ fixes/update part 1.1  Stefani Seibold <
+   3.11	/proc/<pid>/patch_state - Livepatch patch operation state
+   3.12	/proc/<pid>/arch_status - Task architecture specific information
+   3.13  /proc/<pid>/fd - List of symlinks to open files
++  3.14  /proc/<pid/ksm_stat - Information about the process' ksm status.
+ 
+   4	Configuring procfs
+   4.1	Mount options
+@@ -2232,6 +2233,71 @@ The number of open files for the process
+ of stat() output for /proc/<pid>/fd for fast access.
+ -------------------------------------------------------
+ 
++3.14 /proc/<pid/ksm_stat - Information about the process' ksm status
++--------------------------------------------------------------------
++When CONFIG_KSM is enabled, each process has this file which displays
++the information of ksm merging status.
++
++Example
++~~~~~~~
++
++::
++
++    / # cat /proc/self/ksm_stat
++    ksm_rmap_items 0
++    ksm_zero_pages 0
++    ksm_merging_pages 0
++    ksm_process_profit 0
++    ksm_merge_any: no
++    ksm_mergeable: no
++
++Description
++~~~~~~~~~~~
++
++ksm_rmap_items
++^^^^^^^^^^^^^^
++
++The number of ksm_rmap_item structure in use. The structure of
++ksm_rmap_item is to store the reverse mapping information for virtual
++addresses. KSM will generate a ksm_rmap_item for each ksm-scanned page
++of the process.
++
++ksm_zero_pages
++^^^^^^^^^^^^^^
++
++When /sys/kernel/mm/ksm/use_zero_pages is enabled, it represent how many
++empty pages are merged with kernel zero pages by KSM.
++
++ksm_merging_pages
++^^^^^^^^^^^^^^^^^
++
++It represents how many pages of this process are involved in KSM merging
++(not including ksm_zero_pages). It is the same with what
++/proc/<pid>/ksm_merging_pages shows.
++
++ksm_process_profit
++^^^^^^^^^^^^^^^^^^
++
++The profit that KSM brings (Saved bytes). KSM can save memory by merging
++identical pages, but also can consume additional memory, because it needs
++to generate a number of rmap_items to save each scanned page's brief rmap
++information. Some of these pages may be merged, but some may not be abled
++to be merged after being checked several times, which are unprofitable
++memory consumed.
++
++ksm_merge_any
++^^^^^^^^^^^^^
++
++It specifies whether the process'mm is added by prctl() into the candidate list
++of KSM or not, and KSM scanning is fully enabled at process level.
++
++ksm_mergeable
++^^^^^^^^^^^^^
++
++It specifies whether any VMAs of the process'mm are currently applicable to KSM.
++
++More information about KSM can be found at Documentation/admin-guide/mm/ksm.rst.
++
+ 
+ Chapter 4: Configuring procfs
+ =============================
+--- a/fs/proc/base.c~ksm-add-ksm-involvement-information-for-each-process
++++ a/fs/proc/base.c
+@@ -3269,6 +3269,7 @@ static int proc_pid_ksm_stat(struct seq_
+ 				struct pid *pid, struct task_struct *task)
+ {
+ 	struct mm_struct *mm;
++	int ret = 0;
+ 
+ 	mm = get_task_mm(task);
+ 	if (mm) {
+@@ -3276,6 +3277,16 @@ static int proc_pid_ksm_stat(struct seq_
+ 		seq_printf(m, "ksm_zero_pages %ld\n", mm_ksm_zero_pages(mm));
+ 		seq_printf(m, "ksm_merging_pages %lu\n", mm->ksm_merging_pages);
+ 		seq_printf(m, "ksm_process_profit %ld\n", ksm_process_profit(mm));
++		seq_printf(m, "ksm_merge_any: %s\n",
++				test_bit(MMF_VM_MERGE_ANY, &mm->flags) ? "yes" : "no");
++		ret = mmap_read_lock_killable(mm);
++		if (ret) {
++			mmput(mm);
++			return ret;
++		}
++		seq_printf(m, "ksm_mergeable: %s\n",
++				ksm_process_mergeable(mm) ? "yes" : "no");
++		mmap_read_unlock(mm);
+ 		mmput(mm);
+ 	}
+ 
+--- a/include/linux/ksm.h~ksm-add-ksm-involvement-information-for-each-process
++++ a/include/linux/ksm.h
+@@ -93,6 +93,7 @@ void folio_migrate_ksm(struct folio *new
+ void collect_procs_ksm(const struct folio *folio, const struct page *page,
+ 		struct list_head *to_kill, int force_early);
+ long ksm_process_profit(struct mm_struct *);
++bool ksm_process_mergeable(struct mm_struct *mm);
+ 
+ #else  /* !CONFIG_KSM */
+ 
+--- a/mm/ksm.c~ksm-add-ksm-involvement-information-for-each-process
++++ a/mm/ksm.c
+@@ -3262,6 +3262,25 @@ static void wait_while_offlining(void)
+ #endif /* CONFIG_MEMORY_HOTREMOVE */
+ 
+ #ifdef CONFIG_PROC_FS
++/*
++ * The process is mergeable only if any VMA is currently
++ * applicable to KSM.
++ *
++ * The mmap lock must be held in read mode.
++ */
++bool ksm_process_mergeable(struct mm_struct *mm)
++{
++	struct vm_area_struct *vma;
++
++	mmap_assert_locked(mm);
++	VMA_ITERATOR(vmi, mm, 0);
++	for_each_vma(vmi, vma)
++		if (vma->vm_flags & VM_MERGEABLE)
++			return true;
++
++	return false;
++}
++
+ long ksm_process_profit(struct mm_struct *mm)
+ {
+ 	return (long)(mm->ksm_merging_pages + mm_ksm_zero_pages(mm)) * PAGE_SIZE -
+_
