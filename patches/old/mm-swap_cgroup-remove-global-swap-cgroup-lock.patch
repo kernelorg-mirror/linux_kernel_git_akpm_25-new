@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
-Subject: mm, swap_cgroup: remove global swap cgroup lock
-Date: Tue, 10 Dec 2024 17:28:05 +0800
+Subject: mm/swap_cgroup: remove global swap cgroup lock
+Date: Wed, 18 Dec 2024 19:46:32 +0800
 
 commit e9e58a4ec3b1 ("memcg: avoid use cmpxchg in swap cgroup
 maintainance") replaced the cmpxchg/xchg with a global irq spinlock
@@ -15,24 +15,24 @@ to get rid of this lock.  Introduced two helpers for doing so and they can
 be easily dropped if a generic 2 byte xchg is support.
 
 Testing using 64G brd and build with build kernel with make -j96 in 1.5G
-memory cgroup using 4k folios showed below improvement (10 test run):
+memory cgroup using 4k folios showed below improvement (6 test run):
 
 Before this series:
-Sys time: 10809.46 (stdev 80.831491)
-Real time: 171.41 (stdev 1.239894)
+Sys time: 10782.29 (stdev 42.353886)
+Real time: 171.49 (stdev 0.595541)
 
 After this commit:
-Sys time: 9621.26 (stdev 34.620000), -10.42%
-Real time: 160.00 (stdev 0.497814), -6.57%
+Sys time: 9617.23 (stdev 37.764062), -10.81%
+Real time: 159.65 (stdev 0.587388), -6.90%
 
 With 64k folios and 2G memcg:
 Before this series:
-Sys time: 8231.99 (stdev 30.030994)
-Real time: 143.57 (stdev 0.577394)
+Sys time: 8176.94 (stdev 26.414712)
+Real time: 141.98 (stdev 0.797382)
 
 After this commit:
-Sys time: 7403.47 (stdev 6.270000), -10.06%
-Real time: 135.18 (stdev 0.605000), -5.84%
+Sys time: 7358.98 (stdev 54.927593), -10.00%
+Real time: 134.07 (stdev 0.757463), -5.57%
 
 Sequential swapout of 8G 64k zero folios with madvise (24 test run):
 Before this series:
@@ -50,7 +50,7 @@ After this commit:
 
 Performance is better or at least not worse for all tests above.
 
-Link: https://lkml.kernel.org/r/20241210092805.87281-4-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20241218114633.85196-4-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Reviewed-by: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Barry Song <baohua@kernel.org>
@@ -63,8 +63,8 @@ Cc: Yosry Ahmed <yosryahmed@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/swap_cgroup.c |   73 +++++++++++++++++++++++++++------------------
- 1 file changed, 45 insertions(+), 28 deletions(-)
+ mm/swap_cgroup.c |   77 ++++++++++++++++++++++++++++-----------------
+ 1 file changed, 49 insertions(+), 28 deletions(-)
 
 --- a/mm/swap_cgroup.c~mm-swap_cgroup-remove-global-swap-cgroup-lock
 +++ a/mm/swap_cgroup.c
@@ -73,7 +73,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static DEFINE_MUTEX(swap_cgroup_mutex);
  
 +/* Pack two cgroup id (short) of two entries in one swap_cgroup (atomic_t) */
-+#define ID_PER_SC (sizeof(atomic_t) / sizeof(unsigned short))
++#define ID_PER_SC (sizeof(struct swap_cgroup) / sizeof(unsigned short))
 +#define ID_SHIFT (BITS_PER_TYPE(unsigned short))
 +#define ID_MASK (BIT(ID_SHIFT) - 1)
  struct swap_cgroup {
@@ -93,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * SwapCgroup implements "lookup" and "exchange" operations.
   * In typical usage, this swap_cgroup is accessed via memcg's charge/uncharge
-@@ -30,19 +31,32 @@ static struct swap_cgroup_ctrl swap_cgro
+@@ -30,19 +31,35 @@ static struct swap_cgroup_ctrl swap_cgro
   *    SwapCache(and its swp_entry) is under lock.
   *  - When called via swap_free(), there is no user of this entry and no race.
   * Then, we don't need lock around "exchange".
@@ -107,14 +107,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
 -	pgoff_t offset = swp_offset(ent);
 -	struct swap_cgroup_ctrl *ctrl;
-+	unsigned int shift = (offset & 1) ? 0 : ID_SHIFT;
++	unsigned int shift = (offset % ID_PER_SC) * ID_SHIFT;
 +	unsigned int old_ids = atomic_read(&map[offset / ID_PER_SC].ids);
  
 -	ctrl = &swap_cgroup_ctrl[swp_type(ent)];
 -	if (ctrlp)
 -		*ctrlp = ctrl;
 -	return &ctrl->map[offset];
-+	return (old_ids & (ID_MASK << shift)) >> shift;
++	BUILD_BUG_ON(!is_power_of_2(ID_PER_SC));
++	BUILD_BUG_ON(sizeof(struct swap_cgroup) != sizeof(atomic_t));
++
++	return (old_ids >> shift) & ID_MASK;
 +}
 +
 +static unsigned short __swap_cgroup_id_xchg(struct swap_cgroup *map,
@@ -122,12 +125,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +					    unsigned short new_id)
 +{
 +	unsigned short old_id;
-+	unsigned int shift = (offset & 1) ? 0 : ID_SHIFT;
 +	struct swap_cgroup *sc = &map[offset / ID_PER_SC];
++	unsigned int shift = (offset % ID_PER_SC) * ID_SHIFT;
 +	unsigned int new_ids, old_ids = atomic_read(&sc->ids);
 +
 +	do {
-+		old_id = (old_ids & (ID_MASK << shift)) >> shift;
++		old_id = (old_ids >> shift) & ID_MASK;
 +		new_ids = (old_ids & ~(ID_MASK << shift));
 +		new_ids |= ((unsigned int)new_id) << shift;
 +	} while (!atomic_try_cmpxchg(&sc->ids, &old_ids, new_ids));
@@ -136,7 +139,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -58,21 +72,19 @@ unsigned short swap_cgroup_record(swp_en
+@@ -58,21 +75,19 @@ unsigned short swap_cgroup_record(swp_en
  				  unsigned int nr_ents)
  {
  	struct swap_cgroup_ctrl *ctrl;
@@ -167,7 +170,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return old;
  }
-@@ -85,9 +97,13 @@ unsigned short swap_cgroup_record(swp_en
+@@ -85,9 +100,13 @@ unsigned short swap_cgroup_record(swp_en
   */
  unsigned short lookup_swap_cgroup_id(swp_entry_t ent)
  {
@@ -182,12 +185,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  int swap_cgroup_swapon(int type, unsigned long max_pages)
-@@ -98,14 +114,15 @@ int swap_cgroup_swapon(int type, unsigne
+@@ -98,14 +117,16 @@ int swap_cgroup_swapon(int type, unsigne
  	if (mem_cgroup_disabled())
  		return 0;
  
 -	map = vcalloc(max_pages, sizeof(struct swap_cgroup));
-+	BUILD_BUG_ON(!ID_PER_SC);
++	BUILD_BUG_ON(sizeof(unsigned short) * ID_PER_SC !=
++		     sizeof(struct swap_cgroup));
 +	map = vcalloc(DIV_ROUND_UP(max_pages, ID_PER_SC),
 +		      sizeof(struct swap_cgroup));
  	if (!map)

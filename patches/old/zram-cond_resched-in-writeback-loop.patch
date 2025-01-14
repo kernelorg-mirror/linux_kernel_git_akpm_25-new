@@ -1,33 +1,27 @@
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Subject: zram: cond_resched() in writeback loop
-Date: Tue, 10 Dec 2024 19:53:55 +0900
+Date: Wed, 18 Dec 2024 15:34:24 +0900
 
-Patch series "zram: split page type read/write handling".
+zram writeback is a costly operation, because every target slot (unless
+ZRAM_HUGE) is decompressed before it gets written to a backing device. 
+The writeback to a backing device uses submit_bio_wait() which may look
+like a rescheduling point.  However, if the backing device has
+BD_HAS_SUBMIT_BIO bit set __submit_bio() calls directly
+disk->fops->submit_bio(bio) on the backing device and so when
+submit_bio_wait() calls blk_wait_io() the I/O is already done.  On such
+systems we effective end up in a loop
 
-This is a subset of [1] series which contains only fixes and improvements
-(no new features, as ZRAM_HUGE split is still under consideration).
+    for_each (target slot) {
+	decompress(slot)
+	__submit_bio()
+	    disk->fops->submit_bio(bio)
+    }
 
-The motivation for factoring out is that zram_write_page() gets more and
-more complex all the time, because it tries to handle too many scenarios:
-ZRAM_SAME store, ZRAM_HUGE store, compress page store with zs_malloc
-allocation slowpath and conditional recompression, etc.  Factor those out
-and make things easier to handle.
+Which on PREEMPT_NONE systems triggers watchdogs (since there are no
+explicit rescheduling points).  Add cond_resched() to the zram writeback
+loop.
 
-Addition of cond_resched() is simply a fix, I can trigger watchdog from
-zram writeback().  And early slot free is just a reasonable thing to do.
-
-[1] https://lore.kernel.org/linux-kernel/20241119072057.3440039-1-senozhatsky@chromium.org
-
-
-This patch (of 6):
-
-Writeback loop can run for quite a while (depending on wb device
-performance, compression algorithm and the number of entries we
-writeback), so we need to do cond_resched() there, similarly to what we do
-in recompress loop.
-
-Link: https://lkml.kernel.org/r/20241210105420.1888790-1-senozhatsky@chromium.org
-Link: https://lkml.kernel.org/r/20241210105420.1888790-2-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20241218063513.297475-8-senozhatsky@chromium.org
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 Cc: Minchan Kim <minchan@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -38,7 +32,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/drivers/block/zram/zram_drv.c~zram-cond_resched-in-writeback-loop
 +++ a/drivers/block/zram/zram_drv.c
-@@ -889,6 +889,8 @@ static ssize_t writeback_store(struct de
+@@ -884,6 +884,8 @@ static ssize_t writeback_store(struct de
  next:
  		zram_slot_unlock(zram, index);
  		release_pp_slot(zram, pps);
