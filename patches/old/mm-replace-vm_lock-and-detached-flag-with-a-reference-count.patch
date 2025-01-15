@@ -1,11 +1,11 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: mm: replace vm_lock and detached flag with a reference count
-Date: Wed, 8 Jan 2025 18:30:20 -0800
+Date: Fri, 10 Jan 2025 20:25:58 -0800
 
-rw_semaphore is a sizable structure of 40 bytes and consumes
-considerable space for each vm_area_struct. However vma_lock has
-two important specifics which can be used to replace rw_semaphore
-with a simpler structure:
+rw_semaphore is a sizable structure of 40 bytes and consumes considerable
+space for each vm_area_struct.  However vma_lock has two important
+specifics which can be used to replace rw_semaphore with a simpler
+structure:
 
 1. Readers never wait.  They try to take the vma_lock and fall back to
    mmap_lock if that fails.
@@ -29,9 +29,8 @@ introduced mm->vma_writer_wait.  Since all writers take mmap_lock in write
 mode first, there can be only one writer at a time.  The last reader to
 release the lock will signal the writer to wake up.  refcount might
 overflow if there are many competing readers, in which case read-locking
-will fail.  Readers are expected to handle such failures.
+will fail.  Readers are expected to handle such failures.  In summary:
 
-In summary:
 1. all readers increment the vm_refcnt;
 2. writer sets top usable (writer) bit of vm_refcnt;
 3. readers cannot increment the vm_refcnt if the writer bit is set;
@@ -39,7 +38,12 @@ In summary:
 to 1 (ignoring the writer bit), indicating an attached vma with no readers;
 5. vm_refcnt overflow is handled by the readers.
 
-Link: https://lkml.kernel.org/r/20250109023025.2242447-12-surenb@google.com
+While this vm_lock replacement does not yet result in a smaller
+vm_area_struct (it stays at 256 bytes due to cacheline alignment), it
+allows for further size optimization by structure member regrouping
+to bring the size of vm_area_struct below 192 bytes.
+
+Link: https://lkml.kernel.org/r/20250111042604.3230628-12-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Suggested-by: Peter Zijlstra <peterz@infradead.org>
 Suggested-by: Matthew Wilcox <willy@infradead.org>
@@ -49,10 +53,11 @@ Cc: David Hildenbrand <david@redhat.com>
 Cc: David Howells <dhowells@redhat.com>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: Hillf Danton <hdanton@sina.com>
-Cc: Hugh Dickins <hughd@google.com>
+Cc: Hugh Dickens <hughd@google.com>
 Cc: Jann Horn <jannh@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: kernel test robot <oliver.sang@intel.com>
 Cc: Klara Modin <klarasmodin@gmail.com>
 Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Lokesh Gidra <lokeshgidra@google.com>
@@ -63,7 +68,7 @@ Cc: Michal Hocko <mhocko@suse.com>
 Cc: Minchan Kim <minchan@google.com>
 Cc: Oleg Nesterov <oleg@redhat.com>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
-Cc: Paul E. McKenney <paulmck@kernel.org>
+Cc: "Paul E . McKenney" <paulmck@kernel.org>
 Cc: Peter Xu <peterx@redhat.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Sourav Panda <souravpanda@google.com>
@@ -71,14 +76,14 @@ Cc: Wei Yang <richard.weiyang@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mm.h               |   98 +++++++++++++++++++----------
+ include/linux/mm.h               |  102 +++++++++++++++++++----------
  include/linux/mm_types.h         |   22 ++----
  kernel/fork.c                    |   13 +--
  mm/init-mm.c                     |    1 
- mm/memory.c                      |   77 +++++++++++++++++++---
+ mm/memory.c                      |   80 +++++++++++++++++++---
  tools/testing/vma/linux/atomic.h |    5 +
- tools/testing/vma/vma_internal.h |   66 ++++++++++---------
- 7 files changed, 193 insertions(+), 89 deletions(-)
+ tools/testing/vma/vma_internal.h |   66 ++++++++++--------
+ 7 files changed, 198 insertions(+), 91 deletions(-)
 
 --- a/include/linux/mm.h~mm-replace-vm_lock-and-detached-flag-with-a-reference-count
 +++ a/include/linux/mm.h
@@ -90,7 +95,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  struct mempolicy;
  struct anon_vma;
-@@ -697,12 +698,41 @@ static inline void vma_numab_state_free(
+@@ -697,12 +698,43 @@ static inline void vma_numab_state_free(
  #endif /* CONFIG_NUMA_BALANCING */
  
  #ifdef CONFIG_PER_VMA_LOCK
@@ -121,20 +126,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline void vma_refcount_put(struct vm_area_struct *vma)
 +{
++	/* Use a copy of vm_mm in case vma is freed after we drop vm_refcnt */
++	struct mm_struct *mm = vma->vm_mm;
 +	int oldcnt;
 +
++	rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
 +	if (!__refcount_dec_and_test(&vma->vm_refcnt, &oldcnt)) {
-+		rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
 +
 +		if (is_vma_writer_only(oldcnt - 1))
-+			rcuwait_wake_up(&vma->vm_mm->vma_writer_wait);
++			rcuwait_wake_up(&mm->vma_writer_wait);
 +	}
 +}
 +
  /*
   * Try to read-lock a vma. The function is allowed to occasionally yield false
   * locked result to avoid performance overhead, in which case we fall back to
-@@ -710,6 +740,8 @@ static inline void vma_lock_init(struct
+@@ -710,6 +742,8 @@ static inline void vma_lock_init(struct
   */
  static inline bool vma_start_read(struct vm_area_struct *vma)
  {
@@ -143,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Check before locking. A race might cause false locked result.
  	 * We can use READ_ONCE() for the mm_lock_seq here, and don't need
-@@ -720,13 +752,19 @@ static inline bool vma_start_read(struct
+@@ -720,13 +754,19 @@ static inline bool vma_start_read(struct
  	if (READ_ONCE(vma->vm_lock_seq) == READ_ONCE(vma->vm_mm->mm_lock_seq.sequence))
  		return false;
  
@@ -166,7 +173,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * modification invalidates all existing locks.
  	 *
  	 * We must use ACQUIRE semantics for the mm_lock_seq so that if we are
-@@ -735,9 +773,10 @@ static inline bool vma_start_read(struct
+@@ -735,9 +775,10 @@ static inline bool vma_start_read(struct
  	 * This pairs with RELEASE semantics in vma_end_write_all().
  	 */
  	if (unlikely(vma->vm_lock_seq == raw_read_seqcount(&vma->vm_mm->mm_lock_seq))) {
@@ -178,7 +185,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return true;
  }
  
-@@ -749,8 +788,14 @@ static inline bool vma_start_read(struct
+@@ -749,8 +790,14 @@ static inline bool vma_start_read(struct
   */
  static inline bool vma_start_read_locked_nested(struct vm_area_struct *vma, int subclass)
  {
@@ -194,7 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return true;
  }
  
-@@ -762,15 +807,13 @@ static inline bool vma_start_read_locked
+@@ -762,16 +809,12 @@ static inline bool vma_start_read_locked
   */
  static inline bool vma_start_read_locked(struct vm_area_struct *vma)
  {
@@ -206,12 +213,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static inline void vma_end_read(struct vm_area_struct *vma)
  {
- 	rcu_read_lock(); /* keeps vma alive till the end of up_read */
+-	rcu_read_lock(); /* keeps vma alive till the end of up_read */
 -	up_read(&vma->vm_lock.lock);
+-	rcu_read_unlock();
 +	vma_refcount_put(vma);
- 	rcu_read_unlock();
  }
  
+ /* WARNING! Can only be used if mmap_lock is expected to be write-locked */
 @@ -813,36 +856,33 @@ static inline void vma_assert_write_lock
  
  static inline void vma_assert_locked(struct vm_area_struct *vma)
@@ -402,12 +410,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	.user_ns	= &init_user_ns,
 --- a/mm/memory.c~mm-replace-vm_lock-and-detached-flag-with-a-reference-count
 +++ a/mm/memory.c
-@@ -6328,9 +6328,41 @@ fail:
+@@ -6328,9 +6328,47 @@ fail:
  #endif
  
  #ifdef CONFIG_PER_VMA_LOCK
-+static inline bool __vma_enter_locked(struct vm_area_struct *vma, unsigned int tgt_refcnt)
++static inline bool __vma_enter_locked(struct vm_area_struct *vma, bool detaching)
 +{
++	unsigned int tgt_refcnt = VMA_LOCK_OFFSET;
++
++	/* Additional refcnt if the vma is attached. */
++	if (!detaching)
++		tgt_refcnt++;
++
 +	/*
 +	 * If vma is detached then only vma_mark_attached() can raise the
 +	 * vm_refcnt. mmap_write_lock prevents racing with vma_mark_attached().
@@ -437,15 +451,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	/*
 +	 * __vma_enter_locked() returns false immediately if the vma is not
-+	 * attached, otherwise it waits until refcnt is (VMA_LOCK_OFFSET + 1)
-+	 * indicating that vma is attached with no readers.
++	 * attached, otherwise it waits until refcnt is indicating that vma
++	 * is attached with no readers.
 +	 */
-+	locked = __vma_enter_locked(vma, VMA_LOCK_OFFSET + 1);
++	locked = __vma_enter_locked(vma, false);
 +
  	/*
  	 * We should use WRITE_ONCE() here because we can have concurrent reads
  	 * from the early lockless pessimistic check in vma_start_read().
-@@ -6338,10 +6370,43 @@ void __vma_start_write(struct vm_area_st
+@@ -6338,10 +6376,40 @@ void __vma_start_write(struct vm_area_st
  	 * we should use WRITE_ONCE() for cleanliness and to keep KCSAN happy.
  	 */
  	WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
@@ -474,11 +488,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * vm_refcnt.
 +	 */
 +	if (unlikely(!refcount_dec_and_test(&vma->vm_refcnt))) {
-+		/*
-+		 * Wait until refcnt is VMA_LOCK_OFFSET => detached with no
-+		 * readers.
-+		 */
-+		if (__vma_enter_locked(vma, VMA_LOCK_OFFSET)) {
++		/* Wait until vma is detached with no readers. */
++		if (__vma_enter_locked(vma, true)) {
 +			bool detached;
 +
 +			__vma_exit_locked(vma, &detached);
@@ -490,7 +501,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Lookup and lock a VMA under RCU protection. Returned VMA is guaranteed to be
   * stable and not isolated. If the VMA is not found or is being modified the
-@@ -6354,7 +6419,6 @@ struct vm_area_struct *lock_vma_under_rc
+@@ -6354,7 +6422,6 @@ struct vm_area_struct *lock_vma_under_rc
  	struct vm_area_struct *vma;
  
  	rcu_read_lock();
@@ -498,7 +509,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	vma = mas_walk(&mas);
  	if (!vma)
  		goto inval;
-@@ -6362,13 +6426,6 @@ retry:
+@@ -6362,13 +6429,6 @@ retry:
  	if (!vma_start_read(vma))
  		goto inval;
  
