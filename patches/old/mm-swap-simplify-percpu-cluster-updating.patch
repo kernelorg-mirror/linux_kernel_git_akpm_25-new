@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: simplify percpu cluster updating
-Date: Tue, 31 Dec 2024 01:46:18 +0800
+Date: Tue, 14 Jan 2025 01:57:29 +0800
 
 Instead of using a returning argument, we can simply store the next
 cluster offset to the fixed percpu location, which reduce the stack usage
@@ -21,12 +21,13 @@ swapfile.c:1190:5:get_swap_pages       240    static
 After:
 swapfile.c:1185:5:get_swap_pages       216    static
 
-Link: https://lkml.kernel.org/r/20241230174621.61185-11-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250113175732.48099-11-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <v-songbaohua@oppo.com>
-Cc: Chris Li <chrisl@kernel.org>
+Cc: Chis Li <chrisl@kernel.org>
 Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
-Cc: Hugh Dickins <hughd@google.com>
+Cc: Hugh Dickens <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kalesh Singh <kaleshsingh@google.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
@@ -41,7 +42,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
 --- a/include/linux/swap.h~mm-swap-simplify-percpu-cluster-updating
 +++ a/include/linux/swap.h
-@@ -275,9 +275,9 @@ enum swap_cluster_flags {
+@@ -274,9 +274,9 @@ enum swap_cluster_flags {
   * The first page in the swap file is the swap header, which is always marked
   * bad to prevent it from being allocated as an entry. This also prevents the
   * cluster to which it belongs being marked free. Therefore 0 is safe to use as
@@ -55,7 +56,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #define SWAP_NR_ORDERS		(PMD_ORDER + 1)
 --- a/mm/swapfile.c~mm-swap-simplify-percpu-cluster-updating
 +++ a/mm/swapfile.c
-@@ -759,23 +759,23 @@ static bool cluster_alloc_range(struct s
+@@ -765,23 +765,23 @@ static bool cluster_alloc_range(struct s
  	return true;
  }
  
@@ -87,7 +88,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (end -= nr_pages; offset <= end; offset += nr_pages) {
  		need_reclaim = false;
-@@ -789,34 +789,27 @@ static unsigned int alloc_swap_scan_clus
+@@ -795,34 +795,27 @@ static unsigned int alloc_swap_scan_clus
  			 * cluster has no flag set, and change of list
  			 * won't cause fragmentation.
  			 */
@@ -96,7 +97,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (!cluster_is_usable(ci, order))
  				goto out;
 -			}
- 			if (cluster_is_free(ci))
+ 			if (cluster_is_empty(ci))
  				offset = start;
  			/* Reclaim failed but cluster is usable, try next */
  			if (!ret)
@@ -130,9 +131,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /* Return true if reclaimed a whole cluster */
-@@ -885,8 +878,8 @@ static unsigned long cluster_alloc_swap_
+@@ -891,8 +884,8 @@ static unsigned long cluster_alloc_swap_
  		if (cluster_is_usable(ci, order)) {
- 			if (cluster_is_free(ci))
+ 			if (cluster_is_empty(ci))
  				offset = cluster_offset(si, ci);
 -			offset = alloc_swap_scan_cluster(si, offset, &found,
 -							 order, usage);
@@ -141,9 +142,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		} else {
  			unlock_cluster(ci);
  		}
-@@ -897,8 +890,8 @@ static unsigned long cluster_alloc_swap_
+@@ -903,8 +896,8 @@ static unsigned long cluster_alloc_swap_
  new_cluster:
- 	ci = cluster_isolate_lock(si, &si->free_clusters);
+ 	ci = isolate_lock_cluster(si, &si->free_clusters);
  	if (ci) {
 -		offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
 -						 &found, order, usage);
@@ -152,18 +153,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (found)
  			goto done;
  	}
-@@ -911,8 +904,8 @@ new_cluster:
+@@ -917,8 +910,8 @@ new_cluster:
  		unsigned int frags = 0, frags_existing;
  
- 		while ((ci = cluster_isolate_lock(si, &si->nonfull_clusters[order]))) {
+ 		while ((ci = isolate_lock_cluster(si, &si->nonfull_clusters[order]))) {
 -			offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
 -							 &found, order, usage);
 +			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
 +							order, usage);
- 			/*
- 			 * With `fragmenting` set to true, it will surely take
- 			 * the cluster off nonfull list
-@@ -932,8 +925,8 @@ new_cluster:
+ 			if (found)
+ 				goto done;
+ 			/* Clusters failed to allocate are moved to frag_clusters */
+@@ -935,8 +928,8 @@ new_cluster:
  			 * per-CPU usage, but they could contain newly released
  			 * reclaimable (eg. lazy-freed swap cache) slots.
  			 */
@@ -174,9 +175,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (found)
  				goto done;
  			frags++;
-@@ -959,21 +952,20 @@ new_cluster:
+@@ -962,21 +955,20 @@ new_cluster:
  		 */
- 		while ((ci = cluster_isolate_lock(si, &si->frag_clusters[o]))) {
+ 		while ((ci = isolate_lock_cluster(si, &si->frag_clusters[o]))) {
  			atomic_long_dec(&si->frag_cluster_nr[o]);
 -			offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
 -							 &found, order, usage);
@@ -186,7 +187,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto done;
  		}
  
- 		while ((ci = cluster_isolate_lock(si, &si->nonfull_clusters[o]))) {
+ 		while ((ci = isolate_lock_cluster(si, &si->nonfull_clusters[o]))) {
 -			offset = alloc_swap_scan_cluster(si, cluster_offset(si, ci),
 -							 &found, order, usage);
 +			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
@@ -200,7 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	local_unlock(&si->percpu_cluster->lock);
  
  	return found;
-@@ -3194,7 +3186,7 @@ static struct swap_cluster_info *setup_c
+@@ -3200,7 +3192,7 @@ static struct swap_cluster_info *setup_c
  
  		cluster = per_cpu_ptr(si->percpu_cluster, cpu);
  		for (i = 0; i < SWAP_NR_ORDERS; i++)

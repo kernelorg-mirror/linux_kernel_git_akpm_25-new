@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: clean up plist removal and adding
-Date: Tue, 31 Dec 2024 01:46:14 +0800
+Date: Tue, 14 Jan 2025 01:57:25 +0800
 
 When the swap device is full (inuse_pages == pages), it should be removed
 from the allocation available plist.  If any slot is freed, the swap
@@ -32,12 +32,13 @@ unset, we attempt to remove it from the plist.  If the counter is not full
 to the plist.  Removing, adding and bit update is serialized with a lock,
 which is a cold path.  Ordinary counter updates will be lock-free.
 
-Link: https://lkml.kernel.org/r/20241230174621.61185-7-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250113175732.48099-7-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <v-songbaohua@oppo.com>
-Cc: Chris Li <chrisl@kernel.org>
+Cc: Chis Li <chrisl@kernel.org>
 Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
-Cc: Hugh Dickins <hughd@google.com>
+Cc: Hugh Dickens <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kalesh Singh <kaleshsingh@google.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
@@ -47,12 +48,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/swap.h |    2 
- mm/swapfile.c        |  188 ++++++++++++++++++++++++++++++-----------
- 2 files changed, 139 insertions(+), 51 deletions(-)
+ mm/swapfile.c        |  186 ++++++++++++++++++++++++++++++-----------
+ 2 files changed, 138 insertions(+), 50 deletions(-)
 
 --- a/include/linux/swap.h~mm-swap-clean-up-plist-removal-and-adding
 +++ a/include/linux/swap.h
-@@ -307,7 +307,7 @@ struct swap_info_struct {
+@@ -306,7 +306,7 @@ struct swap_info_struct {
  					/* list of cluster that are fragmented or contented */
  	unsigned int frag_cluster_nr[SWAP_NR_ORDERS];
  	unsigned int pages;		/* total of usable pages of swap */
@@ -69,12 +70,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 +/*
 + * Use the second highest bit of inuse_pages counter as the indicator
-+ * of if one swap device is on the available plist, so the atomic can
-+ * still be updated arithmetic while having special data embedded.
++ * if one swap device is on the available plist, so the atomic can
++ * still be updated arithmetically while having special data embedded.
 + *
 + * inuse_pages counter is the only thing indicating if a device should
 + * be on avail_lists or not (except swapon / swapoff). By embedding the
-+ * on-list bit in the atomic counter, updates no longer need any lock
++ * off-list bit in the atomic counter, updates no longer need any lock
 + * to check the list status.
 + *
 + * This bit will be set if the device is not on the plist and not
@@ -104,7 +105,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
 -static void __del_from_avail_list(struct swap_info_struct *si)
-+/* SWAP_USAGE_OFFLIST_BIT can only be cleared by this helper. */
++/* SWAP_USAGE_OFFLIST_BIT can only be set by this helper. */
 +static void del_from_avail_list(struct swap_info_struct *si, bool swapoff)
  {
  	int nid;
@@ -145,7 +146,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
 -static void del_from_avail_list(struct swap_info_struct *si)
-+/* SWAP_USAGE_OFFLIST_BIT can only be set by this helper. */
++/* SWAP_USAGE_OFFLIST_BIT can only be cleared by this helper. */
 +static void add_to_avail_list(struct swap_info_struct *si, bool swapon)
  {
 +	int nid;
@@ -203,7 +204,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		del_from_avail_list(si);
 +	long val = atomic_long_add_return_relaxed(nr_entries, &si->inuse_pages);
  
--		if (si->cluster_info && vm_swap_full())
+-		if (vm_swap_full())
 -			schedule_work(&si->reclaim_work);
 +	/*
 +	 * If device is full, and SWAP_USAGE_OFFLIST_BIT is not set,
@@ -239,7 +240,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			     unsigned int nr_entries)
 +{
 +	if (swap_usage_add(si, nr_entries)) {
-+		if (si->cluster_info && vm_swap_full())
++		if (vm_swap_full())
 +			schedule_work(&si->reclaim_work);
 +	}
  }
@@ -336,15 +337,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!signal_pending(current))
  			goto retry;
  		return -EINTR;
-@@ -2209,7 +2299,7 @@ retry:
- success:
- 	/*
- 	 * Make sure that further cleanups after try_to_unuse() returns happen
--	 * after swap_range_free() reduces si->inuse_pages to 0.
-+	 * after swap_range_free() reduces inuse_pages to 0.
- 	 */
- 	smp_mb();
- 	return 0;
 @@ -2227,7 +2317,7 @@ static void drain_mmlist(void)
  	unsigned int type;
  
