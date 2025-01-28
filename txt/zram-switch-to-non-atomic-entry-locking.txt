@@ -1,0 +1,91 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: switch to non-atomic entry locking
+Date: Mon, 27 Jan 2025 16:29:12 +0900
+
+Patch series "zram: preemptible writes and occasionally preemptible
+reads", v2.
+
+This is Part I (aka Episode IV), which only changes zram and seems like a
+good start.  More work needs to be done, outside of zram, in order to make
+reads() preemptible in a non-occasional manner.  That work will be carried
+out independently.
+
+There are more details in the commit messages, but in short:
+
+Currently zram runs compression and decompression in non-preemptible
+sections, e.g.
+
+    zcomp_stream_get()     // grabs CPU local lock
+    zcomp_compress()
+
+or
+
+    zram_slot_lock()       // grabs entry spin-lock
+    zcomp_stream_get()     // grabs CPU local lock
+    zs_map_object()        // grabs rwlock and CPU local lock
+    zcomp_decompress()
+
+Potentially a little troublesome for a number of reasons.
+
+For instance, this makes it impossible to use async compression algorithms
+or/and H/W compression algorithms, which can wait for OP completion or
+resource availability.  This also restricts what compression algorithms
+can do internally, for example, zstd can allocate internal state memory
+for C/D dictionaries:
+
+do_fsync()
+ do_writepages()
+  zram_bio_write()
+   zram_write_page()                          // become non-preemptible
+    zcomp_compress()
+     zstd_compress()
+      ZSTD_compress_usingCDict()
+       ZSTD_compressBegin_usingCDict_internal()
+        ZSTD_resetCCtx_usingCDict()
+         ZSTD_resetCCtx_internal()
+          zstd_custom_alloc()                 // memory allocation
+
+Not to mention that the system can be configured to maximize compression
+ratio at a cost of CPU/HW time (e.g.  lz4hc or deflate with very high
+compression level) so zram can stay in non-preemptible section (even under
+spin-lock or/and rwlock) for an extended period of time.  Aside from
+compression algorithms, this also restricts what zram can do.  One
+particular example is zram_write_page() zsmalloc handle allocation, which
+has an optimistic allocation (disallowing direct reclaim) and a
+pessimistic fallback path, which then forces zram to compress the page one
+more time.
+
+This series changes zram to not directly impose atomicity restrictions on
+compression algorithms (and on itself), which makes zram write() fully
+preemptible; zram read(), sadly, is not always preemptible.  There are
+still indirect atomicity restrictions imposed by zsmalloc().  Changing
+zsmalloc to permit preemption under zs_map_object() is a separate effort
+(Part II) and will be posted shortly.
+
+
+This patch (of 9):
+
+Concurrent modifications of meta table entries is now handled by per-entry
+spin-lock.  This has a number of shortcomings.
+
+First, this imposes atomic requirements on compression backends.  zram can
+call both zcomp_compress() and zcomp_decompress() under entry spin-lock,
+which implies that we can use only compression algorithms that don't
+schedule/sleep/wait during compression and decompression.  This, for
+instance, makes it impossible to use some of the ASYNC compression
+algorithms (H/W compression, etc.) implementations.
+
+Second, this can potentially trigger watchdogs.  For example, entry
+re-compression with secondary algorithms is performed under entry
+spin-lock.  Given that we chain secondary compression algorithms and that
+some of them can be configured for best compression ratio (and worst
+compression speed) zram can stay under spin-lock for quite some time.
+
+Do not use per-entry spin-locks and instead convert it to an atomic_t
+variable which open codes reader-writer type of lock.  This permits
+preemption from slot_lock section.
+
+Link: https://lkml.kernel.org/r/20250127072932.1289973-1-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20250127072932.1289973-2-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Minchan Kim <minchan@kernel.org>

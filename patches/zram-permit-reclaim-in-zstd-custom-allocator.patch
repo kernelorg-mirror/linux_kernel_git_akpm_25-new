@@ -1,0 +1,56 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: permit reclaim in zstd custom allocator
+Date: Mon, 27 Jan 2025 16:29:17 +0900
+
+When configured with pre-trained compression/decompression dictionary
+support, zstd requires custom memory allocator, which it calls internally
+from compression()/decompression() routines.  This was a tad problematic,
+because that would mean allocation from atomic context (either under entry
+spin-lock, or per-CPU local-lock or both).  Now, with non-atomic zram
+write(), those limitations are relaxed and we can allow direct and
+indirect reclaim during allocations.
+
+The tricky part is zram read() path, which is still atomic in one
+particular case (read_compressed_page()), due to zsmalloc handling of
+object mapping.  However, in zram in order to read() something one has to
+write() it first, and write() is when zstd allocates required internal
+state memory, and write() path is non-atomic.  Because of this write()
+allocation, in theory, zstd should not call its allocator from the atomic
+read() path.  Keep the non-preemptible branch, just in case if zstd
+allocates memory from read(), but WARN_ON_ONCE() if it happens.
+
+Link: https://lkml.kernel.org/r/20250127072932.1289973-7-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/block/zram/backend_zstd.c |   11 +++--------
+ 1 file changed, 3 insertions(+), 8 deletions(-)
+
+--- a/drivers/block/zram/backend_zstd.c~zram-permit-reclaim-in-zstd-custom-allocator
++++ a/drivers/block/zram/backend_zstd.c
+@@ -24,19 +24,14 @@ struct zstd_params {
+ /*
+  * For C/D dictionaries we need to provide zstd with zstd_custom_mem,
+  * which zstd uses internally to allocate/free memory when needed.
+- *
+- * This means that allocator.customAlloc() can be called from zcomp_compress()
+- * under local-lock (per-CPU compression stream), in which case we must use
+- * GFP_ATOMIC.
+- *
+- * Another complication here is that we can be configured as a swap device.
+  */
+ static void *zstd_custom_alloc(void *opaque, size_t size)
+ {
+-	if (!preemptible())
++	/* Technically this should not happen */
++	if (WARN_ON_ONCE(!preemptible()))
+ 		return kvzalloc(size, GFP_ATOMIC);
+ 
+-	return kvzalloc(size, __GFP_KSWAPD_RECLAIM | __GFP_NOWARN);
++	return kvzalloc(size, GFP_NOIO | __GFP_NOWARN);
+ }
+ 
+ static void zstd_custom_free(void *opaque, void *address)
+_

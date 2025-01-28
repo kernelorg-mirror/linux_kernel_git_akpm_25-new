@@ -1,0 +1,128 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: unlock slot during recompression
+Date: Mon, 27 Jan 2025 16:29:20 +0900
+
+Recompression, like writeback, makes a local copy of slot data (we need to
+decompress it anyway) before post-processing so we can unlock slot-entry
+once we have that local copy.
+
+Unlock the entry write-lock before recompression loop (secondary
+algorithms can be tried out one by one, in order of priority) and
+re-acquire it right after the loop.
+
+There is one more potentially costly operation recompress_slot() does -
+new zs_handle allocation, which can schedule().  Release the slot-entry
+write-lock before zsmalloc allocation and grab it again after the
+allocation.
+
+In both cases, once the slot-lock is re-acquired we examine slot's
+ZRAM_PP_SLOT flag to make sure that the slot has not been modified by a
+concurrent operation.
+
+Link: https://lkml.kernel.org/r/20250127072932.1289973-10-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/block/zram/zram_drv.c |   53 ++++++++++++++++++++++----------
+ 1 file changed, 38 insertions(+), 15 deletions(-)
+
+--- a/drivers/block/zram/zram_drv.c~zram-unlock-slot-during-recompression
++++ a/drivers/block/zram/zram_drv.c
+@@ -1908,6 +1908,14 @@ static int recompress_slot(struct zram *
+ 	zram_clear_flag(zram, index, ZRAM_IDLE);
+ 
+ 	class_index_old = zs_lookup_class_index(zram->mem_pool, comp_len_old);
++
++	/*
++	 * Set prio to one past current slot's compression prio, so that
++	 * we automatically skip lower priority algorithms.
++	 */
++	prio = zram_get_priority(zram, index) + 1;
++	/* Slot data copied out - unlock its bucket */
++	zram_slot_write_unlock(zram, index);
+ 	/*
+ 	 * Iterate the secondary comp algorithms list (in order of priority)
+ 	 * and try to recompress the page.
+@@ -1916,13 +1924,6 @@ static int recompress_slot(struct zram *
+ 		if (!zram->comps[prio])
+ 			continue;
+ 
+-		/*
+-		 * Skip if the object is already re-compressed with a higher
+-		 * priority algorithm (or same algorithm).
+-		 */
+-		if (prio <= zram_get_priority(zram, index))
+-			continue;
+-
+ 		num_recomps++;
+ 		zstrm = zcomp_stream_get(zram->comps[prio]);
+ 		src = kmap_local_page(page);
+@@ -1930,10 +1931,8 @@ static int recompress_slot(struct zram *
+ 				     src, &comp_len_new);
+ 		kunmap_local(src);
+ 
+-		if (ret) {
+-			zcomp_stream_put(zram->comps[prio], zstrm);
+-			return ret;
+-		}
++		if (ret)
++			break;
+ 
+ 		class_index_new = zs_lookup_class_index(zram->mem_pool,
+ 							comp_len_new);
+@@ -1949,6 +1948,19 @@ static int recompress_slot(struct zram *
+ 		break;
+ 	}
+ 
++	zram_slot_write_lock(zram, index);
++	/* Compression error */
++	if (ret) {
++		zcomp_stream_put(zram->comps[prio], zstrm);
++		return ret;
++	}
++
++	/* Slot has been modified concurrently */
++	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
++		zcomp_stream_put(zram->comps[prio], zstrm);
++		return 0;
++	}
++
+ 	/*
+ 	 * We did not try to recompress, e.g. when we have only one
+ 	 * secondary algorithm and the page is already recompressed
+@@ -1986,17 +1998,28 @@ static int recompress_slot(struct zram *
+ 	if (threshold && comp_len_new >= threshold)
+ 		return 0;
+ 
+-	/*
+-	 * If we cannot alloc memory for recompressed object then we bail out
+-	 * and simply keep the old (existing) object in zsmalloc.
+-	 */
++	/* zsmalloc handle allocation can schedule, unlock slot's bucket */
++	zram_slot_write_unlock(zram, index);
+ 	handle_new = zs_malloc(zram->mem_pool, comp_len_new,
+ 			       GFP_NOIO | __GFP_HIGHMEM | __GFP_MOVABLE);
++	zram_slot_write_lock(zram, index);
++
++	/*
++	 * If we couldn't allocate memory for recompressed object then bail
++	 * out and simply keep the old (existing) object in mempool.
++	 */
+ 	if (IS_ERR_VALUE(handle_new)) {
+ 		zcomp_stream_put(zram->comps[prio], zstrm);
+ 		return PTR_ERR((void *)handle_new);
+ 	}
+ 
++	/* Slot has been modified concurrently */
++	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
++		zcomp_stream_put(zram->comps[prio], zstrm);
++		zs_free(zram->mem_pool, handle_new);
++		return 0;
++	}
++
+ 	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
+ 	memcpy(dst, zstrm->buffer, comp_len_new);
+ 	zcomp_stream_put(zram->comps[prio], zstrm);
+_
