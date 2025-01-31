@@ -1,6 +1,6 @@
 From: Frank van der Linden <fvdl@google.com>
 Subject: mm/hugetlb: enable bootmem allocation from CMA areas
-Date: Mon, 27 Jan 2025 23:22:07 +0000
+Date: Wed, 29 Jan 2025 22:41:56 +0000
 
 If hugetlb_cma_only is enabled, we know that hugetlb pages can only be
 allocated from CMA.  Now that there is an interface to do early
@@ -18,7 +18,7 @@ so introduce a boolean arch_specific_huge_bootmem_alloc that returns true
 if such an allocator is present.  In that case, CMA bootmem allocations
 can't be used, so check that function before trying.
 
-Link: https://lkml.kernel.org/r/20250127232207.3888640-28-fvdl@google.com
+Link: https://lkml.kernel.org/r/20250129224157.2046079-28-fvdl@google.com
 Signed-off-by: Frank van der Linden <fvdl@google.com>
 Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
@@ -27,36 +27,34 @@ Cc: Andy Lutomirski <luto@kernel.org>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Joao Martins <joao.m.martins@oracle.com>
-Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
-Cc: Usama Arif <usama.arif@bytedance.com>
+Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- arch/powerpc/mm/hugetlbpage.c |    5 +
- include/linux/hugetlb.h       |    7 +
- mm/hugetlb.c                  |  135 ++++++++++++++++++++++++--------
- 3 files changed, 114 insertions(+), 33 deletions(-)
+ arch/powerpc/include/asm/book3s/64/hugetlb.h |    6 
+ include/linux/hugetlb.h                      |   17 ++
+ mm/hugetlb.c                                 |  121 ++++++++++++-----
+ 3 files changed, 113 insertions(+), 31 deletions(-)
 
---- a/arch/powerpc/mm/hugetlbpage.c~mm-hugetlb-enable-bootmem-allocation-from-cma-areas
-+++ a/arch/powerpc/mm/hugetlbpage.c
-@@ -121,6 +121,11 @@ bool __init hugetlb_node_alloc_supported
- {
- 	return false;
+--- a/arch/powerpc/include/asm/book3s/64/hugetlb.h~mm-hugetlb-enable-bootmem-allocation-from-cma-areas
++++ a/arch/powerpc/include/asm/book3s/64/hugetlb.h
+@@ -94,4 +94,10 @@ static inline int check_and_get_huge_psi
+ 	return mmu_psize;
  }
+ 
++#define arch_has_huge_bootmem_alloc arch_has_huge_bootmem_alloc
 +
-+bool __init arch_specific_huge_bootmem_alloc(struct hstate *h)
++static inline bool arch_has_huge_bootmem_alloc(void)
 +{
 +	return (firmware_has_feature(FW_FEATURE_LPAR) && !radix_enabled());
 +}
  #endif
- 
- 
 --- a/include/linux/hugetlb.h~mm-hugetlb-enable-bootmem-allocation-from-cma-areas
 +++ a/include/linux/hugetlb.h
 @@ -591,6 +591,7 @@ enum hugetlb_page_flags {
@@ -94,32 +92,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  bool hugetlb_bootmem_page_zones_valid(int nid, struct huge_bootmem_page *m);
  
-@@ -711,6 +717,7 @@ bool __init hugetlb_node_alloc_supported
+@@ -823,6 +829,17 @@ static inline pte_t arch_make_huge_pte(p
+ }
+ #endif
  
- void __init hugetlb_add_hstate(unsigned order);
- bool __init arch_hugetlb_valid_size(unsigned long size);
-+bool __init arch_specific_huge_bootmem_alloc(struct hstate *h);
- struct hstate *size_to_hstate(unsigned long size);
- 
- #ifndef HUGE_MAX_HSTATE
++#ifndef arch_has_huge_bootmem_alloc
++/*
++ * Some architectures do their own bootmem allocation, so they can't use
++ * early CMA allocation.
++ */
++static inline bool arch_has_huge_bootmem_alloc(void)
++{
++	return false;
++}
++#endif
++
+ static inline struct hstate *folio_hstate(struct folio *folio)
+ {
+ 	VM_BUG_ON_FOLIO(!folio_test_hugetlb(folio), folio);
 --- a/mm/hugetlb.c~mm-hugetlb-enable-bootmem-allocation-from-cma-areas
 +++ a/mm/hugetlb.c
-@@ -61,7 +61,7 @@ static struct cma *hugetlb_cma[MAX_NUMNO
- static unsigned long hugetlb_cma_size_in_node[MAX_NUMNODES] __initdata;
- #endif
- static bool hugetlb_cma_only;
--static unsigned long hugetlb_cma_size __initdata;
-+static unsigned long hugetlb_cma_size;
- 
- __initdata struct list_head huge_boot_pages[MAX_NUMNODES];
- __initdata unsigned long hstate_boot_nrinvalid[HUGE_MAX_HSTATE];
 @@ -132,8 +132,10 @@ static void hugetlb_free_folio(struct fo
  #ifdef CONFIG_CMA
  	int nid = folio_nid(folio);
  
 -	if (cma_free_folio(hugetlb_cma[nid], folio))
 +	if (folio_test_hugetlb_cma(folio)) {
-+		WARN_ON(!cma_free_folio(hugetlb_cma[nid], folio));
++		WARN_ON_ONCE(!cma_free_folio(hugetlb_cma[nid], folio));
  		return;
 +	}
  #endif
@@ -135,26 +134,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  #endif
  	if (!folio) {
-@@ -3175,6 +3180,63 @@ out_end_reservation:
+@@ -3175,6 +3180,53 @@ out_end_reservation:
  	return ERR_PTR(-ENOSPC);
  }
  
-+/*
-+ * Some architectures do their own bootmem allocation, so they can't use
-+ * early CMA allocation. So, allow for this function to be redefined.
-+ */
-+bool __init __attribute((weak))
-+arch_specific_huge_bootmem_alloc(struct hstate *h)
-+{
-+	return false;
-+}
-+
 +static bool __init hugetlb_early_cma(struct hstate *h)
 +{
-+	if (arch_specific_huge_bootmem_alloc(h))
++	if (arch_has_huge_bootmem_alloc())
 +		return false;
 +
-+	return (hstate_is_gigantic(h) && hugetlb_cma_size && hugetlb_cma_only);
++	return (hstate_is_gigantic(h) && hugetlb_cma_only);
 +}
 +
 +static __init void *alloc_bootmem(struct hstate *h, int nid)
@@ -199,7 +188,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int alloc_bootmem_huge_page(struct hstate *h, int nid)
  	__attribute__ ((weak, alias("__alloc_bootmem_huge_page")));
  int __alloc_bootmem_huge_page(struct hstate *h, int nid)
-@@ -3184,17 +3246,14 @@ int __alloc_bootmem_huge_page(struct hst
+@@ -3184,17 +3236,14 @@ int __alloc_bootmem_huge_page(struct hst
  
  	/* do node specific alloc */
  	if (nid != NUMA_NO_NODE) {
@@ -219,7 +208,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (m)
  			break;
  	}
-@@ -3203,7 +3262,6 @@ int __alloc_bootmem_huge_page(struct hst
+@@ -3203,7 +3252,6 @@ int __alloc_bootmem_huge_page(struct hst
  		return 0;
  
  found:
@@ -227,7 +216,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Only initialize the head struct page in memmap_init_reserved_pages,
  	 * rest of the struct pages will be initialized by the HugeTLB
-@@ -3213,18 +3271,6 @@ found:
+@@ -3213,18 +3261,6 @@ found:
  	 */
  	memblock_reserved_mark_noinit(virt_to_phys((void *)m + PAGE_SIZE),
  		huge_page_size(h) - PAGE_SIZE);
@@ -246,18 +235,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return 1;
  }
  
-@@ -3265,13 +3311,25 @@ static void __init hugetlb_folio_init_vm
+@@ -3265,13 +3301,25 @@ static void __init hugetlb_folio_init_vm
  	prep_compound_head((struct page *)folio, huge_page_order(h));
  }
  
 +static bool __init hugetlb_bootmem_page_prehvo(struct huge_bootmem_page *m)
 +{
-+	return (m->flags & HUGE_BOOTMEM_HVO);
++	return m->flags & HUGE_BOOTMEM_HVO;
 +}
 +
 +static bool __init hugetlb_bootmem_page_earlycma(struct huge_bootmem_page *m)
 +{
-+	return (m->flags & HUGE_BOOTMEM_CMA);
++	return m->flags & HUGE_BOOTMEM_CMA;
 +}
 +
  /*
@@ -275,7 +264,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  static void __init hugetlb_bootmem_init_migratetype(struct folio *folio,
  							  struct hstate *h)
-@@ -3280,9 +3338,13 @@ static void __init hugetlb_bootmem_init_
+@@ -3280,9 +3328,13 @@ static void __init hugetlb_bootmem_init_
  
  	WARN_ON_ONCE(!pageblock_aligned(folio_pfn(folio)));
  
@@ -291,16 +280,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void __init prep_and_add_bootmem_folios(struct hstate *h,
-@@ -3319,7 +3381,7 @@ bool __init hugetlb_bootmem_page_zones_v
- 					     struct huge_bootmem_page *m)
- {
- 	unsigned long start_pfn;
--	bool valid;
-+	bool valid = false;
- 
- 	if (m->flags & HUGE_BOOTMEM_ZONES_VALID) {
- 		/*
-@@ -3328,10 +3390,16 @@ bool __init hugetlb_bootmem_page_zones_v
+@@ -3328,10 +3380,16 @@ bool __init hugetlb_bootmem_page_zones_v
  		return true;
  	}
  
@@ -317,7 +297,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!valid)
  		hstate_boot_nrinvalid[hstate_index(m->hstate)]++;
  
-@@ -3360,11 +3428,6 @@ static void __init hugetlb_bootmem_free_
+@@ -3360,11 +3418,6 @@ static void __init hugetlb_bootmem_free_
  	}
  }
  
@@ -329,7 +309,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Put bootmem huge pages into the standard lists after mem_map is up.
   * Note: This only applies to gigantic (order > MAX_PAGE_ORDER) pages.
-@@ -3414,6 +3477,9 @@ static void __init gather_bootmem_preall
+@@ -3414,6 +3467,9 @@ static void __init gather_bootmem_preall
  			 */
  			folio_set_hugetlb_vmemmap_optimized(folio);
  
@@ -339,7 +319,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		list_add(&folio->lru, &folio_list);
  
  		/*
-@@ -3606,8 +3672,11 @@ static void __init hugetlb_hstate_alloc_
+@@ -3606,8 +3662,11 @@ static void __init hugetlb_hstate_alloc_
  {
  	unsigned long allocated;
  

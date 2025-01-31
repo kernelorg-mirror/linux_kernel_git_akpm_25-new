@@ -1,6 +1,6 @@
 From: Frank van der Linden <fvdl@google.com>
 Subject: mm, cma: support multiple contiguous ranges, if requested
-Date: Mon, 27 Jan 2025 23:21:42 +0000
+Date: Wed, 29 Jan 2025 22:41:31 +0000
 
 Currently, CMA manages one range of physically contiguous memory. 
 Creation of larger CMA areas with hugetlb_cma may run in to gaps in
@@ -30,8 +30,8 @@ physically contiguous range, only allow for multiple ranges if a new
 interface, cma_declare_contiguous_nid_multi, is used.  The other
 interfaces will work like before, creating only CMA areas with 1 range.
 
-cma_declare_contiguous_nid_multi works as follows, mimicking the default
-"bottom-up, above 4G" reservation approach:
+cma_declare_contiguous_nid_multi works as follows, mimicking the
+default "bottom-up, above 4G" reservation approach:
 
 0) Try cma_declare_contiguous_nid, which will use only one
    region. If this succeeds, return. This makes sure that for
@@ -45,7 +45,7 @@ cma_declare_contiguous_nid_multi works as follows, mimicking the default
 3) Sort the selected ranges by base address.
 4) Reserve them bottom-up until we get what we wanted.
 
-Link: https://lkml.kernel.org/r/20250127232207.3888640-3-fvdl@google.com
+Link: https://lkml.kernel.org/r/20250129224157.2046079-3-fvdl@google.com
 Signed-off-by: Frank van der Linden <fvdl@google.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Andy Lutomirski <luto@kernel.org>
@@ -54,11 +54,10 @@ Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Joao Martins <joao.m.martins@oracle.com>
 Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
-Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
-Cc: Usama Arif <usama.arif@bytedance.com>
+Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
@@ -67,8 +66,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  include/linux/cma.h |    3 
  mm/cma.c            |  608 +++++++++++++++++++++++++++++++++---------
- mm/cma.h            |   23 +
- 3 files changed, 510 insertions(+), 124 deletions(-)
+ mm/cma.h            |   27 +
+ mm/cma_debug.c      |   56 ++-
+ 4 files changed, 554 insertions(+), 140 deletions(-)
 
 --- a/include/linux/cma.h~mm-cma-support-multiple-contiguous-ranges-if-requested
 +++ a/include/linux/cma.h
@@ -929,9 +929,95 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	cma_sysfs_account_release_pages(cma, count);
  	trace_cma_release(cma->name, pfn, pages, count);
  
+--- a/mm/cma_debug.c~mm-cma-support-multiple-contiguous-ranges-if-requested
++++ a/mm/cma_debug.c
+@@ -46,17 +46,26 @@ DEFINE_DEBUGFS_ATTRIBUTE(cma_used_fops,
+ static int cma_maxchunk_get(void *data, u64 *val)
+ {
+ 	struct cma *cma = data;
++	struct cma_memrange *cmr;
+ 	unsigned long maxchunk = 0;
+-	unsigned long start, end = 0;
+-	unsigned long bitmap_maxno = cma_bitmap_maxno(cma);
++	unsigned long start, end;
++	unsigned long bitmap_maxno;
++	int r;
+ 
+ 	spin_lock_irq(&cma->lock);
+-	for (;;) {
+-		start = find_next_zero_bit(cma->bitmap, bitmap_maxno, end);
+-		if (start >= bitmap_maxno)
+-			break;
+-		end = find_next_bit(cma->bitmap, bitmap_maxno, start);
+-		maxchunk = max(end - start, maxchunk);
++	for (r = 0; r < cma->nranges; r++) {
++		cmr = &cma->ranges[r];
++		bitmap_maxno = cma_bitmap_maxno(cma, cmr);
++		end = 0;
++		for (;;) {
++			start = find_next_zero_bit(cmr->bitmap,
++						   bitmap_maxno, end);
++			if (start >= bitmap_maxno)
++				break;
++			end = find_next_bit(cmr->bitmap, bitmap_maxno,
++					    start);
++			maxchunk = max(end - start, maxchunk);
++		}
+ 	}
+ 	spin_unlock_irq(&cma->lock);
+ 	*val = (u64)maxchunk << cma->order_per_bit;
+@@ -159,24 +168,41 @@ DEFINE_DEBUGFS_ATTRIBUTE(cma_alloc_fops,
+ 
+ static void cma_debugfs_add_one(struct cma *cma, struct dentry *root_dentry)
+ {
+-	struct dentry *tmp;
++	struct dentry *tmp, *dir, *rangedir;
++	int r;
++	char rdirname[3];
++	struct cma_memrange *cmr;
+ 
+ 	tmp = debugfs_create_dir(cma->name, root_dentry);
+ 
+ 	debugfs_create_file("alloc", 0200, tmp, cma, &cma_alloc_fops);
+ 	debugfs_create_file("free", 0200, tmp, cma, &cma_free_fops);
+-	debugfs_create_file("base_pfn", 0444, tmp,
+-			    &cma->base_pfn, &cma_debugfs_fops);
+ 	debugfs_create_file("count", 0444, tmp, &cma->count, &cma_debugfs_fops);
+ 	debugfs_create_file("order_per_bit", 0444, tmp,
+ 			    &cma->order_per_bit, &cma_debugfs_fops);
+ 	debugfs_create_file("used", 0444, tmp, cma, &cma_used_fops);
+ 	debugfs_create_file("maxchunk", 0444, tmp, cma, &cma_maxchunk_fops);
+ 
+-	cma->dfs_bitmap.array = (u32 *)cma->bitmap;
+-	cma->dfs_bitmap.n_elements = DIV_ROUND_UP(cma_bitmap_maxno(cma),
+-						  BITS_PER_BYTE * sizeof(u32));
+-	debugfs_create_u32_array("bitmap", 0444, tmp, &cma->dfs_bitmap);
++	rangedir = debugfs_create_dir("ranges", tmp);
++	for (r = 0; r < cma->nranges; r++) {
++		cmr = &cma->ranges[r];
++		snprintf(rdirname, sizeof(rdirname), "%d", r);
++		dir = debugfs_create_dir(rdirname, rangedir);
++		debugfs_create_file("base_pfn", 0444, dir,
++			    &cmr->base_pfn, &cma_debugfs_fops);
++		cmr->dfs_bitmap.array = (u32 *)cmr->bitmap;
++		cmr->dfs_bitmap.n_elements =
++			DIV_ROUND_UP(cma_bitmap_maxno(cma, cmr),
++					BITS_PER_BYTE * sizeof(u32));
++		debugfs_create_u32_array("bitmap", 0444, dir,
++				&cmr->dfs_bitmap);
++	}
++
++	/*
++	 * Backward compatible symlinks to range 0 for base_pfn and bitmap.
++	 */
++	debugfs_create_symlink("base_pfn", tmp, "ranges/0/base_pfn");
++	debugfs_create_symlink("bitmap", tmp, "ranges/0/bitmap");
+ }
+ 
+ static int __init cma_debugfs_init(void)
 --- a/mm/cma.h~mm-cma-support-multiple-contiguous-ranges-if-requested
 +++ a/mm/cma.h
-@@ -10,11 +10,23 @@ struct cma_kobject {
+@@ -10,19 +10,35 @@ struct cma_kobject {
  	struct cma *cma;
  };
  
@@ -946,6 +1032,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long base_pfn;
 +	unsigned long count;
 +	unsigned long *bitmap;
++#ifdef CONFIG_CMA_DEBUGFS
++	struct debugfs_u32_array dfs_bitmap;
++#endif
 +};
 +#define CMA_MAX_RANGES 8
 +
@@ -957,8 +1046,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned int order_per_bit; /* Order of pages represented by one bit */
  	spinlock_t	lock;
  #ifdef CONFIG_CMA_DEBUGFS
-@@ -23,6 +35,8 @@ struct cma {
- 	struct debugfs_u32_array dfs_bitmap;
+ 	struct hlist_head mem_head;
+ 	spinlock_t mem_head_lock;
+-	struct debugfs_u32_array dfs_bitmap;
  #endif
  	char name[CMA_MAX_NAME];
 +	int nranges;
@@ -966,7 +1056,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_CMA_SYSFS
  	/* the number of CMA page successful allocations */
  	atomic64_t nr_pages_succeeded;
-@@ -39,9 +53,10 @@ struct cma {
+@@ -39,9 +55,10 @@ struct cma {
  extern struct cma cma_areas[MAX_CMA_AREAS];
  extern unsigned int cma_area_count;
  
