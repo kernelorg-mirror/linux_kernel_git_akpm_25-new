@@ -1,0 +1,173 @@
+From: Alexander Graf <graf@amazon.com>
+Subject: arm64: add KHO support
+Date: Thu, 6 Feb 2025 15:27:50 +0200
+
+We now have all bits in place to support KHO kexecs.  This patch adds
+awareness of KHO in the kexec file as well as boot path for arm64 and adds
+the respective kconfig option to the architecture so that it can use KHO
+successfully.
+
+Link: https://lkml.kernel.org/r/20250206132754.2596694-11-rppt@kernel.org
+Signed-off-by: Alexander Graf <graf@amazon.com>
+Co-developed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Anthony Yznaga <anthony.yznaga@oracle.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Ashish Kalra <ashish.kalra@amd.com>
+Cc: Ben Herrenschmidt <benh@kernel.crashing.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Woodhouse <dwmw2@infradead.org>
+Cc: Eric Biederman <ebiederm@xmission.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: James Gowans <jgowans@amazon.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Paolo Bonzini <pbonzini@redhat.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Pratyush Yadav <ptyadav@amazon.de>
+Cc: Rob Herring <robh+dt@kernel.org>
+Cc: Rob Herring <robh@kernel.org>
+Cc: Saravana Kannan <saravanak@google.com>
+Cc: Stanislav Kinsburskii <skinsburskii@linux.microsoft.com>
+Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Tom Lendacky <thomas.lendacky@amd.com>
+Cc: Usama Arif <usama.arif@bytedance.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/Kconfig |    3 +++
+ drivers/of/fdt.c   |   36 ++++++++++++++++++++++++++++++++++++
+ drivers/of/kexec.c |   42 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 81 insertions(+)
+
+--- a/arch/arm64/Kconfig~arm64-add-kho-support
++++ a/arch/arm64/Kconfig
+@@ -1590,6 +1590,9 @@ config ARCH_SUPPORTS_KEXEC_IMAGE_VERIFY_
+ config ARCH_DEFAULT_KEXEC_IMAGE_VERIFY_SIG
+ 	def_bool y
+ 
++config ARCH_SUPPORTS_KEXEC_HANDOVER
++	def_bool y
++
+ config ARCH_SUPPORTS_CRASH_DUMP
+ 	def_bool y
+ 
+--- a/drivers/of/fdt.c~arm64-add-kho-support
++++ a/drivers/of/fdt.c
+@@ -875,6 +875,39 @@ void __init early_init_dt_check_for_usab
+ 		memblock_add(rgn[i].base, rgn[i].size);
+ }
+ 
++/**
++ * early_init_dt_check_kho - Decode info required for kexec handover from DT
++ */
++static void __init early_init_dt_check_kho(void)
++{
++	unsigned long node = chosen_node_offset;
++	u64 kho_start, scratch_start, scratch_size;
++	const __be32 *p;
++	int l;
++
++	if (!IS_ENABLED(CONFIG_KEXEC_HANDOVER) || (long)node < 0)
++		return;
++
++	p = of_get_flat_dt_prop(node, "linux,kho-dt", &l);
++	if (l != (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32))
++		return;
++
++	kho_start = dt_mem_next_cell(dt_root_addr_cells, &p);
++
++	p = of_get_flat_dt_prop(node, "linux,kho-scratch", &l);
++	if (l != (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32))
++		return;
++
++	scratch_start = dt_mem_next_cell(dt_root_addr_cells, &p);
++	scratch_size = dt_mem_next_cell(dt_root_addr_cells, &p);
++
++	p = of_get_flat_dt_prop(node, "linux,kho-mem", &l);
++	if (l != (dt_root_addr_cells + dt_root_size_cells) * sizeof(__be32))
++		return;
++
++	kho_populate(kho_start, scratch_start, scratch_size);
++}
++
+ #ifdef CONFIG_SERIAL_EARLYCON
+ 
+ int __init early_init_dt_scan_chosen_stdout(void)
+@@ -1169,6 +1202,9 @@ void __init early_init_dt_scan_nodes(voi
+ 
+ 	/* Handle linux,usable-memory-range property */
+ 	early_init_dt_check_for_usable_mem_range();
++
++	/* Handle kexec handover */
++	early_init_dt_check_kho();
+ }
+ 
+ bool __init early_init_dt_scan(void *dt_virt, phys_addr_t dt_phys)
+--- a/drivers/of/kexec.c~arm64-add-kho-support
++++ a/drivers/of/kexec.c
+@@ -264,6 +264,43 @@ static inline int setup_ima_buffer(const
+ }
+ #endif /* CONFIG_IMA_KEXEC */
+ 
++static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
++{
++	void *dt = NULL;
++	phys_addr_t dt_mem = 0;
++	phys_addr_t dt_len = 0;
++	phys_addr_t scratch_mem = 0;
++	phys_addr_t scratch_len = 0;
++	int ret = 0;
++
++#ifdef CONFIG_KEXEC_HANDOVER
++	dt = image->kho.dt.buffer;
++	dt_mem = image->kho.dt.mem;
++	dt_len = image->kho.dt.bufsz;
++
++	scratch_mem = image->kho.scratch.mem;
++	scratch_len = image->kho.scratch.bufsz;
++#endif
++
++	if (!dt)
++		goto out;
++
++	pr_debug("Adding kho metadata to DT");
++
++	ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-dt",
++				       dt_mem, dt_len);
++	if (ret)
++		goto out;
++
++	ret = fdt_appendprop_addrrange(fdt, 0, chosen_node, "linux,kho-scratch",
++				       scratch_mem, scratch_len);
++	if (ret)
++		goto out;
++
++out:
++	return ret;
++}
++
+ /*
+  * of_kexec_alloc_and_setup_fdt - Alloc and setup a new Flattened Device Tree
+  *
+@@ -414,6 +451,11 @@ void *of_kexec_alloc_and_setup_fdt(const
+ #endif
+ 	}
+ 
++	/* Add kho metadata if this is a KHO image */
++	ret = kho_add_chosen(image, fdt, chosen_node);
++	if (ret)
++		goto out;
++
+ 	/* add bootargs */
+ 	if (cmdline) {
+ 		ret = fdt_setprop_string(fdt, chosen_node, "bootargs", cmdline);
+_
