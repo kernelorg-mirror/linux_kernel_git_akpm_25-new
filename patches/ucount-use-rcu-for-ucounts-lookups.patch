@@ -1,0 +1,189 @@
+From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Subject: ucount: use RCU for ucounts lookups
+Date: Mon, 3 Feb 2025 16:05:24 +0100
+
+The ucounts element is looked up under ucounts_lock.  This can be
+optimized by using RCU for a lockless lookup and return and element if the
+reference can be obtained.
+
+Replace hlist_head with hlist_nulls_head which is RCU compatible.  Let
+find_ucounts() search for the required item within a RCU section and
+return the item if a reference could be obtained.  This means
+alloc_ucounts() will always return an element (unless the memory
+allocation failed).  Let put_ucounts() RCU free the element if the
+reference counter dropped to zero.
+
+Link: https://lkml.kernel.org/r/20250203150525.456525-4-bigeasy@linutronix.de
+Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+Cc: Acked-by:Thomas Gleixner <tglx@linutronix.de>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: Joel Fernandes <joel@joelfernandes.org>
+Cc: Josh Triplett <josh@joshtriplett.org>
+Cc: Lai jiangshan <jiangshanlai@gmail.com>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Mengen Sun <mengensun@tencent.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Cc: YueHong Wu <yuehongwu@tencent.com>
+Cc: Zqiang <qiang.zhang1211@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/user_namespace.h |    4 +
+ kernel/ucount.c                |   75 ++++++++++++++++---------------
+ 2 files changed, 43 insertions(+), 36 deletions(-)
+
+--- a/include/linux/user_namespace.h~ucount-use-rcu-for-ucounts-lookups
++++ a/include/linux/user_namespace.h
+@@ -5,6 +5,7 @@
+ #include <linux/kref.h>
+ #include <linux/nsproxy.h>
+ #include <linux/ns_common.h>
++#include <linux/rculist_nulls.h>
+ #include <linux/sched.h>
+ #include <linux/workqueue.h>
+ #include <linux/rwsem.h>
+@@ -115,9 +116,10 @@ struct user_namespace {
+ } __randomize_layout;
+ 
+ struct ucounts {
+-	struct hlist_node node;
++	struct hlist_nulls_node node;
+ 	struct user_namespace *ns;
+ 	kuid_t uid;
++	struct rcu_head rcu;
+ 	atomic_t count;
+ 	atomic_long_t ucount[UCOUNT_COUNTS];
+ 	atomic_long_t rlimit[UCOUNT_RLIMIT_COUNTS];
+--- a/kernel/ucount.c~ucount-use-rcu-for-ucounts-lookups
++++ a/kernel/ucount.c
+@@ -15,7 +15,10 @@ struct ucounts init_ucounts = {
+ };
+ 
+ #define UCOUNTS_HASHTABLE_BITS 10
+-static struct hlist_head ucounts_hashtable[(1 << UCOUNTS_HASHTABLE_BITS)];
++#define UCOUNTS_HASHTABLE_ENTRIES (1 << UCOUNTS_HASHTABLE_BITS)
++static struct hlist_nulls_head ucounts_hashtable[UCOUNTS_HASHTABLE_ENTRIES] = {
++	[0 ... UCOUNTS_HASHTABLE_ENTRIES - 1] = HLIST_NULLS_HEAD_INIT(0)
++};
+ static DEFINE_SPINLOCK(ucounts_lock);
+ 
+ #define ucounts_hashfn(ns, uid)						\
+@@ -24,7 +27,6 @@ static DEFINE_SPINLOCK(ucounts_lock);
+ #define ucounts_hashentry(ns, uid)	\
+ 	(ucounts_hashtable + ucounts_hashfn(ns, uid))
+ 
+-
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table_set *
+ set_lookup(struct ctl_table_root *root)
+@@ -127,22 +129,28 @@ void retire_userns_sysctls(struct user_n
+ #endif
+ }
+ 
+-static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid, struct hlist_head *hashent)
++static struct ucounts *find_ucounts(struct user_namespace *ns, kuid_t uid,
++				    struct hlist_nulls_head *hashent)
+ {
+ 	struct ucounts *ucounts;
++	struct hlist_nulls_node *pos;
+ 
+-	hlist_for_each_entry(ucounts, hashent, node) {
+-		if (uid_eq(ucounts->uid, uid) && (ucounts->ns == ns))
+-			return ucounts;
++	guard(rcu)();
++	hlist_nulls_for_each_entry_rcu(ucounts, pos, hashent, node) {
++		if (uid_eq(ucounts->uid, uid) && (ucounts->ns == ns)) {
++			if (atomic_inc_not_zero(&ucounts->count))
++				return ucounts;
++		}
+ 	}
+ 	return NULL;
+ }
+ 
+ static void hlist_add_ucounts(struct ucounts *ucounts)
+ {
+-	struct hlist_head *hashent = ucounts_hashentry(ucounts->ns, ucounts->uid);
++	struct hlist_nulls_head *hashent = ucounts_hashentry(ucounts->ns, ucounts->uid);
++
+ 	spin_lock_irq(&ucounts_lock);
+-	hlist_add_head(&ucounts->node, hashent);
++	hlist_nulls_add_head_rcu(&ucounts->node, hashent);
+ 	spin_unlock_irq(&ucounts_lock);
+ }
+ 
+@@ -155,37 +163,33 @@ struct ucounts *get_ucounts(struct ucoun
+ 
+ struct ucounts *alloc_ucounts(struct user_namespace *ns, kuid_t uid)
+ {
+-	struct hlist_head *hashent = ucounts_hashentry(ns, uid);
+-	struct ucounts *ucounts, *new = NULL;
++	struct hlist_nulls_head *hashent = ucounts_hashentry(ns, uid);
++	struct ucounts *ucounts, *new;
++
++	ucounts = find_ucounts(ns, uid, hashent);
++	if (ucounts)
++		return ucounts;
++
++	new = kzalloc(sizeof(*new), GFP_KERNEL);
++	if (!new)
++		return NULL;
++
++	new->ns = ns;
++	new->uid = uid;
++	atomic_set(&new->count, 1);
+ 
+ 	spin_lock_irq(&ucounts_lock);
+ 	ucounts = find_ucounts(ns, uid, hashent);
+-	if (!ucounts) {
++	if (ucounts) {
+ 		spin_unlock_irq(&ucounts_lock);
+-
+-		new = kzalloc(sizeof(*new), GFP_KERNEL);
+-		if (!new)
+-			return NULL;
+-
+-		new->ns = ns;
+-		new->uid = uid;
+-		atomic_set(&new->count, 1);
+-
+-		spin_lock_irq(&ucounts_lock);
+-		ucounts = find_ucounts(ns, uid, hashent);
+-		if (!ucounts) {
+-			hlist_add_head(&new->node, hashent);
+-			get_user_ns(new->ns);
+-			spin_unlock_irq(&ucounts_lock);
+-			return new;
+-		}
++		kfree(new);
++		return ucounts;
+ 	}
+-	if (!atomic_inc_not_zero(&ucounts->count))
+-		ucounts = NULL;
+-	spin_unlock_irq(&ucounts_lock);
+-	kfree(new);
+ 
+-	return ucounts;
++	hlist_nulls_add_head_rcu(&new->node, hashent);
++	get_user_ns(new->ns);
++	spin_unlock_irq(&ucounts_lock);
++	return new;
+ }
+ 
+ void put_ucounts(struct ucounts *ucounts)
+@@ -193,10 +197,11 @@ void put_ucounts(struct ucounts *ucounts
+ 	unsigned long flags;
+ 
+ 	if (atomic_dec_and_lock_irqsave(&ucounts->count, &ucounts_lock, flags)) {
+-		hlist_del_init(&ucounts->node);
++		hlist_nulls_del_rcu(&ucounts->node);
+ 		spin_unlock_irqrestore(&ucounts_lock, flags);
++
+ 		put_user_ns(ucounts->ns);
+-		kfree(ucounts);
++		kfree_rcu(ucounts, rcu);
+ 	}
+ }
+ 
+_
