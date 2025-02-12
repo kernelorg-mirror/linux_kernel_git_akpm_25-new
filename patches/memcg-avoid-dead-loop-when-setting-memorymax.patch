@@ -1,0 +1,85 @@
+From: Chen Ridong <chenridong@huawei.com>
+Subject: memcg: avoid dead loop when setting memory.max
+Date: Tue, 11 Feb 2025 08:18:19 +0000
+
+A softlockup issue was found with stress test:
+ watchdog: BUG: soft lockup - CPU#27 stuck for 26s! [migration/27:181]
+ CPU: 27 UID: 0 PID: 181 Comm: migration/27 6.14.0-rc2-next-20250210 #1
+ Stopper: multi_cpu_stop <- stop_machine_from_inactive_cpu
+ RIP: 0010:stop_machine_yield+0x2/0x10
+ RSP: 0000:ff4a0dcecd19be48 EFLAGS: 00000246
+ RAX: ffffffff89c0108f RBX: ff4a0dcec03afe44 RCX: 0000000000000000
+ RDX: ff1cdaaf6eba5808 RSI: 0000000000000282 RDI: ff1cda80c1775a40
+ RBP: 0000000000000001 R08: 00000011620096c6 R09: 7fffffffffffffff
+ R10: 0000000000000001 R11: 0000000000000100 R12: ff1cda80c1775a40
+ R13: 0000000000000000 R14: 0000000000000001 R15: ff4a0dcec03afe20
+ FS:  0000000000000000(0000) GS:ff1cdaaf6eb80000(0000)
+ CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+ CR2: 0000000000000000 CR3: 00000025e2c2a001 CR4: 0000000000773ef0
+ DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+ DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+ PKRU: 55555554
+ Call Trace:
+  multi_cpu_stop+0x8f/0x100
+  cpu_stopper_thread+0x90/0x140
+  smpboot_thread_fn+0xad/0x150
+  kthread+0xc2/0x100
+  ret_from_fork+0x2d/0x50
+
+The stress test involves CPU hotplug operations and memory control group
+(memcg) operations. The scenario can be described as follows:
+
+ echo xx > memory.max 	cache_ap_online			oom_reaper
+ (CPU23)						(CPU50)
+ xx < usage		stop_machine_from_inactive_cpu
+ for(;;)			// all active cpus
+ trigger OOM		queue_stop_cpus_work
+ // waiting oom_reaper
+ 			multi_cpu_stop(migration/xx)
+ 			// sync all active cpus ack
+ 			// waiting cpu23 ack
+ 			// CPU50 loops in multi_cpu_stop
+ 							waiting cpu50
+
+Detailed explanation:
+1. When the usage is larger than xx, an OOM may be triggered. If the
+   process does not handle with ths kill signal immediately, it will loop
+   in the memory_max_write.
+2. When cache_ap_online is triggered, the multi_cpu_stop is queued to the
+   active cpus. Within the multi_cpu_stop function,  it attempts to
+   synchronize the CPU states. However, the CPU23 didn't acknowledge
+   because it is stuck in a loop within the for(;;).
+3. The oom_reaper process is blocked because CPU50 is in a loop, waiting
+   for CPU23 to acknowledge the synchronization request.
+4. Finally, it formed cyclic dependency and lead to softlockup and dead
+   loop.
+
+To fix this issue, add cond_resched() in the memory_max_write, so that it
+will not block migration task.
+
+Link: https://lkml.kernel.org/r/20250211081819.33307-1-chenridong@huaweicloud.com
+Fixes: b6e6edcfa405 ("mm: memcontrol: reclaim and OOM kill when shrinking memory.max below usage")
+Signed-off-by: Chen Ridong <chenridong@huawei.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: Wang Weiyang <wangweiyang2@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memcontrol.c |    1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/mm/memcontrol.c~memcg-avoid-dead-loop-when-setting-memorymax
++++ a/mm/memcontrol.c
+@@ -4166,6 +4166,7 @@ static ssize_t memory_max_write(struct k
+ 		memcg_memory_event(memcg, MEMCG_OOM);
+ 		if (!mem_cgroup_out_of_memory(memcg, GFP_KERNEL, 0))
+ 			break;
++		cond_resched();
+ 	}
+ 
+ 	memcg_wb_domain_size_changed(memcg);
+_
