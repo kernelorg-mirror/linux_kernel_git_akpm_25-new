@@ -1,6 +1,6 @@
 From: Alistair Popple <apopple@nvidia.com>
 Subject: fs/dax: properly refcount fs dax pages
-Date: Tue, 7 Jan 2025 14:42:37 +1100
+Date: Wed, 5 Feb 2025 09:48:16 +1100
 
 Currently fs dax pages are considered free when the refcount drops to one
 and their refcounts are not increased when mapped via PTEs or decreased
@@ -21,56 +21,62 @@ case for normal pages.
 This may also allow a future clean-up to remove the pgmap refcounting that
 is currently done in mm/gup.c.
 
-Link: https://lkml.kernel.org/r/b603c8f861330581b2ca2ac6ab2d98c4b0c5d133.1736221254.git-series.apopple@nvidia.com
+Link: https://lkml.kernel.org/r/b5c33b201b9dc0131d8bb33b31661645c68bf398.1738709036.git-series.apopple@nvidia.com
 Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Alison Schofield <alison.schofield@intel.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Asahi Lina <lina@asahilina.net>
 Cc: Bjorn Helgaas <bhelgaas@google.com>
-Cc: Björn Töpel <bjorn@rivosinc.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christoph Hellwig <hch@lst.de>
 Cc: Chunyan Zhang <zhang.lyra@gmail.com>
-Cc: Dan Wiliams <dan.j.williams@intel.com>
-Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
 Cc: Dave Chinner <david@fromorbit.com>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Dave Jiang <dave.jiang@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
 Cc: Ira Weiny <ira.weiny@intel.com>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jason Gunthorpe <jgg@ziepe.ca>
 Cc: John Hubbard <jhubbard@nvidia.com>
-Cc: kernel test robot <lkp@intel.com>
+Cc: linmiaohe <linmiaohe@huawei.com>
 Cc: Logan Gunthorpe <logang@deltatee.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mattew Wilcox <willy@infradead.org>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
 Cc: Nicholas Piggin <npiggin@gmail.com>
 Cc: Peter Xu <peterx@redhat.com>
-Cc: Theodore Ts'o <tytso@mit.edu>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Ted Ts'o <tytso@mit.edu>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vishal Verma <vishal.l.verma@intel.com>
 Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: WANG Xuerui <kernel@xen0n.name>
 Cc: Will Deacon <will@kernel.org>
+Cc: Balbir Singh <balbirs@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  drivers/nvdimm/pmem.c    |    4 
- fs/dax.c                 |  212 ++++++++++++++++++++++---------------
+ fs/dax.c                 |  200 ++++++++++++++++++++++---------------
  fs/fuse/virtio_fs.c      |    3 
- fs/xfs/xfs_inode.c       |    2 
- include/linux/dax.h      |    6 -
+ include/linux/dax.h      |    2 
  include/linux/mm.h       |   27 ----
- include/linux/mm_types.h |    5 
+ include/linux/mm_types.h |    7 +
  mm/gup.c                 |    9 -
  mm/huge_memory.c         |    6 -
  mm/internal.h            |    2 
  mm/memory-failure.c      |    6 -
  mm/memory.c              |    6 -
- mm/memremap.c            |   47 +++-----
+ mm/memremap.c            |   47 ++++----
  mm/mm_init.c             |    9 -
  mm/swap.c                |    2 
- 15 files changed, 181 insertions(+), 165 deletions(-)
+ 14 files changed, 171 insertions(+), 159 deletions(-)
 
 --- a/drivers/nvdimm/pmem.c~fs-dax-properly-refcount-fs-dax-pages
 +++ a/drivers/nvdimm/pmem.c
@@ -113,7 +119,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void *dax_make_entry(pfn_t pfn, unsigned long flags)
  {
  	return xa_mk_value(flags | (pfn_t_to_pfn(pfn) << DAX_SHIFT));
-@@ -338,44 +343,88 @@ static unsigned long dax_entry_size(void
+@@ -338,28 +343,15 @@ static unsigned long dax_entry_size(void
  		return PAGE_SIZE;
  }
  
@@ -133,7 +139,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * A DAX page is considered shared if it has no mapping set and ->share (which
   * shares the ->index field) is non-zero. Note this may return false even if the
-  * page if shared between multiple files but has not yet actually been mapped
+  * page is shared between multiple files but has not yet actually been mapped
   * into multiple address spaces.
   */
 -static inline bool dax_page_is_shared(struct page *page)
@@ -144,25 +150,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-- * Increase the page share refcount, warning if the page is not marked as shared.
-+ * Increase the folio share refcount, warning if the folio is not marked as shared.
+@@ -372,88 +364,129 @@ static inline bool dax_page_is_shared(st
+  * recover ->mapping and ->index information. For example by implementing
+  * dax_holder_operations.
   */
--static inline void dax_page_share_get(struct page *page)
-+static inline void dax_folio_share_get(void *entry)
+-static void dax_page_make_shared(struct page *page)
++static void dax_folio_make_shared(struct folio *folio)
  {
--	WARN_ON_ONCE(!page->share);
--	WARN_ON_ONCE(page->mapping);
--	page->share++;
-+	struct folio *folio = dax_to_folio(entry);
-+
-+	WARN_ON_ONCE(!folio->share);
-+	WARN_ON_ONCE(folio->mapping);
-+	WARN_ON_ONCE(dax_entry_order(entry) != folio_order(folio));
-+	folio->share++;
+ 	/*
+-	 * page is not currently shared so mark it as shared by clearing
+-	 * page->mapping.
++	 * folio is not currently shared so mark it as shared by clearing
++	 * folio->mapping.
+ 	 */
+-	page->mapping = NULL;
++	folio->mapping = NULL;
+ 
+ 	/*
+-	 * page has previously been mapped into one address space so set the
++	 * folio has previously been mapped into one address space so set the
+ 	 * share count.
+ 	 */
+-	page->share = 1;
++	folio->share = 1;
  }
  
 -static inline unsigned long dax_page_share_put(struct page *page)
-+static inline unsigned long dax_folio_share_put(struct folio *folio)
++static inline unsigned long dax_folio_put(struct folio *folio)
  {
 -	WARN_ON_ONCE(!page->share);
 -	return --page->share;
@@ -204,14 +218,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return ref;
 +}
 +
-+static void dax_device_folio_init(void *entry)
++static void dax_folio_init(void *entry)
 +{
 +	struct folio *folio = dax_to_folio(entry);
 +	int order = dax_entry_order(entry);
 +
 +	/*
 +	 * Folio should have been split back to order-0 pages in
-+	 * dax_folio_share_put() when they were removed from their
++	 * dax_folio_put() when they were removed from their
 +	 * final mapping.
 +	 */
 +	WARN_ON_ONCE(folio_order(folio));
@@ -224,10 +238,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	}
  }
  
- /*
-@@ -388,72 +437,58 @@ static inline unsigned long dax_page_sha
-  * dax_holder_operations.
-  */
  static void dax_associate_entry(void *entry, struct address_space *mapping,
 -		struct vm_area_struct *vma, unsigned long address, bool shared)
 +				struct vm_area_struct *vma, unsigned long address, bool shared)
@@ -244,36 +254,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	for_each_mapped_pfn(entry, pfn) {
 -		struct page *page = pfn_to_page(pfn);
 -
--		if (shared && page->mapping && page->share) {
--			if (page->mapping) {
--				page->mapping = NULL;
+-		if (shared && (page->mapping || page->share)) {
+-			if (page->mapping)
+-				dax_page_make_shared(page);
 -
--				/*
--				 * Page has already been mapped into one address
--				 * space so set the share count.
--				 */
--				page->share = 1;
--			}
-+	if (shared && (folio->mapping || dax_folio_is_shared(folio))) {
-+		if (folio->mapping) {
-+			folio->mapping = NULL;
- 
--			dax_page_share_get(page);
+-			WARN_ON_ONCE(!page->share);
+-			page->share++;
 -		} else {
 -			WARN_ON_ONCE(page->mapping);
 -			page->mapping = mapping;
 -			page->index = index + i++;
-+			/*
-+			 * folio has already been mapped into one address
-+			 * space so set the share count.
-+			 */
-+			folio->share = 1;
- 		}
+-		}
++	if (shared && (folio->mapping || dax_folio_is_shared(folio))) {
++		if (folio->mapping)
++			dax_folio_make_shared(folio);
 +
-+		dax_folio_share_get(entry);
++		WARN_ON_ONCE(!folio->share);
++		WARN_ON_ONCE(dax_entry_order(entry) != folio_order(folio));
++		folio->share++;
 +	} else {
 +		WARN_ON_ONCE(folio->mapping);
-+		dax_device_folio_init(entry);
++		dax_folio_init(entry);
 +		folio = dax_to_folio(entry);
 +		folio->mapping = mapping;
 +		folio->index = index;
@@ -303,7 +304,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		page->mapping = NULL;
 -		page->index = 0;
 -	}
-+	dax_folio_share_put(folio);
++	dax_folio_put(folio);
  }
  
  static struct page *dax_busy_page(void *entry)
@@ -327,7 +328,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -786,7 +821,7 @@ struct page *dax_layout_busy_page(struct
+@@ -786,7 +819,7 @@ struct page *dax_layout_busy_page(struct
  EXPORT_SYMBOL_GPL(dax_layout_busy_page);
  
  static int __dax_invalidate_entry(struct address_space *mapping,
@@ -336,35 +337,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	XA_STATE(xas, &mapping->i_pages, index);
  	int ret = 0;
-@@ -892,7 +927,7 @@ static int wait_page_idle(struct page *p
- 			void (cb)(struct inode *),
- 			struct inode *inode)
- {
--	return ___wait_var_event(page, page_ref_count(page) == 1,
-+	return ___wait_var_event(page, page_ref_count(page) == 0,
- 				TASK_INTERRUPTIBLE, 0, 0, cb(inode));
- }
- 
-@@ -900,7 +935,7 @@ static void wait_page_idle_uninterruptib
- 					void (cb)(struct inode *),
- 					struct inode *inode)
- {
--	___wait_var_event(page, page_ref_count(page) == 1,
-+	___wait_var_event(page, page_ref_count(page) == 0,
- 			TASK_UNINTERRUPTIBLE, 0, 0, cb(inode));
- }
- 
-@@ -949,7 +984,8 @@ void dax_break_mapping_uninterruptible(s
- 		wait_page_idle_uninterruptible(page, cb, inode);
+@@ -954,7 +987,8 @@ void dax_break_layout_final(struct inode
+ 		wait_page_idle_uninterruptible(page, inode);
  	} while (true);
  
 -	dax_delete_mapping_range(inode->i_mapping, 0, LLONG_MAX);
 +	if (!page)
 +		dax_delete_mapping_range(inode->i_mapping, 0, LLONG_MAX);
  }
- EXPORT_SYMBOL_GPL(dax_break_mapping_uninterruptible);
+ EXPORT_SYMBOL_GPL(dax_break_layout_final);
  
-@@ -1035,8 +1071,10 @@ static void *dax_insert_entry(struct xa_
+@@ -1040,8 +1074,10 @@ static void *dax_insert_entry(struct xa_
  		void *old;
  
  		dax_disassociate_entry(entry, mapping, false);
@@ -377,7 +360,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * Only swap our new entry into the page cache if the current
  		 * entry is a zero page or an empty entry.  If a normal PTE or
-@@ -1224,9 +1262,7 @@ static int dax_iomap_direct_access(const
+@@ -1229,9 +1265,7 @@ static int dax_iomap_direct_access(const
  		goto out;
  	if (pfn_t_to_pfn(*pfnp) & (PHYS_PFN(size)-1))
  		goto out;
@@ -388,7 +371,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	rc = 0;
  
  out_check_addr:
-@@ -1333,7 +1369,7 @@ static vm_fault_t dax_load_hole(struct x
+@@ -1338,7 +1372,7 @@ static vm_fault_t dax_load_hole(struct x
  
  	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn, DAX_ZERO_PAGE);
  
@@ -397,7 +380,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	trace_dax_load_hole(inode, vmf, ret);
  	return ret;
  }
-@@ -1804,7 +1840,8 @@ static vm_fault_t dax_fault_iter(struct
+@@ -1809,7 +1843,8 @@ static vm_fault_t dax_fault_iter(struct
  	loff_t pos = (loff_t)xas->xa_index << PAGE_SHIFT;
  	bool write = iter->flags & IOMAP_WRITE;
  	unsigned long entry_flags = pmd ? DAX_PMD : 0;
@@ -407,7 +390,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pfn_t pfn;
  	void *kaddr;
  
-@@ -1836,17 +1873,18 @@ static vm_fault_t dax_fault_iter(struct
+@@ -1841,17 +1876,18 @@ static vm_fault_t dax_fault_iter(struct
  			return dax_fault_return(err);
  	}
  
@@ -432,7 +415,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static vm_fault_t dax_iomap_pte_fault(struct vm_fault *vmf, pfn_t *pfnp,
-@@ -2085,6 +2123,7 @@ dax_insert_pfn_mkwrite(struct vm_fault *
+@@ -2090,6 +2126,7 @@ dax_insert_pfn_mkwrite(struct vm_fault *
  {
  	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
  	XA_STATE_ORDER(xas, &mapping->i_pages, vmf->pgoff, order);
@@ -440,7 +423,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	void *entry;
  	vm_fault_t ret;
  
-@@ -2102,14 +2141,17 @@ dax_insert_pfn_mkwrite(struct vm_fault *
+@@ -2107,14 +2144,17 @@ dax_insert_pfn_mkwrite(struct vm_fault *
  	xas_set_mark(&xas, PAGECACHE_TAG_DIRTY);
  	dax_lock_entry(&xas, entry);
  	xas_unlock_irq(&xas);
@@ -472,36 +455,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return nr_pages > max_nr_pages ? max_nr_pages : nr_pages;
  }
  
---- a/fs/xfs/xfs_inode.c~fs-dax-properly-refcount-fs-dax-pages
-+++ a/fs/xfs/xfs_inode.c
-@@ -2740,7 +2740,7 @@ again:
- 	 * for this nested lock case.
- 	 */
- 	page = dax_layout_busy_page(VFS_I(ip2)->i_mapping);
--	if (page && page_ref_count(page) != 1) {
-+	if (page && page_ref_count(page) != 0) {
- 		xfs_iunlock(ip2, XFS_MMAPLOCK_EXCL);
- 		xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
- 		goto again;
 --- a/include/linux/dax.h~fs-dax-properly-refcount-fs-dax-pages
 +++ a/include/linux/dax.h
-@@ -211,8 +211,12 @@ static inline int dax_wait_page_idle(str
- 				void (cb)(struct inode *),
- 				struct inode *inode)
+@@ -209,7 +209,7 @@ int dax_truncate_page(struct inode *inod
+ 
+ static inline bool dax_page_is_idle(struct page *page)
  {
--	return ___wait_var_event(page, page_ref_count(page) == 1,
-+	int ret;
-+
-+	ret = ___wait_var_event(page, !page_ref_count(page),
- 				TASK_INTERRUPTIBLE, 0, 0, cb(inode));
-+
-+	return ret;
+-	return page && page_ref_count(page) == 1;
++	return page && page_ref_count(page) == 0;
  }
  
  #if IS_ENABLED(CONFIG_DAX)
 --- a/include/linux/mm.h~fs-dax-properly-refcount-fs-dax-pages
 +++ a/include/linux/mm.h
-@@ -1182,6 +1182,8 @@ int vma_is_stack_for_current(struct vm_a
+@@ -1098,6 +1098,8 @@ int vma_is_stack_for_current(struct vm_a
  struct mmu_gather;
  struct inode;
  
@@ -510,7 +477,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * compound_order() can be called without holding a reference, which means
   * that niceties like page_folio() don't work.  These callers should be
-@@ -1503,25 +1505,6 @@ vm_fault_t finish_fault(struct vm_fault
+@@ -1419,25 +1421,6 @@ vm_fault_t finish_fault(struct vm_fault
   *   back into memory.
   */
  
@@ -536,7 +503,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /* 127: arbitrary random number, small enough to assemble well */
  #define folio_ref_zero_or_close_to_overflow(folio) \
  	((unsigned int) folio_ref_count(folio) + 127u <= 127u)
-@@ -1636,12 +1619,6 @@ static inline void put_page(struct page
+@@ -1552,12 +1535,6 @@ static inline void put_page(struct page
  {
  	struct folio *folio = page_folio(page);
  
@@ -551,7 +518,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/include/linux/mm_types.h~fs-dax-properly-refcount-fs-dax-pages
 +++ a/include/linux/mm_types.h
-@@ -345,7 +345,10 @@ struct folio {
+@@ -295,6 +295,8 @@ typedef struct {
+  *    anonymous memory.
+  * @index: Offset within the file, in units of pages.  For anonymous memory,
+  *    this is the index from the beginning of the mmap.
++ * @share: number of DAX mappings that reference this folio. See
++ *    dax_associate_entry.
+  * @private: Filesystem per-folio data (see folio_attach_private()).
+  * @swap: Used for swp_entry_t if folio_test_swapcache().
+  * @_mapcount: Do not access this member directly.  Use folio_mapcount() to
+@@ -344,7 +346,10 @@ struct folio {
  				struct dev_pagemap *pgmap;
  			};
  			struct address_space *mapping;
@@ -597,7 +573,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/huge_memory.c~fs-dax-properly-refcount-fs-dax-pages
 +++ a/mm/huge_memory.c
-@@ -2209,7 +2209,7 @@ int zap_huge_pmd(struct mmu_gather *tlb,
+@@ -2221,7 +2221,7 @@ int zap_huge_pmd(struct mmu_gather *tlb,
  						tlb->fullmm);
  	arch_check_zapped_pmd(vma, orig_pmd);
  	tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
@@ -606,7 +582,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (arch_needs_pgtable_deposit())
  			zap_deposited_table(tlb->mm, pmd);
  		spin_unlock(ptl);
-@@ -2865,13 +2865,15 @@ static void __split_huge_pmd_locked(stru
+@@ -2877,13 +2877,15 @@ static void __split_huge_pmd_locked(stru
  		 */
  		if (arch_needs_pgtable_deposit())
  			zap_deposited_table(mm, pmd);
@@ -636,7 +612,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/memory.c~fs-dax-properly-refcount-fs-dax-pages
 +++ a/mm/memory.c
-@@ -3841,13 +3841,15 @@ static vm_fault_t do_wp_page(struct vm_f
+@@ -3827,13 +3827,15 @@ static vm_fault_t do_wp_page(struct vm_f
  	if (vma->vm_flags & (VM_SHARED | VM_MAYSHARE)) {
  		/*
  		 * VM_MIXEDMAP !pfn_valid() case, or VM_SOFTDIRTY clear on a

@@ -1,6 +1,6 @@
 From: Alistair Popple <apopple@nvidia.com>
 Subject: huge_memory: add vmf_insert_folio_pmd()
-Date: Tue, 7 Jan 2025 14:42:32 +1100
+Date: Wed, 5 Feb 2025 09:48:13 +1100
 
 Currently DAX folio/page reference counts are managed differently to
 normal pages.  To allow these to be managed the same as normal pages
@@ -11,43 +11,57 @@ This is distinct from the current mechanism, vmf_insert_pfn_pmd, which
 simply inserts a special devmap PMD entry into the page table without
 holding a reference to the page for the mapping.
 
-Link: https://lkml.kernel.org/r/c18097d2e12146928ddf5cdc4eb8875063d00251.1736221254.git-series.apopple@nvidia.com
+It is not currently useful to implement a more generic vmf_insert_folio()
+which selects the correct behaviour based on folio_order().  This is
+because PTE faults require only a subpage of the folio to be PTE mapped
+rather than the entire folio.  It would be possible to add this context
+somewhere but callers already need to handle PTE faults and PMD faults
+separately so a more generic function is not useful.
+
+Link: https://lkml.kernel.org/r/9f10e88441f3cb26eff6be0c9ef5997844c8c24e.1738709036.git-series.apopple@nvidia.com
 Signed-off-by: Alistair Popple <apopple@nvidia.com>
+Tested-by: Alison Schofield <alison.schofield@intel.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Asahi Lina <lina@asahilina.net>
 Cc: Bjorn Helgaas <bhelgaas@google.com>
-Cc: Björn Töpel <bjorn@rivosinc.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christoph Hellwig <hch@lst.de>
 Cc: Chunyan Zhang <zhang.lyra@gmail.com>
 Cc: Dan Wiliams <dan.j.williams@intel.com>
-Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
 Cc: Dave Chinner <david@fromorbit.com>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Dave Jiang <dave.jiang@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
 Cc: Ira Weiny <ira.weiny@intel.com>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jason Gunthorpe <jgg@ziepe.ca>
 Cc: John Hubbard <jhubbard@nvidia.com>
-Cc: kernel test robot <lkp@intel.com>
+Cc: linmiaohe <linmiaohe@huawei.com>
 Cc: Logan Gunthorpe <logang@deltatee.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mattew Wilcox <willy@infradead.org>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
 Cc: Nicholas Piggin <npiggin@gmail.com>
 Cc: Peter Xu <peterx@redhat.com>
-Cc: Theodore Ts'o <tytso@mit.edu>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Ted Ts'o <tytso@mit.edu>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vishal Verma <vishal.l.verma@intel.com>
 Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: WANG Xuerui <kernel@xen0n.name>
 Cc: Will Deacon <will@kernel.org>
+Cc: Balbir Singh <balbirs@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/huge_mm.h |    1 
- mm/huge_memory.c        |   54 ++++++++++++++++++++++++++++++--------
- 2 files changed, 45 insertions(+), 10 deletions(-)
+ mm/huge_memory.c        |   61 +++++++++++++++++++++++++++++++-------
+ 2 files changed, 51 insertions(+), 11 deletions(-)
 
 --- a/include/linux/huge_mm.h~huge_memory-add-vmf_insert_folio_pmd
 +++ a/include/linux/huge_mm.h
@@ -61,32 +75,41 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  enum transparent_hugepage_flag {
 --- a/mm/huge_memory.c~huge_memory-add-vmf_insert_folio_pmd
 +++ a/mm/huge_memory.c
-@@ -1381,14 +1381,12 @@ static void insert_pfn_pmd(struct vm_are
+@@ -1375,20 +1375,20 @@ vm_fault_t do_huge_pmd_anonymous_page(st
+ 	return __do_huge_pmd_anonymous_page(vmf);
+ }
+ 
+-static void insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
++static int insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+ 		pmd_t *pmd, pfn_t pfn, pgprot_t prot, bool write,
+ 		pgtable_t pgtable)
  {
  	struct mm_struct *mm = vma->vm_mm;
  	pmd_t entry;
 -	spinlock_t *ptl;
  
 -	ptl = pmd_lock(mm, pmd);
++	lockdep_assert_held(pmd_lockptr(mm, pmd));
++
  	if (!pmd_none(*pmd)) {
  		if (write) {
  			if (pmd_pfn(*pmd) != pfn_t_to_pfn(pfn)) {
  				WARN_ON_ONCE(!is_huge_zero_pmd(*pmd));
 -				goto out_unlock;
-+				return;
++				return -EEXIST;
  			}
  			entry = pmd_mkyoung(*pmd);
  			entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
-@@ -1396,7 +1394,7 @@ static void insert_pfn_pmd(struct vm_are
+@@ -1396,7 +1396,7 @@ static void insert_pfn_pmd(struct vm_are
  				update_mmu_cache_pmd(vma, addr, pmd);
  		}
  
 -		goto out_unlock;
-+		return;
++		return -EEXIST;
  	}
  
  	entry = pmd_mkhuge(pfn_t_pmd(pfn, prot));
-@@ -1417,11 +1415,6 @@ static void insert_pfn_pmd(struct vm_are
+@@ -1417,11 +1417,7 @@ static void insert_pfn_pmd(struct vm_are
  
  	set_pmd_at(mm, addr, pmd, entry);
  	update_mmu_cache_pmd(vma, addr, pmd);
@@ -95,28 +118,30 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	spin_unlock(ptl);
 -	if (pgtable)
 -		pte_free(mm, pgtable);
++	return 0;
  }
  
  /**
-@@ -1440,6 +1433,7 @@ vm_fault_t vmf_insert_pfn_pmd(struct vm_
+@@ -1440,6 +1436,8 @@ vm_fault_t vmf_insert_pfn_pmd(struct vm_
  	struct vm_area_struct *vma = vmf->vma;
  	pgprot_t pgprot = vma->vm_page_prot;
  	pgtable_t pgtable = NULL;
 +	spinlock_t *ptl;
++	int error;
  
  	/*
  	 * If we had pmd_special, we could avoid all these restrictions,
-@@ -1462,12 +1456,52 @@ vm_fault_t vmf_insert_pfn_pmd(struct vm_
+@@ -1462,12 +1460,53 @@ vm_fault_t vmf_insert_pfn_pmd(struct vm_
  	}
  
  	track_pfn_insert(vma, &pgprot, pfn);
--
 +	ptl = pmd_lock(vma->vm_mm, vmf->pmd);
- 	insert_pfn_pmd(vma, addr, vmf->pmd, pfn, pgprot, write, pgtable);
++	error = insert_pfn_pmd(vma, addr, vmf->pmd, pfn, pgprot, write, pgtable);
 +	spin_unlock(ptl);
-+	if (pgtable)
++	if (error && pgtable)
 +		pte_free(vma->vm_mm, pgtable);
-+
+ 
+-	insert_pfn_pmd(vma, addr, vmf->pmd, pfn, pgprot, write, pgtable);
  	return VM_FAULT_NOPAGE;
  }
  EXPORT_SYMBOL_GPL(vmf_insert_pfn_pmd);
@@ -128,6 +153,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct mm_struct *mm = vma->vm_mm;
 +	spinlock_t *ptl;
 +	pgtable_t pgtable = NULL;
++	int error;
 +
 +	if (addr < vma->vm_start || addr >= vma->vm_end)
 +		return VM_FAULT_SIGBUS;
@@ -147,10 +173,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		folio_add_file_rmap_pmd(folio, &folio->page, vma);
 +		add_mm_counter(mm, mm_counter_file(folio), HPAGE_PMD_NR);
 +	}
-+	insert_pfn_pmd(vma, addr, vmf->pmd, pfn_to_pfn_t(folio_pfn(folio)),
-+		       vma->vm_page_prot, write, pgtable);
++	error = insert_pfn_pmd(vma, addr, vmf->pmd, pfn_to_pfn_t(folio_pfn(folio)),
++			       vma->vm_page_prot, write, pgtable);
 +	spin_unlock(ptl);
-+	if (pgtable)
++	if (error && pgtable)
 +		pte_free(mm, pgtable);
 +
 +	return VM_FAULT_NOPAGE;

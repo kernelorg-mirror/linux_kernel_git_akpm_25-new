@@ -1,6 +1,6 @@
 From: Alistair Popple <apopple@nvidia.com>
 Subject: fs/dax: always remove DAX page-cache entries when breaking layouts
-Date: Tue, 7 Jan 2025 14:42:22 +1100
+Date: Wed, 5 Feb 2025 09:48:03 +1100
 
 Prior to any truncation operations file systems call dax_break_mapping()
 to ensure pages in the range are not under going DMA.  Later DAX
@@ -19,46 +19,52 @@ idle pages can be removed from the FS DAX page-cache and makes it easy to
 detect if a file-system hasn't called dax_break_mapping() prior to a
 truncate operation.
 
-Link: https://lkml.kernel.org/r/fc4ce7ac0815bc33d00ca6626925a1012473ff7a.1736221254.git-series.apopple@nvidia.com
+Link: https://lkml.kernel.org/r/e493188d4668b45b87e8bf284fcb59a65e45b6e3.1738709036.git-series.apopple@nvidia.com
 Signed-off-by: Alistair Popple <apopple@nvidia.com>
-
+Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+Tested-by: Alison Schofield <alison.schofield@intel.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Asahi Lina <lina@asahilina.net>
 Cc: Bjorn Helgaas <bhelgaas@google.com>
-Cc: Björn Töpel <bjorn@rivosinc.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christoph Hellwig <hch@lst.de>
 Cc: Chunyan Zhang <zhang.lyra@gmail.com>
-Cc: Dan Wiliams <dan.j.williams@intel.com>
-Cc: Darrick J. Wong <djwong@kernel.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
 Cc: Dave Chinner <david@fromorbit.com>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Dave Jiang <dave.jiang@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
 Cc: Ira Weiny <ira.weiny@intel.com>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jason Gunthorpe <jgg@ziepe.ca>
 Cc: John Hubbard <jhubbard@nvidia.com>
-Cc: kernel test robot <lkp@intel.com>
+Cc: linmiaohe <linmiaohe@huawei.com>
 Cc: Logan Gunthorpe <logang@deltatee.com>
-Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
-Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Mattew Wilcox <willy@infradead.org>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
 Cc: Nicholas Piggin <npiggin@gmail.com>
 Cc: Peter Xu <peterx@redhat.com>
-Cc: Theodore Ts'o <tytso@mit.edu>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Ted Ts'o <tytso@mit.edu>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vishal Verma <vishal.l.verma@intel.com>
 Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: WANG Xuerui <kernel@xen0n.name>
 Cc: Will Deacon <will@kernel.org>
+Cc: Balbir Singh <balbirs@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- fs/dax.c            |   33 +++++++++++++++++++++++++++++++++
- fs/xfs/xfs_inode.c  |    6 ++++++
+ fs/dax.c            |   40 ++++++++++++++++++++++++++++++++++++++++
+ fs/xfs/xfs_inode.c  |    5 ++---
  include/linux/dax.h |    2 ++
  mm/truncate.c       |   16 +++++++++++++++-
- 4 files changed, 56 insertions(+), 1 deletion(-)
+ 4 files changed, 59 insertions(+), 4 deletions(-)
 
 --- a/fs/dax.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
 +++ a/fs/dax.c
@@ -99,7 +105,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int wait_page_idle(struct page *page,
  			void (cb)(struct inode *),
  			struct inode *inode)
-@@ -874,6 +904,9 @@ int dax_break_mapping(struct inode *inod
+@@ -856,6 +886,9 @@ static int wait_page_idle(struct page *p
+ /*
+  * Unmaps the inode and waits for any DMA to complete prior to deleting the
+  * DAX mapping entries for the range.
++ *
++ * For NOWAIT behavior, pass @cb as NULL to early-exit on first found
++ * busy page
+  */
+ int dax_break_layout(struct inode *inode, loff_t start, loff_t end,
+ 		void (cb)(struct inode *))
+@@ -870,10 +903,17 @@ int dax_break_layout(struct inode *inode
+ 		page = dax_layout_busy_page_range(inode->i_mapping, start, end);
+ 		if (!page)
+ 			break;
++		if (!cb) {
++			error = -ERESTARTSYS;
++			break;
++		}
+ 
  		error = wait_page_idle(page, cb, inode);
  	} while (error == 0);
  
@@ -108,25 +132,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  	return error;
  }
- EXPORT_SYMBOL_GPL(dax_break_mapping);
+ EXPORT_SYMBOL_GPL(dax_break_layout);
 --- a/fs/xfs/xfs_inode.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
 +++ a/fs/xfs/xfs_inode.c
-@@ -2746,6 +2746,12 @@ again:
+@@ -2735,7 +2735,6 @@ xfs_mmaplock_two_inodes_and_break_dax_la
+ 	struct xfs_inode	*ip2)
+ {
+ 	int			error;
+-	struct page		*page;
+ 
+ 	if (ip1->i_ino > ip2->i_ino)
+ 		swap(ip1, ip2);
+@@ -2759,8 +2758,8 @@ again:
+ 	 * need to unlock & lock the XFS_MMAPLOCK_EXCL which is not suitable
+ 	 * for this nested lock case.
+ 	 */
+-	page = dax_layout_busy_page(VFS_I(ip2)->i_mapping);
+-	if (!dax_page_is_idle(page)) {
++	error = dax_break_layout(VFS_I(ip2), 0, -1, NULL);
++	if (error) {
+ 		xfs_iunlock(ip2, XFS_MMAPLOCK_EXCL);
+ 		xfs_iunlock(ip1, XFS_MMAPLOCK_EXCL);
  		goto again;
- 	}
- 
-+	/*
-+	 * Normally xfs_break_dax_layouts() would delete the mapping entries as well so
-+	 * do that here.
-+	 */
-+	dax_delete_mapping_range(VFS_I(ip2)->i_mapping, 0, LLONG_MAX);
-+
- 	return 0;
- }
- 
 --- a/include/linux/dax.h~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
 +++ a/include/linux/dax.h
-@@ -263,6 +263,8 @@ vm_fault_t dax_iomap_fault(struct vm_fau
+@@ -255,6 +255,8 @@ vm_fault_t dax_iomap_fault(struct vm_fau
  vm_fault_t dax_finish_sync_fault(struct vm_fault *vmf,
  		unsigned int order, pfn_t pfn);
  int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
@@ -134,7 +164,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				loff_t start, loff_t end);
  int dax_invalidate_mapping_entry_sync(struct address_space *mapping,
  				      pgoff_t index);
- int __must_check dax_break_mapping(struct inode *inode, loff_t start,
+ int __must_check dax_break_layout(struct inode *inode, loff_t start,
 --- a/mm/truncate.c~fs-dax-always-remove-dax-page-cache-entries-when-breaking-layouts
 +++ a/mm/truncate.c
 @@ -78,8 +78,22 @@ static void truncate_folio_batch_excepti
@@ -145,7 +175,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (xa_is_value(fbatch->folios[i])) {
 +				/*
 +				 * File systems should already have called
-+				 * dax_break_mapping_entry() to remove all DAX
++				 * dax_break_layout_entry() to remove all DAX
 +				 * entries while holding a lock to prevent
 +				 * establishing new entries. Therefore we
 +				 * shouldn't find any here.
