@@ -1,0 +1,79 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: mm: replace vm_lock and detached flag with a reference count
+Date: Thu, 13 Feb 2025 14:46:49 -0800
+
+rw_semaphore is a sizable structure of 40 bytes and consumes considerable
+space for each vm_area_struct.  However vma_lock has two important
+specifics which can be used to replace rw_semaphore with a simpler
+structure:
+
+1. Readers never wait.  They try to take the vma_lock and fall back to
+   mmap_lock if that fails.
+
+2. Only one writer at a time will ever try to write-lock a vma_lock
+   because writers first take mmap_lock in write mode.  Because of these
+   requirements, full rw_semaphore functionality is not needed and we can
+   replace rw_semaphore and the vma->detached flag with a refcount
+   (vm_refcnt).
+
+When vma is in detached state, vm_refcnt is 0 and only a call to
+vma_mark_attached() can take it out of this state.  Note that unlike
+before, now we enforce both vma_mark_attached() and vma_mark_detached() to
+be done only after vma has been write-locked.  vma_mark_attached() changes
+vm_refcnt to 1 to indicate that it has been attached to the vma tree. 
+When a reader takes read lock, it increments vm_refcnt, unless the top
+usable bit of vm_refcnt (0x40000000) is set, indicating presence of a
+writer.  When writer takes write lock, it sets the top usable bit to
+indicate its presence.  If there are readers, writer will wait using newly
+introduced mm->vma_writer_wait.  Since all writers take mmap_lock in write
+mode first, there can be only one writer at a time.  The last reader to
+release the lock will signal the writer to wake up.  refcount might
+overflow if there are many competing readers, in which case read-locking
+will fail.  Readers are expected to handle such failures.
+
+In summary:
+1. all readers increment the vm_refcnt;
+2. writer sets top usable (writer) bit of vm_refcnt;
+3. readers cannot increment the vm_refcnt if the writer bit is set;
+4. in the presence of readers, writer must wait for the vm_refcnt to drop
+to 1 (plus the VMA_LOCK_OFFSET writer bit), indicating an attached vma
+with no readers;
+5. vm_refcnt overflow is handled by the readers.
+
+While this vm_lock replacement does not yet result in a smaller
+vm_area_struct (it stays at 256 bytes due to cacheline alignment), it
+allows for further size optimization by structure member regrouping to
+bring the size of vm_area_struct below 192 bytes.
+
+Link: https://lkml.kernel.org/r/20250213224655.1680278-13-surenb@google.com
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Suggested-by: Peter Zijlstra <peterz@infradead.org>
+Suggested-by: Matthew Wilcox <willy@infradead.org>
+Tested-by: Shivank Garg <shivankg@amd.com>
+  Link: https://lkml.kernel.org/r/5e19ec93-8307-47c2-bb13-3ddf7150624e@amd.com
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Hugh Dickens <hughd@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Klara Modin <klarasmodin@gmail.com>
+Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Minchan Kim <minchan@google.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: "Paul E . McKenney" <paulmck@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Sourav Panda <souravpanda@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Will Deacon <will@kernel.org>
