@@ -1,6 +1,6 @@
 From: Frank van der Linden <fvdl@google.com>
 Subject: mm, cma: support multiple contiguous ranges, if requested
-Date: Wed, 29 Jan 2025 22:41:31 +0000
+Date: Thu, 6 Feb 2025 18:50:42 +0000
 
 Currently, CMA manages one range of physically contiguous memory. 
 Creation of larger CMA areas with hugetlb_cma may run in to gaps in
@@ -45,7 +45,7 @@ default "bottom-up, above 4G" reservation approach:
 3) Sort the selected ranges by base address.
 4) Reserve them bottom-up until we get what we wanted.
 
-Link: https://lkml.kernel.org/r/20250129224157.2046079-3-fvdl@google.com
+Link: https://lkml.kernel.org/r/20250206185109.1210657-3-fvdl@google.com
 Signed-off-by: Frank van der Linden <fvdl@google.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Andy Lutomirski <luto@kernel.org>
@@ -61,15 +61,38 @@ Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/cma.h |    3 
- mm/cma.c            |  608 +++++++++++++++++++++++++++++++++---------
- mm/cma.h            |   27 +
- mm/cma_debug.c      |   56 ++-
- 4 files changed, 554 insertions(+), 140 deletions(-)
+ Documentation/admin-guide/mm/cma_debugfs.rst |   10 
+ include/linux/cma.h                          |    3 
+ mm/cma.c                                     |  598 +++++++++++++----
+ mm/cma.h                                     |   27 
+ mm/cma_debug.c                               |   56 +
+ 5 files changed, 552 insertions(+), 142 deletions(-)
 
+--- a/Documentation/admin-guide/mm/cma_debugfs.rst~mm-cma-support-multiple-contiguous-ranges-if-requested
++++ a/Documentation/admin-guide/mm/cma_debugfs.rst
+@@ -12,10 +12,16 @@ its CMA name like below:
+ 
+ The structure of the files created under that directory is as follows:
+ 
+- - [RO] base_pfn: The base PFN (Page Frame Number) of the zone.
++ - [RO] base_pfn: The base PFN (Page Frame Number) of the CMA area.
++        This is the same as ranges/0/base_pfn.
+  - [RO] count: Amount of memory in the CMA area.
+  - [RO] order_per_bit: Order of pages represented by one bit.
+- - [RO] bitmap: The bitmap of page states in the zone.
++ - [RO] bitmap: The bitmap of allocated pages in the area.
++        This is the same as ranges/0/base_pfn.
++ - [RO] ranges/N/base_pfn: The base PFN of contiguous range N
++        in the CMA area.
++ - [RO] ranges/N/bitmap: The bit map of allocated pages in
++        range N in the CMA area.
+  - [WO] alloc: Allocate N pages from that CMA area. For example::
+ 
+ 	echo 5 > <debugfs>/cma/<cma_name>/alloc
 --- a/include/linux/cma.h~mm-cma-support-multiple-contiguous-ranges-if-requested
 +++ a/include/linux/cma.h
 @@ -40,6 +40,9 @@ static inline int __init cma_declare_con
@@ -152,18 +175,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	int allocrange, r;
  	struct zone *zone;
 +	struct cma_memrange *cmr;
-+
-+	for (allocrange = 0; allocrange < cma->nranges; allocrange++) {
-+		cmr = &cma->ranges[allocrange];
-+		cmr->bitmap = bitmap_zalloc(cma_bitmap_maxno(cma, cmr),
-+					    GFP_KERNEL);
-+		if (!cmr->bitmap)
-+			goto cleanup;
-+	}
-+
-+	for (r = 0; r < cma->nranges; r++) {
-+		cmr = &cma->ranges[r];
-+		base_pfn = cmr->base_pfn;
  
 -	cma->bitmap = bitmap_zalloc(cma_bitmap_maxno(cma), GFP_KERNEL);
 -	if (!cma->bitmap)
@@ -185,6 +196,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	for (pfn = base_pfn; pfn < base_pfn + cma->count;
 -	     pfn += pageblock_nr_pages)
 -		init_cma_reserved_pageblock(pfn_to_page(pfn));
++	for (allocrange = 0; allocrange < cma->nranges; allocrange++) {
++		cmr = &cma->ranges[allocrange];
++		cmr->bitmap = bitmap_zalloc(cma_bitmap_maxno(cma, cmr),
++					    GFP_KERNEL);
++		if (!cmr->bitmap)
++			goto cleanup;
++	}
++
++	for (r = 0; r < cma->nranges; r++) {
++		cmr = &cma->ranges[r];
++		base_pfn = cmr->base_pfn;
++
 +		/*
 +		 * alloc_contig_range() requires the pfn range specified
 +		 * to be in the same zone. Simplify by forcing the entire
@@ -346,7 +369,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	if (list_empty(ranges))
 +		list_add(&mrp->list, ranges);
-+	{
++	else {
 +		list_for_each(mp, ranges) {
 +			mlp = list_entry(mp, struct cma_init_memrange, list);
 +			if (cmp(mlp, mrp))
@@ -793,7 +816,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (ret != -EBUSY)
  			break;
  
-@@ -490,6 +791,48 @@ static struct page *__cma_alloc(struct c
+@@ -490,6 +791,38 @@ static struct page *__cma_alloc(struct c
  		/* try again with a bit different memory target */
  		start = bitmap_no + mask + 1;
  	}
@@ -802,16 +825,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return ret;
 +}
 +
-+/**
-+ * cma_alloc() - allocate pages from contiguous area
-+ * @cma:   Contiguous memory region for which the allocation is performed.
-+ * @count: Requested number of pages.
-+ * @align: Requested alignment of pages (in PAGE_SIZE order).
-+ * @no_warn: Avoid printing message about failed allocation
-+ *
-+ * This function allocates part of contiguous memory on specific
-+ * contiguous memory area.
-+ */
 +static struct page *__cma_alloc(struct cma *cma, unsigned long count,
 +		       unsigned int align, gfp_t gfp)
 +{
@@ -842,7 +855,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * CMA can allocate multiple page blocks, which results in different
-@@ -508,7 +851,8 @@ static struct page *__cma_alloc(struct c
+@@ -508,7 +841,8 @@ static struct page *__cma_alloc(struct c
  	}
  
  	pr_debug("%s(): returned %p\n", __func__, page);
@@ -852,7 +865,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (page) {
  		count_vm_event(CMA_ALLOC_SUCCESS);
  		cma_sysfs_account_success_pages(cma, count);
-@@ -551,20 +895,31 @@ struct folio *cma_alloc_folio(struct cma
+@@ -551,20 +885,31 @@ struct folio *cma_alloc_folio(struct cma
  bool cma_pages_valid(struct cma *cma, const struct page *pages,
  		     unsigned long count)
  {
@@ -891,7 +904,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -580,19 +935,32 @@ bool cma_pages_valid(struct cma *cma, co
+@@ -580,19 +925,32 @@ bool cma_pages_valid(struct cma *cma, co
  bool cma_release(struct cma *cma, const struct page *pages,
  		 unsigned long count)
  {
@@ -973,7 +986,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	struct dentry *tmp;
 +	struct dentry *tmp, *dir, *rangedir;
 +	int r;
-+	char rdirname[3];
++	char rdirname[12];
 +	struct cma_memrange *cmr;
  
  	tmp = debugfs_create_dir(cma->name, root_dentry);
