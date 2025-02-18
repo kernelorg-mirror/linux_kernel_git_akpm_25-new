@@ -1,25 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/huge_memory: add two new (not yet used) functions for folio_split()
-Date: Tue, 4 Feb 2025 22:14:11 -0500
-
-Patch series "Buddy allocator like (or non-uniform) folio split", v6.
-
-This patchset adds a new buddy allocator like (or non-uniform) large folio
-split to reduce the total number of after-split folios, the amount of
-memory needed for multi-index xarray split, and keep more large folios
-after a split.  It is on top of mm-everything-2025-02-01-05-58.  It is
-ready to be merged.
-
-Instead of duplicating existing split_huge_page*() code, __folio_split()
-is introduced as the shared backend code for both
-split_huge_page_to_list_to_order() and folio_split().  __folio_split() can
-support both uniform split and buddy allocator like (or non-uniform)
-split.  All existing split_huge_page*() users can be gradually converted
-to use folio_split() if possible.  In this patchset, I converted
-truncate_inode_partial_folio() to use folio_split().
-
-
-This patch (of 6):
+Date: Tue, 11 Feb 2025 10:50:27 -0500
 
 This is a preparation patch, both added functions are not used yet.
 
@@ -33,29 +14,28 @@ given folio to the new order.  For buddy allocator split,
 __split_unmapped_folio() calls it (folio_order - new_order) times and each
 time splits the folio containing the given page to one lower order.
 
-Link: https://lkml.kernel.org/r/20250205031417.1771278-1-ziy@nvidia.com
-Link: https://lkml.kernel.org/r/20250205031417.1771278-2-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250211155034.268962-3-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: David Hildenbrand <david@redhat.com>
-Cc: Hugh Dickens <hughd@google.com>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Kirill A. Shuemov <kirill.shutemov@linux.intel.com>
-Cc: linmiaohe <linmiaohe@huawei.com>
-Cc: Mattew Wilcox <willy@infradead.org> [English fixes]
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |  350 ++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 349 insertions(+), 1 deletion(-)
+ mm/huge_memory.c |  349 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 348 insertions(+), 1 deletion(-)
 
 --- a/mm/huge_memory.c~mm-huge_memory-add-two-new-not-yet-used-functions-for-folio_split
 +++ a/mm/huge_memory.c
-@@ -3262,7 +3262,6 @@ static void remap_page(struct folio *fol
+@@ -3139,7 +3139,6 @@ static void remap_page(struct folio *fol
  static void lru_add_page_tail(struct folio *folio, struct page *tail,
  		struct lruvec *lruvec, struct list_head *list)
  {
@@ -63,7 +43,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VM_BUG_ON_FOLIO(PageLRU(tail), folio);
  	lockdep_assert_held(&lruvec->lru_lock);
  
-@@ -3507,6 +3506,355 @@ bool can_split_folio(struct folio *folio
+@@ -3384,6 +3383,354 @@ bool can_split_folio(struct folio *folio
  }
  
  /*
@@ -197,18 +177,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * 1. uniform split: the given @folio into multiple @new_order small folios,
 + *    where all small folios have the same order. This is done when
 + *    uniform_split is true.
-+ * 2. buddy allocator like split: the given @folio is split into half and one
-+ *    of the half (containing the given page) is split into half until the
-+ *    given @page's order becomes @new_order. This is done when uniform_split is
-+ *    false.
++ * 2. buddy allocator like (non-uniform) split: the given @folio is split into
++ *    half and one of the half (containing the given page) is split into half
++ *    until the given @page's order becomes @new_order. This is done when
++ *    uniform_split is false.
 + *
 + * The high level flow for these two methods are:
 + * 1. uniform split: a single __split_folio_to_order() is called to split the
 + *    @folio into @new_order, then we traverse all the resulting folios one by
 + *    one in PFN ascending order and perform stats, unfreeze, adding to list,
 + *    and file mapping index operations.
-+ * 2. buddy allocator like split: in general, folio_order - @new_order calls to
-+ *    __split_folio_to_order() are called in the for loop to split the @folio
++ * 2. non-uniform split: in general, folio_order - @new_order calls to
++ *    __split_folio_to_order() are made in a for loop to split the @folio
 + *    to one lower order at a time. The resulting small folios are processed
 + *    like what is done during the traversal in 1, except the one containing
 + *    @page, which is split in next for loop.
@@ -218,7 +198,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *
 + * In terms of locking, after splitting,
 + * 1. uniform split leaves @page (or the folio contains it) locked;
-+ * 2. buddy allocator like split leaves @folio locked.
++ * 2. buddy allocator like (non-uniform) split leaves @folio locked.
 + *
 + *
 + * For !uniform_split, when -ENOMEM is returned, the original folio might be
@@ -280,21 +260,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (mapping) {
 +			/*
 +			 * uniform split has xas_split_alloc() called before
-+			 * irq is disabled, since xas_nomem() might not be
-+			 * able to allocate enough memory.
++			 * irq is disabled to allocate enough memory, whereas
++			 * non-uniform split can handle ENOMEM.
 +			 */
 +			if (uniform_split)
 +				xas_split(xas, folio, old_order);
 +			else {
 +				xas_set_order(xas, folio->index, split_order);
-+				xas_split_alloc(xas, folio, folio_order(folio),
++				xas_try_split(xas, folio, old_order,
 +						GFP_NOWAIT);
 +				if (xas_error(xas)) {
 +					ret = xas_error(xas);
 +					stop_split = true;
 +					goto after_split;
 +				}
-+				xas_split(xas, folio, old_order);
 +			}
 +		}
 +
