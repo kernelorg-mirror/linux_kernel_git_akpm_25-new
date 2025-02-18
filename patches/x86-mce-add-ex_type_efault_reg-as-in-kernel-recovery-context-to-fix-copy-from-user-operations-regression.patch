@@ -1,0 +1,100 @@
+From: Shuai Xue <xueshuai@linux.alibaba.com>
+Subject: x86/mce: add EX_TYPE_EFAULT_REG as in-kernel recovery context to fix copy-from-user operations regression
+Date: Mon, 17 Feb 2025 14:33:33 +0800
+
+Commit 4c132d1d844a ("x86/futex: Remove .fixup usage") introduced a new
+extable fixup type, EX_TYPE_EFAULT_REG, and later patches updated the
+extable fixup type for copy-from-user operations, changing it from
+EX_TYPE_UACCESS to EX_TYPE_EFAULT_REG.
+
+Specifically, commit 99641e094d6c ("x86/uaccess: Remove .fixup usage")
+altered the extable fixup type for the get_user family, while commit
+4c132d1d844a ("x86/futex: Remove .fixup usage") addressed the futex
+operations.  This change inadvertently caused a regression where the error
+context for some copy-from-user operations no longer functions as an
+in-kernel recovery context, leading to kernel panics with the message:
+"Machine check: Data load in unrecoverable area of kernel."
+
+To fix the regression, add EX_TYPE_EFAULT_REG as a in-kernel recovery
+context for copy-from-user operations.
+
+Link: https://lkml.kernel.org/r/20250217063335.22257-4-xueshuai@linux.alibaba.com
+Signed-off-by: Shuai Xue <xueshuai@linux.alibaba.com>
+Fixes: 4c132d1d844a ("x86/futex: Remove .fixup usage")
+Cc: <stable@vger.kernel.org>
+Cc: Acked-by:Thomas Gleixner <tglx@linutronix.de>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Jarkko Sakkinen <jarkko@kernel.org>
+Cc: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Josh Poimboeuf <jpoimboe@kernel.org>
+Cc: linmiaohe <linmiaohe@huawei.com>
+Cc: "Luck, Tony" <tony.luck@intel.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ruidong Tian <tianruidong@linux.alibaba.com>
+Cc: Yazen Ghannam <yazen.ghannam@amd.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/kernel/cpu/mce/severity.c |   21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+--- a/arch/x86/kernel/cpu/mce/severity.c~x86-mce-add-ex_type_efault_reg-as-in-kernel-recovery-context-to-fix-copy-from-user-operations-regression
++++ a/arch/x86/kernel/cpu/mce/severity.c
+@@ -16,6 +16,7 @@
+ #include <asm/traps.h>
+ #include <asm/insn.h>
+ #include <asm/insn-eval.h>
++#include <linux/extable.h>
+ 
+ #include "internal.h"
+ 
+@@ -285,7 +286,8 @@ static bool is_copy_from_user(struct pt_
+  */
+ static noinstr int error_context(struct mce *m, struct pt_regs *regs)
+ {
+-	int fixup_type;
++	const struct exception_table_entry *e;
++	int fixup_type, imm;
+ 	bool copy_user;
+ 
+ 	if ((m->cs & 3) == 3)
+@@ -294,9 +296,14 @@ static noinstr int error_context(struct
+ 	if (!mc_recoverable(m->mcgstatus))
+ 		return IN_KERNEL;
+ 
++	e = search_exception_tables(m->ip);
++	if (!e)
++		return IN_KERNEL;
++
+ 	/* Allow instrumentation around external facilities usage. */
+ 	instrumentation_begin();
+-	fixup_type = ex_get_fixup_type(m->ip);
++	fixup_type = FIELD_GET(EX_DATA_TYPE_MASK, e->data);
++	imm  = FIELD_GET(EX_DATA_IMM_MASK,  e->data);
+ 	copy_user  = is_copy_from_user(regs);
+ 	instrumentation_end();
+ 
+@@ -304,9 +311,13 @@ static noinstr int error_context(struct
+ 	case EX_TYPE_UACCESS:
+ 		if (!copy_user)
+ 			return IN_KERNEL;
+-		m->kflags |= MCE_IN_KERNEL_COPYIN;
+-		fallthrough;
+-
++		m->kflags |= MCE_IN_KERNEL_COPYIN | MCE_IN_KERNEL_RECOV;
++		return IN_KERNEL_RECOV;
++	case EX_TYPE_IMM_REG:
++		if (!copy_user || imm != -EFAULT)
++			return IN_KERNEL;
++		m->kflags |= MCE_IN_KERNEL_COPYIN | MCE_IN_KERNEL_RECOV;
++		return IN_KERNEL_RECOV;
+ 	case EX_TYPE_FAULT_MCE_SAFE:
+ 	case EX_TYPE_DEFAULT_MCE_SAFE:
+ 		m->kflags |= MCE_IN_KERNEL_RECOV;
+_

@@ -1,6 +1,6 @@
 From: Waiman Long <longman@redhat.com>
 Subject: kasan: don't call find_vm_area() in RT kernel
-Date: Tue, 11 Feb 2025 11:07:50 -0500
+Date: Wed, 12 Feb 2025 11:21:51 -0500
 
 The following bug report appeared with a test run in a RT debug kernel.
 
@@ -18,72 +18,101 @@ The following bug report appeared with a test run in a RT debug kernel.
 [ 3359.353976]  kasan_report+0x90/0xc8
 [ 3359.353980]  __asan_load1+0x60/0x70
 
-print_address_description() is run with a raw_spinlock_t acquired and
-interrupt disabled.  find_vm_area() needs to acquire a spinlock_t which
-becomes a sleeping lock in the RT kernel.  IOW, we can't call
-find_vm_area() in a RT kernel.  Fix this bug report by skipping the
-find_vm_area() call in this case and just print out the address as is.
+Commit e30a0361b851 ("kasan: make report_lock a raw spinlock") changes
+report_lock to a raw_spinlock_t to avoid a similar RT problem.  The
+print_address_description() function is called with report_lock acquired
+and interrupt disabled.  However, the find_vm_area() function still needs
+to acquire a spinlock_t which becomes a sleeping lock in the RT kernel. 
+IOW, we can't call find_vm_area() in a RT kernel and changing report_lock
+to a raw_spinlock_t is not enough to completely solve this RT kernel
+problem.
+
+Fix this bug report by skipping the find_vm_area() call in this case and
+just print out the address as is.
 
 For !RT kernel, follow the example set in commit 0cce06ba859a
 ("debugobjects,locking: Annotate debug_object_fill_pool() wait type
 violation") and use DEFINE_WAIT_OVERRIDE_MAP() to avoid a spinlock_t
 inside raw_spinlock_t warning.
 
-Link: https://lkml.kernel.org/r/20250211160750.1301353-1-longman@redhat.com
-Fixes: e30a0361b851 ("kasan: make report_lock a raw spinlock") 
+Link: https://lkml.kernel.org/r/20250212162151.1599059-1-longman@redhat.com
+Fixes: e30a0361b851 ("kasan: make report_lock a raw spinlock")
 Signed-off-by: Waiman Long <longman@redhat.com>
+Acked-by: Andrey Ryabinin <ryabinin.a.a@gmail.com>
 Cc: Alexander Potapenko <glider@google.com>
 Cc: Andrey Konovalov <andreyknvl@gmail.com>
-Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
 Cc: Dmitriy Vyukov <dvyukov@google.com>
 Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Mariano Pache <npache@redhat.com>
 Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
 Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
-Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/kasan/report.c |   20 ++++++++++++++++++--
- 1 file changed, 18 insertions(+), 2 deletions(-)
+ mm/kasan/report.c |   47 +++++++++++++++++++++++++++++++-------------
+ 1 file changed, 34 insertions(+), 13 deletions(-)
 
 --- a/mm/kasan/report.c~kasan-dont-call-find_vm_area-in-rt-kernel
 +++ a/mm/kasan/report.c
-@@ -398,9 +398,20 @@ static void print_address_description(vo
+@@ -370,6 +370,38 @@ static inline bool init_task_stack_addr(
+ 			sizeof(init_thread_union.stack));
+ }
+ 
++/*
++ * RT kernel cannot call find_vm_area() in atomic context. For !RT kernel,
++ * prevent spinlock_t inside raw_spinlock_t warning by raising wait-type
++ * to WAIT_SLEEP.
++ *
++ * Return: page pointer or NULL
++ */
++static inline struct page *kasan_print_vmalloc_info_ret_page(void *addr)
++{
++	if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
++		static DEFINE_WAIT_OVERRIDE_MAP(vmalloc_map, LD_WAIT_SLEEP);
++		struct page *page = NULL;
++		struct vm_struct *va;
++
++		lock_map_acquire_try(&vmalloc_map);
++		va = find_vm_area(addr);
++		if (va) {
++			pr_err("The buggy address belongs to the virtual mapping at\n"
++			       " [%px, %px) created by:\n"
++			       " %pS\n",
++			       va->addr, va->addr + va->size, va->caller);
++			pr_err("\n");
++
++			page = vmalloc_to_page(addr);
++		}
++		lock_map_release(&vmalloc_map);
++		return page;
++	}
++	pr_err("The buggy address %px belongs to a vmalloc virtual mapping\n", addr);
++	return NULL;
++}
++
+ static void print_address_description(void *addr, u8 tag,
+ 				      struct kasan_report_info *info)
+ {
+@@ -398,19 +430,8 @@ static void print_address_description(vo
  		pr_err("\n");
  	}
  
 -	if (is_vmalloc_addr(addr)) {
 -		struct vm_struct *va = find_vm_area(addr);
-+	if (!is_vmalloc_addr(addr))
-+		goto print_page;
+-
+-		if (va) {
+-			pr_err("The buggy address belongs to the virtual mapping at\n"
+-			       " [%px, %px) created by:\n"
+-			       " %pS\n",
+-			       va->addr, va->addr + va->size, va->caller);
+-			pr_err("\n");
+-
+-			page = vmalloc_to_page(addr);
+-		}
+-	}
++	if (is_vmalloc_addr(addr))
++		page = kasan_print_vmalloc_info_ret_page(addr);
  
-+	/*
-+	 * RT kernel cannot call find_vm_area() in atomic context.
-+	 * For !RT kernel, prevent spinlock_t inside raw_spinlock_t warning
-+	 * by raising wait-type to WAIT_SLEEP.
-+	 */
-+	if (!IS_ENABLED(CONFIG_PREEMPT_RT)) {
-+		static DEFINE_WAIT_OVERRIDE_MAP(vmalloc_map, LD_WAIT_SLEEP);
-+		struct vm_struct *va;
-+
-+		lock_map_acquire_try(&vmalloc_map);
-+		va = find_vm_area(addr);
- 		if (va) {
- 			pr_err("The buggy address belongs to the virtual mapping at\n"
- 			       " [%px, %px) created by:\n"
-@@ -410,8 +421,13 @@ static void print_address_description(vo
- 
- 			page = vmalloc_to_page(addr);
- 		}
-+		lock_map_release(&vmalloc_map);
-+	} else {
-+		pr_err("The buggy address %px belongs to a vmalloc virtual mapping\n",
-+			addr);
- 	}
- 
-+print_page:
  	if (page) {
  		pr_err("The buggy address belongs to the physical page:\n");
- 		dump_page(page, "kasan: bad access detected");
 _
