@@ -37,6 +37,8 @@ leave the optimization for later after some evaluation.
 
 After resolving the inconsistency, the warnings disappear.
 
+[42.hyeyoo@gmail.com: refactor zswap_store_page()]
+  Link: https://lkml.kernel.org/r/20250131082037.2426-1-42.hyeyoo@gmail.com
 Link: https://lkml.kernel.org/r/20250129100844.2935-1-42.hyeyoo@gmail.com
 Fixes: b7c0ccdfbafd ("mm: zswap: support large folios in zswap_store()")
 Co-developed-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
@@ -50,27 +52,72 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zswap.c |   10 ++++------
- 1 file changed, 4 insertions(+), 6 deletions(-)
+ mm/zswap.c |   35 ++++++++++++++++-------------------
+ 1 file changed, 16 insertions(+), 19 deletions(-)
 
 --- a/mm/zswap.c~mm-zswap-fix-inconsistency-when-zswap_store_page-fails
 +++ a/mm/zswap.c
-@@ -1504,11 +1504,14 @@ static ssize_t zswap_store_page(struct p
- 	entry->pool = pool;
- 	entry->swpentry = page_swpentry;
- 	entry->objcg = objcg;
-+	if (objcg)
-+		obj_cgroup_charge_zswap(objcg, entry->length);
- 	entry->referenced = true;
- 	if (entry->length) {
- 		INIT_LIST_HEAD(&entry->lru);
- 		zswap_lru_add(&zswap_list_lru, entry);
+@@ -1445,9 +1445,9 @@ resched:
+ * main API
+ **********************************/
+ 
+-static ssize_t zswap_store_page(struct page *page,
+-				struct obj_cgroup *objcg,
+-				struct zswap_pool *pool)
++static bool zswap_store_page(struct page *page,
++			     struct obj_cgroup *objcg,
++			     struct zswap_pool *pool)
+ {
+ 	swp_entry_t page_swpentry = page_swap_entry(page);
+ 	struct zswap_entry *entry, *old;
+@@ -1456,7 +1456,7 @@ static ssize_t zswap_store_page(struct p
+ 	entry = zswap_entry_cache_alloc(GFP_KERNEL, page_to_nid(page));
+ 	if (!entry) {
+ 		zswap_reject_kmemcache_fail++;
+-		return -EINVAL;
++		return false;
  	}
+ 
+ 	if (!zswap_compress(page, entry, pool))
+@@ -1483,13 +1483,17 @@ static ssize_t zswap_store_page(struct p
+ 
+ 	/*
+ 	 * The entry is successfully compressed and stored in the tree, there is
+-	 * no further possibility of failure. Grab refs to the pool and objcg.
+-	 * These refs will be dropped by zswap_entry_free() when the entry is
+-	 * removed from the tree.
++	 * no further possibility of failure. Grab refs to the pool and objcg,
++	 * charge zswap memory, and increment zswap_stored_pages.
++	 * The opposite actions will be performed by zswap_entry_free()
++	 * when the entry is removed from the tree.
+ 	 */
+ 	zswap_pool_get(pool);
+-	if (objcg)
++	if (objcg) {
+ 		obj_cgroup_get(objcg);
++		obj_cgroup_charge_zswap(objcg, entry->length);
++	}
 +	atomic_long_inc(&zswap_stored_pages);
  
- 	return entry->length;
+ 	/*
+ 	 * We finish initializing the entry while it's already in xarray.
+@@ -1510,13 +1514,13 @@ static ssize_t zswap_store_page(struct p
+ 		zswap_lru_add(&zswap_list_lru, entry);
+ 	}
  
-@@ -1526,7 +1529,6 @@ bool zswap_store(struct folio *folio)
+-	return entry->length;
++	return true;
+ 
+ store_failed:
+ 	zpool_free(pool->zpool, entry->handle);
+ compress_failed:
+ 	zswap_entry_cache_free(entry);
+-	return -EINVAL;
++	return false;
+ }
+ 
+ bool zswap_store(struct folio *folio)
+@@ -1526,7 +1530,6 @@ bool zswap_store(struct folio *folio)
  	struct obj_cgroup *objcg = NULL;
  	struct mem_cgroup *memcg = NULL;
  	struct zswap_pool *pool;
@@ -78,9 +125,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	bool ret = false;
  	long index;
  
-@@ -1569,15 +1571,11 @@ bool zswap_store(struct folio *folio)
- 		bytes = zswap_store_page(page, objcg, pool);
- 		if (bytes < 0)
+@@ -1564,20 +1567,14 @@ bool zswap_store(struct folio *folio)
+ 
+ 	for (index = 0; index < nr_pages; ++index) {
+ 		struct page *page = folio_page(folio, index);
+-		ssize_t bytes;
+ 
+-		bytes = zswap_store_page(page, objcg, pool);
+-		if (bytes < 0)
++		if (!zswap_store_page(page, objcg, pool))
  			goto put_pool;
 -		compressed_bytes += bytes;
  	}
