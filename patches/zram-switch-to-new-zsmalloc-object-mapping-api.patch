@@ -1,0 +1,156 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: switch to new zsmalloc object mapping API
+Date: Sat, 22 Feb 2025 07:25:44 +0900
+
+Use new read/write zsmalloc object API.  For cases when RO mapped object
+spans two physical pages (requires temp buffer) compression streams now
+carry around one extra physical page.
+
+Link: https://lkml.kernel.org/r/20250221222958.2225035-14-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Hillf Danton <hdanton@sina.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Yosry Ahmed <yosry.ahmed@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/block/zram/zcomp.c    |    4 +++-
+ drivers/block/zram/zcomp.h    |    2 ++
+ drivers/block/zram/zram_drv.c |   28 ++++++++++------------------
+ 3 files changed, 15 insertions(+), 19 deletions(-)
+
+--- a/drivers/block/zram/zcomp.c~zram-switch-to-new-zsmalloc-object-mapping-api
++++ a/drivers/block/zram/zcomp.c
+@@ -45,6 +45,7 @@ static const struct zcomp_ops *backends[
+ static void zcomp_strm_free(struct zcomp *comp, struct zcomp_strm *zstrm)
+ {
+ 	comp->ops->destroy_ctx(&zstrm->ctx);
++	vfree(zstrm->local_copy);
+ 	vfree(zstrm->buffer);
+ 	zstrm->buffer = NULL;
+ }
+@@ -57,12 +58,13 @@ static int zcomp_strm_init(struct zcomp
+ 	if (ret)
+ 		return ret;
+ 
++	zstrm->local_copy = vzalloc(PAGE_SIZE);
+ 	/*
+ 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
+ 	 * case when compressed size is larger than the original one
+ 	 */
+ 	zstrm->buffer = vzalloc(2 * PAGE_SIZE);
+-	if (!zstrm->buffer) {
++	if (!zstrm->buffer || !zstrm->local_copy) {
+ 		zcomp_strm_free(comp, zstrm);
+ 		return -ENOMEM;
+ 	}
+--- a/drivers/block/zram/zcomp.h~zram-switch-to-new-zsmalloc-object-mapping-api
++++ a/drivers/block/zram/zcomp.h
+@@ -34,6 +34,8 @@ struct zcomp_strm {
+ 	struct mutex lock;
+ 	/* compression buffer */
+ 	void *buffer;
++	/* local copy of handle memory */
++	void *local_copy;
+ 	struct zcomp_ctx ctx;
+ };
+ 
+--- a/drivers/block/zram/zram_drv.c~zram-switch-to-new-zsmalloc-object-mapping-api
++++ a/drivers/block/zram/zram_drv.c
+@@ -1566,11 +1566,11 @@ static int read_incompressible_page(stru
+ 	void *src, *dst;
+ 
+ 	handle = zram_get_handle(zram, index);
+-	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
++	src = zs_obj_read_begin(zram->mem_pool, handle, NULL);
+ 	dst = kmap_local_page(page);
+ 	copy_page(dst, src);
+ 	kunmap_local(dst);
+-	zs_unmap_object(zram->mem_pool, handle);
++	zs_obj_read_end(zram->mem_pool, handle, src);
+ 
+ 	return 0;
+ }
+@@ -1588,11 +1588,11 @@ static int read_compressed_page(struct z
+ 	prio = zram_get_priority(zram, index);
+ 
+ 	zstrm = zcomp_stream_get(zram->comps[prio]);
+-	src = zs_map_object(zram->mem_pool, handle, ZS_MM_RO);
++	src = zs_obj_read_begin(zram->mem_pool, handle, zstrm->local_copy);
+ 	dst = kmap_local_page(page);
+ 	ret = zcomp_decompress(zram->comps[prio], zstrm, src, size, dst);
+ 	kunmap_local(dst);
+-	zs_unmap_object(zram->mem_pool, handle);
++	zs_obj_read_end(zram->mem_pool, handle, src);
+ 	zcomp_stream_put(zstrm);
+ 
+ 	return ret;
+@@ -1688,7 +1688,7 @@ static int write_incompressible_page(str
+ 				     u32 index)
+ {
+ 	unsigned long handle;
+-	void *src, *dst;
++	void *src;
+ 
+ 	/*
+ 	 * This function is called from preemptible context so we don't need
+@@ -1705,11 +1705,9 @@ static int write_incompressible_page(str
+ 		return -ENOMEM;
+ 	}
+ 
+-	dst = zs_map_object(zram->mem_pool, handle, ZS_MM_WO);
+ 	src = kmap_local_page(page);
+-	memcpy(dst, src, PAGE_SIZE);
++	zs_obj_write(zram->mem_pool, handle, src, PAGE_SIZE);
+ 	kunmap_local(src);
+-	zs_unmap_object(zram->mem_pool, handle);
+ 
+ 	zram_slot_lock(zram, index);
+ 	zram_set_flag(zram, index, ZRAM_HUGE);
+@@ -1730,7 +1728,7 @@ static int zram_write_page(struct zram *
+ 	int ret = 0;
+ 	unsigned long handle;
+ 	unsigned int comp_len;
+-	void *dst, *mem;
++	void *mem;
+ 	struct zcomp_strm *zstrm;
+ 	unsigned long element;
+ 	bool same_filled;
+@@ -1776,11 +1774,8 @@ static int zram_write_page(struct zram *
+ 		return -ENOMEM;
+ 	}
+ 
+-	dst = zs_map_object(zram->mem_pool, handle, ZS_MM_WO);
+-
+-	memcpy(dst, zstrm->buffer, comp_len);
++	zs_obj_write(zram->mem_pool, handle, zstrm->buffer, comp_len);
+ 	zcomp_stream_put(zstrm);
+-	zs_unmap_object(zram->mem_pool, handle);
+ 
+ 	zram_slot_lock(zram, index);
+ 	zram_set_handle(zram, index, handle);
+@@ -1892,7 +1887,7 @@ static int recompress_slot(struct zram *
+ 	unsigned int comp_len_new;
+ 	unsigned int class_index_old;
+ 	unsigned int class_index_new;
+-	void *src, *dst;
++	void *src;
+ 	int ret = 0;
+ 
+ 	handle_old = zram_get_handle(zram, index);
+@@ -2002,12 +1997,9 @@ static int recompress_slot(struct zram *
+ 		return PTR_ERR((void *)handle_new);
+ 	}
+ 
+-	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
+-	memcpy(dst, zstrm->buffer, comp_len_new);
++	zs_obj_write(zram->mem_pool, handle_new, zstrm->buffer, comp_len_new);
+ 	zcomp_stream_put(zstrm);
+ 
+-	zs_unmap_object(zram->mem_pool, handle_new);
+-
+ 	zram_free_page(zram, index);
+ 	zram_set_handle(zram, index, handle_new);
+ 	zram_set_obj_size(zram, index, comp_len_new);
+_
