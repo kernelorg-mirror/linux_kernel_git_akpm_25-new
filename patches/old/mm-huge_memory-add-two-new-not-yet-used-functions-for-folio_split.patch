@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/huge_memory: add two new (not yet used) functions for folio_split()
-Date: Tue, 11 Feb 2025 10:50:27 -0500
+Date: Tue, 18 Feb 2025 18:50:06 -0500
 
 This is a preparation patch, both added functions are not used yet.
 
@@ -14,7 +14,7 @@ given folio to the new order.  For buddy allocator split,
 __split_unmapped_folio() calls it (folio_order - new_order) times and each
 time splits the folio containing the given page to one lower order.
 
-Link: https://lkml.kernel.org/r/20250211155034.268962-3-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250218235012.1542225-3-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -27,15 +27,16 @@ Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Yu Zhao <yuzhao@google.com>
+Cc: Kairui Song <kasong@tencent.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |  349 ++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 348 insertions(+), 1 deletion(-)
+ mm/huge_memory.c |  339 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 338 insertions(+), 1 deletion(-)
 
 --- a/mm/huge_memory.c~mm-huge_memory-add-two-new-not-yet-used-functions-for-folio_split
 +++ a/mm/huge_memory.c
-@@ -3139,7 +3139,6 @@ static void remap_page(struct folio *fol
+@@ -3267,7 +3267,6 @@ static void remap_page(struct folio *fol
  static void lru_add_page_tail(struct folio *folio, struct page *tail,
  		struct lruvec *lruvec, struct list_head *list)
  {
@@ -43,22 +44,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VM_BUG_ON_FOLIO(PageLRU(tail), folio);
  	lockdep_assert_held(&lruvec->lru_lock);
  
-@@ -3384,6 +3383,354 @@ bool can_split_folio(struct folio *folio
+@@ -3512,6 +3511,344 @@ bool can_split_folio(struct folio *folio
  }
  
  /*
 + * It splits @folio into @new_order folios and copies the @folio metadata to
 + * all the resulting folios.
 + */
-+static int __split_folio_to_order(struct folio *folio, int new_order)
++static void __split_folio_to_order(struct folio *folio, int new_order)
 +{
-+	int curr_order = folio_order(folio);
 +	long nr_pages = folio_nr_pages(folio);
 +	long new_nr_pages = 1 << new_order;
 +	long index;
-+
-+	if (curr_order <= new_order)
-+		return -EINVAL;
 +
 +	/*
 +	 * Skip the first new_nr_pages, since the new folio from them have all
@@ -154,8 +151,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	if (!new_order)
 +		ClearPageCompound(&folio->page);
-+
-+	return 0;
 +}
 +
 +/*
@@ -164,8 +159,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @new_order: the smallest order of the after split folios (since buddy
 + *             allocator like split generates folios with orders from @folio's
 + *             order - 1 to new_order).
-+ * @page: in buddy allocator like split, the folio containing @page will be
-+ *        split until its order becomes @new_order.
++ * @split_at: in buddy allocator like split, the folio containing @split_at
++ *            will be split until its order becomes @new_order.
++ * @lock_at: the folio containing @lock_at is left locked for caller.
 + * @list: the after split folios will be added to @list if it is not NULL,
 + *        otherwise to LRU lists.
 + * @end: the end of the file @folio maps to. -1 if @folio is anonymous memory.
@@ -205,7 +201,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * split. The caller needs to check the input folio.
 + */
 +static int __split_unmapped_folio(struct folio *folio, int new_order,
-+		struct page *page, struct list_head *list, pgoff_t end,
++		struct page *split_at, struct page *lock_at,
++		struct list_head *list, pgoff_t end,
 +		struct xa_state *xas, struct address_space *mapping,
 +		bool uniform_split)
 +{
@@ -249,7 +246,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		int old_order = folio_order(folio);
 +		struct folio *release;
 +		struct folio *end_folio = folio_next(folio);
-+		int status;
 +
 +		/* order-1 anonymous folio is not supported */
 +		if (folio_test_anon(folio) && split_order == 1)
@@ -282,12 +278,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		split_page_owner(&folio->page, old_order, split_order);
 +		pgalloc_tag_split(folio, old_order, split_order);
 +
-+		status = __split_folio_to_order(folio, split_order);
-+
-+		if (status < 0) {
-+			stop_split = true;
-+			ret = -EINVAL;
-+		}
++		__split_folio_to_order(folio, split_order);
 +
 +after_split:
 +		/*
@@ -306,7 +297,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			 * until the folio's order is new_order or stop_split
 +			 * is set to true by the above xas_split() failure.
 +			 */
-+			if (release == page_folio(page)) {
++			if (release == page_folio(split_at)) {
 +				folio = release;
 +				if (split_order != new_order && !stop_split)
 +					continue;
@@ -325,8 +316,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				     folio_test_swapcache(origin_folio)) ?
 +					     folio_nr_pages(release) : 0));
 +
-+			if (release != origin_folio)
-+				lru_add_page_tail(origin_folio, &release->page,
++			if (release == origin_folio)
++				continue;
++
++			lru_add_page_tail(origin_folio, &release->page,
 +						lruvec, list);
 +
 +			/* Some pages can be beyond EOF: drop them from page cache */
@@ -376,9 +369,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	for (new_folio = origin_folio, next = folio_next(origin_folio);
 +	     new_folio != next_folio;
 +	     new_folio = next, next = folio_next(next)) {
-+		if (uniform_split && new_folio == folio)
-+			continue;
-+		if (!uniform_split && new_folio == origin_folio)
++		if (new_folio == page_folio(lock_at))
 +			continue;
 +
 +		folio_unlock(new_folio);
