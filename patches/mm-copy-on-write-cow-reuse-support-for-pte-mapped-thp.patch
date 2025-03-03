@@ -1,0 +1,148 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: Copy-on-Write (COW) reuse support for PTE-mapped THP
+Date: Mon, 3 Mar 2025 17:30:06 +0100
+
+Currently, we never end up reusing PTE-mapped THPs after fork.  This
+wasn't really a problem with PMD-sized THPs, because they would have to be
+PTE-mapped first, but it's getting a problem with smaller THP sizes that
+are effectively always PTE-mapped.
+
+With our new "mapped exclusively" vs "maybe mapped shared" logic for large
+folios, implementing CoW reuse for PTE-mapped THPs is straight forward: if
+exclusively mapped, make sure that all references are from these (our)
+mappings.  Add some helpful comments to explain the details.
+
+CONFIG_TRANSPARENT_HUGEPAGE selects CONFIG_MM_ID.  If we spot an anon
+large folio without CONFIG_TRANSPARENT_HUGEPAGE in that code, something is
+seriously messed up.
+
+There are plenty of things we can optimize in the future: For example, we
+could remember that the folio is fully exclusive so we could speedup the
+next fault further.  Also, we could try "faulting around", turning
+surrounding PTEs that map the same folio writable.  But especially the
+latter might increase COW latency, so it would need further investigation.
+
+Link: https://lkml.kernel.org/r/20250303163014.1128035-14-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Andy Lutomirks^H^Hski <luto@kernel.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcow (Oracle) <willy@infradead.org>
+Cc: Michal Koutn <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: tejun heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zefan Li <lizefan.x@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   83 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 75 insertions(+), 8 deletions(-)
+
+--- a/mm/memory.c~mm-copy-on-write-cow-reuse-support-for-pte-mapped-thp
++++ a/mm/memory.c
+@@ -3729,19 +3729,86 @@ static vm_fault_t wp_page_shared(struct
+ 	return ret;
+ }
+ 
+-static bool wp_can_reuse_anon_folio(struct folio *folio,
+-				    struct vm_area_struct *vma)
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++static bool __wp_can_reuse_large_anon_folio(struct folio *folio,
++		struct vm_area_struct *vma)
+ {
++	bool exclusive = false;
++
++	/* Let's just free up a large folio if only a single page is mapped. */
++	if (folio_large_mapcount(folio) <= 1)
++		return false;
++
+ 	/*
+-	 * We could currently only reuse a subpage of a large folio if no
+-	 * other subpages of the large folios are still mapped. However,
+-	 * let's just consistently not reuse subpages even if we could
+-	 * reuse in that scenario, and give back a large folio a bit
+-	 * sooner.
++	 * The assumption for anonymous folios is that each page can only get
++	 * mapped once into each MM. The only exception are KSM folios, which
++	 * are always small.
++	 *
++	 * Each taken mapcount must be paired with exactly one taken reference,
++	 * whereby the refcount must be incremented before the mapcount when
++	 * mapping a page, and the refcount must be decremented after the
++	 * mapcount when unmapping a page.
++	 *
++	 * If all folio references are from mappings, and all mappings are in
++	 * the page tables of this MM, then this folio is exclusive to this MM.
+ 	 */
+-	if (folio_test_large(folio))
++	if (folio_test_large_maybe_mapped_shared(folio))
+ 		return false;
+ 
++	VM_WARN_ON_ONCE(folio_test_ksm(folio));
++	VM_WARN_ON_ONCE(folio_mapcount(folio) > folio_nr_pages(folio));
++	VM_WARN_ON_ONCE(folio_entire_mapcount(folio));
++
++	if (unlikely(folio_test_swapcache(folio))) {
++		/*
++		 * Note: freeing up the swapcache will fail if some PTEs are
++		 * still swap entries.
++		 */
++		if (!folio_trylock(folio))
++			return false;
++		folio_free_swap(folio);
++		folio_unlock(folio);
++	}
++
++	if (folio_large_mapcount(folio) != folio_ref_count(folio))
++		return false;
++
++	/* Stabilize the mapcount vs. refcount and recheck. */
++	folio_lock_large_mapcount(folio);
++	VM_WARN_ON_ONCE(folio_large_mapcount(folio) < folio_ref_count(folio));
++
++	if (folio_test_large_maybe_mapped_shared(folio))
++		goto unlock;
++	if (folio_large_mapcount(folio) != folio_ref_count(folio))
++		goto unlock;
++
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) != vma->vm_mm->mm_id &&
++			folio_mm_id(folio, 1) != vma->vm_mm->mm_id);
++
++	/*
++	 * Do we need the folio lock? Likely not. If there would have been
++	 * references from page migration/swapout, we would have detected
++	 * an additional folio reference and never ended up here.
++	 */
++	exclusive = true;
++unlock:
++	folio_unlock_large_mapcount(folio);
++	return exclusive;
++}
++#else /* !CONFIG_TRANSPARENT_HUGEPAGE */
++static bool __wp_can_reuse_large_anon_folio(struct folio *folio,
++		struct vm_area_struct *vma)
++{
++	BUILD_BUG();
++}
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++
++static bool wp_can_reuse_anon_folio(struct folio *folio,
++				    struct vm_area_struct *vma)
++{
++	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) && folio_test_large(folio))
++		return __wp_can_reuse_large_anon_folio(folio, vma);
++
+ 	/*
+ 	 * We have to verify under folio lock: these early checks are
+ 	 * just an optimization to avoid locking the folio and freeing
+_

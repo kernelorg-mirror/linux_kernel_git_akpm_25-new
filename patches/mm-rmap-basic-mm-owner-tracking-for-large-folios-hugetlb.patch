@@ -1,0 +1,530 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/rmap: basic MM owner tracking for large folios (!hugetlb)
+Date: Mon, 3 Mar 2025 17:30:05 +0100
+
+For small folios, we traditionally use the mapcount to decide whether it
+was "certainly mapped exclusively" by a single MM (mapcount == 1) or
+whether it "maybe mapped shared" by multiple MMs (mapcount > 1).  For
+PMD-sized folios that were PMD-mapped, we were able to use a similar
+mechanism (single PMD mapping), but for PTE-mapped folios and in the
+future folios that span multiple PMDs, this does not work.
+
+So we need a different mechanism to handle large folios.  Let's add a new
+mechanism to detect whether a large folio is "certainly mapped
+exclusively", or whether it is "maybe mapped shared".
+
+We'll use this information next to optimize CoW reuse for PTE-mapped
+anonymous THP, and to convert folio_likely_mapped_shared() to
+folio_maybe_mapped_shared(), independent of per-page mapcounts.
+
+For each large folio, we'll have two slots, whereby a slot stores:
+ (1) an MM id: unique id assigned to each MM
+ (2) a per-MM mapcount
+
+If a slot is unoccupied, it can be taken by the next MM that maps folio
+page.
+
+In addition, we'll remember the current state -- "mapped exclusively" vs. 
+"maybe mapped shared" -- and use a bit spinlock to sync on updates and to
+reduce the total number of atomic accesses on updates.  In the future, it
+might be possible to squeeze a proper spinlock into "struct folio".  For
+now, keep it simple, as we require the whole thing with THP only, that is
+incompatible with RT.
+
+As we have to squeeze this information into the "struct folio" of even
+folios of order-1 (2 pages), and we generally want to reduce the required
+metadata, we'll assign each MM a unique ID that can fit into an int.  In
+total, we can squeeze everything into 4x int (2x long) on 64bit.
+
+32bit support is a bit challenging, because we only have 2x long == 2x int
+in order-1 folios.  But we can make it work for now, because we neither
+expect many MMs nor very large folios on 32bit.
+
+We will reliably detect folios as "mapped exclusively" vs.  "mapped
+shared" as long as only two MMs map pages of a folio at one point in time
+-- for example with fork() and short-lived child processes, or with apps
+that hand over state from one instance to another.
+
+As soon as three MMs are involved at the same time, we might detect "maybe
+mapped shared" although the folio is "mapped exclusively".
+
+Example 1:
+
+(1) App1 faults in a (shmem/file-backed) folio page -> Tracked as MM0
+(2) App2 faults in a folio page -> Tracked as MM1
+(4) App1 unmaps all folio pages
+
+ -> We will detect "mapped exclusively".
+
+Example 2:
+
+(1) App1 faults in a (shmem/file-backed) folio page -> Tracked as MM0
+(2) App2 faults in a folio page -> Tracked as MM1
+(3) App3 faults in a folio page -> No slot available, tracked as "unknown"
+(4) App1 and App2 unmap all folio pages
+
+ -> We will detect "maybe mapped shared".
+
+Make use of __always_inline to keep possible performance degradation when
+(un)mapping large folios to a minimum.
+
+Note: by squeezing the two flags into the "unsigned long" that stores the
+MM ids, we can use non-atomic __bit_spin_unlock() and non-atomic
+setting/clearing of the "maybe mapped shared" bit, effectively not adding
+any new atomics on the hot path when updating the large mapcount + new
+metadata, which further helps reduce the runtime overhead in
+micro-benchmarks.
+
+Link: https://lkml.kernel.org/r/20250303163014.1128035-13-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Andy Lutomirks^H^Hski <luto@kernel.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcow (Oracle) <willy@infradead.org>
+Cc: Michal Koutn <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: tejun heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zefan Li <lizefan.x@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/mm/transhuge.rst |    8 +
+ include/linux/mm_types.h       |   49 +++++++++
+ include/linux/page-flags.h     |    4 
+ include/linux/rmap.h           |  165 +++++++++++++++++++++++++++++++
+ kernel/fork.c                  |   36 ++++++
+ mm/Kconfig                     |    4 
+ mm/internal.h                  |    5 
+ mm/page_alloc.c                |   10 +
+ 8 files changed, 281 insertions(+)
+
+--- a/Documentation/mm/transhuge.rst~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/Documentation/mm/transhuge.rst
+@@ -120,11 +120,19 @@ pages:
+     and also increment/decrement folio->_nr_pages_mapped by ENTIRELY_MAPPED
+     when _entire_mapcount goes from -1 to 0 or 0 to -1.
+ 
++    We also maintain the two slots for tracking MM owners (MM ID and
++    corresponding mapcount), and the current status ("maybe mapped shared" vs.
++    "mapped exclusively").
++
+   - map/unmap of individual pages with PTE entry increment/decrement
+     page->_mapcount, increment/decrement folio->_large_mapcount and also
+     increment/decrement folio->_nr_pages_mapped when page->_mapcount goes
+     from -1 to 0 or 0 to -1 as this counts the number of pages mapped by PTE.
+ 
++    We also maintain the two slots for tracking MM owners (MM ID and
++    corresponding mapcount), and the current status ("maybe mapped shared" vs.
++    "mapped exclusively").
++
+ split_huge_page internally has to distribute the refcounts in the head
+ page to the tail pages before clearing all PG_head/tail bits from the page
+ structures. It can be done easily for refcounts taken by page table
+--- a/include/linux/mm_types.h~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/include/linux/mm_types.h
+@@ -292,6 +292,44 @@ typedef struct {
+ #define NR_PAGES_IN_LARGE_FOLIO
+ #endif
+ 
++/*
++ * On 32bit, we can cut the required metadata in half, because:
++ * (a) PID_MAX_LIMIT implicitly limits the number of MMs we could ever have,
++ *     so we can limit MM IDs to 15 bit (32767).
++ * (b) We don't expect folios where even a single complete PTE mapping by
++ *     one MM would exceed 15 bits (order-15).
++ */
++#ifdef CONFIG_64BIT
++typedef int mm_id_mapcount_t;
++#define MM_ID_MAPCOUNT_MAX		INT_MAX
++typedef unsigned int mm_id_t;
++#else /* !CONFIG_64BIT */
++typedef short mm_id_mapcount_t;
++#define MM_ID_MAPCOUNT_MAX		SHRT_MAX
++typedef unsigned short mm_id_t;
++#endif /* CONFIG_64BIT */
++
++/* We implicitly use the dummy ID for init-mm etc. where we never rmap pages. */
++#define MM_ID_DUMMY			0
++#define MM_ID_MIN			(MM_ID_DUMMY + 1)
++
++/*
++ * We leave the highest bit of each MM id unused, so we can store a flag
++ * in the highest bit of each folio->_mm_id[].
++ */
++#define MM_ID_BITS			((sizeof(mm_id_t) * BITS_PER_BYTE) - 1)
++#define MM_ID_MASK			((1U << MM_ID_BITS) - 1)
++#define MM_ID_MAX			MM_ID_MASK
++
++/*
++ * In order to use bit_spin_lock(), which requires an unsigned long, we
++ * operate on folio->_mm_ids when working on flags.
++ */
++#define FOLIO_MM_IDS_LOCK_BITNUM	MM_ID_BITS
++#define FOLIO_MM_IDS_LOCK_BIT		BIT(FOLIO_MM_IDS_LOCK_BITNUM)
++#define FOLIO_MM_IDS_SHARED_BITNUM	(2 * MM_ID_BITS + 1)
++#define FOLIO_MM_IDS_SHARED_BIT		BIT(FOLIO_MM_IDS_SHARED_BITNUM)
++
+ /**
+  * struct folio - Represents a contiguous set of bytes.
+  * @flags: Identical to the page flags.
+@@ -318,6 +356,9 @@ typedef struct {
+  * @_nr_pages_mapped: Do not use outside of rmap and debug code.
+  * @_pincount: Do not use directly, call folio_maybe_dma_pinned().
+  * @_nr_pages: Do not use directly, call folio_nr_pages().
++ * @_mm_id: Do not use outside of rmap code.
++ * @_mm_ids: Do not use outside of rmap code.
++ * @_mm_id_mapcount: Do not use outside of rmap code.
+  * @_hugetlb_subpool: Do not use directly, use accessor in hugetlb.h.
+  * @_hugetlb_cgroup: Do not use directly, use accessor in hugetlb_cgroup.h.
+  * @_hugetlb_cgroup_rsvd: Do not use directly, use accessor in hugetlb_cgroup.h.
+@@ -390,6 +431,11 @@ struct folio {
+ 					atomic_t _entire_mapcount;
+ 					atomic_t _pincount;
+ #endif /* CONFIG_64BIT */
++					mm_id_mapcount_t _mm_id_mapcount[2];
++					union {
++						mm_id_t _mm_id[2];
++						unsigned long _mm_ids;
++					};
+ 				};
+ 				unsigned long _usable_1[4];
+ 			};
+@@ -1111,6 +1157,9 @@ struct mm_struct {
+ #endif
+ 		} lru_gen;
+ #endif /* CONFIG_LRU_GEN_WALKS_MMU */
++#ifdef CONFIG_MM_ID
++		mm_id_t mm_id;
++#endif /* CONFIG_MM_ID */
+ 	} __randomize_layout;
+ 
+ 	/*
+--- a/include/linux/page-flags.h~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/include/linux/page-flags.h
+@@ -1222,6 +1222,10 @@ static inline int folio_has_private(cons
+ 	return !!(folio->flags & PAGE_FLAGS_PRIVATE);
+ }
+ 
++static inline bool folio_test_large_maybe_mapped_shared(const struct folio *folio)
++{
++	return test_bit(FOLIO_MM_IDS_SHARED_BITNUM, &folio->_mm_ids);
++}
+ #undef PF_ANY
+ #undef PF_HEAD
+ #undef PF_NO_TAIL
+--- a/include/linux/rmap.h~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/include/linux/rmap.h
+@@ -13,6 +13,7 @@
+ #include <linux/highmem.h>
+ #include <linux/pagemap.h>
+ #include <linux/memremap.h>
++#include <linux/bit_spinlock.h>
+ 
+ /*
+  * The anon_vma heads a list of private "related" vmas, to scan if
+@@ -173,6 +174,169 @@ static inline void anon_vma_merge(struct
+ 
+ struct anon_vma *folio_get_anon_vma(const struct folio *folio);
+ 
++#ifdef CONFIG_MM_ID
++static __always_inline void folio_lock_large_mapcount(struct folio *folio)
++{
++	bit_spin_lock(FOLIO_MM_IDS_LOCK_BITNUM, &folio->_mm_ids);
++}
++
++static __always_inline void folio_unlock_large_mapcount(struct folio *folio)
++{
++	__bit_spin_unlock(FOLIO_MM_IDS_LOCK_BITNUM, &folio->_mm_ids);
++}
++
++static inline unsigned int folio_mm_id(const struct folio *folio, int idx)
++{
++	VM_WARN_ON_ONCE(idx != 0 && idx != 1);
++	return folio->_mm_id[idx] & MM_ID_MASK;
++}
++
++static inline void folio_set_mm_id(struct folio *folio, int idx, mm_id_t id)
++{
++	VM_WARN_ON_ONCE(idx != 0 && idx != 1);
++	folio->_mm_id[idx] &= ~MM_ID_MASK;
++	folio->_mm_id[idx] |= id;
++}
++
++static inline void __folio_large_mapcount_sanity_checks(const struct folio *folio,
++		int diff, mm_id_t mm_id)
++{
++	VM_WARN_ON_ONCE(!folio_test_large(folio) || folio_test_hugetlb(folio));
++	VM_WARN_ON_ONCE(diff <= 0);
++	VM_WARN_ON_ONCE(mm_id < MM_ID_MIN || mm_id > MM_ID_MAX);
++
++	/*
++	 * Make sure we can detect at least one complete PTE mapping of the
++	 * folio in a single MM as "exclusively mapped". This is primarily
++	 * a check on 32bit, where we currently reduce the size of the per-MM
++	 * mapcount to a short.
++	 */
++	VM_WARN_ON_ONCE(diff > folio_large_nr_pages(folio));
++	VM_WARN_ON_ONCE(folio_large_nr_pages(folio) - 1 > MM_ID_MAPCOUNT_MAX);
++
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) == MM_ID_DUMMY &&
++			folio->_mm_id_mapcount[0] != -1);
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) != MM_ID_DUMMY &&
++			folio->_mm_id_mapcount[0] < 0);
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 1) == MM_ID_DUMMY &&
++			folio->_mm_id_mapcount[1] != -1);
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 1) != MM_ID_DUMMY &&
++			folio->_mm_id_mapcount[1] < 0);
++	VM_WARN_ON_ONCE(!folio_mapped(folio) &&
++			folio_test_large_maybe_mapped_shared(folio));
++}
++
++static __always_inline void folio_set_large_mapcount(struct folio *folio,
++		int mapcount, struct vm_area_struct *vma)
++{
++	__folio_large_mapcount_sanity_checks(folio, mapcount, vma->vm_mm->mm_id);
++
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 0) != MM_ID_DUMMY);
++	VM_WARN_ON_ONCE(folio_mm_id(folio, 1) != MM_ID_DUMMY);
++
++	/* Note: mapcounts start at -1. */
++	atomic_set(&folio->_large_mapcount, mapcount - 1);
++	folio->_mm_id_mapcount[0] = mapcount - 1;
++	folio_set_mm_id(folio, 0, vma->vm_mm->mm_id);
++}
++
++static __always_inline void folio_add_large_mapcount(struct folio *folio,
++		int diff, struct vm_area_struct *vma)
++{
++	const mm_id_t mm_id = vma->vm_mm->mm_id;
++	int new_mapcount_val;
++
++	folio_lock_large_mapcount(folio);
++	__folio_large_mapcount_sanity_checks(folio, diff, mm_id);
++
++	new_mapcount_val = atomic_read(&folio->_large_mapcount) + diff;
++	atomic_set(&folio->_large_mapcount, new_mapcount_val);
++
++	/*
++	 * If a folio is mapped more than once into an MM on 32bit, we
++	 * can in theory overflow the per-MM mapcount (although only for
++	 * fairly large folios), turning it negative. In that case, just
++	 * free up the slot and mark the folio "mapped shared", otherwise
++	 * we might be in trouble when unmapping pages later.
++	 */
++	if (folio_mm_id(folio, 0) == mm_id) {
++		folio->_mm_id_mapcount[0] += diff;
++		if (!IS_ENABLED(CONFIG_64BIT) && unlikely(folio->_mm_id_mapcount[0] < 0)) {
++			folio->_mm_id_mapcount[0] = -1;
++			folio_set_mm_id(folio, 0, MM_ID_DUMMY);
++			folio->_mm_ids |= FOLIO_MM_IDS_SHARED_BIT;
++		}
++	} else if (folio_mm_id(folio, 1) == mm_id) {
++		folio->_mm_id_mapcount[1] += diff;
++		if (!IS_ENABLED(CONFIG_64BIT) && unlikely(folio->_mm_id_mapcount[1] < 0)) {
++			folio->_mm_id_mapcount[1] = -1;
++			folio_set_mm_id(folio, 1, MM_ID_DUMMY);
++			folio->_mm_ids |= FOLIO_MM_IDS_SHARED_BIT;
++		}
++	} else if (folio_mm_id(folio, 0) == MM_ID_DUMMY) {
++		folio_set_mm_id(folio, 0, mm_id);
++		folio->_mm_id_mapcount[0] = diff - 1;
++		/* We might have other mappings already. */
++		if (new_mapcount_val != diff - 1)
++			folio->_mm_ids |= FOLIO_MM_IDS_SHARED_BIT;
++	} else if (folio_mm_id(folio, 1) == MM_ID_DUMMY) {
++		folio_set_mm_id(folio, 1, mm_id);
++		folio->_mm_id_mapcount[1] = diff - 1;
++		/* Slot 0 certainly has mappings as well. */
++		folio->_mm_ids |= FOLIO_MM_IDS_SHARED_BIT;
++	}
++	folio_unlock_large_mapcount(folio);
++}
++
++static __always_inline void folio_sub_large_mapcount(struct folio *folio,
++		int diff, struct vm_area_struct *vma)
++{
++	const mm_id_t mm_id = vma->vm_mm->mm_id;
++	int new_mapcount_val;
++
++	folio_lock_large_mapcount(folio);
++	__folio_large_mapcount_sanity_checks(folio, diff, mm_id);
++
++	new_mapcount_val = atomic_read(&folio->_large_mapcount) - diff;
++	atomic_set(&folio->_large_mapcount, new_mapcount_val);
++
++	/*
++	 * There are valid corner cases where we might underflow a per-MM
++	 * mapcount (some mappings added when no slot was free, some mappings
++	 * added once a slot was free), so we always set it to -1 once we go
++	 * negative.
++	 */
++	if (folio_mm_id(folio, 0) == mm_id) {
++		folio->_mm_id_mapcount[0] -= diff;
++		if (folio->_mm_id_mapcount[0] >= 0)
++			goto out;
++		folio->_mm_id_mapcount[0] = -1;
++		folio_set_mm_id(folio, 0, MM_ID_DUMMY);
++	} else if (folio_mm_id(folio, 1) == mm_id) {
++		folio->_mm_id_mapcount[1] -= diff;
++		if (folio->_mm_id_mapcount[1] >= 0)
++			goto out;
++		folio->_mm_id_mapcount[1] = -1;
++		folio_set_mm_id(folio, 1, MM_ID_DUMMY);
++	}
++
++	/*
++	 * If one MM slot owns all mappings, the folio is mapped exclusively.
++	 * Note that if the folio is now unmapped (new_mapcount_val == -1), both
++	 * slots must be free (mapcount == -1), and we'll also mark it as
++	 * exclusive.
++	 */
++	if (folio->_mm_id_mapcount[0] == new_mapcount_val ||
++	    folio->_mm_id_mapcount[1] == new_mapcount_val)
++		folio->_mm_ids &= ~FOLIO_MM_IDS_SHARED_BIT;
++out:
++	folio_unlock_large_mapcount(folio);
++}
++#else /* !CONFIG_MM_ID */
++/*
++ * See __folio_rmap_sanity_checks(), we might map large folios even without
++ * CONFIG_TRANSPARENT_HUGEPAGE. We'll keep that working for now.
++ */
+ static inline void folio_set_large_mapcount(struct folio *folio, int mapcount,
+ 		struct vm_area_struct *vma)
+ {
+@@ -191,6 +355,7 @@ static inline void folio_sub_large_mapco
+ {
+ 	atomic_sub(diff, &folio->_large_mapcount);
+ }
++#endif /* CONFIG_MM_ID */
+ 
+ #define folio_inc_large_mapcount(folio, vma) \
+ 	folio_add_large_mapcount(folio, 1, vma)
+--- a/kernel/fork.c~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/kernel/fork.c
+@@ -802,6 +802,36 @@ static int dup_mmap(struct mm_struct *mm
+ #define mm_free_pgd(mm)
+ #endif /* CONFIG_MMU */
+ 
++#ifdef CONFIG_MM_ID
++static DEFINE_IDA(mm_ida);
++
++static inline int mm_alloc_id(struct mm_struct *mm)
++{
++	int ret;
++
++	ret = ida_alloc_range(&mm_ida, MM_ID_MIN, MM_ID_MAX, GFP_KERNEL);
++	if (ret < 0)
++		return ret;
++	mm->mm_id = ret;
++	return 0;
++}
++
++static inline void mm_free_id(struct mm_struct *mm)
++{
++	const mm_id_t id = mm->mm_id;
++
++	mm->mm_id = MM_ID_DUMMY;
++	if (id == MM_ID_DUMMY)
++		return;
++	if (WARN_ON_ONCE(id < MM_ID_MIN || id > MM_ID_MAX))
++		return;
++	ida_free(&mm_ida, id);
++}
++#else /* !CONFIG_MM_ID */
++static inline int mm_alloc_id(struct mm_struct *mm) { return 0; }
++static inline void mm_free_id(struct mm_struct *mm) {}
++#endif /* CONFIG_MM_ID */
++
+ static void check_mm(struct mm_struct *mm)
+ {
+ 	int i;
+@@ -905,6 +935,7 @@ void __mmdrop(struct mm_struct *mm)
+ 
+ 	WARN_ON_ONCE(mm == current->active_mm);
+ 	mm_free_pgd(mm);
++	mm_free_id(mm);
+ 	destroy_context(mm);
+ 	mmu_notifier_subscriptions_destroy(mm);
+ 	check_mm(mm);
+@@ -1289,6 +1320,9 @@ static struct mm_struct *mm_init(struct
+ 	if (mm_alloc_pgd(mm))
+ 		goto fail_nopgd;
+ 
++	if (mm_alloc_id(mm))
++		goto fail_noid;
++
+ 	if (init_new_context(p, mm))
+ 		goto fail_nocontext;
+ 
+@@ -1308,6 +1342,8 @@ fail_pcpu:
+ fail_cid:
+ 	destroy_context(mm);
+ fail_nocontext:
++	mm_free_id(mm);
++fail_noid:
+ 	mm_free_pgd(mm);
+ fail_nopgd:
+ 	free_mm(mm);
+--- a/mm/internal.h~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/mm/internal.h
+@@ -720,6 +720,11 @@ static inline void prep_compound_head(st
+ 	folio_set_order(folio, order);
+ 	atomic_set(&folio->_large_mapcount, -1);
+ 	atomic_set(&folio->_nr_pages_mapped, 0);
++	if (IS_ENABLED(CONFIG_MM_ID)) {
++		folio->_mm_ids = 0;
++		folio->_mm_id_mapcount[0] = -1;
++		folio->_mm_id_mapcount[1] = -1;
++	}
+ 	if (IS_ENABLED(CONFIG_64BIT) || order > 1) {
+ 		atomic_set(&folio->_pincount, 0);
+ 		atomic_set(&folio->_entire_mapcount, -1);
+--- a/mm/Kconfig~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/mm/Kconfig
+@@ -809,11 +809,15 @@ config ARCH_WANT_GENERAL_HUGETLB
+ config ARCH_WANTS_THP_SWAP
+ 	def_bool n
+ 
++config MM_ID
++	def_bool n
++
+ menuconfig TRANSPARENT_HUGEPAGE
+ 	bool "Transparent Hugepage Support"
+ 	depends on HAVE_ARCH_TRANSPARENT_HUGEPAGE && !PREEMPT_RT
+ 	select COMPACTION
+ 	select XARRAY_MULTI
++	select MM_ID
+ 	help
+ 	  Transparent Hugepages allows the kernel to use huge pages and
+ 	  huge tlb transparently to the applications whenever possible.
+--- a/mm/page_alloc.c~mm-rmap-basic-mm-owner-tracking-for-large-folios-hugetlb
++++ a/mm/page_alloc.c
+@@ -959,6 +959,16 @@ static int free_tail_page_prepare(struct
+ 			bad_page(page, "nonzero nr_pages_mapped");
+ 			goto out;
+ 		}
++		if (IS_ENABLED(CONFIG_MM_ID)) {
++			if (unlikely(folio->_mm_id_mapcount[0] != -1)) {
++				bad_page(page, "nonzero mm mapcount 0");
++				goto out;
++			}
++			if (unlikely(folio->_mm_id_mapcount[1] != -1)) {
++				bad_page(page, "nonzero mm mapcount 1");
++				goto out;
++			}
++		}
+ 		if (IS_ENABLED(CONFIG_64BIT)) {
+ 			if (unlikely(atomic_read(&folio->_entire_mapcount) + 1)) {
+ 				bad_page(page, "nonzero entire_mapcount");
+_

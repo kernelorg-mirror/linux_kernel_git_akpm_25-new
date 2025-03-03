@@ -1,0 +1,226 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: move _pincount in folio to page[2] on 32bit
+Date: Mon, 3 Mar 2025 17:29:58 +0100
+
+Let's free up some space on 32bit in page[1] by moving the _pincount to
+page[2].
+
+For order-1 folios (never anon folios!) on 32bit, we will now also use the
+GUP_PIN_COUNTING_BIAS approach.  A fully-mapped order-1 folio requires 2
+references.  With GUP_PIN_COUNTING_BIAS being 1024, we'd detect such
+folios as "maybe pinned" with 512 full mappings, instead of 1024 for
+order-0.  As anon folios are out of the picture (which are the most
+relevant users of checking for pinnings on *mapped* pages) and we are
+talking about 32bit, this is not expected to cause any trouble.
+
+In __dump_page(), copy one additional folio page if we detect a folio with
+an order > 1, so we can dump the pincount on order > 1 folios reliably.
+
+Note that THPs on 32bit are not particularly common (and we don't care too
+much about performance), but we want to keep it working reliably, because
+likely we want to use large folios there as well in the future,
+independent of PMD leaf support.
+
+Once we dynamically allocate "struct folio", fortunately the 32bit
+specifics will likely go away again; even small folios could then have a
+pincount and folio_has_pincount() would essentially always return "true".
+
+Link: https://lkml.kernel.org/r/20250303163014.1128035-6-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Andy Lutomirks^H^Hski <luto@kernel.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcow (Oracle) <willy@infradead.org>
+Cc: Michal Koutn <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: tejun heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zefan Li <lizefan.x@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mm.h       |   11 +++++++++--
+ include/linux/mm_types.h |    5 +++++
+ mm/debug.c               |   10 +++++++++-
+ mm/gup.c                 |    8 ++++----
+ mm/internal.h            |    3 ++-
+ mm/page_alloc.c          |   14 +++++++++++---
+ 6 files changed, 40 insertions(+), 11 deletions(-)
+
+--- a/include/linux/mm.h~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/include/linux/mm.h
+@@ -2004,6 +2004,13 @@ static inline struct folio *pfn_folio(un
+ 	return page_folio(pfn_to_page(pfn));
+ }
+ 
++static inline bool folio_has_pincount(const struct folio *folio)
++{
++	if (IS_ENABLED(CONFIG_64BIT))
++		return folio_test_large(folio);
++	return folio_order(folio) > 1;
++}
++
+ /**
+  * folio_maybe_dma_pinned - Report if a folio may be pinned for DMA.
+  * @folio: The folio.
+@@ -2020,7 +2027,7 @@ static inline struct folio *pfn_folio(un
+  * get that many refcounts, and b) all the callers of this routine are
+  * expected to be able to deal gracefully with a false positive.
+  *
+- * For large folios, the result will be exactly correct. That's because
++ * For most large folios, the result will be exactly correct. That's because
+  * we have more tracking data available: the _pincount field is used
+  * instead of the GUP_PIN_COUNTING_BIAS scheme.
+  *
+@@ -2031,7 +2038,7 @@ static inline struct folio *pfn_folio(un
+  */
+ static inline bool folio_maybe_dma_pinned(struct folio *folio)
+ {
+-	if (folio_test_large(folio))
++	if (folio_has_pincount(folio))
+ 		return atomic_read(&folio->_pincount) > 0;
+ 
+ 	/*
+--- a/include/linux/mm_types.h~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/include/linux/mm_types.h
+@@ -387,7 +387,9 @@ struct folio {
+ 					atomic_t _large_mapcount;
+ 					atomic_t _entire_mapcount;
+ 					atomic_t _nr_pages_mapped;
++#ifdef CONFIG_64BIT
+ 					atomic_t _pincount;
++#endif /* CONFIG_64BIT */
+ 				};
+ 				unsigned long _usable_1[4];
+ 			};
+@@ -406,6 +408,9 @@ struct folio {
+ 			unsigned long _head_2;
+ 	/* public: */
+ 			struct list_head _deferred_list;
++#ifndef CONFIG_64BIT
++			atomic_t _pincount;
++#endif /* !CONFIG_64BIT */
+ 	/* private: the union with struct page is transitional */
+ 		};
+ 		struct page __page_2;
+--- a/mm/debug.c~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/mm/debug.c
+@@ -79,12 +79,17 @@ static void __dump_folio(struct folio *f
+ 			folio_ref_count(folio), mapcount, mapping,
+ 			folio->index + idx, pfn);
+ 	if (folio_test_large(folio)) {
++		int pincount = 0;
++
++		if (folio_has_pincount(folio))
++			pincount = atomic_read(&folio->_pincount);
++
+ 		pr_warn("head: order:%u mapcount:%d entire_mapcount:%d nr_pages_mapped:%d pincount:%d\n",
+ 				folio_order(folio),
+ 				folio_mapcount(folio),
+ 				folio_entire_mapcount(folio),
+ 				folio_nr_pages_mapped(folio),
+-				atomic_read(&folio->_pincount));
++				pincount);
+ 	}
+ 
+ #ifdef CONFIG_MEMCG
+@@ -146,6 +151,9 @@ again:
+ 	if (idx < MAX_FOLIO_NR_PAGES) {
+ 		memcpy(&folio, foliop, 2 * sizeof(struct page));
+ 		nr_pages = folio_nr_pages(&folio);
++		if (nr_pages > 1)
++			memcpy(&folio.__page_2, &foliop->__page_2,
++			       sizeof(struct page));
+ 		foliop = &folio;
+ 	}
+ 
+--- a/mm/gup.c~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/mm/gup.c
+@@ -109,7 +109,7 @@ static void gup_put_folio(struct folio *
+ 		if (is_zero_folio(folio))
+ 			return;
+ 		node_stat_mod_folio(folio, NR_FOLL_PIN_RELEASED, refs);
+-		if (folio_test_large(folio))
++		if (folio_has_pincount(folio))
+ 			atomic_sub(refs, &folio->_pincount);
+ 		else
+ 			refs *= GUP_PIN_COUNTING_BIAS;
+@@ -164,7 +164,7 @@ int __must_check try_grab_folio(struct f
+ 		 * Increment the normal page refcount field at least once,
+ 		 * so that the page really is pinned.
+ 		 */
+-		if (folio_test_large(folio)) {
++		if (folio_has_pincount(folio)) {
+ 			folio_ref_add(folio, refs);
+ 			atomic_add(refs, &folio->_pincount);
+ 		} else {
+@@ -223,7 +223,7 @@ void folio_add_pin(struct folio *folio)
+ 	 * page refcount field at least once, so that the page really is
+ 	 * pinned.
+ 	 */
+-	if (folio_test_large(folio)) {
++	if (folio_has_pincount(folio)) {
+ 		WARN_ON_ONCE(atomic_read(&folio->_pincount) < 1);
+ 		folio_ref_inc(folio);
+ 		atomic_inc(&folio->_pincount);
+@@ -575,7 +575,7 @@ static struct folio *try_grab_folio_fast
+ 	 * is pinned.  That's why the refcount from the earlier
+ 	 * try_get_folio() is left intact.
+ 	 */
+-	if (folio_test_large(folio))
++	if (folio_has_pincount(folio))
+ 		atomic_add(refs, &folio->_pincount);
+ 	else
+ 		folio_ref_add(folio,
+--- a/mm/internal.h~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/mm/internal.h
+@@ -721,7 +721,8 @@ static inline void prep_compound_head(st
+ 	atomic_set(&folio->_large_mapcount, -1);
+ 	atomic_set(&folio->_entire_mapcount, -1);
+ 	atomic_set(&folio->_nr_pages_mapped, 0);
+-	atomic_set(&folio->_pincount, 0);
++	if (IS_ENABLED(CONFIG_64BIT) || order > 1)
++		atomic_set(&folio->_pincount, 0);
+ 	if (order > 1)
+ 		INIT_LIST_HEAD(&folio->_deferred_list);
+ }
+--- a/mm/page_alloc.c~mm-move-_pincount-in-folio-to-page-on-32bit
++++ a/mm/page_alloc.c
+@@ -963,9 +963,11 @@ static int free_tail_page_prepare(struct
+ 			bad_page(page, "nonzero nr_pages_mapped");
+ 			goto out;
+ 		}
+-		if (unlikely(atomic_read(&folio->_pincount))) {
+-			bad_page(page, "nonzero pincount");
+-			goto out;
++		if (IS_ENABLED(CONFIG_64BIT)) {
++			if (unlikely(atomic_read(&folio->_pincount))) {
++				bad_page(page, "nonzero pincount");
++				goto out;
++			}
+ 		}
+ 		break;
+ 	case 2:
+@@ -974,6 +976,12 @@ static int free_tail_page_prepare(struct
+ 			bad_page(page, "on deferred list");
+ 			goto out;
+ 		}
++		if (!IS_ENABLED(CONFIG_64BIT)) {
++			if (unlikely(atomic_read(&folio->_pincount))) {
++				bad_page(page, "nonzero pincount");
++				goto out;
++			}
++		}
+ 		break;
+ 	case 3:
+ 		/* the third tail page: hugetlb specifics overlap ->mappings */
+_

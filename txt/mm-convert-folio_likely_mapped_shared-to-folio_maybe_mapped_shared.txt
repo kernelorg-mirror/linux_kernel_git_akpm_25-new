@@ -1,0 +1,121 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: convert folio_likely_mapped_shared() to folio_maybe_mapped_shared()
+Date: Mon, 3 Mar 2025 17:30:07 +0100
+
+Let's reuse our new MM ownership tracking infrastructure for large folios
+to make folio_likely_mapped_shared() never return false negatives -- never
+indicating "not mapped shared" although the folio *is* mapped shared. 
+With that, we can rename it to folio_maybe_mapped_shared() and get rid of
+the dependency on the mapcount of the first folio page.
+
+The semantics are now arguably clearer: no mixture of "false negatives"
+and "false positives", only the remaining possibility for "false
+positives".
+
+Thoroughly document the new semantics.  We might now detect that a large
+folio is "maybe mapped shared" although it *no longer* is -- but once was.
+Now, if more than two MMs mapped a folio at the same time, and the MM
+mapping the folio exclusively at the end is not one tracked in the two
+folio MM slots, we will detect the folio as "maybe mapped shared".
+
+For anonymous folios, usually (except weird corner cases) all PTEs that
+target a "maybe mapped shared" folio are R/O.  As soon as a child process
+would write to them (iow, actively use them), we would CoW and effectively
+replace these PTEs.  Most cases (below) are not expected to really matter
+with large anonymous folios for this reason.
+
+Most importantly, there will be no change at all for:
+* small folios
+* hugetlb folios
+* PMD-mapped PMD-sized THPs (single mapping)
+
+This change has the potential to affect existing callers of
+folio_likely_mapped_shared() -> folio_maybe_mapped_shared():
+
+(1) fs/proc/task_mmu.c: no change (hugetlb)
+
+(2) khugepaged counts PTEs that target shared folios towards
+    max_ptes_shared (default: HPAGE_PMD_NR / 2), meaning we could skip a
+    collapse where we would have previously collapsed.  This only applies
+    to anonymous folios and is not expected to matter in practice.
+
+    Worth noting that this change sorts out case (A) documented in
+    commit 1bafe96e89f0 ("mm/khugepaged: replace page_mapcount() check by
+    folio_likely_mapped_shared()") by removing the possibility for "false
+    negatives".
+
+(3) MADV_COLD / MADV_PAGEOUT / MADV_FREE will not try splitting
+    PTE-mapped THPs that are considered shared but not fully covered by
+    the requested range, consequently not processing them.
+
+    PMD-mapped PMD-sized THP are not affected, or when all PTEs are
+    covered.  These functions are usually only called on anon/file folios
+    that are exclusively mapped most of the time (no other file mappings
+    or no fork()), so the "false negatives" are not expected to matter in
+    practice.
+
+(4) mbind() / migrate_pages() / move_pages() will refuse to migrate
+    shared folios unless MPOL_MF_MOVE_ALL is effective (requires
+    CAP_SYS_NICE).  We will now reject some folios that could be migrated.
+
+    Similar to (3), especially with MPOL_MF_MOVE_ALL, so this is not
+    expected to matter in practice.
+
+    Note that cpuset_migrate_mm_workfn() calls do_migrate_pages() with
+    MPOL_MF_MOVE_ALL.
+
+(5) NUMA hinting
+
+    mm/migrate.c:migrate_misplaced_folio_prepare() will skip file
+    folios that are probably shared libraries (-> "mapped shared" and
+    executable).  This check would have detected it as a shared library at
+    some point (at least 3 MMs mapping it), so detecting it afterwards
+    does not sound wrong (still a shared library).  Not expected to
+    matter.
+
+    mm/memory.c:numa_migrate_check() will indicate TNF_SHARED in
+    MAP_SHARED file mappings when encountering a shared folio.  Similar
+    reasoning, not expected to matter.
+
+    mm/mprotect.c:change_pte_range() will skip folios detected as
+    shared in CoW mappings.  Similarly, this is not expected to matter in
+    practice, but if it would ever be a problem we could relax that check
+    a bit (e.g., basing it on the average page-mapcount in a folio),
+    because it was only an optimization when many (e.g., 288) processes
+    were mapping the same folios -- see commit 859d4adc3415 ("mm: numa: do
+    not trap faults on shared data section pages.")
+
+(6) mm/rmap.c:folio_referenced_one() will skip exclusive swapbacked
+    folios in dying processes.  Applies to anonymous folios only.  Without
+    "false negatives", we'll now skip all actually shared ones.  Skipping
+    ones that are actually exclusive won't really matter, it's a pure
+    optimization, and is not expected to matter in practice.
+
+In theory, one can detect the problematic scenario: folio_mapcount() > 0
+and no folio MM slot is occupied ("state unknown").  One could reset the
+MM slots while doing an rmap walk, which migration / folio split already
+do when setting everything up.  Further, when batching PTEs we might
+naturally learn about a owner (e.g., folio_mapcount() == nr_ptes) and
+could update the owner.  However, we'll defer that until the scenarios
+where it would really matter are clear.
+
+Link: https://lkml.kernel.org/r/20250303163014.1128035-15-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Cc: Andy Lutomirks^H^Hski <luto@kernel.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcow (Oracle) <willy@infradead.org>
+Cc: Michal Koutn <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: tejun heo <tj@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zefan Li <lizefan.x@bytedance.com>
