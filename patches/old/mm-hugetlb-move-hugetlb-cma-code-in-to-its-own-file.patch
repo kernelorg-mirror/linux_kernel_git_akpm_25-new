@@ -1,6 +1,6 @@
 From: Frank van der Linden <fvdl@google.com>
 Subject: mm/hugetlb: move hugetlb CMA code in to its own file
-Date: Thu, 6 Feb 2025 18:51:08 +0000
+Date: Tue, 18 Feb 2025 18:16:55 +0000
 
 hugetlb.c contained a number of CONFIG_CMA ifdefs, and the code inside
 them was large enough to merit being in its own file, so move it, cleaning
@@ -10,36 +10,36 @@ Hide some direct variable access behind functions to accommodate the move.
 
 No functional change intended.
 
-Link: https://lkml.kernel.org/r/20250206185109.1210657-29-fvdl@google.com
+Link: https://lkml.kernel.org/r/20250218181656.207178-28-fvdl@google.com
 Signed-off-by: Frank van der Linden <fvdl@google.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Dan Carpenter <dan.carpenter@linaro.org>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Joao Martins <joao.m.martins@oracle.com>
 Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
 Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
 Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Yu Zhao <yuzhao@google.com>
-Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
-Cc: Oscar Salvador <osalvador@suse.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  MAINTAINERS      |    2 
  mm/Makefile      |    3 
- mm/hugetlb.c     |  252 ++-----------------------------------------
- mm/hugetlb_cma.c |  258 +++++++++++++++++++++++++++++++++++++++++++++
- mm/hugetlb_cma.h |   55 +++++++++
- 5 files changed, 334 insertions(+), 236 deletions(-)
+ mm/hugetlb.c     |  269 ++------------------------------------------
+ mm/hugetlb_cma.c |  275 +++++++++++++++++++++++++++++++++++++++++++++
+ mm/hugetlb_cma.h |   57 +++++++++
+ 5 files changed, 354 insertions(+), 252 deletions(-)
 
 --- a/MAINTAINERS~mm-hugetlb-move-hugetlb-cma-code-in-to-its-own-file
 +++ a/MAINTAINERS
-@@ -10708,6 +10708,8 @@ F:	fs/hugetlbfs/
+@@ -10702,6 +10702,8 @@ F:	fs/hugetlbfs/
  F:	include/linux/hugetlb.h
  F:	include/trace/events/hugetlbfs.h
  F:	mm/hugetlb.c
@@ -122,7 +122,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			return NULL;
  
  		folio = folio_alloc_gigantic(order, gfp_mask, nid, nodemask);
-@@ -3179,32 +3148,19 @@ out_end_reservation:
+@@ -3187,47 +3156,14 @@ out_end_reservation:
  	return ERR_PTR(-ENOSPC);
  }
  
@@ -134,27 +134,50 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	return (hstate_is_gigantic(h) && hugetlb_cma_only);
 -}
 -
- static __init void *alloc_bootmem(struct hstate *h, int nid)
+ static __init void *alloc_bootmem(struct hstate *h, int nid, bool node_exact)
  {
  	struct huge_bootmem_page *m;
 -	unsigned long flags;
 -	struct cma *cma;
+ 	int listnode = nid;
  
 -#ifdef CONFIG_CMA
 -	if (hugetlb_early_cma(h)) {
 -		flags = HUGE_BOOTMEM_CMA;
 -		cma = hugetlb_cma[nid];
 -		m = cma_reserve_early(cma, huge_page_size(h));
+-		if (!m) {
+-			int node;
+-
+-			if (node_exact)
+-				return NULL;
+-			for_each_online_node(node) {
+-				cma = hugetlb_cma[node];
+-				if (!cma || node == nid)
+-					continue;
+-				m = cma_reserve_early(cma, huge_page_size(h));
+-				if (m) {
+-					listnode = node;
+-					break;
+-				}
+-			}
+-		}
 -	} else
 -#endif
 -	{
 -		flags = 0;
 -		cma = NULL;
 +	if (hugetlb_early_cma(h))
-+		m = hugetlb_cma_alloc_bootmem(h, nid);
++		m = hugetlb_cma_alloc_bootmem(h, &listnode, node_exact);
 +	else {
- 		m = memblock_alloc_try_nid_raw(huge_page_size(h),
- 			huge_page_size(h), 0, MEMBLOCK_ALLOC_ACCESSIBLE, nid);
+ 		if (node_exact)
+ 			m = memblock_alloc_exact_nid_raw(huge_page_size(h),
+ 				huge_page_size(h), 0,
+@@ -3246,6 +3182,11 @@ static __init void *alloc_bootmem(struct
+ 			if (m)
+ 				listnode = early_pfn_to_nid(PHYS_PFN(virt_to_phys(m)));
+ 		}
++
 +		if (m) {
 +			m->flags = 0;
 +			m->cma = NULL;
@@ -162,16 +185,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	if (m) {
-@@ -3219,8 +3175,6 @@ static __init void *alloc_bootmem(struct
+@@ -3260,8 +3201,6 @@ static __init void *alloc_bootmem(struct
  		INIT_LIST_HEAD(&m->list);
- 		list_add(&m->list, &huge_boot_pages[nid]);
+ 		list_add(&m->list, &huge_boot_pages[listnode]);
  		m->hstate = h;
 -		m->flags = flags;
 -		m->cma = cma;
  	}
  
  	return m;
-@@ -3665,7 +3619,8 @@ static void __init hugetlb_hstate_alloc_
+@@ -3711,7 +3650,8 @@ static void __init hugetlb_hstate_alloc_
  	 * Skip gigantic hugepages allocation if early CMA
  	 * reservations are not available.
  	 */
@@ -181,7 +204,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pr_warn_once("HugeTLB: hugetlb_cma is enabled, skip boot time allocation\n");
  		return;
  	}
-@@ -3702,7 +3657,7 @@ static void __init hugetlb_init_hstates(
+@@ -3748,7 +3688,7 @@ static void __init hugetlb_init_hstates(
  		 */
  		if (hstate_is_gigantic(h) && !gigantic_page_runtime_supported())
  			continue;
@@ -190,7 +213,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			continue;
  		for_each_hstate(h2) {
  			if (h2 == h)
-@@ -4604,14 +4559,6 @@ static void hugetlb_register_all_nodes(v
+@@ -4650,14 +4590,6 @@ static void hugetlb_register_all_nodes(v
  
  #endif
  
@@ -205,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void __init hugetlb_sysfs_init(void)
  {
  	struct hstate *h;
-@@ -4795,8 +4742,7 @@ static __init void hugetlb_parse_params(
+@@ -4841,8 +4773,7 @@ static __init void hugetlb_parse_params(
  		hcp->setup(hcp->val);
  	}
  
@@ -215,7 +238,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -7866,169 +7812,3 @@ void hugetlb_unshare_all_pmds(struct vm_
+@@ -7912,169 +7843,3 @@ void hugetlb_unshare_all_pmds(struct vm_
  	hugetlb_unshare_pmds(vma, ALIGN(vma->vm_start, PUD_SIZE),
  			ALIGN_DOWN(vma->vm_end, PUD_SIZE));
  }
@@ -389,7 +412,7 @@ diff --git a/mm/hugetlb_cma.c a/mm/hugetlb_cma.c
 new file mode 100644
 --- /dev/null
 +++ a/mm/hugetlb_cma.c
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,275 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +
 +#include <linux/mm.h>
@@ -446,13 +469,30 @@ new file mode 100644
 +}
 +
 +struct huge_bootmem_page * __init
-+hugetlb_cma_alloc_bootmem(struct hstate *h, int nid)
++hugetlb_cma_alloc_bootmem(struct hstate *h, int *nid, bool node_exact)
 +{
 +	struct cma *cma;
 +	struct huge_bootmem_page *m;
++	int node = *nid;
 +
-+	cma = hugetlb_cma[nid];
++	cma = hugetlb_cma[*nid];
 +	m = cma_reserve_early(cma, huge_page_size(h));
++	if (!m) {
++		if (node_exact)
++			return NULL;
++
++		for_each_online_node(node) {
++			cma = hugetlb_cma[node];
++			if (!cma || node == *nid)
++				continue;
++			m = cma_reserve_early(cma, huge_page_size(h));
++			if (m) {
++				*nid = node;
++				break;
++			}
++		}
++	}
++
 +	if (m) {
 +		m->flags = HUGE_BOOTMEM_CMA;
 +		m->cma = cma;
@@ -652,7 +692,7 @@ diff --git a/mm/hugetlb_cma.h a/mm/hugetlb_cma.h
 new file mode 100644
 --- /dev/null
 +++ a/mm/hugetlb_cma.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,57 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _LINUX_HUGETLB_CMA_H
 +#define _LINUX_HUGETLB_CMA_H
@@ -661,7 +701,8 @@ new file mode 100644
 +void hugetlb_cma_free_folio(struct folio *folio);
 +struct folio *hugetlb_cma_alloc_folio(struct hstate *h, gfp_t gfp_mask,
 +				      int nid, nodemask_t *nodemask);
-+struct huge_bootmem_page *hugetlb_cma_alloc_bootmem(struct hstate *h, int nid);
++struct huge_bootmem_page *hugetlb_cma_alloc_bootmem(struct hstate *h, int *nid,
++						    bool node_exact);
 +void hugetlb_cma_check(void);
 +bool hugetlb_cma_exclusive_alloc(void);
 +unsigned long hugetlb_cma_total_size(void);
@@ -679,7 +720,8 @@ new file mode 100644
 +}
 +
 +static inline
-+struct huge_bootmem_page *hugetlb_cma_alloc_bootmem(struct hstate *h, int nid)
++struct huge_bootmem_page *hugetlb_cma_alloc_bootmem(struct hstate *h, int *nid,
++						    bool node_exact)
 +{
 +	return NULL;
 +}

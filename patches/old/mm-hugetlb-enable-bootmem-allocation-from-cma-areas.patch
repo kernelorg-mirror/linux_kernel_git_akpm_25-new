@@ -1,6 +1,6 @@
 From: Frank van der Linden <fvdl@google.com>
 Subject: mm/hugetlb: enable bootmem allocation from CMA areas
-Date: Thu, 6 Feb 2025 18:51:07 +0000
+Date: Tue, 18 Feb 2025 18:16:54 +0000
 
 If hugetlb_cma_only is enabled, we know that hugetlb pages can only be
 allocated from CMA.  Now that there is an interface to do early
@@ -18,30 +18,30 @@ so introduce a boolean arch_specific_huge_bootmem_alloc that returns true
 if such an allocator is present.  In that case, CMA bootmem allocations
 can't be used, so check that function before trying.
 
-Link: https://lkml.kernel.org/r/20250206185109.1210657-28-fvdl@google.com
+Link: https://lkml.kernel.org/r/20250218181656.207178-27-fvdl@google.com
 Signed-off-by: Frank van der Linden <fvdl@google.com>
 Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
 Cc: Michael Ellerman <mpe@ellerman.id.au>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Dan Carpenter <dan.carpenter@linaro.org>
 Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Joao Martins <joao.m.martins@oracle.com>
 Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Roman Gushchin (Cruise) <roman.gushchin@linux.dev>
 Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Yu Zhao <yuzhao@google.com>
-Cc: Zhenguo Yao <yaozhenguo1@gmail.com>
-Cc: Oscar Salvador <osalvador@suse.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  arch/powerpc/include/asm/book3s/64/hugetlb.h |    6 
- include/linux/hugetlb.h                      |   17 ++
- mm/hugetlb.c                                 |  121 ++++++++++++-----
- 3 files changed, 113 insertions(+), 31 deletions(-)
+ include/linux/hugetlb.h                      |   17 +
+ mm/hugetlb.c                                 |  168 +++++++++++++----
+ 3 files changed, 152 insertions(+), 39 deletions(-)
 
 --- a/arch/powerpc/include/asm/book3s/64/hugetlb.h~mm-hugetlb-enable-bootmem-allocation-from-cma-areas
 +++ a/arch/powerpc/include/asm/book3s/64/hugetlb.h
@@ -93,7 +93,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  bool hugetlb_bootmem_page_zones_valid(int nid, struct huge_bootmem_page *m);
  
-@@ -823,6 +829,17 @@ static inline pte_t arch_make_huge_pte(p
+@@ -824,6 +830,17 @@ static inline pte_t arch_make_huge_pte(p
  }
  #endif
  
@@ -135,7 +135,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  #endif
  	if (!folio) {
-@@ -3174,6 +3179,53 @@ out_end_reservation:
+@@ -3182,6 +3187,86 @@ out_end_reservation:
  	return ERR_PTR(-ENOSPC);
  }
  
@@ -147,24 +147,57 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return (hstate_is_gigantic(h) && hugetlb_cma_only);
 +}
 +
-+static __init void *alloc_bootmem(struct hstate *h, int nid)
++static __init void *alloc_bootmem(struct hstate *h, int nid, bool node_exact)
 +{
 +	struct huge_bootmem_page *m;
 +	unsigned long flags;
 +	struct cma *cma;
++	int listnode = nid;
 +
 +#ifdef CONFIG_CMA
 +	if (hugetlb_early_cma(h)) {
 +		flags = HUGE_BOOTMEM_CMA;
 +		cma = hugetlb_cma[nid];
 +		m = cma_reserve_early(cma, huge_page_size(h));
++		if (!m) {
++			int node;
++
++			if (node_exact)
++				return NULL;
++			for_each_online_node(node) {
++				cma = hugetlb_cma[node];
++				if (!cma || node == nid)
++					continue;
++				m = cma_reserve_early(cma, huge_page_size(h));
++				if (m) {
++					listnode = node;
++					break;
++				}
++			}
++		}
 +	} else
 +#endif
 +	{
 +		flags = 0;
 +		cma = NULL;
-+		m = memblock_alloc_try_nid_raw(huge_page_size(h),
-+			huge_page_size(h), 0, MEMBLOCK_ALLOC_ACCESSIBLE, nid);
++		if (node_exact)
++			m = memblock_alloc_exact_nid_raw(huge_page_size(h),
++				huge_page_size(h), 0,
++				MEMBLOCK_ALLOC_ACCESSIBLE, nid);
++		else {
++			m = memblock_alloc_try_nid_raw(huge_page_size(h),
++				huge_page_size(h), 0,
++				MEMBLOCK_ALLOC_ACCESSIBLE, nid);
++			/*
++			 * For pre-HVO to work correctly, pages need to be on
++			 * the list for the node they were actually allocated
++			 * from. That node may be different in the case of
++			 * fallback by memblock_alloc_try_nid_raw. So,
++			 * extract the actual node first.
++			 */
++			if (m)
++				listnode = early_pfn_to_nid(PHYS_PFN(virt_to_phys(m)));
++		}
 +	}
 +
 +	if (m) {
@@ -177,7 +210,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * is not up yet.
 +		 */
 +		INIT_LIST_HEAD(&m->list);
-+		list_add(&m->list, &huge_boot_pages[nid]);
++		list_add(&m->list, &huge_boot_pages[listnode]);
 +		m->hstate = h;
 +		m->flags = flags;
 +		m->cma = cma;
@@ -189,46 +222,47 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int alloc_bootmem_huge_page(struct hstate *h, int nid)
  	__attribute__ ((weak, alias("__alloc_bootmem_huge_page")));
  int __alloc_bootmem_huge_page(struct hstate *h, int nid)
-@@ -3183,17 +3235,14 @@ int __alloc_bootmem_huge_page(struct hst
+@@ -3191,22 +3276,15 @@ int __alloc_bootmem_huge_page(struct hst
  
  	/* do node specific alloc */
  	if (nid != NUMA_NO_NODE) {
--		m = memblock_alloc_try_nid_raw(huge_page_size(h), huge_page_size(h),
+-		m = memblock_alloc_exact_nid_raw(huge_page_size(h), huge_page_size(h),
 -				0, MEMBLOCK_ALLOC_ACCESSIBLE, nid);
-+		m = alloc_bootmem(h, node);
++		m = alloc_bootmem(h, node, true);
  		if (!m)
  			return 0;
  		goto found;
  	}
++
  	/* allocate from next node when distributing huge pages */
  	for_each_node_mask_to_alloc(&h->next_nid_to_alloc, nr_nodes, node, &node_states[N_ONLINE]) {
 -		m = memblock_alloc_try_nid_raw(
 -				huge_page_size(h), huge_page_size(h),
 -				0, MEMBLOCK_ALLOC_ACCESSIBLE, node);
-+		m = alloc_bootmem(h, node);
- 		if (m)
- 			break;
- 	}
-@@ -3202,7 +3251,6 @@ int __alloc_bootmem_huge_page(struct hst
- 		return 0;
- 
- found:
--
- 	/*
- 	 * Only initialize the head struct page in memmap_init_reserved_pages,
- 	 * rest of the struct pages will be initialized by the HugeTLB
-@@ -3212,18 +3260,6 @@ found:
- 	 */
+-		/*
+-		 * Use the beginning of the huge page to store the
+-		 * huge_bootmem_page struct (until gather_bootmem
+-		 * puts them into the mem_map).
+-		 */
++		m = alloc_bootmem(h, node, false);
+ 		if (!m)
+ 			return 0;
+ 		goto found;
+@@ -3224,21 +3302,6 @@ found:
  	memblock_reserved_mark_noinit(virt_to_phys((void *)m + PAGE_SIZE),
  		huge_page_size(h) - PAGE_SIZE);
+ 
 -	/*
--	 * Use the beginning of the huge page to store the
--	 * huge_bootmem_page struct (until gather_bootmem
--	 * puts them into the mem_map).
+-	 * Put them into a private list first because mem_map is not up yet.
 -	 *
--	 * Put them into a private list first because mem_map
--	 * is not up yet.
+-	 * For pre-HVO to work correctly, pages need to be on the list for
+-	 * the node they were actually allocated from. That node may be
+-	 * different in the case of fallback by memblock_alloc_try_nid_raw.
+-	 * So, extract the actual node first.
 -	 */
+-	if (nid == NUMA_NO_NODE)
+-		node = early_pfn_to_nid(PHYS_PFN(virt_to_phys(m)));
+-
 -	INIT_LIST_HEAD(&m->list);
 -	list_add(&m->list, &huge_boot_pages[node]);
 -	m->hstate = h;
@@ -236,7 +270,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return 1;
  }
  
-@@ -3264,13 +3300,25 @@ static void __init hugetlb_folio_init_vm
+@@ -3279,13 +3342,25 @@ static void __init hugetlb_folio_init_vm
  	prep_compound_head((struct page *)folio, huge_page_order(h));
  }
  
@@ -265,7 +299,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  static void __init hugetlb_bootmem_init_migratetype(struct folio *folio,
  							  struct hstate *h)
-@@ -3279,9 +3327,13 @@ static void __init hugetlb_bootmem_init_
+@@ -3294,9 +3369,13 @@ static void __init hugetlb_bootmem_init_
  
  	WARN_ON_ONCE(!pageblock_aligned(folio_pfn(folio)));
  
@@ -281,7 +315,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void __init prep_and_add_bootmem_folios(struct hstate *h,
-@@ -3327,10 +3379,16 @@ bool __init hugetlb_bootmem_page_zones_v
+@@ -3342,10 +3421,16 @@ bool __init hugetlb_bootmem_page_zones_v
  		return true;
  	}
  
@@ -298,7 +332,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!valid)
  		hstate_boot_nrinvalid[hstate_index(m->hstate)]++;
  
-@@ -3359,11 +3417,6 @@ static void __init hugetlb_bootmem_free_
+@@ -3374,11 +3459,6 @@ static void __init hugetlb_bootmem_free_
  	}
  }
  
@@ -310,7 +344,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Put bootmem huge pages into the standard lists after mem_map is up.
   * Note: This only applies to gigantic (order > MAX_PAGE_ORDER) pages.
-@@ -3413,6 +3466,9 @@ static void __init gather_bootmem_preall
+@@ -3428,14 +3508,21 @@ static void __init gather_bootmem_preall
  			 */
  			folio_set_hugetlb_vmemmap_optimized(folio);
  
@@ -320,7 +354,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		list_add(&folio->lru, &folio_list);
  
  		/*
-@@ -3605,8 +3661,11 @@ static void __init hugetlb_hstate_alloc_
+ 		 * We need to restore the 'stolen' pages to totalram_pages
+ 		 * in order to fix confusing memory reports from free(1) and
+ 		 * other side-effects, like CommitLimit going negative.
++		 *
++		 * For CMA pages, this is done in init_cma_pageblock
++		 * (via hugetlb_bootmem_init_migratetype), so skip it here.
+ 		 */
+-		adjust_managed_page_count(page, pages_per_huge_page(h));
++		if (!folio_test_hugetlb_cma(folio))
++			adjust_managed_page_count(page, pages_per_huge_page(h));
+ 		cond_resched();
+ 	}
+ 
+@@ -3620,8 +3707,11 @@ static void __init hugetlb_hstate_alloc_
  {
  	unsigned long allocated;
  
