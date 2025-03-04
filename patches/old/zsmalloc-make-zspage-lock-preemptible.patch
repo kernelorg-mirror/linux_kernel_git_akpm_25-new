@@ -1,6 +1,6 @@
 From: Sergey Senozhatsky <senozhatsky@chromium.org>
 Subject: zsmalloc: make zspage lock preemptible
-Date: Fri, 14 Feb 2025 13:50:23 +0900
+Date: Sat, 22 Feb 2025 07:25:42 +0900
 
 In order to implement preemptible object mapping we need a zspage lock
 that satisfies several preconditions:
@@ -20,18 +20,16 @@ reader-writer semaphore that satisfies all of the preconditions.
 
 The spin-lock based zspage_lock is suggested by Hillf Danton.
 
-Link: https://lkml.kernel.org/r/20250214045208.1388854-12-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20250221222958.2225035-12-senozhatsky@chromium.org
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
-Suggested-by: Hillf Danton <hdanton@sina.com>
-Cc: Kairui Song <ryncsn@gmail.com>
 Cc: Minchan Kim <minchan@kernel.org>
 Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
 Cc: Yosry Ahmed <yosry.ahmed@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zsmalloc.c |  246 +++++++++++++++++++++++++++++++++++++-----------
- 1 file changed, 192 insertions(+), 54 deletions(-)
+ mm/zsmalloc.c |  184 ++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 131 insertions(+), 53 deletions(-)
 
 --- a/mm/zsmalloc.c~zsmalloc-make-zspage-lock-preemptible
 +++ a/mm/zsmalloc.c
@@ -73,113 +71,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  struct mapping_area {
-@@ -279,6 +294,148 @@ struct mapping_area {
+@@ -279,6 +294,93 @@ struct mapping_area {
  	enum zs_mapmode vm_mm; /* mapping mode */
  };
  
-+static void zspage_lock_init(struct zspage *zspage)
-+{
 +#ifdef CONFIG_DEBUG_LOCK_ALLOC
-+	lockdep_init_map(&zspage->zsl.dep_map, "zspage->lock",
-+			 &zspage->pool->lock_class, 0);
++#define zsl_dep_map(zsl) (&(zsl)->dep_map)
++#define zspool_lock_class(pool) (&(pool)->lock_class)
++#else
++#define zsl_dep_map(zsl) NULL
++#define zspool_lock_class(pool) NULL
 +#endif
 +
-+	spin_lock_init(&zspage->zsl.lock);
-+	zspage->zsl.cnt = ZS_PAGE_UNLOCKED;
-+}
-+
-+#ifdef CONFIG_DEBUG_LOCK_ALLOC
-+static inline void __read_lock(struct zspage *zspage)
++static void zspage_lock_init(struct zspage *zspage)
 +{
 +	struct zspage_lock *zsl = &zspage->zsl;
 +
-+	rwsem_acquire_read(&zsl->dep_map, 0, 0, _RET_IP_);
-+
-+	spin_lock(&zsl->lock);
-+	zsl->cnt++;
-+	spin_unlock(&zsl->lock);
-+
-+	lock_acquired(&zsl->dep_map, _RET_IP_);
-+}
-+
-+static inline void __read_unlock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	rwsem_release(&zsl->dep_map, _RET_IP_);
-+
-+	spin_lock(&zsl->lock);
-+	zsl->cnt--;
-+	spin_unlock(&zsl->lock);
-+}
-+
-+static inline bool __write_trylock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	spin_lock(&zsl->lock);
-+	if (zsl->cnt == ZS_PAGE_UNLOCKED) {
-+		zsl->cnt = ZS_PAGE_WRLOCKED;
-+		rwsem_acquire(&zsl->dep_map, 0, 1, _RET_IP_);
-+		lock_acquired(&zsl->dep_map, _RET_IP_);
-+		return true;
-+	}
-+
-+	lock_contended(&zsl->dep_map, _RET_IP_);
-+	spin_unlock(&zsl->lock);
-+	return false;
-+}
-+
-+static inline void __write_unlock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	rwsem_release(&zsl->dep_map, _RET_IP_);
-+
++	lockdep_init_map(zsl_dep_map(zsl), "zspage->lock",
++			 zspool_lock_class(zspage->pool), 0);
++	spin_lock_init(&zsl->lock);
 +	zsl->cnt = ZS_PAGE_UNLOCKED;
-+	spin_unlock(&zsl->lock);
 +}
-+#else
-+static inline void __read_lock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	spin_lock(&zsl->lock);
-+	zsl->cnt++;
-+	spin_unlock(&zsl->lock);
-+}
-+
-+static inline void __read_unlock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	spin_lock(&zsl->lock);
-+	zsl->cnt--;
-+	spin_unlock(&zsl->lock);
-+}
-+
-+static inline bool __write_trylock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	spin_lock(&zsl->lock);
-+	if (zsl->cnt == ZS_PAGE_UNLOCKED) {
-+		zsl->cnt = ZS_PAGE_WRLOCKED;
-+		return true;
-+	}
-+
-+	spin_unlock(&zsl->lock);
-+	return false;
-+}
-+
-+static inline void __write_unlock(struct zspage *zspage)
-+{
-+	struct zspage_lock *zsl = &zspage->zsl;
-+
-+	zsl->cnt = ZS_PAGE_UNLOCKED;
-+	spin_unlock(&zsl->lock);
-+}
-+#endif /* CONFIG_DEBUG_LOCK_ALLOC */
 +
 +/*
 + * The zspage lock can be held from atomic contexts, but it needs to remain
@@ -201,28 +113,59 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + */
 +static void zspage_read_lock(struct zspage *zspage)
 +{
-+	return __read_lock(zspage);
++	struct zspage_lock *zsl = &zspage->zsl;
++
++	rwsem_acquire_read(zsl_dep_map(zsl), 0, 0, _RET_IP_);
++
++	spin_lock(&zsl->lock);
++	zsl->cnt++;
++	spin_unlock(&zsl->lock);
++
++	lock_acquired(zsl_dep_map(zsl), _RET_IP_);
 +}
 +
 +static void zspage_read_unlock(struct zspage *zspage)
 +{
-+	return __read_unlock(zspage);
++	struct zspage_lock *zsl = &zspage->zsl;
++
++	rwsem_release(zsl_dep_map(zsl), _RET_IP_);
++
++	spin_lock(&zsl->lock);
++	zsl->cnt--;
++	spin_unlock(&zsl->lock);
 +}
 +
 +static __must_check bool zspage_write_trylock(struct zspage *zspage)
 +{
-+	return __write_trylock(zspage);
++	struct zspage_lock *zsl = &zspage->zsl;
++
++	spin_lock(&zsl->lock);
++	if (zsl->cnt == ZS_PAGE_UNLOCKED) {
++		zsl->cnt = ZS_PAGE_WRLOCKED;
++		rwsem_acquire(zsl_dep_map(zsl), 0, 1, _RET_IP_);
++		lock_acquired(zsl_dep_map(zsl), _RET_IP_);
++		return true;
++	}
++
++	lock_contended(zsl_dep_map(zsl), _RET_IP_);
++	spin_unlock(&zsl->lock);
++	return false;
 +}
 +
 +static void zspage_write_unlock(struct zspage *zspage)
 +{
-+	return __write_unlock(zspage);
++	struct zspage_lock *zsl = &zspage->zsl;
++
++	rwsem_release(zsl_dep_map(zsl), _RET_IP_);
++
++	zsl->cnt = ZS_PAGE_UNLOCKED;
++	spin_unlock(&zsl->lock);
 +}
 +
  /* huge object: pages_per_zspage == 1 && maxobj_per_zspage == 1 */
  static void SetZsHugePage(struct zspage *zspage)
  {
-@@ -290,12 +447,6 @@ static bool ZsHugePage(struct zspage *zs
+@@ -290,12 +392,6 @@ static bool ZsHugePage(struct zspage *zs
  	return zspage->huge;
  }
  
@@ -235,7 +178,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_COMPACTION
  static void kick_deferred_free(struct zs_pool *pool);
  static void init_deferred_free(struct zs_pool *pool);
-@@ -992,7 +1143,9 @@ static struct zspage *alloc_zspage(struc
+@@ -992,7 +1088,9 @@ static struct zspage *alloc_zspage(struc
  		return NULL;
  
  	zspage->magic = ZSPAGE_MAGIC;
@@ -246,7 +189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < class->pages_per_zspage; i++) {
  		struct zpdesc *zpdesc;
-@@ -1015,8 +1168,6 @@ static struct zspage *alloc_zspage(struc
+@@ -1015,8 +1113,6 @@ static struct zspage *alloc_zspage(struc
  
  	create_page_chain(class, zspage, zpdescs);
  	init_zspage(class, zspage);
@@ -255,7 +198,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return zspage;
  }
-@@ -1217,7 +1368,7 @@ void *zs_map_object(struct zs_pool *pool
+@@ -1217,7 +1313,7 @@ void *zs_map_object(struct zs_pool *pool
  	 * zs_unmap_object API so delegate the locking from class to zspage
  	 * which is smaller granularity.
  	 */
@@ -264,7 +207,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	read_unlock(&pool->lock);
  
  	class = zspage_class(pool, zspage);
-@@ -1277,7 +1428,7 @@ void zs_unmap_object(struct zs_pool *poo
+@@ -1277,7 +1373,7 @@ void zs_unmap_object(struct zs_pool *poo
  	}
  	local_unlock(&zs_map_area.lock);
  
@@ -273,7 +216,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  EXPORT_SYMBOL_GPL(zs_unmap_object);
  
-@@ -1671,18 +1822,18 @@ static void lock_zspage(struct zspage *z
+@@ -1671,18 +1767,18 @@ static void lock_zspage(struct zspage *z
  	/*
  	 * Pages we haven't locked yet can be migrated off the list while we're
  	 * trying to lock them, so we need to be careful and only attempt to
@@ -296,7 +239,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		zpdesc_wait_locked(zpdesc);
  		zpdesc_put(zpdesc);
  	}
-@@ -1693,41 +1844,16 @@ static void lock_zspage(struct zspage *z
+@@ -1693,41 +1789,16 @@ static void lock_zspage(struct zspage *z
  			curr_zpdesc = zpdesc;
  		} else {
  			zpdesc_get(zpdesc);
@@ -341,16 +284,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_COMPACTION
  
  static const struct movable_operations zsmalloc_mops;
-@@ -1769,7 +1895,7 @@ static bool zs_page_isolate(struct page
- }
- 
- static int zs_page_migrate(struct page *newpage, struct page *page,
--		enum migrate_mode mode)
-+			   enum migrate_mode mode)
- {
- 	struct zs_pool *pool;
- 	struct size_class *class;
-@@ -1785,9 +1911,6 @@ static int zs_page_migrate(struct page *
+@@ -1785,9 +1856,6 @@ static int zs_page_migrate(struct page *
  
  	VM_BUG_ON_PAGE(!zpdesc_is_isolated(zpdesc), zpdesc_page(zpdesc));
  
@@ -360,7 +294,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* The page is locked, so this pointer must remain valid */
  	zspage = get_zspage(zpdesc);
  	pool = zspage->pool;
-@@ -1803,8 +1926,15 @@ static int zs_page_migrate(struct page *
+@@ -1803,8 +1871,15 @@ static int zs_page_migrate(struct page *
  	 * the class lock protects zpage alloc/free in the zspage.
  	 */
  	spin_lock(&class->lock);
@@ -378,7 +312,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	offset = get_first_obj_offset(zpdesc);
  	s_addr = kmap_local_zpdesc(zpdesc);
-@@ -1835,7 +1965,7 @@ static int zs_page_migrate(struct page *
+@@ -1835,7 +1910,7 @@ static int zs_page_migrate(struct page *
  	 */
  	write_unlock(&pool->lock);
  	spin_unlock(&class->lock);
@@ -387,7 +321,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	zpdesc_get(newzpdesc);
  	if (zpdesc_zone(newzpdesc) != zpdesc_zone(zpdesc)) {
-@@ -1971,9 +2101,11 @@ static unsigned long __zs_compact(struct
+@@ -1971,9 +2046,11 @@ static unsigned long __zs_compact(struct
  		if (!src_zspage)
  			break;
  
@@ -401,25 +335,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		fg = putback_zspage(class, src_zspage);
  		if (fg == ZS_INUSE_RATIO_0) {
-@@ -2233,7 +2365,9 @@ struct zs_pool *zs_create_pool(const cha
+@@ -2141,6 +2218,7 @@ struct zs_pool *zs_create_pool(const cha
+ 	init_deferred_free(pool);
+ 	rwlock_init(&pool->lock);
+ 	atomic_set(&pool->compaction_in_progress, 0);
++	lockdep_register_key(zspool_lock_class(pool));
+ 
+ 	pool->name = kstrdup(name, GFP_KERNEL);
+ 	if (!pool->name)
+@@ -2233,7 +2311,6 @@ struct zs_pool *zs_create_pool(const cha
  	 * trigger compaction manually. Thus, ignore return code.
  	 */
  	zs_register_shrinker(pool);
 -
-+#ifdef CONFIG_DEBUG_LOCK_ALLOC
-+	lockdep_register_key(&pool->lock_class);
-+#endif
  	return pool;
  
  err:
-@@ -2270,6 +2404,10 @@ void zs_destroy_pool(struct zs_pool *poo
+@@ -2270,6 +2347,7 @@ void zs_destroy_pool(struct zs_pool *poo
  		kfree(class);
  	}
  
-+#ifdef CONFIG_DEBUG_LOCK_ALLOC
-+	lockdep_unregister_key(&pool->lock_class);
-+#endif
-+
++	lockdep_unregister_key(zspool_lock_class(pool));
  	destroy_cache(pool);
  	kfree(pool->name);
  	kfree(pool);
