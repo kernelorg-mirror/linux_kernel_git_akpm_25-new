@@ -1,0 +1,163 @@
+From: Yosry Ahmed <yosry.ahmed@linux.dev>
+Subject: mm: zpool: add interfaces for object read/write APIs
+Date: Wed, 5 Mar 2025 06:11:29 +0000
+
+Patch series "Switch zswap to object read/write APIs".
+
+This patch series updates zswap to use the new object read/write APIs
+defined by zsmalloc in [1], and remove the old object mapping APIs and the
+related code from zpool and zsmalloc.
+
+
+This patch (of 5):
+
+Zsmalloc introduced new APIs to read/write objects besides mapping them. 
+Add the necessary zpool interfaces.
+
+Link: https://lkml.kernel.org/r/20250305061134.4105762-1-yosry.ahmed@linux.dev
+Link: https://lkml.kernel.org/r/20250305061134.4105762-2-yosry.ahmed@linux.dev
+Signed-off-by: Yosry Ahmed <yosry.ahmed@linux.dev>
+Reviewed-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/zpool.h |   17 ++++++++++++++
+ mm/zpool.c            |   48 ++++++++++++++++++++++++++++++++++++++++
+ mm/zsmalloc.c         |   21 +++++++++++++++++
+ 3 files changed, 86 insertions(+)
+
+--- a/include/linux/zpool.h~mm-zpool-add-interfaces-for-object-read-write-apis
++++ a/include/linux/zpool.h
+@@ -52,6 +52,16 @@ void *zpool_map_handle(struct zpool *poo
+ 
+ void zpool_unmap_handle(struct zpool *pool, unsigned long handle);
+ 
++
++void *zpool_obj_read_begin(struct zpool *zpool, unsigned long handle,
++			   void *local_copy);
++
++void zpool_obj_read_end(struct zpool *zpool, unsigned long handle,
++			void *handle_mem);
++
++void zpool_obj_write(struct zpool *zpool, unsigned long handle,
++		     void *handle_mem, size_t mem_len);
++
+ u64 zpool_get_total_pages(struct zpool *pool);
+ 
+ 
+@@ -90,6 +100,13 @@ struct zpool_driver {
+ 				enum zpool_mapmode mm);
+ 	void (*unmap)(void *pool, unsigned long handle);
+ 
++	void *(*obj_read_begin)(void *pool, unsigned long handle,
++				void *local_copy);
++	void (*obj_read_end)(void *pool, unsigned long handle,
++			     void *handle_mem);
++	void (*obj_write)(void *pool, unsigned long handle,
++			  void *handle_mem, size_t mem_len);
++
+ 	u64 (*total_pages)(void *pool);
+ };
+ 
+--- a/mm/zpool.c~mm-zpool-add-interfaces-for-object-read-write-apis
++++ a/mm/zpool.c
+@@ -321,6 +321,54 @@ void zpool_unmap_handle(struct zpool *zp
+ }
+ 
+ /**
++ * zpool_obj_read_begin() - Start reading from a previously allocated handle.
++ * @zpool:	The zpool that the handle was allocated from
++ * @handle:	The handle to read from
++ * @local_copy:	A local buffer to use if needed.
++ *
++ * This starts a read operation of a previously allocated handle. The passed
++ * @local_copy buffer may be used if needed by copying the memory into.
++ * zpool_obj_read_end() MUST be called after the read is completed to undo any
++ * actions taken (e.g. release locks).
++ *
++ * Returns: A pointer to the handle memory to be read, if @local_copy is used,
++ * the returned pointer is @local_copy.
++ */
++void *zpool_obj_read_begin(struct zpool *zpool, unsigned long handle,
++			   void *local_copy)
++{
++	return zpool->driver->obj_read_begin(zpool->pool, handle, local_copy);
++}
++
++/**
++ * zpool_obj_read_end() - Finish reading from a previously allocated handle.
++ * @zpool:	The zpool that the handle was allocated from
++ * @handle:	The handle to read from
++ * @handle_mem:	The pointer returned by zpool_obj_read_begin()
++ *
++ * Finishes a read operation previously started by zpool_obj_read_begin().
++ */
++void zpool_obj_read_end(struct zpool *zpool, unsigned long handle,
++			void *handle_mem)
++{
++	zpool->driver->obj_read_end(zpool->pool, handle, handle_mem);
++}
++
++/**
++ * zpool_obj_write() - Write to a previously allocated handle.
++ * @zpool:	The zpool that the handle was allocated from
++ * @handle:	The handle to read from
++ * @handle_mem:	The memory to copy from into the handle.
++ * @mem_len:	The length of memory to be written.
++ *
++ */
++void zpool_obj_write(struct zpool *zpool, unsigned long handle,
++		     void *handle_mem, size_t mem_len)
++{
++	zpool->driver->obj_write(zpool->pool, handle, handle_mem, mem_len);
++}
++
++/**
+  * zpool_get_total_pages() - The total size of the pool
+  * @zpool:	The zpool to check
+  *
+--- a/mm/zsmalloc.c~mm-zpool-add-interfaces-for-object-read-write-apis
++++ a/mm/zsmalloc.c
+@@ -507,6 +507,24 @@ static void zs_zpool_unmap(void *pool, u
+ 	zs_unmap_object(pool, handle);
+ }
+ 
++static void *zs_zpool_obj_read_begin(void *pool, unsigned long handle,
++				     void *local_copy)
++{
++	return zs_obj_read_begin(pool, handle, local_copy);
++}
++
++static void zs_zpool_obj_read_end(void *pool, unsigned long handle,
++				  void *handle_mem)
++{
++	zs_obj_read_end(pool, handle, handle_mem);
++}
++
++static void zs_zpool_obj_write(void *pool, unsigned long handle,
++			       void *handle_mem, size_t mem_len)
++{
++	zs_obj_write(pool, handle, handle_mem, mem_len);
++}
++
+ static u64 zs_zpool_total_pages(void *pool)
+ {
+ 	return zs_get_total_pages(pool);
+@@ -522,6 +540,9 @@ static struct zpool_driver zs_zpool_driv
+ 	.free =			  zs_zpool_free,
+ 	.map =			  zs_zpool_map,
+ 	.unmap =		  zs_zpool_unmap,
++	.obj_read_begin =	  zs_zpool_obj_read_begin,
++	.obj_read_end  =	  zs_zpool_obj_read_end,
++	.obj_write =		  zs_zpool_obj_write,
+ 	.total_pages =		  zs_zpool_total_pages,
+ };
+ 
+_

@@ -1,0 +1,111 @@
+From: Yosry Ahmed <yosry.ahmed@linux.dev>
+Subject: mm: zswap: use object read/write APIs instead of object mapping APIs
+Date: Wed, 5 Mar 2025 06:11:30 +0000
+
+Use the new object read/write APIs instead of mapping APIs.
+
+On compress side, zpool_obj_write() is more concise and provides exactly
+what zswap needs to write the compressed object to the zpool, instead of
+map->copy->unmap.
+
+On the decompress side, zpool_obj_read_begin() is sleepable, which
+allows avoiding the memcpy() for zsmalloc and slightly simplifying the
+code by:
+- Avoiding checking if the zpool driver is sleepable, reducing special
+  cases and shrinking the huge comment.
+- Having a single zpool_obj_read_end() call rather than multiple
+  conditional zpool_unmap_handle() calls.
+
+The !virt_addr_valid() case can be removed in the future if the crypto API
+supports kmap addresses or by using kmap_to_page(), completely eliminating
+the memcpy() path in zswap_decompress().  This a step toward that.  In
+that spirit, opportunistically make the comment more specific about the
+kmap case instead of generic non-linear addresses.  This is the only case
+that needs to be handled in practice, and the generic comment makes it
+seem like a bigger problem that it actually is.
+
+Link: https://lkml.kernel.org/r/20250305061134.4105762-3-yosry.ahmed@linux.dev
+Signed-off-by: Yosry Ahmed <yosry.ahmed@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/zswap.c |   33 +++++++++++++--------------------
+ 1 file changed, 13 insertions(+), 20 deletions(-)
+
+--- a/mm/zswap.c~mm-zswap-use-object-read-write-apis-instead-of-object-mapping-apis
++++ a/mm/zswap.c
+@@ -930,7 +930,6 @@ static bool zswap_compress(struct page *
+ 	unsigned int dlen = PAGE_SIZE;
+ 	unsigned long handle;
+ 	struct zpool *zpool;
+-	char *buf;
+ 	gfp_t gfp;
+ 	u8 *dst;
+ 
+@@ -972,10 +971,7 @@ static bool zswap_compress(struct page *
+ 	if (alloc_ret)
+ 		goto unlock;
+ 
+-	buf = zpool_map_handle(zpool, handle, ZPOOL_MM_WO);
+-	memcpy(buf, dst, dlen);
+-	zpool_unmap_handle(zpool, handle);
+-
++	zpool_obj_write(zpool, handle, dst, dlen);
+ 	entry->handle = handle;
+ 	entry->length = dlen;
+ 
+@@ -996,24 +992,22 @@ static void zswap_decompress(struct zswa
+ 	struct zpool *zpool = entry->pool->zpool;
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
+-	u8 *src;
++	u8 *src, *obj;
+ 
+ 	acomp_ctx = acomp_ctx_get_cpu_lock(entry->pool);
+-	src = zpool_map_handle(zpool, entry->handle, ZPOOL_MM_RO);
++	obj = zpool_obj_read_begin(zpool, entry->handle, acomp_ctx->buffer);
++
+ 	/*
+-	 * If zpool_map_handle is atomic, we cannot reliably utilize its mapped buffer
+-	 * to do crypto_acomp_decompress() which might sleep. In such cases, we must
+-	 * resort to copying the buffer to a temporary one.
+-	 * Meanwhile, zpool_map_handle() might return a non-linearly mapped buffer,
+-	 * such as a kmap address of high memory or even ever a vmap address.
+-	 * However, sg_init_one is only equipped to handle linearly mapped low memory.
+-	 * In such cases, we also must copy the buffer to a temporary and lowmem one.
++	 * zpool_obj_read_begin() might return a kmap address of highmem when
++	 * acomp_ctx->buffer is not used.  However, sg_init_one() does not
++	 * handle highmem addresses, so copy the object to acomp_ctx->buffer.
+ 	 */
+-	if ((acomp_ctx->is_sleepable && !zpool_can_sleep_mapped(zpool)) ||
+-	    !virt_addr_valid(src)) {
+-		memcpy(acomp_ctx->buffer, src, entry->length);
++	if (virt_addr_valid(obj)) {
++		src = obj;
++	} else {
++		WARN_ON_ONCE(obj == acomp_ctx->buffer);
++		memcpy(acomp_ctx->buffer, obj, entry->length);
+ 		src = acomp_ctx->buffer;
+-		zpool_unmap_handle(zpool, entry->handle);
+ 	}
+ 
+ 	sg_init_one(&input, src, entry->length);
+@@ -1023,8 +1017,7 @@ static void zswap_decompress(struct zswa
+ 	BUG_ON(crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait));
+ 	BUG_ON(acomp_ctx->req->dlen != PAGE_SIZE);
+ 
+-	if (src != acomp_ctx->buffer)
+-		zpool_unmap_handle(zpool, entry->handle);
++	zpool_obj_read_end(zpool, entry->handle, obj);
+ 	acomp_ctx_put_unlock(acomp_ctx);
+ }
+ 
+_
