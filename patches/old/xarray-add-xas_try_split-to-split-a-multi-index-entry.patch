@@ -1,16 +1,16 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: xarray: add xas_try_split() to split a multi-index entry
-Date: Tue, 18 Feb 2025 18:50:05 -0500
+Date: Wed, 26 Feb 2025 16:00:24 -0500
 
-Patch series "Buddy allocator like (or non-uniform) folio split", v8.
+Patch series "Buddy allocator like (or non-uniform) folio split", v9.
 
 This patchset adds a new buddy allocator like (or non-uniform) large folio
 split from a order-n folio to order-m with m < n.  It reduces
 
 1. the total number of after-split folios from 2^(n-m) to n-m+1;
 
-2. the amount of memory needed for multi-index xarray split from
-   2^(n/6-m/6) to n/6-m/6, assuming XA_CHUNK_SHIFT=6;
+2. the amount of memory needed for multi-index xarray split from 2^(n/6-m/6) to
+   n/6-m/6, assuming XA_CHUNK_SHIFT=6;
 
 3. keep more large folios after a split from all order-m folios to
    order-(n-1) to order-m folios.
@@ -28,8 +28,6 @@ support both uniform split and buddy allocator like (or non-uniform)
 split.  All existing split_huge_page*() users can be gradually converted
 to use folio_split() if possible.  In this patchset, I converted
 truncate_inode_partial_folio() to use folio_split().
-
-xfstests quick group passed for both tmpfs and xfs.
 
 
 This patch (of 8):
@@ -83,8 +81,8 @@ xas_try_split() splits an order-9 to order-0:
 | xa_node |
 -----------
 
-Link: https://lkml.kernel.org/r/20250218235012.1542225-1-ziy@nvidia.com
-Link: https://lkml.kernel.org/r/20250218235012.1542225-2-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250226210032.2044041-1-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250226210032.2044041-2-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -103,11 +101,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  Documentation/core-api/xarray.rst |   14 ++
- include/linux/xarray.h            |    7 +
- lib/test_xarray.c                 |   47 +++++++++
- lib/xarray.c                      |  138 ++++++++++++++++++++++++----
+ include/linux/xarray.h            |    6 +
+ lib/test_xarray.c                 |   52 +++++++++++
+ lib/xarray.c                      |  131 +++++++++++++++++++++++++---
  tools/testing/radix-tree/Makefile |    1 
- 5 files changed, 190 insertions(+), 17 deletions(-)
+ 5 files changed, 191 insertions(+), 13 deletions(-)
 
 --- a/Documentation/core-api/xarray.rst~xarray-add-xas_try_split-to-split-a-multi-index-entry
 +++ a/Documentation/core-api/xarray.rst
@@ -134,22 +132,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  ========================
 --- a/include/linux/xarray.h~xarray-add-xas_try_split-to-split-a-multi-index-entry
 +++ a/include/linux/xarray.h
-@@ -1555,6 +1555,8 @@ int xa_get_order(struct xarray *, unsign
+@@ -1555,6 +1555,7 @@ int xa_get_order(struct xarray *, unsign
  int xas_get_order(struct xa_state *xas);
  void xas_split(struct xa_state *, void *entry, unsigned int order);
  void xas_split_alloc(struct xa_state *, void *entry, unsigned int order, gfp_t);
-+void xas_try_split(struct xa_state *xas, void *entry, unsigned int order,
-+		gfp_t gfp);
++void xas_try_split(struct xa_state *xas, void *entry, unsigned int order);
  #else
  static inline int xa_get_order(struct xarray *xa, unsigned long index)
  {
-@@ -1576,6 +1578,11 @@ static inline void xas_split_alloc(struc
+@@ -1576,6 +1577,11 @@ static inline void xas_split_alloc(struc
  		unsigned int order, gfp_t gfp)
  {
  }
 +
 +static inline void xas_try_split(struct xa_state *xas, void *entry,
-+		unsigned int order, gfp_t gfp)
++		unsigned int order)
 +{
 +}
  #endif
@@ -157,7 +154,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
 --- a/lib/test_xarray.c~xarray-add-xas_try_split-to-split-a-multi-index-entry
 +++ a/lib/test_xarray.c
-@@ -1858,6 +1858,49 @@ static void check_split_1(struct xarray
+@@ -1858,6 +1858,54 @@ static void check_split_1(struct xarray
  	xa_destroy(xa);
  }
  
@@ -171,8 +168,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	xa_store_order(xa, index, order, xa, GFP_KERNEL);
 +	xa_set_mark(xa, index, XA_MARK_1);
 +
++	/* allocate a node for xas_try_split() */
++	xas_set_err(&xas, -ENOMEM);
++	XA_BUG_ON(xa, !xas_nomem(&xas, GFP_KERNEL));
++
 +	xas_lock(&xas);
-+	xas_try_split(&xas, xa, order, GFP_KERNEL);
++	xas_try_split(&xas, xa, order);
 +	if (((new_order / XA_CHUNK_SHIFT) < (order / XA_CHUNK_SHIFT)) &&
 +	    new_order < order - 1) {
 +		XA_BUG_ON(xa, !xas_error(&xas) || xas_error(&xas) != -EINVAL);
@@ -201,13 +202,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	rcu_read_unlock();
 +	XA_BUG_ON(xa, found != 1 << (order - new_order));
 +out:
++	xas_destroy(&xas);
 +	xa_destroy(xa);
 +}
 +
  static noinline void check_split(struct xarray *xa)
  {
  	unsigned int order, new_order;
-@@ -1869,6 +1912,10 @@ static noinline void check_split(struct
+@@ -1869,6 +1917,10 @@ static noinline void check_split(struct
  			check_split_1(xa, 0, order, new_order);
  			check_split_1(xa, 1UL << order, order, new_order);
  			check_split_1(xa, 3UL << order, order, new_order);
@@ -220,21 +222,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/lib/xarray.c~xarray-add-xas_try_split-to-split-a-multi-index-entry
 +++ a/lib/xarray.c
-@@ -1007,6 +1007,31 @@ static void node_set_marks(struct xa_nod
+@@ -1007,6 +1007,26 @@ static void node_set_marks(struct xa_nod
  	}
  }
  
-+static struct xa_node *__xas_alloc_node_for_split(struct xa_state *xas,
-+		void *entry, gfp_t gfp)
++static void __xas_init_node_for_split(struct xa_state *xas,
++		struct xa_node *node, void *entry)
 +{
 +	unsigned int i;
 +	void *sibling = NULL;
-+	struct xa_node *node;
 +	unsigned int mask = xas->xa_sibs;
 +
-+	node = kmem_cache_alloc_lru(radix_tree_node_cachep, xas->xa_lru, gfp);
 +	if (!node)
-+		return NULL;
++		return;
 +	node->array = xas->xa;
 +	for (i = 0; i < XA_CHUNK_SIZE; i++) {
 +		if ((i & mask) == 0) {
@@ -244,15 +244,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			RCU_INIT_POINTER(node->slots[i], sibling);
 +		}
 +	}
-+	RCU_INIT_POINTER(node->parent, xas->xa_alloc);
-+
-+	return node;
 +}
 +
  /**
   * xas_split_alloc() - Allocate memory for splitting an entry.
   * @xas: XArray operation state.
-@@ -1025,7 +1050,6 @@ void xas_split_alloc(struct xa_state *xa
+@@ -1025,7 +1045,6 @@ void xas_split_alloc(struct xa_state *xa
  		gfp_t gfp)
  {
  	unsigned int sibs = (1 << (order % XA_CHUNK_SHIFT)) - 1;
@@ -260,16 +257,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* XXX: no support for splitting really large entries yet */
  	if (WARN_ON(xas->xa_shift + 2 * XA_CHUNK_SHIFT <= order))
-@@ -1034,23 +1058,9 @@ void xas_split_alloc(struct xa_state *xa
+@@ -1034,22 +1053,13 @@ void xas_split_alloc(struct xa_state *xa
  		return;
  
  	do {
 -		unsigned int i;
 -		void *sibling = NULL;
--		struct xa_node *node;
--
--		node = kmem_cache_alloc_lru(radix_tree_node_cachep, xas->xa_lru, gfp);
-+		struct xa_node *node = __xas_alloc_node_for_split(xas, entry, gfp);
+ 		struct xa_node *node;
+ 
+ 		node = kmem_cache_alloc_lru(radix_tree_node_cachep, xas->xa_lru, gfp);
  		if (!node)
  			goto nomem;
 -		node->array = xas->xa;
@@ -281,11 +277,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -				RCU_INIT_POINTER(node->slots[i], sibling);
 -			}
 -		}
--		RCU_INIT_POINTER(node->parent, xas->xa_alloc);
++
++		__xas_init_node_for_split(xas, node, entry);
+ 		RCU_INIT_POINTER(node->parent, xas->xa_alloc);
  		xas->xa_alloc = node;
  	} while (sibs-- > 0);
- 
-@@ -1122,6 +1132,102 @@ void xas_split(struct xa_state *xas, voi
+@@ -1122,6 +1132,103 @@ void xas_split(struct xa_state *xas, voi
  	xas_update(xas, node);
  }
  EXPORT_SYMBOL_GPL(xas_split);
@@ -295,23 +292,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @xas: XArray operation state.
 + * @entry: New entry to store in the array.
 + * @order: Current entry order.
-+ * @gfp: Memory allocation flags.
 + *
 + * The size of the new entries is set in @xas.  The value in @entry is
-+ * copied to all the replacement entries. If and only if one xa_node needs to
-+ * be allocated, the function will use @gfp to get one. If more xa_node are
-+ * needed, the function gives EINVAL error.
++ * copied to all the replacement entries. If and only if one new xa_node is
++ * needed, the function will use GFP_NOWAIT to get one if xas->xa_alloc is
++ * NULL. If more new xa_node are needed, the function gives EINVAL error.
 + *
 + * Context: Any context.  The caller should hold the xa_lock.
 + */
-+void xas_try_split(struct xa_state *xas, void *entry, unsigned int order,
-+		gfp_t gfp)
++void xas_try_split(struct xa_state *xas, void *entry, unsigned int order)
 +{
 +	unsigned int sibs = (1 << (order % XA_CHUNK_SHIFT)) - 1;
 +	unsigned int offset, marks;
 +	struct xa_node *node;
 +	void *curr = xas_load(xas);
 +	int values = 0;
++	gfp_t gfp = GFP_NOWAIT;
 +
 +	node = xas->xa_node;
 +	if (xas_top(node))
@@ -343,14 +339,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		}
 +
 +		if (!child) {
-+			child = __xas_alloc_node_for_split(xas, entry,
-+					gfp);
++			child = kmem_cache_alloc_lru(radix_tree_node_cachep,
++						     xas->xa_lru, gfp);
 +			if (!child) {
 +				xas_destroy(xas);
 +				xas_set_err(xas, -ENOMEM);
 +				return;
 +			}
++			RCU_INIT_POINTER(child->parent, xas->xa_alloc);
 +		}
++		__xas_init_node_for_split(xas, child, entry);
 +
 +		xas->xa_alloc = rcu_dereference_raw(child->parent);
 +		child->shift = node->shift - XA_CHUNK_SHIFT;
