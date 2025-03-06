@@ -1,0 +1,101 @@
+From: Yang Shi <yang@os.amperecomputing.com>
+Subject: mm: vma: skip anonymous vma when inserting vma to file rmap tree
+Date: Thu, 6 Mar 2025 13:49:48 -0800
+
+LKP reported 800% performance improvement for small-allocs benchmark from
+vm-scalability [1] with patch ("/dev/zero: make private mapping full
+anonymous mapping") [2], but the patch was nack'ed since it changes the
+output of smaps somewhat.
+
+The profiling shows one of the major sources of the performance
+improvement is the less contention to i_mmap_rwsem.
+
+The small-allocs benchmark creates a lot of 40K size memory maps by
+mmap'ing private /dev/zero then triggers page fault on the mappings.  When
+creating private mapping for /dev/zero, the anonymous VMA is created, but
+it has valid vm_file.  Kernel basically assumes anonymous VMAs should have
+NULL vm_file, for example, mmap inserts VMA to the file rmap tree if
+vm_file is not NULL.  So the private /dev/zero mapping will be inserted to
+the file rmap tree, this resulted in the contention to i_mmap_rwsem.  But
+it is actually anonymous VMA, so it is pointless to insert it to file rmap
+tree.
+
+Skip anonymous VMA for this case.  Over 400% performance improvement was
+reported [3].
+
+It is not on par with the 800% improvement from the original patch.  It is
+because page fault handler needs to access some members of struct file if
+vm_file is not NULL, for example, f_mode and f_mapping.  They are in the
+same cacheline with file refcount.  When mmap'ing a file the file refcount
+is inc'ed and dec'ed, this caused bad cache false sharing problem.  The
+further debug showed checking whether the VMA is anonymous or not can
+alleviate the problem.  But I'm not sure whether it is the best way to
+handle it, maybe we should consider shuffle the layout of struct file.
+
+However it sounds rare that real life applications would create that many
+maps with mmap'ing private /dev/zero and share the same struct file, so
+the cache false sharing problem may be not that bad.  But i_mmap_rwsem
+contention problem seems more real since all /dev/zero private mappings
+even from different applications share the same struct address_space so
+the same i_mmap_rwsem.
+
+[1] https://lore.kernel.org/linux-mm/202501281038.617c6b60-lkp@intel.com/
+[2] https://lore.kernel.org/linux-mm/20250113223033.4054534-1-yang@os.amperecomputing.com/
+[3] https://lore.kernel.org/linux-mm/Z6RshwXCWhAGoMOK@xsang-OptiPlex-9020/#t
+
+Link: https://lkml.kernel.org/r/20250306214948.2939043-1-yang@os.amperecomputing.com
+Signed-off-by: Yang Shi <yang@os.amperecomputing.com>
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: kernel test robot <oliver.sang@intel.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vma.c |   15 +++++++++++++--
+ 1 file changed, 13 insertions(+), 2 deletions(-)
+
+--- a/mm/vma.c~mm-vma-skip-anonymous-vma-when-inserting-vma-to-file-rmap-tree
++++ a/mm/vma.c
+@@ -1652,6 +1652,9 @@ static void unlink_file_vma_batch_proces
+ void unlink_file_vma_batch_add(struct unlink_vma_file_batch *vb,
+ 			       struct vm_area_struct *vma)
+ {
++	if (vma_is_anonymous(vma))
++		return;
++
+ 	if (vma->vm_file == NULL)
+ 		return;
+ 
+@@ -1675,8 +1678,12 @@ void unlink_file_vma_batch_final(struct
+  */
+ void unlink_file_vma(struct vm_area_struct *vma)
+ {
+-	struct file *file = vma->vm_file;
++	struct file *file;
++
++	if (vma_is_anonymous(vma))
++		return;
+ 
++	file = vma->vm_file;
+ 	if (file) {
+ 		struct address_space *mapping = file->f_mapping;
+ 
+@@ -1688,9 +1695,13 @@ void unlink_file_vma(struct vm_area_stru
+ 
+ void vma_link_file(struct vm_area_struct *vma)
+ {
+-	struct file *file = vma->vm_file;
++	struct file *file;
+ 	struct address_space *mapping;
+ 
++	if (vma_is_anonymous(vma))
++		return;
++
++	file = vma->vm_file;
+ 	if (file) {
+ 		mapping = file->f_mapping;
+ 		i_mmap_lock_write(mapping);
+_
