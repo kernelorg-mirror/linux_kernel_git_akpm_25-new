@@ -1,0 +1,182 @@
+From: Thomas Weißschuh <thomas.weissschuh@linutronix.de>
+Subject: vdso: Add generic random data storage
+Date: Tue Feb 4 13:05:38 2025 +0100
+
+Extend the generic vDSO data storage with a page for the random state data.
+The random state data is stored in a dedicated page, as the existing
+storage page is only meant for time-related, time-namespace-aware data.
+This simplifies to access logic to not need to handle time namespaces
+anymore and also frees up more space in the time-related page.
+
+In case further generic vDSO data store is required it can be added to
+the random state page.
+
+Signed-off-by: Thomas Weißschuh <thomas.weissschuh@linutronix.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/all/20250204-vdso-store-rng-v3-6-13a4669dfc8c@linutronix.de
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/char/random.c               |    6 +++---
+ include/asm-generic/vdso/vsyscall.h |   12 ++++++++++++
+ include/vdso/datapage.h             |   10 ++++++++++
+ lib/vdso/datastore.c                |   14 ++++++++++++++
+ lib/vdso/getrandom.c                |    8 ++++++--
+ 5 files changed, 45 insertions(+), 5 deletions(-)
+
+--- a/drivers/char/random.c~51d6ca373f459fa6c91743e14ae69854d844aa38
++++ a/drivers/char/random.c
+@@ -278,7 +278,7 @@ static void crng_reseed(struct work_stru
+ 	WRITE_ONCE(base_crng.generation, next_gen);
+ #ifdef CONFIG_VDSO_GETRANDOM
+ 	/* base_crng.generation's invalid value is ULONG_MAX, while
+-	 * _vdso_rng_data.generation's invalid value is 0, so add one to the
++	 * vdso_k_rng_data->generation's invalid value is 0, so add one to the
+ 	 * former to arrive at the latter. Use smp_store_release so that this
+ 	 * is ordered with the write above to base_crng.generation. Pairs with
+ 	 * the smp_rmb() before the syscall in the vDSO code.
+@@ -290,7 +290,7 @@ static void crng_reseed(struct work_stru
+ 	 * because the vDSO side only checks whether the value changed, without
+ 	 * actually using or interpreting the value.
+ 	 */
+-	smp_store_release((unsigned long *)&__arch_get_k_vdso_rng_data()->generation, next_gen + 1);
++	smp_store_release((unsigned long *)&vdso_k_rng_data->generation, next_gen + 1);
+ #endif
+ 	if (!static_branch_likely(&crng_is_ready))
+ 		crng_init = CRNG_READY;
+@@ -743,7 +743,7 @@ static void __cold _credit_init_bits(siz
+ 			queue_work(system_unbound_wq, &set_ready);
+ 		atomic_notifier_call_chain(&random_ready_notifier, 0, NULL);
+ #ifdef CONFIG_VDSO_GETRANDOM
+-		WRITE_ONCE(__arch_get_k_vdso_rng_data()->is_ready, true);
++		WRITE_ONCE(vdso_k_rng_data->is_ready, true);
+ #endif
+ 		wake_up_interruptible(&crng_init_wait);
+ 		kill_fasync(&fasync, SIGIO, POLL_IN);
+--- a/include/asm-generic/vdso/vsyscall.h~51d6ca373f459fa6c91743e14ae69854d844aa38
++++ a/include/asm-generic/vdso/vsyscall.h
+@@ -13,6 +13,13 @@ static __always_inline const struct vdso
+ }
+ #endif
+ 
++#ifndef __arch_get_vdso_u_rng_data
++static __always_inline const struct vdso_rng_data *__arch_get_vdso_u_rng_data(void)
++{
++	return &vdso_u_rng_data;
++}
++#endif
++
+ #else  /* !CONFIG_GENERIC_VDSO_DATA_STORE */
+ 
+ #ifndef __arch_get_k_vdso_data
+@@ -25,6 +32,11 @@ static __always_inline struct vdso_data
+ 
+ #define __arch_get_vdso_u_time_data __arch_get_vdso_data
+ 
++#ifndef __arch_get_vdso_u_rng_data
++#define __arch_get_vdso_u_rng_data() __arch_get_vdso_rng_data()
++#endif
++#define vdso_k_rng_data __arch_get_k_vdso_rng_data()
++
+ #endif /* CONFIG_GENERIC_VDSO_DATA_STORE */
+ 
+ #ifndef __arch_update_vsyscall
+--- a/include/vdso/datapage.h~51d6ca373f459fa6c91743e14ae69854d844aa38
++++ a/include/vdso/datapage.h
+@@ -144,8 +144,10 @@ extern struct vdso_time_data _timens_dat
+ extern struct vdso_rng_data _vdso_rng_data __attribute__((visibility("hidden")));
+ #else
+ extern struct vdso_time_data vdso_u_time_data[CS_BASES] __attribute__((visibility("hidden")));
++extern struct vdso_rng_data vdso_u_rng_data __attribute__((visibility("hidden")));
+ 
+ extern struct vdso_time_data *vdso_k_time_data;
++extern struct vdso_rng_data *vdso_k_rng_data;
+ #endif
+ 
+ /**
+@@ -161,6 +163,7 @@ union vdso_data_store {
+ enum vdso_pages {
+ 	VDSO_TIME_PAGE_OFFSET,
+ 	VDSO_TIMENS_PAGE_OFFSET,
++	VDSO_RNG_PAGE_OFFSET,
+ 	VDSO_NR_PAGES
+ };
+ 
+@@ -184,9 +187,16 @@ enum vdso_pages {
+ 
+ #else /* !__ASSEMBLY__ */
+ 
++#ifdef CONFIG_VDSO_GETRANDOM
++#define __vdso_u_rng_data	PROVIDE(vdso_u_rng_data = vdso_u_data + 2 * PAGE_SIZE);
++#else
++#define __vdso_u_rng_data
++#endif
++
+ #define VDSO_VVAR_SYMS						\
+ 	PROVIDE(vdso_u_data = . - __VDSO_PAGES * PAGE_SIZE);	\
+ 	PROVIDE(vdso_u_time_data = vdso_u_data);		\
++	__vdso_u_rng_data					\
+ 
+ 
+ #endif /* !__ASSEMBLY__ */
+--- a/lib/vdso/datastore.c~51d6ca373f459fa6c91743e14ae69854d844aa38
++++ a/lib/vdso/datastore.c
+@@ -17,6 +17,15 @@ struct vdso_time_data *vdso_k_time_data
+ static_assert(sizeof(vdso_time_data_store) == PAGE_SIZE);
+ #endif /* CONFIG_HAVE_GENERIC_VDSO */
+ 
++#ifdef CONFIG_VDSO_GETRANDOM
++static union {
++	struct vdso_rng_data	data;
++	u8			page[PAGE_SIZE];
++} vdso_rng_data_store __page_aligned_data;
++struct vdso_rng_data *vdso_k_rng_data = &vdso_rng_data_store.data;
++static_assert(sizeof(vdso_rng_data_store) == PAGE_SIZE);
++#endif /* CONFIG_VDSO_GETRANDOM */
++
+ static vm_fault_t vvar_fault(const struct vm_special_mapping *sm,
+ 			     struct vm_area_struct *vma, struct vm_fault *vmf)
+ {
+@@ -53,6 +62,11 @@ static vm_fault_t vvar_fault(const struc
+ 			return VM_FAULT_SIGBUS;
+ 		pfn = __phys_to_pfn(__pa_symbol(vdso_k_time_data));
+ 		break;
++	case VDSO_RNG_PAGE_OFFSET:
++		if (!IS_ENABLED(CONFIG_VDSO_GETRANDOM))
++			return VM_FAULT_SIGBUS;
++		pfn = __phys_to_pfn(__pa_symbol(vdso_k_rng_data));
++		break;
+ 	default:
+ 		return VM_FAULT_SIGBUS;
+ 	}
+--- a/lib/vdso/getrandom.c~51d6ca373f459fa6c91743e14ae69854d844aa38
++++ a/lib/vdso/getrandom.c
+@@ -12,6 +12,9 @@
+ #include <uapi/linux/mman.h>
+ #include <uapi/linux/random.h>
+ 
++/* Bring in default accessors */
++#include <vdso/vsyscall.h>
++
+ #undef PAGE_SIZE
+ #undef PAGE_MASK
+ #define PAGE_SIZE (1UL << CONFIG_PAGE_SHIFT)
+@@ -152,7 +155,7 @@ retry_generation:
+ 
+ 		/*
+ 		 * Prevent the syscall from being reordered wrt current_generation. Pairs with the
+-		 * smp_store_release(&_vdso_rng_data.generation) in random.c.
++		 * smp_store_release(&vdso_k_rng_data->generation) in random.c.
+ 		 */
+ 		smp_rmb();
+ 
+@@ -256,5 +259,6 @@ fallback_syscall:
+ static __always_inline ssize_t
+ __cvdso_getrandom(void *buffer, size_t len, unsigned int flags, void *opaque_state, size_t opaque_len)
+ {
+-	return __cvdso_getrandom_data(__arch_get_vdso_rng_data(), buffer, len, flags, opaque_state, opaque_len);
++	return __cvdso_getrandom_data(__arch_get_vdso_u_rng_data(), buffer, len, flags,
++				      opaque_state, opaque_len);
+ }
+_

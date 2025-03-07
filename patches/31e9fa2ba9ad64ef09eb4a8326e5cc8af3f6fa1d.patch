@@ -1,0 +1,212 @@
+From: Thomas Weißschuh <thomas.weissschuh@linutronix.de>
+Subject: arm: vdso: Switch to generic storage implementation
+Date: Tue Feb 4 13:05:43 2025 +0100
+
+The generic storage implementation provides the same features as the
+custom one. However it can be shared between architectures, making
+maintenance easier.
+
+Co-developed-by: Nam Cao <namcao@linutronix.de>
+Signed-off-by: Nam Cao <namcao@linutronix.de>
+Signed-off-by: Thomas Weißschuh <thomas.weissschuh@linutronix.de>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/all/20250204-vdso-store-rng-v3-11-13a4669dfc8c@linutronix.de
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm/include/asm/vdso.h              |    2 +
+ arch/arm/include/asm/vdso/gettimeofday.h |    7 ----
+ arch/arm/include/asm/vdso/vsyscall.h     |   12 +------
+ arch/arm/kernel/asm-offsets.c            |    4 --
+ arch/arm/kernel/vdso.c                   |   34 ++++-----------------
+ arch/arm/mm/Kconfig                      |    1 
+ arch/arm/vdso/vdso.lds.S                 |    4 +-
+ 7 files changed, 15 insertions(+), 49 deletions(-)
+
+--- a/arch/arm/include/asm/vdso/gettimeofday.h~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/include/asm/vdso/gettimeofday.h
+@@ -112,7 +112,7 @@ static inline bool arm_vdso_hres_capable
+ #define __arch_vdso_hres_capable arm_vdso_hres_capable
+ 
+ static __always_inline u64 __arch_get_hw_counter(int clock_mode,
+-						 const struct vdso_data *vd)
++						 const struct vdso_time_data *vd)
+ {
+ #ifdef CONFIG_ARM_ARCH_TIMER
+ 	u64 cycle_now;
+@@ -135,11 +135,6 @@ static __always_inline u64 __arch_get_hw
+ #endif
+ }
+ 
+-static __always_inline const struct vdso_data *__arch_get_vdso_data(void)
+-{
+-	return _vdso_data;
+-}
+-
+ #endif /* !__ASSEMBLY__ */
+ 
+ #endif /* __ASM_VDSO_GETTIMEOFDAY_H */
+--- a/arch/arm/include/asm/vdso.h~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/include/asm/vdso.h
+@@ -4,6 +4,8 @@
+ 
+ #ifdef __KERNEL__
+ 
++#define __VDSO_PAGES	4
++
+ #ifndef __ASSEMBLY__
+ 
+ struct mm_struct;
+--- a/arch/arm/include/asm/vdso/vsyscall.h~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/include/asm/vdso/vsyscall.h
+@@ -7,22 +7,14 @@
+ #include <vdso/datapage.h>
+ #include <asm/cacheflush.h>
+ 
+-extern struct vdso_data *vdso_data;
+ extern bool cntvct_ok;
+ 
+ static __always_inline
+-struct vdso_data *__arm_get_k_vdso_data(void)
+-{
+-	return vdso_data;
+-}
+-#define __arch_get_k_vdso_data __arm_get_k_vdso_data
+-
+-static __always_inline
+-void __arm_sync_vdso_data(struct vdso_data *vdata)
++void __arch_sync_vdso_time_data(struct vdso_time_data *vdata)
+ {
+ 	flush_dcache_page(virt_to_page(vdata));
+ }
+-#define __arch_sync_vdso_data __arm_sync_vdso_data
++#define __arch_sync_vdso_time_data __arch_sync_vdso_time_data
+ 
+ /* The asm-generic header needs to be included after the definitions above */
+ #include <asm-generic/vdso/vsyscall.h>
+--- a/arch/arm/kernel/asm-offsets.c~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/kernel/asm-offsets.c
+@@ -153,10 +153,6 @@ int main(void)
+   DEFINE(CACHE_WRITEBACK_ORDER, __CACHE_WRITEBACK_ORDER);
+   DEFINE(CACHE_WRITEBACK_GRANULE, __CACHE_WRITEBACK_GRANULE);
+   BLANK();
+-#ifdef CONFIG_VDSO
+-  DEFINE(VDSO_DATA_SIZE,	sizeof(union vdso_data_store));
+-#endif
+-  BLANK();
+ #ifdef CONFIG_ARM_MPU
+   DEFINE(MPU_RNG_INFO_RNGS,	offsetof(struct mpu_rgn_info, rgns));
+   DEFINE(MPU_RNG_INFO_USED,	offsetof(struct mpu_rgn_info, used));
+--- a/arch/arm/kernel/vdso.c~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/kernel/vdso.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/cache.h>
++#include <linux/vdso_datastore.h>
+ #include <linux/elf.h>
+ #include <linux/err.h>
+ #include <linux/kernel.h>
+@@ -33,15 +34,6 @@ extern char vdso_start[], vdso_end[];
+ /* Total number of pages needed for the data and text portions of the VDSO. */
+ unsigned int vdso_total_pages __ro_after_init;
+ 
+-static union vdso_data_store vdso_data_store __page_aligned_data;
+-struct vdso_data *vdso_data = vdso_data_store.data;
+-
+-static struct page *vdso_data_page __ro_after_init;
+-static const struct vm_special_mapping vdso_data_mapping = {
+-	.name = "[vvar]",
+-	.pages = &vdso_data_page,
+-};
+-
+ static int vdso_mremap(const struct vm_special_mapping *sm,
+ 		struct vm_area_struct *new_vma)
+ {
+@@ -192,9 +184,6 @@ static int __init vdso_init(void)
+ 	if (vdso_text_pagelist == NULL)
+ 		return -ENOMEM;
+ 
+-	/* Grab the VDSO data page. */
+-	vdso_data_page = virt_to_page(vdso_data);
+-
+ 	/* Grab the VDSO text pages. */
+ 	for (i = 0; i < text_pages; i++) {
+ 		struct page *page;
+@@ -205,7 +194,7 @@ static int __init vdso_init(void)
+ 
+ 	vdso_text_mapping.pages = vdso_text_pagelist;
+ 
+-	vdso_total_pages = 1; /* for the data/vvar page */
++	vdso_total_pages = VDSO_NR_PAGES; /* for the data/vvar pages */
+ 	vdso_total_pages += text_pages;
+ 
+ 	cntvct_ok = cntvct_functional();
+@@ -216,16 +205,7 @@ static int __init vdso_init(void)
+ }
+ arch_initcall(vdso_init);
+ 
+-static int install_vvar(struct mm_struct *mm, unsigned long addr)
+-{
+-	struct vm_area_struct *vma;
+-
+-	vma = _install_special_mapping(mm, addr, PAGE_SIZE,
+-				       VM_READ | VM_MAYREAD,
+-				       &vdso_data_mapping);
+-
+-	return PTR_ERR_OR_ZERO(vma);
+-}
++static_assert(__VDSO_PAGES == VDSO_NR_PAGES);
+ 
+ /* assumes mmap_lock is write-locked */
+ void arm_install_vdso(struct mm_struct *mm, unsigned long addr)
+@@ -238,12 +218,12 @@ void arm_install_vdso(struct mm_struct *
+ 	if (vdso_text_pagelist == NULL)
+ 		return;
+ 
+-	if (install_vvar(mm, addr))
++	if (IS_ERR(vdso_install_vvar_mapping(mm, addr)))
+ 		return;
+ 
+-	/* Account for vvar page. */
+-	addr += PAGE_SIZE;
+-	len = (vdso_total_pages - 1) << PAGE_SHIFT;
++	/* Account for vvar pages. */
++	addr += VDSO_NR_PAGES * PAGE_SIZE;
++	len = (vdso_total_pages - VDSO_NR_PAGES) << PAGE_SHIFT;
+ 
+ 	vma = _install_special_mapping(mm, addr, len,
+ 		VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC,
+--- a/arch/arm/mm/Kconfig~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/mm/Kconfig
+@@ -928,6 +928,7 @@ config VDSO
+ 	select GENERIC_TIME_VSYSCALL
+ 	select GENERIC_VDSO_32
+ 	select GENERIC_GETTIMEOFDAY
++	select GENERIC_VDSO_DATA_STORE
+ 	help
+ 	  Place in the process address space an ELF shared object
+ 	  providing fast implementations of gettimeofday and
+--- a/arch/arm/vdso/vdso.lds.S~31e9fa2ba9ad64ef09eb4a8326e5cc8af3f6fa1d
++++ a/arch/arm/vdso/vdso.lds.S
+@@ -11,16 +11,16 @@
+  */
+ 
+ #include <linux/const.h>
+-#include <asm/asm-offsets.h>
+ #include <asm/page.h>
+ #include <asm/vdso.h>
++#include <vdso/datapage.h>
+ 
+ OUTPUT_FORMAT("elf32-littlearm", "elf32-bigarm", "elf32-littlearm")
+ OUTPUT_ARCH(arm)
+ 
+ SECTIONS
+ {
+-	PROVIDE(_vdso_data = . - VDSO_DATA_SIZE);
++	VDSO_VVAR_SYMS
+ 
+ 	. = SIZEOF_HEADERS;
+ 
+_
