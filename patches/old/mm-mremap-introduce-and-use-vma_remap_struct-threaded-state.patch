@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/mremap: introduce and use vma_remap_struct threaded state
-Date: Mon, 3 Mar 2025 11:08:33 +0000
+Date: Thu, 6 Mar 2025 10:33:59 +0000
 
 A number of mremap() calls both pass around and modify a large number of
 parameters, making the code less readable and often repeatedly having to
@@ -34,30 +34,30 @@ move_vma() to accept a VRM parameter.  We defer this as there is
 pre-requisite work required to be able to do so which we will do in a
 subsequent patch.
 
-Link: https://lkml.kernel.org/r/665d51a5bf1002e84d76733ab313fe304ff73f65.1740911247.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/1aeadc40d377fff8796b7c114cb0351c92a68f20.1741256580.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Harry Yoo <harry.yoo@oracle.com>
 Cc: Jann Horn <jannh@google.com>
-Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Yosry Ahmed <yosry.ahmed@linux.dev>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mremap.c |  561 +++++++++++++++++++++++++++++++-------------------
- 1 file changed, 355 insertions(+), 206 deletions(-)
+ mm/mremap.c |  567 +++++++++++++++++++++++++++++++-------------------
+ 1 file changed, 359 insertions(+), 208 deletions(-)
 
 --- a/mm/mremap.c~mm-mremap-introduce-and-use-vma_remap_struct-threaded-state
 +++ a/mm/mremap.c
-@@ -32,6 +32,43 @@
+@@ -32,6 +32,44 @@
  
  #include "internal.h"
  
 +/* Classify the kind of remap operation being performed. */
-+enum mremap_operation {
-+	MREMAP_NO_RESIZE, /* old_len == new_len, if not moved, do nothing. */
-+	MREMAP_SHRINK, /* old_len > new_len. */
-+	MREMAP_EXPAND, /* old_len < new_len. */
++enum mremap_type {
++	MREMAP_INVALID,		/* Initial state. */
++	MREMAP_NO_RESIZE,	/* old_len == new_len, if not moved, do nothing. */
++	MREMAP_SHRINK,		/* old_len > new_len. */
++	MREMAP_EXPAND,		/* old_len < new_len. */
 +};
 +
 +/*
@@ -69,11 +69,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + */
 +struct vma_remap_struct {
 +	/* User-provided state. */
-+	unsigned long addr; /* User-specified address from which we remap. */
-+	unsigned long old_len; /* Length of range being remapped. */
-+	unsigned long new_len; /* Desired new length of mapping. */
-+	unsigned long flags; /* user-specified MREMAP_* flags. */
-+	unsigned long new_addr; /* Optionally, desired new address. */
++	unsigned long addr;	/* User-specified address from which we remap. */
++	unsigned long old_len;	/* Length of range being remapped. */
++	unsigned long new_len;	/* Desired new length of mapping. */
++	unsigned long flags;	/* user-specified MREMAP_* flags. */
++	unsigned long new_addr;	/* Optionally, desired new address. */
 +
 +	/* uffd state. */
 +	struct vm_userfaultfd_ctx *uf;
@@ -84,16 +84,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct vm_area_struct *vma;
 +
 +	/* Internal state, determined in do_mremap(). */
-+	unsigned long delta; /* Absolute delta of old_len, new_len. */
-+	bool locked; /* Was the VMA mlock()'d (has the VM_LOCKED flag set). */
-+	enum mremap_operation remap_type; /* expand, shrink, etc. */
-+	bool mmap_locked; /* Is current->mm currently write-locked? */
++	unsigned long delta;		/* Absolute delta of old_len,new_len. */
++	bool mlocked;			/* Was the VMA mlock()'d? */
++	enum mremap_type remap_type;	/* expand, shrink, etc. */
++	bool mmap_locked;		/* Is mm currently write-locked? */
 +};
 +
  static pud_t *get_old_pud(struct mm_struct *mm, unsigned long addr)
  {
  	pgd_t *pgd;
-@@ -693,6 +730,97 @@ again:
+@@ -693,10 +731,95 @@ again:
  	return len + old_addr - old_end;	/* how much done */
  }
  
@@ -104,7 +104,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/* Determine what kind of remap this is - shrink, expand or no resize at all. */
-+static enum mremap_operation vrm_remap_type(struct vma_remap_struct *vrm)
++static enum mremap_type vrm_remap_type(struct vma_remap_struct *vrm)
 +{
 +	if (vrm->delta == 0)
 +		return MREMAP_NO_RESIZE;
@@ -113,12 +113,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return MREMAP_SHRINK;
 +
 +	return MREMAP_EXPAND;
-+}
-+
-+/* Set the vrm->remap_type, assumes state is sufficient set up for this. */
-+static void vrm_set_remap_type(struct vma_remap_struct *vrm)
-+{
-+	vrm->remap_type = vrm_remap_type(vrm);
 +}
 +
 +/*
@@ -191,7 +185,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static unsigned long move_vma(struct vm_area_struct *vma,
  		unsigned long old_addr, unsigned long old_len,
  		unsigned long new_len, unsigned long new_addr,
-@@ -860,18 +988,15 @@ static unsigned long move_vma(struct vm_
+-		bool *locked, unsigned long flags,
++		bool *mlocked, unsigned long flags,
+ 		struct vm_userfaultfd_ctx *uf, struct list_head *uf_unmap)
+ {
+ 	long to_account = new_len - old_len;
+@@ -837,7 +960,7 @@ static unsigned long move_vma(struct vm_
+ 
+ 	if (vm_flags & VM_LOCKED) {
+ 		mm->locked_vm += new_len >> PAGE_SHIFT;
+-		*locked = true;
++		*mlocked = true;
+ 	}
+ 
+ 	mm->hiwater_vm = hiwater_vm;
+@@ -860,18 +983,15 @@ static unsigned long move_vma(struct vm_
   * resize_is_valid() - Ensure the vma can be resized to the new length at the give
   * address.
   *
@@ -215,7 +223,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned long pgoff;
  
  	/*
-@@ -883,11 +1008,12 @@ static int resize_is_valid(struct vm_are
+@@ -883,11 +1003,12 @@ static int resize_is_valid(struct vm_are
  	 * behavior.  As a result, fail such attempts.
  	 */
  	if (!old_len && !(vma->vm_flags & (VM_SHARED | VM_MAYSHARE))) {
@@ -230,7 +238,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			(vma->vm_flags & (VM_DONTEXPAND | VM_PFNMAP)))
  		return -EINVAL;
  
-@@ -907,99 +1033,114 @@ static int resize_is_valid(struct vm_are
+@@ -907,99 +1028,117 @@ static int resize_is_valid(struct vm_are
  	if (vma->vm_flags & (VM_DONTEXPAND | VM_PFNMAP))
  		return -EFAULT;
  
@@ -345,7 +353,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		old_len = new_len;
 +		/*
 +		 * If we remap a portion of a VMA elsewhere in the same VMA,
-+		 * this can invalidate the old VMA and iterator. Reset.
++		 * this can invalidate the old VMA. Reset.
 +		 */
 +		vrm->vma = vma_lookup(mm, vrm->addr);
  	}
@@ -353,42 +361,45 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	vma = vma_lookup(mm, addr);
 -	if (!vma)
 -		return -EFAULT;
+-
+-	ret = resize_is_valid(vma, addr, old_len, new_len, flags);
+-	if (ret)
+-		return ret;
 +	if (vrm->remap_type == MREMAP_SHRINK) {
 +		err = shrink_vma(vrm, /* drop_lock= */false);
 +		if (err)
 +			return err;
  
--	ret = resize_is_valid(vma, addr, old_len, new_len, flags);
--	if (ret)
--		return ret;
-+		/* Set up for the move now shrink has been executed. */
-+		vrm->old_len = vrm->new_len;
-+	}
-+
-+	err = resize_is_valid(vrm);
-+	if (err)
-+		return err;
- 
- 	/* MREMAP_DONTUNMAP expands by old_len since old_len == new_len */
+-	/* MREMAP_DONTUNMAP expands by old_len since old_len == new_len */
 -	if (flags & MREMAP_DONTUNMAP &&
 -		!may_expand_vm(mm, vma->vm_flags, old_len >> PAGE_SHIFT)) {
-+	if (vrm->flags & MREMAP_DONTUNMAP &&
-+		!may_expand_vm(mm, vrm->vma->vm_flags, vrm->old_len >> PAGE_SHIFT)) {
- 		return -ENOMEM;
+-		return -ENOMEM;
++		/* Set up for the move now shrink has been executed. */
++		vrm->old_len = vrm->new_len;
  	}
  
 -	if (flags & MREMAP_FIXED)
 -		map_flags |= MAP_FIXED;
--
++	err = resize_is_valid(vrm);
++	if (err)
++		return err;
+ 
 -	if (vma->vm_flags & VM_MAYSHARE)
 -		map_flags |= MAP_SHARED;
--
++	/* MREMAP_DONTUNMAP expands by old_len since old_len == new_len */
++	if (vrm->flags & MREMAP_DONTUNMAP) {
++		vm_flags_t vm_flags = vrm->vma->vm_flags;
++		unsigned long pages = vrm->old_len >> PAGE_SHIFT;
+ 
 -	ret = get_unmapped_area(vma->vm_file, new_addr, new_len, vma->vm_pgoff +
 -				((addr - vma->vm_start) >> PAGE_SHIFT),
 -				map_flags);
 -	if (IS_ERR_VALUE(ret))
 -		return ret;
--
++		if (!may_expand_vm(mm, vm_flags, pages))
++			return -ENOMEM;
++	}
+ 
 -	/* We got a new mapping */
 -	if (!(flags & MREMAP_FIXED))
 -		new_addr = ret;
@@ -399,12 +410,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	return move_vma(vma, addr, old_len, new_len, new_addr, locked, flags,
 -			uf, uf_unmap);
 +	return move_vma(vrm->vma, vrm->addr, vrm->old_len, vrm->new_len,
-+			vrm->new_addr, &vrm->locked, vrm->flags,
++			vrm->new_addr, &vrm->mlocked, vrm->flags,
 +			vrm->uf, vrm->uf_unmap);
  }
  
  static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
-@@ -1016,22 +1157,33 @@ static int vma_expandable(struct vm_area
+@@ -1016,22 +1155,33 @@ static int vma_expandable(struct vm_area
  	return 1;
  }
  
@@ -446,7 +457,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Ensure no unexpected flag values. */
  	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP))
  		return -EINVAL;
-@@ -1045,15 +1197,15 @@ static unsigned long check_mremap_params
+@@ -1045,15 +1195,15 @@ static unsigned long check_mremap_params
  	 * for DOS-emu "duplicate shm area" thing. But
  	 * a zero new-len is nonsensical.
  	 */
@@ -465,7 +476,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return -EINVAL;
  
  	/* A fixed address implies a move. */
-@@ -1061,7 +1213,7 @@ static unsigned long check_mremap_params
+@@ -1061,7 +1211,7 @@ static unsigned long check_mremap_params
  		return -EINVAL;
  
  	/* MREMAP_DONTUNMAP does not allow resizing in the process. */
@@ -474,7 +485,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return -EINVAL;
  
  	/*
-@@ -1090,11 +1242,11 @@ static unsigned long check_mremap_params
+@@ -1090,11 +1240,11 @@ static unsigned long check_mremap_params
   * If we discover the VMA is locked, update mm_struct statistics accordingly and
   * indicate so to the caller.
   */
@@ -489,7 +500,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VMA_ITERATOR(vmi, mm, vma->vm_end);
  	long charged = 0;
  
-@@ -1114,7 +1266,7 @@ static unsigned long expand_vma_inplace(
+@@ -1114,7 +1264,7 @@ static unsigned long expand_vma_inplace(
  	 * adjacent to the expanded vma and otherwise
  	 * compatible.
  	 */
@@ -498,12 +509,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!vma) {
  		vm_unacct_memory(charged);
  		return -ENOMEM;
-@@ -1123,42 +1275,34 @@ static unsigned long expand_vma_inplace(
+@@ -1123,42 +1273,34 @@ static unsigned long expand_vma_inplace(
  	vm_stat_account(mm, vma->vm_flags, pages);
  	if (vma->vm_flags & VM_LOCKED) {
  		mm->locked_vm += pages;
 -		*locked = true;
-+		vrm->locked = true;
++		vrm->mlocked = true;
  	}
  
  	return 0;
@@ -552,7 +563,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return true;
  }
  
-@@ -1169,19 +1313,16 @@ static bool align_hugetlb(struct vm_area
+@@ -1169,19 +1311,16 @@ static bool align_hugetlb(struct vm_area
   * Try to do so in-place, if this fails, then move the VMA to a new location to
   * action the change.
   */
@@ -579,7 +590,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (err)
  		return err;
  
-@@ -1189,10 +1330,9 @@ static unsigned long expand_vma(struct v
+@@ -1189,10 +1328,9 @@ static unsigned long expand_vma(struct v
  	 * [addr, old_len) spans precisely to the end of the VMA, so try to
  	 * expand it in-place.
  	 */
@@ -593,18 +604,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			return err;
  
  		/*
-@@ -1200,8 +1340,8 @@ static unsigned long expand_vma(struct v
+@@ -1200,8 +1338,8 @@ static unsigned long expand_vma(struct v
  		 * satisfy the expectation that mlock()'ing a VMA maintains all
  		 * of its pages in memory.
  		 */
 -		if (*locked_ptr)
 -			*new_addr_ptr = addr;
-+		if (vrm->locked)
++		if (vrm->mlocked)
 +			vrm->new_addr = addr;
  
  		/* OK we're done! */
  		return addr;
-@@ -1217,62 +1357,65 @@ static unsigned long expand_vma(struct v
+@@ -1217,62 +1355,67 @@ static unsigned long expand_vma(struct v
  		return -ENOMEM;
  
  	/* Find a new location to move the VMA to. */
@@ -621,7 +632,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	return move_vma(vma, addr, old_len, new_len, new_addr,
 -			locked_ptr, flags, uf_ptr, uf_unmap_ptr);
 +	return move_vma(vma, addr, old_len, new_len, vrm->new_addr,
-+			&vrm->locked, flags, vrm->uf, vrm->uf_unmap);
++			&vrm->mlocked, flags, vrm->uf, vrm->uf_unmap);
  }
  
  /*
@@ -641,6 +652,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long res;
 +
 +	switch (vrm->remap_type) {
++	case MREMAP_INVALID:
++		break;
 +	case MREMAP_NO_RESIZE:
 +		/* NO-OP CASE - resizing to the same size. */
 +		return vrm->addr;
@@ -674,7 +687,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	struct vm_userfaultfd_ctx uf = NULL_VM_UFFD_CTX;
 -	LIST_HEAD(uf_unmap_early);
 -	LIST_HEAD(uf_unmap);
- 
+-
 -	/*
 -	 * There is a deliberate asymmetry here: we strip the pointer tag
 -	 * from the old address but leave the new address alone. This is
@@ -687,7 +700,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 * information.
 -	 */
 -	addr = untagged_addr(addr);
--
+ 
 -	ret = check_mremap_params(addr, flags, old_len, new_len, new_addr);
 +	ret = check_mremap_params(vrm);
  	if (ret)
@@ -709,7 +722,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!vma) {
  		ret = -EFAULT;
  		goto out;
-@@ -1285,62 +1428,68 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
+@@ -1285,62 +1428,70 @@ SYSCALL_DEFINE5(mremap, unsigned long, a
  	}
  
  	/* Align to hugetlb page size, if required. */
@@ -727,21 +740,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -				&uf_unmap);
 -		goto out;
 -	}
-+	vrm_set_remap_type(vrm);
++	vrm->remap_type = vrm_remap_type(vrm);
  
 -	/*
 -	 * From here on in we are only RESIZING the VMA, attempting to do so
 -	 * in-place, moving the VMA if we cannot.
 -	 */
--
++	/* Actually execute mremap. */
++	ret = vrm_implies_new_addr(vrm) ? mremap_to(vrm) : mremap_at(vrm);
+ 
 -	/* NO-OP CASE - resizing to the same size. */
 -	if (new_len == old_len) {
 -		ret = addr;
 -		goto out;
 -	}
-+	/* Actually execute mremap. */
-+	ret = vrm_implies_new_addr(vrm) ? mremap_to(vrm) : mremap_at(vrm);
- 
+-
 -	/* SHRINK CASE. Can always be done in-place. */
 -	if (new_len < old_len) {
 -		VMA_ITERATOR(vmi, mm, addr + new_len);
@@ -762,7 +775,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		/* We succeeded, mmap lock released for us. */
 -		ret = addr;
 -		goto out_unlocked;
-+		if (!offset_in_page(ret) && vrm->locked && vrm->new_len > vrm->old_len)
++		if (!offset_in_page(ret) && vrm->mlocked && vrm->new_len > vrm->old_len)
 +			mm_populate(vrm->new_addr + vrm->old_len, vrm->delta);
  	}
  
@@ -821,6 +834,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		.uf = &uf,
 +		.uf_unmap_early = &uf_unmap_early,
 +		.uf_unmap = &uf_unmap,
++
++		.remap_type = MREMAP_INVALID, /* We set later. */
 +	};
 +
 +	return do_mremap(&vrm);
