@@ -1,0 +1,121 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: page_alloc: defrag_mode
+Date: Thu, 13 Mar 2025 17:05:34 -0400
+
+The page allocator groups requests by migratetype to stave off
+fragmentation.  However, in practice this is routinely defeated by the
+fact that it gives up *before* invoking reclaim and compaction - which may
+well produce suitable pages.  As a result, fragmentation of physical
+memory is a common ongoing process in many load scenarios.
+
+Fragmentation deteriorates compaction's ability to produce huge pages. 
+Depending on the lifetime of the fragmenting allocations, those effects
+can be long-lasting or even permanent, requiring drastic measures like
+forcible idle states or even reboots as the only reliable ways to recover
+the address space for THP production.
+
+In a kernel build test with supplemental THP pressure, the THP allocation
+rate steadily declines over 15 runs:
+
+    thp_fault_alloc
+    61988
+    56474
+    57258
+    50187
+    52388
+    55409
+    52925
+    47648
+    43669
+    40621
+    36077
+    41721
+    36685
+    34641
+    33215
+
+This is a hurdle in adopting THP in any environment where hosts are shared
+between multiple overlapping workloads (cloud environments), and rarely
+experience true idle periods.  To make THP a reliable and predictable
+optimization, there needs to be a stronger guarantee to avoid such
+fragmentation.
+
+Introduce defrag_mode.  When enabled, reclaim/compaction is invoked to its
+full extent *before* falling back.  Specifically, ALLOC_NOFRAGMENT is
+enforced on the allocator fastpath and the reclaiming slowpath.
+
+For now, fallbacks are permitted to avert OOMs.  There is a plan to add
+defrag_mode=2 to prefer OOMs over fragmentation, but this requires
+additional prep work in compaction and the reserve management to make it
+ready for all possible allocation contexts.
+
+The following test results are from a kernel build with periodic bursts of
+THP allocations, over 15 runs:
+
+                                        vanilla    defrag_mode=1
+@claimer[unmovable]:                        189              103
+@claimer[movable]:                           92              103
+@claimer[reclaimable]:                      207               61
+@pollute[unmovable from movable]:            25                0
+@pollute[unmovable from reclaimable]:        28                0
+@pollute[movable from unmovable]:         38835                0
+@pollute[movable from reclaimable]:      147136                0
+@pollute[reclaimable from unmovable]:       178                0
+@pollute[reclaimable from movable]:          33                0
+@steal[unmovable from movable]:              11                0
+@steal[unmovable from reclaimable]:           5                0
+@steal[reclaimable from unmovable]:         107                0
+@steal[reclaimable from movable]:            90                0
+@steal[movable from reclaimable]:           354                0
+@steal[movable from unmovable]:             130                0
+
+Both types of polluting fallbacks are eliminated in this workload.
+
+Interestingly, whole block conversions are reduced as well.  This is
+because once a block is claimed for a type, its empty space remains
+available for future allocations, instead of being padded with fallbacks;
+this allows the native type to group up instead of spreading out to new
+blocks.  The assumption in the allocator has been that pollution from
+movable allocations is less harmful than from other types, since they can
+be reclaimed or migrated out should the space be needed.  However, since
+fallbacks occur *before* reclaim/compaction is invoked, movable pollution
+will still cause non-movable allocations to spread out and claim more
+blocks.
+
+Without fragmentation, THP rates hold steady with defrag_mode=1:
+
+    thp_fault_alloc
+    32478
+    20725
+    45045
+    32130
+    14018
+    21711
+    40791
+    29134
+    34458
+    45381
+    28305
+    17265
+    22584
+    28454
+    30850
+
+While the downward trend is eliminated, the keen reader will of course
+notice that the baseline rate is much smaller than the vanilla kernel's to
+begin with.  This is due to deficiencies in how reclaim and compaction are
+currently driven: ALLOC_NOFRAGMENT increases the extent to which smaller
+allocations are competing with THPs for pageblocks, while making no effort
+themselves to reclaim or compact beyond their own request size.  This
+effect already exists with the current usage of ALLOC_NOFRAGMENT, but is
+amplified by defrag_mode insisting on whole block stealing much more
+strongly.
+
+Subsequent patches will address defrag_mode reclaim strategy to raise the
+THP success baseline above the vanilla kernel.
+
+Link: https://lkml.kernel.org/r/20250313210647.1314586-4-hannes@cmpxchg.org
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
