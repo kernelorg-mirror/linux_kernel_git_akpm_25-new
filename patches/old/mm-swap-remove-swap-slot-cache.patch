@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: remove swap slot cache
-Date: Tue, 25 Feb 2025 02:02:11 +0800
+Date: Fri, 14 Mar 2025 00:59:34 +0800
 
 Slot cache is no longer needed now, removing it and all related code.
 
@@ -25,7 +25,7 @@ make -j96 (64K):  6841.71 (409.04)    6437.99 (435.55)
 
 Similar to above, 64k mTHP case showed a slight improvement.
 
-Link: https://lkml.kernel.org/r/20250224180212.22802-7-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250313165935.63303-7-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Reviewed-by: Baoquan He <bhe@redhat.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -41,13 +41,13 @@ Cc: Yosry Ahmed <yosryahmed@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/swap.h       |    2 
+ include/linux/swap.h       |    3 
  include/linux/swap_slots.h |   28 ---
  mm/Makefile                |    2 
  mm/swap_slots.c            |  295 -----------------------------------
  mm/swap_state.c            |    8 
- mm/swapfile.c              |  193 ++++++++--------------
- 6 files changed, 71 insertions(+), 457 deletions(-)
+ mm/swapfile.c              |  194 +++++++----------------
+ 6 files changed, 67 insertions(+), 463 deletions(-)
 
 --- a/include/linux/swap.h~mm-swap-remove-swap-slot-cache
 +++ a/include/linux/swap.h
@@ -59,7 +59,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  /* Swap 50% full? Release swapcache more aggressively.. */
  static inline bool vm_swap_full(void)
-@@ -489,7 +488,6 @@ extern void swap_shmem_alloc(swp_entry_t
+@@ -483,13 +482,11 @@ swp_entry_t folio_alloc_swap(struct foli
+ bool folio_free_swap(struct folio *folio);
+ void put_swap_folio(struct folio *folio, swp_entry_t entry);
+ extern swp_entry_t get_swap_page_of_type(int);
+-extern int get_swap_pages(int n, swp_entry_t swp_entries[], int order);
+ extern int add_swap_count_continuation(swp_entry_t, gfp_t);
+ extern void swap_shmem_alloc(swp_entry_t, int);
  extern int swap_duplicate(swp_entry_t);
  extern int swapcache_prepare(swp_entry_t entry, int nr);
  extern void swap_free_nr(swp_entry_t entry, int nr_pages);
@@ -121,10 +127,14 @@ deleted file mode 100644
  #include <linux/sort.h>
  #include <linux/completion.h>
  #include <linux/suspend.h>
-@@ -885,6 +884,13 @@ static unsigned long cluster_alloc_swap_
+@@ -885,16 +884,20 @@ static unsigned long cluster_alloc_swap_
  	struct swap_cluster_info *ci;
- 	unsigned int offset, found = 0;
+ 	unsigned int offset = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
  
+-	if (si->flags & SWP_SOLIDSTATE) {
+-		if (si == this_cpu_read(percpu_swap_cluster.si[order]))
+-			offset = this_cpu_read(percpu_swap_cluster.offset[order]);
+-	} else {
 +	/*
 +	 * Swapfile is not block device so unable
 +	 * to allocate large entries.
@@ -132,10 +142,19 @@ deleted file mode 100644
 +	if (order && !(si->flags & SWP_BLKDEV))
 +		return 0;
 +
- 	if (!(si->flags & SWP_SOLIDSTATE)) {
++	if (!(si->flags & SWP_SOLIDSTATE)) {
  		/* Serialize HDD SWAP allocation for each device. */
  		spin_lock(&si->global_cluster_lock);
-@@ -1148,43 +1154,6 @@ static void swap_range_free(struct swap_
+ 		offset = si->global_cluster->next[order];
+-	}
++		if (offset == SWAP_ENTRY_INVALID)
++			goto new_cluster;
+ 
+-	if (offset) {
+ 		ci = lock_cluster(si, offset);
+ 		/* Cluster could have been used by another order */
+ 		if (cluster_is_usable(ci, order)) {
+@@ -1153,43 +1156,6 @@ static void swap_range_free(struct swap_
  	swap_usage_sub(si, nr_entries);
  }
  
@@ -179,7 +198,7 @@ deleted file mode 100644
  static bool get_swap_device_info(struct swap_info_struct *si)
  {
  	if (!percpu_ref_tryget_live(&si->users))
-@@ -1205,16 +1174,13 @@ static bool get_swap_device_info(struct
+@@ -1210,16 +1176,13 @@ static bool get_swap_device_info(struct
   * Fast path try to get swap entries with specified order from current
   * CPU's swap entry pool (a cluster).
   */
@@ -199,17 +218,19 @@ deleted file mode 100644
  
  	/*
  	 * Once allocated, swap_info_struct will never be completely freed,
-@@ -1223,44 +1189,48 @@ static int swap_alloc_fast(swp_entry_t e
- 	si = __this_cpu_read(percpu_swap_cluster.si[order]);
- 	offset = __this_cpu_read(percpu_swap_cluster.offset[order]);
+@@ -1228,46 +1191,48 @@ static int swap_alloc_fast(swp_entry_t e
+ 	si = this_cpu_read(percpu_swap_cluster.si[order]);
+ 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
  	if (!si || !offset || !get_swap_device_info(si))
 -		return 0;
 +		return false;
  
 -	while (offset) {
 -		ci = lock_cluster(si, offset);
--		if (!cluster_is_usable(ci, order))
+-		if (!cluster_is_usable(ci, order)) {
+-			unlock_cluster(ci);
 -			break;
+-		}
 +	ci = lock_cluster(si, offset);
 +	if (cluster_is_usable(ci, order)) {
  		if (cluster_is_empty(ci))
@@ -220,7 +241,7 @@ deleted file mode 100644
 -		entries[n_ret++] = swp_entry(si->type, found);
 -		if (n_ret == n_goal)
 -			break;
--		offset = __this_cpu_read(percpu_swap_cluster.offset[order]);
+-		offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 +		if (found)
 +			*entry = swp_entry(si->type, found);
 +	} else {
@@ -262,15 +283,14 @@ deleted file mode 100644
 -				SWAP_HAS_CACHE,
 -				order, n_goal);
 -	if (n_ret == n_goal)
--		goto out;
 +	if (swap_alloc_fast(&entry, SWAP_HAS_CACHE, order))
-+		goto out_alloced;
+ 		goto out;
  
 -	n_goal = min_t(int, n_goal - n_ret, SWAP_BATCH);
  	/* Rotate the device and switch to a new cluster */
  	spin_lock(&swap_avail_lock);
  start_over:
-@@ -1269,19 +1239,14 @@ start_over:
+@@ -1276,18 +1241,13 @@ start_over:
  		plist_requeue(&si->avail_lists[node], &swap_avail_heads[node]);
  		spin_unlock(&swap_avail_lock);
  		if (get_swap_device_info(si)) {
@@ -287,41 +307,32 @@ deleted file mode 100644
 +			offset = cluster_alloc_swap_entry(si, order, SWAP_HAS_CACHE);
  			put_swap_device(si);
 -			if (n_ret || size > 1)
--				goto out;
 +			if (offset) {
 +				entry = swp_entry(si->type, offset);
-+				goto out_alloced;
++				goto out;
 +			}
 +			if (order)
-+				goto out_failed;
+ 				goto out;
  		}
  
- 		spin_lock(&swap_avail_lock);
-@@ -1300,10 +1265,20 @@ start_over:
- 			goto start_over;
- 	}
+@@ -1309,8 +1269,14 @@ start_over:
  	spin_unlock(&swap_avail_lock);
--out:
-+out_failed:
-+	local_unlock(&percpu_swap_cluster.lock);
-+	return entry;
-+
-+out_alloced:
+ out:
  	local_unlock(&percpu_swap_cluster.lock);
 -	atomic_long_sub(n_ret * size, &nr_swap_pages);
 -	return n_ret;
++	/* Need to call this even if allocation failed, for MEMCG_SWAP_FAIL. */
 +	if (mem_cgroup_try_charge_swap(folio, entry)) {
 +		put_swap_folio(folio, entry);
 +		entry.val = 0;
-+	} else {
-+		atomic_long_sub(size, &nr_swap_pages);
 +	}
-+
++	if (entry.val)
++		atomic_long_sub(size, &nr_swap_pages);
 +	return entry;
  }
  
  static struct swap_info_struct *_swap_info_get(swp_entry_t entry)
-@@ -1599,25 +1574,6 @@ void put_swap_folio(struct folio *folio,
+@@ -1606,25 +1572,6 @@ void put_swap_folio(struct folio *folio,
  	unlock_cluster(ci);
  }
  
@@ -347,7 +358,7 @@ deleted file mode 100644
  int __swap_count(swp_entry_t entry)
  {
  	struct swap_info_struct *si = swp_swap_info(entry);
-@@ -1858,6 +1814,7 @@ out:
+@@ -1865,6 +1812,7 @@ out:
  swp_entry_t get_swap_page_of_type(int type)
  {
  	struct swap_info_struct *si = swap_type_to_swap_info(type);
@@ -355,7 +366,7 @@ deleted file mode 100644
  	swp_entry_t entry = {0};
  
  	if (!si)
-@@ -1865,8 +1822,13 @@ swp_entry_t get_swap_page_of_type(int ty
+@@ -1872,8 +1820,13 @@ swp_entry_t get_swap_page_of_type(int ty
  
  	/* This is called for allocating swap entry, not cache */
  	if (get_swap_device_info(si)) {
@@ -371,7 +382,7 @@ deleted file mode 100644
  		put_swap_device(si);
  	}
  fail:
-@@ -2627,21 +2589,6 @@ static void reinsert_swap_info(struct sw
+@@ -2634,21 +2587,6 @@ static void reinsert_swap_info(struct sw
  	spin_unlock(&swap_lock);
  }
  
@@ -393,7 +404,7 @@ deleted file mode 100644
  /*
   * Called after clearing SWP_WRITEOK, ensures cluster_alloc_range
   * see the updated flags, so there will be no more allocations.
-@@ -2732,8 +2679,6 @@ SYSCALL_DEFINE1(swapoff, const char __us
+@@ -2761,8 +2699,6 @@ SYSCALL_DEFINE1(swapoff, const char __us
  
  	wait_for_allocation(p);
  
@@ -402,7 +413,7 @@ deleted file mode 100644
  	set_current_oom_origin();
  	err = try_to_unuse(p->type);
  	clear_current_oom_origin();
-@@ -2741,12 +2686,9 @@ SYSCALL_DEFINE1(swapoff, const char __us
+@@ -2770,12 +2706,9 @@ SYSCALL_DEFINE1(swapoff, const char __us
  	if (err) {
  		/* re-insert swap space back into swap_list */
  		reinsert_swap_info(p);
@@ -415,7 +426,7 @@ deleted file mode 100644
  	/*
  	 * Wait for swap operations protected by get/put_swap_device()
  	 * to complete.  Because of synchronize_rcu() here, all swap
-@@ -3495,8 +3437,6 @@ out:
+@@ -3525,8 +3458,6 @@ out:
  		putname(name);
  	if (inode)
  		inode_unlock(inode);
@@ -424,7 +435,7 @@ deleted file mode 100644
  	return error;
  }
  
-@@ -3892,6 +3832,11 @@ static void free_swap_count_continuation
+@@ -3922,6 +3853,11 @@ static void free_swap_count_continuation
  }
  
  #if defined(CONFIG_MEMCG) && defined(CONFIG_BLK_CGROUP)

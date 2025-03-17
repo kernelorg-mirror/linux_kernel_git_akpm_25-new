@@ -1,31 +1,31 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: mm: allow vma_start_read_locked/vma_start_read_locked_nested to fail
-Date: Fri, 10 Jan 2025 20:25:54 -0800
+Date: Thu, 13 Feb 2025 14:46:44 -0800
 
 With upcoming replacement of vm_lock with vm_refcnt, we need to handle a
 possibility of vma_start_read_locked/vma_start_read_locked_nested failing
 due to refcount overflow.  Prepare for such possibility by changing these
 APIs and adjusting their users.
 
-Link: https://lkml.kernel.org/r/20250111042604.3230628-8-surenb@google.com
+Link: https://lkml.kernel.org/r/20250213224655.1680278-8-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
-Acked-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Lokesh Gidra <lokeshgidra@google.com>
+Tested-by: Shivank Garg <shivankg@amd.com>
+  Link: https://lkml.kernel.org/r/5e19ec93-8307-47c2-bb13-3ddf7150624e@amd.com
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: David Howells <dhowells@redhat.com>
 Cc: Davidlohr Bueso <dave@stgolabs.net>
-Cc: Hillf Danton <hdanton@sina.com>
-Cc: Hugh Dickens <hughd@google.com>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: Jann Horn <jannh@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
-Cc: kernel test robot <oliver.sang@intel.com>
 Cc: Klara Modin <klarasmodin@gmail.com>
 Cc: Liam R. Howlett <Liam.Howlett@Oracle.com>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Mateusz Guzik <mjguzik@gmail.com>
-Cc: Mattew Wilcox <willy@infradead.org>
+Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Mel Gorman <mgorman@techsingularity.net>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Minchan Kim <minchan@google.com>
@@ -37,12 +37,15 @@ Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Sourav Panda <souravpanda@google.com>
 Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Stephen Rothwell <sfr@canb.auug.org.au>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/mm.h |    6 ++++--
- mm/userfaultfd.c   |   18 +++++++++++++-----
- 2 files changed, 17 insertions(+), 7 deletions(-)
+ mm/userfaultfd.c   |   30 +++++++++++++++++++++++-------
+ 2 files changed, 27 insertions(+), 9 deletions(-)
 
 --- a/include/linux/mm.h~mm-allow-vma_start_read_locked-vma_start_read_locked_nested-to-fail
 +++ a/include/linux/mm.h
@@ -74,36 +77,49 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline void vma_end_read(struct vm_area_struct *vma)
 --- a/mm/userfaultfd.c~mm-allow-vma_start_read_locked-vma_start_read_locked_nested-to-fail
 +++ a/mm/userfaultfd.c
-@@ -85,7 +85,8 @@ static struct vm_area_struct *uffd_lock_
+@@ -85,8 +85,12 @@ static struct vm_area_struct *uffd_lock_
+ 
  	mmap_read_lock(mm);
  	vma = find_vma_and_prepare_anon(mm, address);
- 	if (!IS_ERR(vma))
+-	if (!IS_ERR(vma))
 -		vma_start_read_locked(vma);
-+		if (!vma_start_read_locked(vma))
++	if (!IS_ERR(vma)) {
++		bool locked = vma_start_read_locked(vma);
++
++		if (!locked)
 +			vma = ERR_PTR(-EAGAIN);
++	}
  
  	mmap_read_unlock(mm);
  	return vma;
-@@ -1483,10 +1484,17 @@ static int uffd_move_lock(struct mm_stru
+@@ -1555,12 +1559,24 @@ static int uffd_move_lock(struct mm_stru
+ 
  	mmap_read_lock(mm);
  	err = find_vmas_mm_locked(mm, dst_start, src_start, dst_vmap, src_vmap);
- 	if (!err) {
+-	if (!err) {
 -		vma_start_read_locked(*dst_vmap);
 -		if (*dst_vmap != *src_vmap)
 -			vma_start_read_locked_nested(*src_vmap,
 -						SINGLE_DEPTH_NESTING);
-+		if (vma_start_read_locked(*dst_vmap)) {
-+			if (*dst_vmap != *src_vmap) {
-+				if (!vma_start_read_locked_nested(*src_vmap,
-+							SINGLE_DEPTH_NESTING)) {
-+					vma_end_read(*dst_vmap);
-+					err = -EAGAIN;
-+				}
-+			}
-+		} else {
-+			err = -EAGAIN;
-+		}
++	if (err)
++		goto out;
++
++	if (!vma_start_read_locked(*dst_vmap)) {
++		err = -EAGAIN;
++		goto out;
  	}
++
++	/* Nothing further to do if both vmas are locked. */
++	if (*dst_vmap == *src_vmap)
++		goto out;
++
++	if (!vma_start_read_locked_nested(*src_vmap, SINGLE_DEPTH_NESTING)) {
++		/* Undo dst_vmap locking if src_vmap failed to lock */
++		vma_end_read(*dst_vmap);
++		err = -EAGAIN;
++	}
++out:
  	mmap_read_unlock(mm);
  	return err;
+ }
 _

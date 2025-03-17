@@ -1,6 +1,6 @@
 From: Barry Song <v-songbaohua@oppo.com>
 Subject: mm: support batched unmap for lazyfree large folios during reclamation
-Date: Wed, 15 Jan 2025 16:38:07 +1300
+Date: Fri, 14 Feb 2025 22:30:14 +1300
 
 Currently, the PTEs and rmap of a large folio are removed one at a time. 
 This is not only slow but also causes the large folio to be unnecessarily
@@ -105,7 +105,7 @@ Time taken by reclamation: 0.072433 seconds, split_deferred: 0
 Time taken by reclamation: 0.071939 seconds, split_deferred: 0
 ...
 
-Link: https://lkml.kernel.org/r/20250115033808.40641-4-21cnbao@gmail.com
+Link: https://lkml.kernel.org/r/20250214093015.51024-4-21cnbao@gmail.com
 Signed-off-by: Barry Song <v-songbaohua@oppo.com>
 Cc: Albert Ou <aou@eecs.berkeley.edu>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
@@ -138,12 +138,12 @@ Cc: Yosry Ahmed <yosryahmed@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/rmap.c |   47 +++++++++++++++++++++++++++++++++++++++++------
- 1 file changed, 41 insertions(+), 6 deletions(-)
+ mm/rmap.c |   72 ++++++++++++++++++++++++++++++++++++----------------
+ 1 file changed, 50 insertions(+), 22 deletions(-)
 
 --- a/mm/rmap.c~mm-support-batched-unmap-for-lazyfree-large-folios-during-reclamation
 +++ a/mm/rmap.c
-@@ -1642,6 +1642,25 @@ void folio_remove_rmap_pmd(struct folio
+@@ -1722,6 +1722,25 @@ void folio_remove_rmap_pmd(struct folio
  #endif
  }
  
@@ -157,7 +157,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	if (!folio_test_anon(folio) || folio_test_swapbacked(folio))
 +		return false;
-+	if (pte_none(pte) || pte_unused(pte) || !pte_present(pte))
++	if (pte_unused(pte))
 +		return false;
 +	if (pte_pfn(pte) != folio_pfn(folio))
 +		return false;
@@ -169,32 +169,58 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * @arg: enum ttu_flags will be passed to this argument
   */
-@@ -1655,6 +1674,7 @@ static bool try_to_unmap_one(struct foli
- 	bool anon_exclusive, ret = true;
+@@ -1735,6 +1754,7 @@ static bool try_to_unmap_one(struct foli
+ 	struct page *subpage;
  	struct mmu_notifier_range range;
  	enum ttu_flags flags = (enum ttu_flags)(long)arg;
-+	int nr_pages = 1;
++	unsigned long nr_pages = 1, end_addr;
  	unsigned long pfn;
  	unsigned long hsz = 0;
  
-@@ -1780,6 +1800,16 @@ static bool try_to_unmap_one(struct foli
- 				hugetlb_vma_unlock_write(vma);
- 			}
- 			pteval = huge_ptep_clear_flush(vma, address, pvmw.pte);
-+		} else if (folio_test_large(folio) && !(flags & TTU_HWPOISON) &&
-+				can_batch_unmap_folio_ptes(address, folio, pvmw.pte)) {
-+			nr_pages = folio_nr_pages(folio);
-+			flush_cache_range(vma, range.start, range.end);
+@@ -1874,23 +1894,26 @@ static bool try_to_unmap_one(struct foli
+ 			if (pte_dirty(pteval))
+ 				folio_mark_dirty(folio);
+ 		} else if (likely(pte_present(pteval))) {
+-			flush_cache_page(vma, address, pfn);
+-			/* Nuke the page table entry. */
+-			if (should_defer_flush(mm, flags)) {
+-				/*
+-				 * We clear the PTE but do not flush so potentially
+-				 * a remote CPU could still be writing to the folio.
+-				 * If the entry was previously clean then the
+-				 * architecture must guarantee that a clear->dirty
+-				 * transition on a cached TLB entry is written through
+-				 * and traps if the PTE is unmapped.
+-				 */
+-				pteval = ptep_get_and_clear(mm, address, pvmw.pte);
++			if (folio_test_large(folio) && !(flags & TTU_HWPOISON) &&
++			    can_batch_unmap_folio_ptes(address, folio, pvmw.pte))
++				nr_pages = folio_nr_pages(folio);
++			end_addr = address + nr_pages * PAGE_SIZE;
++			flush_cache_range(vma, address, end_addr);
+ 
+-				set_tlb_ubc_flush_pending(mm, pteval, address, address + PAGE_SIZE);
+-			} else {
+-				pteval = ptep_clear_flush(vma, address, pvmw.pte);
+-			}
++			/* Nuke the page table entry. */
 +			pteval = get_and_clear_full_ptes(mm, address, pvmw.pte, nr_pages, 0);
++			/*
++			 * We clear the PTE but do not flush so potentially
++			 * a remote CPU could still be writing to the folio.
++			 * If the entry was previously clean then the
++			 * architecture must guarantee that a clear->dirty
++			 * transition on a cached TLB entry is written through
++			 * and traps if the PTE is unmapped.
++			 */
 +			if (should_defer_flush(mm, flags))
-+				set_tlb_ubc_flush_pending(mm, pteval, address,
-+					address + folio_size(folio));
++				set_tlb_ubc_flush_pending(mm, pteval, address, end_addr);
 +			else
-+				flush_tlb_range(vma, range.start, range.end);
++				flush_tlb_range(vma, address, end_addr);
+ 			if (pte_dirty(pteval))
+ 				folio_mark_dirty(folio);
  		} else {
- 			flush_cache_page(vma, address, pfn);
- 			/* Nuke the page table entry. */
-@@ -1875,7 +1905,7 @@ static bool try_to_unmap_one(struct foli
+@@ -1968,7 +1991,7 @@ static bool try_to_unmap_one(struct foli
  					 * redirtied either using the page table or a previously
  					 * obtained GUP reference.
  					 */
@@ -203,7 +229,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  					folio_set_swapbacked(folio);
  					goto walk_abort;
  				} else if (ref_count != 1 + map_count) {
-@@ -1888,10 +1918,10 @@ static bool try_to_unmap_one(struct foli
+@@ -1981,10 +2004,10 @@ static bool try_to_unmap_one(struct foli
  					 * We'll come back here later and detect if the folio was
  					 * dirtied when the additional reference is gone.
  					 */
@@ -216,7 +242,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto discard;
  			}
  
-@@ -1943,13 +1973,18 @@ static bool try_to_unmap_one(struct foli
+@@ -2049,13 +2072,18 @@ static bool try_to_unmap_one(struct foli
  			dec_mm_counter(mm, mm_counter_file(folio));
  		}
  discard:

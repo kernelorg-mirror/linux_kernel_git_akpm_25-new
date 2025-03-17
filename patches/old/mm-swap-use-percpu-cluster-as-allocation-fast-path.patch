@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: use percpu cluster as allocation fast path
-Date: Tue, 25 Feb 2025 02:02:10 +0800
+Date: Fri, 14 Mar 2025 00:59:33 +0800
 
 Current allocation workflow first traverses the plist with a global lock
 held, after choosing a device, it uses the percpu cluster on that swap
@@ -28,21 +28,21 @@ several times without mentioning.
 
 After this commit, and once slot cache is gone in later commits, swap
 device rotation will happen for every consumed cluster.  Ideally non-HDD
-devices will be rotated if 2M space has been consumed for each order. 
+devices will be rotated if 2M space has been consumed for each order.
 Fragmented clusters will rotate the device faster, which seems OK.  HDD
 devices is rotated for every allocation regardless of the allocation
 order, which should be OK too and trivial.
 
-This commit also slightly changes allocation behaviour for slot cache. 
+This commit also slightly changes allocation behaviour for slot cache.
 The new added cluster allocation fast path may allocate entries from
 different device to the slot cache, this is not observable from user
 space, only impact performance very slightly, and slot cache will be just
 gone in next commit, so this can be ignored.
 
-Link: https://lkml.kernel.org/r/20250224180212.22802-6-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250313165935.63303-6-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
-Reviewed-by: Baoquan He <bhe@redhat.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <v-songbaohua@oppo.com>
 Cc: Chris Li <chrisl@kernel.org>
 Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
@@ -55,9 +55,9 @@ Cc: Yosry Ahmed <yosryahmed@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/swap.h |   11 +--
- mm/swapfile.c        |  136 +++++++++++++++++++++++++++--------------
- 2 files changed, 95 insertions(+), 52 deletions(-)
+ include/linux/swap.h |   11 +-
+ mm/swapfile.c        |  158 ++++++++++++++++++++++++++++++-----------
+ 2 files changed, 121 insertions(+), 48 deletions(-)
 
 --- a/include/linux/swap.h~mm-swap-use-percpu-cluster-as-allocation-fast-path
 +++ a/include/linux/swap.h
@@ -125,15 +125,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		__this_cpu_write(si->percpu_cluster->next[order], next);
 -	else
 +	if (si->flags & SWP_SOLIDSTATE) {
-+		__this_cpu_write(percpu_swap_cluster.si[order], si);
-+		__this_cpu_write(percpu_swap_cluster.offset[order], next);
++		this_cpu_write(percpu_swap_cluster.offset[order], next);
++		this_cpu_write(percpu_swap_cluster.si[order], si);
 +	} else {
  		si->global_cluster->next[order] = next;
 +	}
  	return found;
  }
  
-@@ -862,9 +876,8 @@ static void swap_reclaim_work(struct wor
+@@ -862,20 +876,18 @@ static void swap_reclaim_work(struct wor
  }
  
  /*
@@ -145,28 +145,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   */
  static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si, int order,
  					      unsigned char usage)
-@@ -872,18 +885,12 @@ static unsigned long cluster_alloc_swap_
+ {
  	struct swap_cluster_info *ci;
- 	unsigned int offset, found = 0;
+-	unsigned int offset, found = 0;
++	unsigned int offset = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
  
--	if (si->flags & SWP_SOLIDSTATE) {
+ 	if (si->flags & SWP_SOLIDSTATE) {
 -		/* Fast path using per CPU cluster */
 -		local_lock(&si->percpu_cluster->lock);
 -		offset = __this_cpu_read(si->percpu_cluster->next[order]);
--	} else {
-+	if (!(si->flags & SWP_SOLIDSTATE)) {
++		if (si == this_cpu_read(percpu_swap_cluster.si[order]))
++			offset = this_cpu_read(percpu_swap_cluster.offset[order]);
+ 	} else {
  		/* Serialize HDD SWAP allocation for each device. */
  		spin_lock(&si->global_cluster_lock);
- 		offset = si->global_cluster->next[order];
--	}
--
--	if (offset) {
- 		ci = lock_cluster(si, offset);
-+
- 		/* Cluster could have been used by another order */
- 		if (cluster_is_usable(ci, order)) {
- 			if (cluster_is_empty(ci))
-@@ -973,9 +980,7 @@ new_cluster:
+@@ -973,9 +985,7 @@ new_cluster:
  		}
  	}
  done:
@@ -177,7 +170,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		spin_unlock(&si->global_cluster_lock);
  	return found;
  }
-@@ -1196,6 +1201,49 @@ static bool get_swap_device_info(struct
+@@ -1196,6 +1206,51 @@ static bool get_swap_device_info(struct
  	return true;
  }
  
@@ -200,15 +193,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * Once allocated, swap_info_struct will never be completely freed,
 +	 * so checking it's liveness by get_swap_device_info is enough.
 +	 */
-+	si = __this_cpu_read(percpu_swap_cluster.si[order]);
-+	offset = __this_cpu_read(percpu_swap_cluster.offset[order]);
++	si = this_cpu_read(percpu_swap_cluster.si[order]);
++	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 +	if (!si || !offset || !get_swap_device_info(si))
 +		return 0;
 +
 +	while (offset) {
 +		ci = lock_cluster(si, offset);
-+		if (!cluster_is_usable(ci, order))
++		if (!cluster_is_usable(ci, order)) {
++			unlock_cluster(ci);
 +			break;
++		}
 +		if (cluster_is_empty(ci))
 +			offset = cluster_offset(si, ci);
 +		found = alloc_swap_scan_cluster(si, ci, offset, order, usage);
@@ -217,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		entries[n_ret++] = swp_entry(si->type, found);
 +		if (n_ret == n_goal)
 +			break;
-+		offset = __this_cpu_read(percpu_swap_cluster.offset[order]);
++		offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 +	}
 +
 +	put_swap_device(si);
@@ -227,7 +222,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int get_swap_pages(int n_goal, swp_entry_t swp_entries[], int entry_order)
  {
  	int order = swap_entry_order(entry_order);
-@@ -1204,19 +1252,36 @@ int get_swap_pages(int n_goal, swp_entry
+@@ -1204,19 +1259,36 @@ int get_swap_pages(int n_goal, swp_entry
  	int n_ret = 0;
  	int node;
  
@@ -268,7 +263,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  
  		spin_lock(&swap_avail_lock);
-@@ -1234,12 +1299,10 @@ start_over:
+@@ -1234,12 +1306,10 @@ start_over:
  		if (plist_node_empty(&next->avail_lists[node]))
  			goto start_over;
  	}
@@ -283,7 +278,44 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return n_ret;
  }
  
-@@ -2725,8 +2788,6 @@ SYSCALL_DEFINE1(swapoff, const char __us
+@@ -2597,6 +2667,28 @@ static void wait_for_allocation(struct s
+ 	}
+ }
+ 
++/*
++ * Called after swap device's reference count is dead, so
++ * neither scan nor allocation will use it.
++ */
++static void flush_percpu_swap_cluster(struct swap_info_struct *si)
++{
++	int cpu, i;
++	struct swap_info_struct **pcp_si;
++
++	for_each_possible_cpu(cpu) {
++		pcp_si = per_cpu_ptr(percpu_swap_cluster.si, cpu);
++		/*
++		 * Invalidate the percpu swap cluster cache, si->users
++		 * is dead, so no new user will point to it, just flush
++		 * any existing user.
++		 */
++		for (i = 0; i < SWAP_NR_ORDERS; i++)
++			cmpxchg(&pcp_si[i], si, NULL);
++	}
++}
++
++
+ SYSCALL_DEFINE1(swapoff, const char __user *, specialfile)
+ {
+ 	struct swap_info_struct *p = NULL;
+@@ -2698,6 +2790,7 @@ SYSCALL_DEFINE1(swapoff, const char __us
+ 
+ 	flush_work(&p->discard_work);
+ 	flush_work(&p->reclaim_work);
++	flush_percpu_swap_cluster(p);
+ 
+ 	destroy_swap_extents(p);
+ 	if (p->flags & SWP_CONTINUED)
+@@ -2725,8 +2818,6 @@ SYSCALL_DEFINE1(swapoff, const char __us
  	arch_swap_invalidate_area(p->type);
  	zswap_swapoff(p->type);
  	mutex_unlock(&swapon_mutex);
@@ -292,7 +324,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	kfree(p->global_cluster);
  	p->global_cluster = NULL;
  	vfree(swap_map);
-@@ -3125,7 +3186,7 @@ static struct swap_cluster_info *setup_c
+@@ -3125,7 +3216,7 @@ static struct swap_cluster_info *setup_c
  	unsigned long nr_clusters = DIV_ROUND_UP(maxpages, SWAPFILE_CLUSTER);
  	struct swap_cluster_info *cluster_info;
  	unsigned long i, j, idx;
@@ -301,7 +333,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	cluster_info = kvcalloc(nr_clusters, sizeof(*cluster_info), GFP_KERNEL);
  	if (!cluster_info)
-@@ -3134,20 +3195,7 @@ static struct swap_cluster_info *setup_c
+@@ -3134,20 +3225,7 @@ static struct swap_cluster_info *setup_c
  	for (i = 0; i < nr_clusters; i++)
  		spin_lock_init(&cluster_info[i].lock);
  
@@ -323,7 +355,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		si->global_cluster = kmalloc(sizeof(*si->global_cluster),
  				     GFP_KERNEL);
  		if (!si->global_cluster)
-@@ -3424,8 +3472,6 @@ free_swap_address_space:
+@@ -3424,8 +3502,6 @@ free_swap_address_space:
  bad_swap_unlock_inode:
  	inode_unlock(inode);
  bad_swap:
