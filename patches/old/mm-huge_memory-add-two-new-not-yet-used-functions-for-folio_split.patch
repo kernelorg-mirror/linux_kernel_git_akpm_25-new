@@ -1,20 +1,25 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/huge_memory: add two new (not yet used) functions for folio_split()
-Date: Wed, 26 Feb 2025 16:00:25 -0500
+Date: Fri, 7 Mar 2025 12:39:55 -0500
 
 This is a preparation patch, both added functions are not used yet.
 
 The added __split_unmapped_folio() is able to split a folio with its
 mapping removed in two manners: 1) uniform split (the existing way), and
-2) buddy allocator like split.
+2) buddy allocator like (or non-uniform) split.
 
 The added __split_folio_to_order() can split a folio into any lower order.
 For uniform split, __split_unmapped_folio() calls it once to split the
-given folio to the new order.  For buddy allocator split,
-__split_unmapped_folio() calls it (folio_order - new_order) times and each
-time splits the folio containing the given page to one lower order.
+given folio to the new order.  For buddy allocator like (non-uniform)
+split, __split_unmapped_folio() calls it (folio_order - new_order) times
+and each time splits the folio containing the given page to one lower
+order.
 
-Link: https://lkml.kernel.org/r/20250226210032.2044041-3-ziy@nvidia.com
+[ziy@nvidia.com: unfreeze head folio after page cache entries are updated]
+  Link: https://lkml.kernel.org/r/0F15DA7F-1977-412F-9A3E-F06B515D4BD2@nvidia.com
+[ziy@nvidia.com: use NULL instead of 0 for folio->private assignment]
+  Link: https://lkml.kernel.org/r/1E11B9DD-3A87-4C9C-8FB4-E1324FB6A21A@nvidia.com
+Link: https://lkml.kernel.org/r/20250307174001.242794-3-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -31,12 +36,12 @@ Cc: Kairui Song <kasong@tencent.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |  338 ++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 337 insertions(+), 1 deletion(-)
+ mm/huge_memory.c |  354 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 353 insertions(+), 1 deletion(-)
 
 --- a/mm/huge_memory.c~mm-huge_memory-add-two-new-not-yet-used-functions-for-folio_split
 +++ a/mm/huge_memory.c
-@@ -3267,7 +3267,6 @@ static void remap_page(struct folio *fol
+@@ -3265,7 +3265,6 @@ static void remap_page(struct folio *fol
  static void lru_add_page_tail(struct folio *folio, struct page *tail,
  		struct lruvec *lruvec, struct list_head *list)
  {
@@ -44,26 +49,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	VM_BUG_ON_FOLIO(PageLRU(tail), folio);
  	lockdep_assert_held(&lruvec->lru_lock);
  
-@@ -3512,6 +3511,343 @@ bool can_split_folio(struct folio *folio
+@@ -3518,6 +3517,359 @@ bool can_split_folio(struct folio *folio
  }
  
  /*
 + * It splits @folio into @new_order folios and copies the @folio metadata to
 + * all the resulting folios.
 + */
-+static void __split_folio_to_order(struct folio *folio, int new_order)
++static void __split_folio_to_order(struct folio *folio, int old_order,
++		int new_order)
 +{
-+	long nr_pages = folio_nr_pages(folio);
 +	long new_nr_pages = 1 << new_order;
-+	long index;
++	long nr_pages = 1 << old_order;
++	long i;
 +
 +	/*
 +	 * Skip the first new_nr_pages, since the new folio from them have all
 +	 * the flags from the original folio.
 +	 */
-+	for (index = new_nr_pages; index < nr_pages; index += new_nr_pages) {
-+		struct page *head = &folio->page;
-+		struct page *new_head = head + index;
++	for (i = new_nr_pages; i < nr_pages; i += new_nr_pages) {
++		struct page *new_head = &folio->page + i;
 +
 +		/*
 +		 * Careful: new_folio is not a "real" folio before we cleared PageTail.
@@ -71,7 +76,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 */
 +		struct folio *new_folio = (struct folio *)new_head;
 +
-+		VM_BUG_ON_PAGE(atomic_read(&new_head->_mapcount) != -1, new_head);
++		VM_BUG_ON_PAGE(atomic_read(&new_folio->_mapcount) != -1, new_head);
 +
 +		/*
 +		 * Clone page flags before unfreezing refcount.
@@ -86,8 +91,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * unreferenced sub-pages of an anonymous THP: we can simply drop
 +		 * PG_anon_exclusive (-> PG_mappedtodisk) for these here.
 +		 */
-+		new_head->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
-+		new_head->flags |= (head->flags &
++		new_folio->flags &= ~PAGE_FLAGS_CHECK_AT_PREP;
++		new_folio->flags |= (folio->flags &
 +				((1L << PG_referenced) |
 +				 (1L << PG_swapbacked) |
 +				 (1L << PG_swapcache) |
@@ -106,23 +111,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				 (1L << PG_dirty) |
 +				 LRU_GEN_MASK | LRU_REFS_MASK));
 +
-+		/* ->mapping in first and second tail page is replaced by other uses */
-+		VM_BUG_ON_PAGE(new_nr_pages > 2 && new_head->mapping != TAIL_MAPPING,
-+			       new_head);
-+		new_head->mapping = head->mapping;
-+		new_head->index = head->index + index;
++		new_folio->mapping = folio->mapping;
++		new_folio->index = folio->index + i;
 +
 +		/*
 +		 * page->private should not be set in tail pages. Fix up and warn once
 +		 * if private is unexpectedly set.
 +		 */
-+		if (unlikely(new_head->private)) {
++		if (unlikely(new_folio->private)) {
 +			VM_WARN_ON_ONCE_PAGE(true, new_head);
-+			new_head->private = 0;
++			new_folio->private = NULL;
 +		}
 +
 +		if (folio_test_swapcache(folio))
-+			new_folio->swap.val = folio->swap.val + index;
++			new_folio->swap.val = folio->swap.val + i;
 +
 +		/* Page flags must be visible before we make the page non-compound. */
 +		smp_wmb();
@@ -137,8 +139,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		if (new_order) {
 +			prep_compound_page(new_head, new_order);
 +			folio_set_large_rmappable(new_folio);
-+
-+			folio_set_order(folio, new_order);
 +		}
 +
 +		if (folio_test_young(folio))
@@ -149,7 +149,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		folio_xchg_last_cpupid(new_folio, folio_last_cpupid(folio));
 +	}
 +
-+	if (!new_order)
++	if (new_order)
++		folio_set_order(folio, new_order);
++	else
 +		ClearPageCompound(&folio->page);
 +}
 +
@@ -219,7 +221,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	int ret = 0;
 +	bool stop_split = false;
 +
-+	if (folio_test_anon(folio) && folio_test_swapcache(folio)) {
++	if (folio_test_swapcache(folio)) {
++		VM_BUG_ON(mapping);
++
 +		/* a swapcache folio can only be uniformly split to order-0 */
 +		if (!uniform_split || new_order != 0)
 +			return -EINVAL;
@@ -272,12 +276,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			}
 +		}
 +
++		/*
++		 * Reset any memcg data overlay in the tail pages.
++		 * folio_nr_pages() is unreliable until prep_compound_page()
++		 * was called again.
++		 */
++#ifdef NR_PAGES_IN_LARGE_FOLIO
++		folio->_nr_pages = 0;
++#endif
++
++
 +		/* complete memcg works before add pages to LRU */
 +		split_page_memcg(&folio->page, old_order, split_order);
 +		split_page_owner(&folio->page, old_order, split_order);
 +		pgalloc_tag_split(folio, old_order, split_order);
 +
-+		__split_folio_to_order(folio, split_order);
++		__split_folio_to_order(folio, old_order, split_order);
 +
 +after_split:
 +		/*
@@ -287,9 +301,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * is new_order, since the folio will be worked on in next
 +		 * iteration.
 +		 */
-+		for (release = folio, next = folio_next(folio);
-+		     release != end_folio;
-+		     release = next, next = folio_next(next)) {
++		for (release = folio; release != end_folio; release = next) {
++			next = folio_next(release);
 +			/*
 +			 * for buddy allocator like split, the folio containing
 +			 * page will be split next and should not be released,
@@ -307,46 +320,55 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			}
 +
 +			/*
-+			 * Unfreeze refcount first. Additional reference from
-+			 * page cache.
++			 * origin_folio should be kept frozon until page cache
++			 * entries are updated with all the other after-split
++			 * folios to prevent others seeing stale page cache
++			 * entries.
 +			 */
-+			folio_ref_unfreeze(release,
-+				1 + ((!folio_test_anon(origin_folio) ||
-+				     folio_test_swapcache(origin_folio)) ?
-+					     folio_nr_pages(release) : 0));
-+
 +			if (release == origin_folio)
 +				continue;
++
++			folio_ref_unfreeze(release, 1 +
++					((mapping || swap_cache) ?
++						folio_nr_pages(release) : 0));
 +
 +			lru_add_page_tail(origin_folio, &release->page,
 +						lruvec, list);
 +
-+			/* Some pages can be beyond EOF: drop them from page cache */
++			/* Some pages can be beyond EOF: drop them from cache */
 +			if (release->index >= end) {
-+				if (shmem_mapping(origin_folio->mapping))
++				if (shmem_mapping(mapping))
 +					nr_dropped += folio_nr_pages(release);
 +				else if (folio_test_clear_dirty(release))
 +					folio_account_cleaned(release,
-+						inode_to_wb(origin_folio->mapping->host));
++						inode_to_wb(mapping->host));
 +				__filemap_remove_folio(release, NULL);
-+				folio_put(release);
-+			} else if (!folio_test_anon(release)) {
-+				__xa_store(&origin_folio->mapping->i_pages,
-+						release->index, &release->page, 0);
++				folio_put_refs(release, folio_nr_pages(release));
++			} else if (mapping) {
++				__xa_store(&mapping->i_pages,
++						release->index, release, 0);
 +			} else if (swap_cache) {
 +				__xa_store(&swap_cache->i_pages,
 +						swap_cache_index(release->swap),
-+						&release->page, 0);
++						release, 0);
 +			}
 +		}
 +	}
 +
++	/*
++	 * Unfreeze origin_folio only after all page cache entries, which used
++	 * to point to it, have been updated with new folios. Otherwise,
++	 * a parallel folio_try_get() can grab origin_folio and its caller can
++	 * see stale page cache entries.
++	 */
++	folio_ref_unfreeze(origin_folio, 1 +
++		((mapping || swap_cache) ? folio_nr_pages(origin_folio) : 0));
++
 +	unlock_page_lruvec(lruvec);
 +
-+	if (folio_test_anon(origin_folio)) {
-+		if (folio_test_swapcache(origin_folio))
-+			xa_unlock(&swap_cache->i_pages);
-+	} else
++	if (swap_cache)
++		xa_unlock(&swap_cache->i_pages);
++	if (mapping)
 +		xa_unlock(&mapping->i_pages);
 +
 +	/* Caller disabled irqs, so they are still disabled here */
@@ -365,9 +387,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * For buddy allocator like split, the first after-split folio is left
 +	 * for caller to unlock.
 +	 */
-+	for (new_folio = origin_folio, next = folio_next(origin_folio);
-+	     new_folio != next_folio;
-+	     new_folio = next, next = folio_next(next)) {
++	for (new_folio = origin_folio; new_folio != next_folio; new_folio = next) {
++		next = folio_next(new_folio);
 +		if (new_folio == page_folio(lock_at))
 +			continue;
 +

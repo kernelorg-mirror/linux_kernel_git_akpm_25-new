@@ -1,6 +1,44 @@
 From: Luiz Capitulino <luizcap@redhat.com>
 Subject: mm: page_ext: add an iteration API for page extensions
-Date: Mon, 24 Feb 2025 16:59:06 -0500
+Date: Thu, 6 Mar 2025 17:44:50 -0500
+
+Patch series "mm: page_ext: Introduce new iteration API", v3.
+
+Introduction
+============
+
+  [ Thanks to David Hildenbrand for identifying the root cause of this
+    issue and proving guidance on how to fix it. The new API idea, bugs
+    and misconceptions are all mine though ]
+
+Currently, trying to reserve 1G pages with page_owner=on and sparsemem
+causes a crash. The reproducer is very simple:
+
+ 1. Build the kernel with CONFIG_SPARSEMEM=y and the table extensions
+ 2. Pass 'default_hugepagesz=1 page_owner=on' in the kernel command-line
+ 3. Reserve one 1G page at run-time, this should crash (see patch 1 for
+    backtrace) 
+
+ [ A crash with page_table_check is also possible, but harder to trigger ]
+
+Apparently, starting with commit cf54f310d0d3 ("mm/hugetlb: use __GFP_COMP
+for gigantic folios") we now pass the full allocation order to page
+extension clients and the page extension implementation assumes that all
+PFNs of an allocation range will be stored in the same memory section (which
+is not true for 1G pages).
+
+To fix this, this series introduces a new iteration API for page extension
+objects. The API checks if the next page extension object can be retrieved
+from the current section or if it needs to look up for it in another
+section.
+
+Please, find all details in patch 1.
+
+I tested this series on arm64 and x86 by reserving 1G pages at run-time
+and doing kernel builds (always with page_owner=on and page_table_check=on).
+
+
+This patch (of 3):
 
 The page extension implementation assumes that all page extensions of a
 given page order are stored in the same memory section.  The function
@@ -47,8 +85,9 @@ rcu_read_unlock();
 """
 
 The loop construct uses page_ext_iter_next() which checks to see if we
-have crossed sections in the iteration. In this case, page_ext_iter_next()
-retrieves the next page_ext object from another section.
+have crossed sections in the iteration.  In this case,
+page_ext_iter_next() retrieves the next page_ext object from another
+section.
 
 Thanks to David Hildenbrand for helping identify the root cause and
 providing suggestions on how to fix and optmize the solution (final
@@ -91,33 +130,34 @@ Lastly, here's the backtrace, without kasan you can get random crashes:
 [   76.200939]  el0t_64_sync_handler+0x144/0x168
 [   76.205287]  el0t_64_sync+0x1ac/0x1b0
 
-Link: https://lkml.kernel.org/r/08aea5d87f5419f4c7033c81d97645f940f87f7e.1740434344.git.luizcap@redhat.com
+Link: https://lkml.kernel.org/r/cover.1741301089.git.luizcap@redhat.com
+Link: https://lkml.kernel.org/r/a45893880b7e1601082d39d2c5c8b50bcc096305.1741301089.git.luizcap@redhat.com
 Fixes: cf54f310d0d3 ("mm/hugetlb: use __GFP_COMP for gigantic folios")
 Signed-off-by: Luiz Capitulino <luizcap@redhat.com>
 Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Luiz Capitulino <luizcap@redhat.com>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
 Cc: Yu Zhao <yuzhao@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/page_ext.h |   92 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 92 insertions(+)
+ include/linux/page_ext.h |   93 +++++++++++++++++++++++++++++++++++++
+ mm/page_ext.c            |   13 +++++
+ 2 files changed, 106 insertions(+)
 
 --- a/include/linux/page_ext.h~mm-page_ext-add-an-iteration-api-for-page-extensions
 +++ a/include/linux/page_ext.h
-@@ -2,7 +2,9 @@
- #ifndef __LINUX_PAGE_EXT_H
+@@ -3,6 +3,7 @@
  #define __LINUX_PAGE_EXT_H
  
-+#include <linux/pgtable.h>
  #include <linux/types.h>
 +#include <linux/mmzone.h>
  #include <linux/stacktrace.h>
  
  struct pglist_data;
-@@ -69,12 +71,26 @@ extern void page_ext_init(void);
+@@ -69,16 +70,31 @@ extern void page_ext_init(void);
  static inline void page_ext_init_flatmem_late(void)
  {
  }
@@ -144,7 +184,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
  
  extern struct page_ext *page_ext_get(const struct page *page);
-@@ -94,6 +110,82 @@ static inline struct page_ext *page_ext_
+ extern void page_ext_put(struct page_ext *page_ext);
++extern struct page_ext *page_ext_lookup(unsigned long pfn);
+ 
+ static inline void *page_ext_data(struct page_ext *page_ext,
+ 				  struct page_ext_operations *ops)
+@@ -93,6 +109,83 @@ static inline struct page_ext *page_ext_
  	return next;
  }
  
@@ -157,17 +202,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +/**
 + * page_ext_iter_begin() - Prepare for iterating through page extensions.
 + * @iter: page extension iterator.
-+ * @page: The page we're interested in.
++ * @pfn: PFN of the page we're interested in.
 + *
 + * Must be called with RCU read lock taken.
 + *
 + * Return: NULL if no page_ext exists for this page.
 + */
-+static inline struct page_ext *page_ext_iter_begin(struct page_ext_iter *iter, struct page *page)
++static inline struct page_ext *page_ext_iter_begin(struct page_ext_iter *iter,
++						unsigned long pfn)
 +{
 +	iter->index = 0;
-+	iter->start_pfn = page_to_pfn(page);
-+	iter->page_ext = lookup_page_ext(page);
++	iter->start_pfn = pfn;
++	iter->page_ext = page_ext_lookup(pfn);
 +
 +	return iter->page_ext;
 +}
@@ -193,7 +239,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (page_ext_iter_next_fast_possible(pfn))
 +		iter->page_ext = page_ext_next(iter->page_ext);
 +	else
-+		iter->page_ext = lookup_page_ext(pfn_to_page(pfn));
++		iter->page_ext = page_ext_lookup(pfn);
 +
 +	return iter->page_ext;
 +}
@@ -220,11 +266,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * IMPORTANT: must be called with RCU read lock taken.
 + */
 +#define for_each_page_ext(__page, __pgcount, __page_ext, __iter) \
-+	for (__page_ext = page_ext_iter_begin(&__iter, __page);  \
++	for (__page_ext = page_ext_iter_begin(&__iter, page_to_pfn(__page));\
 +		__page_ext && __iter.index < __pgcount;          \
 +		__page_ext = page_ext_iter_next(&__iter))
 +
  #else /* !CONFIG_PAGE_EXTENSION */
  struct page_ext;
  
+--- a/mm/page_ext.c~mm-page_ext-add-an-iteration-api-for-page-extensions
++++ a/mm/page_ext.c
+@@ -508,6 +508,19 @@ void __meminit pgdat_page_ext_init(struc
+ #endif
+ 
+ /**
++ * page_ext_lookup() - Lookup a page extension for a PFN.
++ * @pfn: PFN of the page we're interested in.
++ *
++ * Must be called with RCU read lock taken and @pfn must be valid.
++ *
++ * Return: NULL if no page_ext exists for this page.
++ */
++struct page_ext *page_ext_lookup(unsigned long pfn)
++{
++	return lookup_page_ext(pfn_to_page(pfn));
++}
++
++/**
+  * page_ext_get() - Get the extended information for a page.
+  * @page: The page we're interested in.
+  *
 _

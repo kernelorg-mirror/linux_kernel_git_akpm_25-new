@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/mremap: refactor move_page_tables(), abstracting state
-Date: Thu, 6 Mar 2025 10:34:02 +0000
+Date: Mon, 10 Mar 2025 20:50:39 +0000
 
 A lot of state is threaded throughout the page table moving logic within
 the mremap code, including boolean values which control behaviour
@@ -27,34 +27,30 @@ We additionally also take the opportunity to add significant comments
 describing the address realignment logic to make it abundantly clear what
 is going on in this code.
 
-Link: https://lkml.kernel.org/r/89f2446f70acd41172dadbb3404db9d95415c78c.1741256580.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/e20180add9c8746184aa3f23a61fff69a06cdaa9.1741639347.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Harry Yoo <harry.yoo@oracle.com>
-Cc: Jann Horn <jannh@google.com>
 Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/internal.h |   46 +++++++++++-
+ mm/internal.h |   43 ++++++++++--
  mm/mmap.c     |    5 -
  mm/mremap.c   |  172 +++++++++++++++++++++++++++++++++++-------------
- 3 files changed, 171 insertions(+), 52 deletions(-)
+ 3 files changed, 168 insertions(+), 52 deletions(-)
 
 --- a/mm/internal.h~mm-mremap-refactor-move_page_tables-abstracting-state
 +++ a/mm/internal.h
-@@ -25,6 +25,47 @@
+@@ -25,6 +25,44 @@
  struct folio_batch;
  
  /*
 + * Maintains state across a page table move. The operation assumes both source
 + * and destination VMAs already exist and are specified by the user.
 + *
-+ * Partial moves are permitted, but:
-+ *      from_vma->vm_start <= from_addr < from_vma->vm_end - len
-+ *      to_vma->vm_start <= to_addr < to_vma->vm_end - len
-+ *
-+ * Must be maintained.
++ * Partial moves are permitted, but the old and new ranges must both reside
++ * within a VMA.
 + *
 + * mmap lock must be held in write and VMA write locks must be held on any VMA
 + * that is visible.
@@ -91,7 +87,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * The set of flags that only affect watermark checking and reclaim
   * behaviour. This is used by the MM to obey the caller constraints
   * about IO, FS and watermark checking while ignoring placement
-@@ -1537,10 +1578,7 @@ extern struct list_lru shadow_nodes;
+@@ -1527,10 +1565,7 @@ extern struct list_lru shadow_nodes;
  } while (0)
  
  /* mremap.c */
@@ -179,7 +175,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * operation is wortwhile.
 +	 *
 +	 * So ensure that we only perform this realignment if the end of the
-+	 * range being copied from is at least page table aligned:
++	 * range being copied reaches or crosses the page table boundary.
 +	 *
 +	 * boundary                        boundary
 +	 *    .<- old_align ->                .
@@ -223,7 +219,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *
 + * Consider an mremap() of a VMA with page table boundaries as below, and no
 + * preceding VMAs from the lower page table boundary to the start of the VMA,
-+ * with the end of the range being at least page table aligned:
++ * with the end of the range reaching or crossing the page table boundary.
 + *
 + *   boundary                        boundary
 + *      .              |----------------.-----------|
@@ -293,6 +289,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return move_hugetlb_page_tables(pmc->old, pmc->new, pmc->old_addr,
 +						pmc->new_addr, pmc->len_in);
  
++	old_end = pmc->old_end;
  	/*
  	 * If possible, realign addresses to PMD boundary for faster copy.
  	 * Only realign if the mremap copying hits a PMD boundary.
@@ -304,7 +301,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/* These may have been changed. */
 +	old_addr = pmc->old_addr;
 +	new_addr = pmc->new_addr;
-+	old_end = pmc->old_end;
  
  	flush_cache_range(vma, old_addr, old_end);
  	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, vma->vm_mm,
@@ -357,7 +353,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /* Set vrm->delta to the difference in VMA size specified by user. */
-@@ -1039,37 +1116,40 @@ static int copy_vma_and_data(struct vma_
+@@ -1040,37 +1117,40 @@ static int copy_vma_and_data(struct vma_
  	unsigned long internal_pgoff = internal_offset >> PAGE_SHIFT;
  	unsigned long new_pgoff = vrm->vma->vm_pgoff + internal_pgoff;
  	unsigned long moved_len;
