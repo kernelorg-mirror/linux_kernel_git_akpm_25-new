@@ -1,0 +1,89 @@
+From: Jinjiang Tu <tujinjiang@huawei.com>
+Subject: mm/memory_hotplug: fix call folio_test_large with tail page in do_migrate_range
+Date: Mon, 24 Mar 2025 21:17:50 +0800
+
+We triggered the below BUG:
+
+ page: refcount:0 mapcount:0 mapping:0000000000000000 index:0x2 pfn:0x240402
+ head: order:9 mapcount:0 entire_mapcount:0 nr_pages_mapped:0 pincount:0
+ flags: 0x1ffffe0000000040(head|node=1|zone=3|lastcpupid=0x1ffff)
+ page_type: f4(hugetlb)
+ page dumped because: VM_BUG_ON_PAGE(page->compound_head & 1)
+ ------------[ cut here ]------------
+ kernel BUG at ./include/linux/page-flags.h:310!
+ Internal error: Oops - BUG: 00000000f2000800 [#1] PREEMPT SMP
+ Modules linked in:
+ CPU: 7 UID: 0 PID: 166 Comm: sh Not tainted 6.14.0-rc7-dirty #374
+ Hardware name: QEMU QEMU Virtual Machine, BIOS 0.0.0 02/06/2015
+ pstate: 60000005 (nZCv daif -PAN -UAO -TCO -DIT -SSBS BTYPE=--)
+ pc : const_folio_flags+0x3c/0x58
+ lr : const_folio_flags+0x3c/0x58
+ Call trace:
+  const_folio_flags+0x3c/0x58 (P)
+  do_migrate_range+0x164/0x720
+  offline_pages+0x63c/0x6fc
+  memory_subsys_offline+0x190/0x1f4
+  device_offline+0xc0/0x13c
+  state_store+0x90/0xd8
+  dev_attr_store+0x18/0x2c
+  sysfs_kf_write+0x44/0x54
+  kernfs_fop_write_iter+0x120/0x1cc
+  vfs_write+0x240/0x378
+  ksys_write+0x70/0x108
+  __arm64_sys_write+0x1c/0x28
+  invoke_syscall+0x48/0x10c
+  el0_svc_common.constprop.0+0x40/0xe0
+
+When allocating a hugetlb folio, between the folio is taken from buddy and
+prep_compound_page() is called, start_isolate_page_range() and
+do_migrate_range() is called.  When do_migrate_range() scans the head page
+of the hugetlb folio, the compound_head field isn't set, so scans the tail
+page next.  And at this time, the compound_head field of tail page is set,
+folio_test_large() is called by tail page, thus triggers VM_BUG_ON().
+
+To fix it, get folio refcount before calling folio_test_large().
+
+Link: https://lkml.kernel.org/r/20250324131750.1551884-1-tujinjiang@huawei.com
+Fixes: 8135d8926c08 ("mm: memory_hotplug: memory hotremove supports thp migration")
+Fixes: b62b51d2d159 ("mm: memory_hotplug: remove head variable in do_migrate_range()")
+Signed-off-by: Jinjiang Tu <tujinjiang@huawei.com>
+Acked-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Nanyong Sun <sunnanyong@huawei.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory_hotplug.c |   12 +++---------
+ 1 file changed, 3 insertions(+), 9 deletions(-)
+
+--- a/mm/memory_hotplug.c~mm-memory_hotplug-fix-call-folio_test_large-with-tail-page-in-do_migrate_range
++++ a/mm/memory_hotplug.c
+@@ -1813,21 +1813,15 @@ static void do_migrate_range(unsigned lo
+ 		page = pfn_to_page(pfn);
+ 		folio = page_folio(page);
+ 
+-		/*
+-		 * No reference or lock is held on the folio, so it might
+-		 * be modified concurrently (e.g. split).  As such,
+-		 * folio_nr_pages() may read garbage.  This is fine as the outer
+-		 * loop will revisit the split folio later.
+-		 */
+-		if (folio_test_large(folio))
+-			pfn = folio_pfn(folio) + folio_nr_pages(folio) - 1;
+-
+ 		if (!folio_try_get(folio))
+ 			continue;
+ 
+ 		if (unlikely(page_folio(page) != folio))
+ 			goto put_folio;
+ 
++		if (folio_test_large(folio))
++			pfn = folio_pfn(folio) + folio_nr_pages(folio) - 1;
++
+ 		if (folio_contain_hwpoisoned_page(folio)) {
+ 			if (WARN_ON(folio_test_lru(folio)))
+ 				folio_isolate_lru(folio);
+_
