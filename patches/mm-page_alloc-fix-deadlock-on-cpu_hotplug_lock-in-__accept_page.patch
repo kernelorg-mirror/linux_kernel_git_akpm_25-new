@@ -1,0 +1,113 @@
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Subject: mm/page_alloc: fix deadlock on cpu_hotplug_lock in __accept_page()
+Date: Sat, 29 Mar 2025 19:10:29 +0200
+
+When the last page in the zone is accepted, __accept_page() calls
+static_branch_dec().  This function takes cpu_hotplug_lock, which can lead
+to a deadlock if the allocation occurs during CPU bringup path as
+_cpu_up() also takes the lock.
+
+To prevent this deadlock, defer static_branch_dec() to a workqueue.
+
+Call static_branch_dec() only when the workqueue is not yet initialized. 
+Workqueues are initialized before CPU bring up, so this will not conflict
+with the first scenario.
+
+Link: https://lkml.kernel.org/r/20250329171030.3942298-1-kirill.shutemov@linux.intel.com
+Fixes: 55ad43e8ba0f ("mm: add a helper to accept page")
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Reported-by: Srikanth Aithal <sraithal@amd.com>
+Tested-by: Srikanth Aithal <sraithal@amd.com>
+Cc: Ashish Kalra <ashish.kalra@amd.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Edgecombe, Rick P" <rick.p.edgecombe@intel.com>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: "Mike Rapoport (IBM)" <rppt@kernel.org>
+Cc: Thomas Lendacky <thomas.lendacky@amd.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmzone.h |    3 +++
+ mm/internal.h          |    1 +
+ mm/mm_init.c           |    1 +
+ mm/page_alloc.c        |   28 ++++++++++++++++++++++++++--
+ 4 files changed, 31 insertions(+), 2 deletions(-)
+
+--- a/include/linux/mmzone.h~mm-page_alloc-fix-deadlock-on-cpu_hotplug_lock-in-__accept_page
++++ a/include/linux/mmzone.h
+@@ -964,6 +964,9 @@ struct zone {
+ #ifdef CONFIG_UNACCEPTED_MEMORY
+ 	/* Pages to be accepted. All pages on the list are MAX_PAGE_ORDER */
+ 	struct list_head	unaccepted_pages;
++
++	/* To be called once the last page in the zone is accepted */
++	struct work_struct	unaccepted_cleanup;
+ #endif
+ 
+ 	/* zone flags, see below */
+--- a/mm/internal.h~mm-page_alloc-fix-deadlock-on-cpu_hotplug_lock-in-__accept_page
++++ a/mm/internal.h
+@@ -1517,6 +1517,7 @@ unsigned long move_page_tables(struct vm
+ 
+ #ifdef CONFIG_UNACCEPTED_MEMORY
+ void accept_page(struct page *page);
++void unaccepted_cleanup_work(struct work_struct *work);
+ #else /* CONFIG_UNACCEPTED_MEMORY */
+ static inline void accept_page(struct page *page)
+ {
+--- a/mm/mm_init.c~mm-page_alloc-fix-deadlock-on-cpu_hotplug_lock-in-__accept_page
++++ a/mm/mm_init.c
+@@ -1404,6 +1404,7 @@ static void __meminit zone_init_free_lis
+ 
+ #ifdef CONFIG_UNACCEPTED_MEMORY
+ 	INIT_LIST_HEAD(&zone->unaccepted_pages);
++	INIT_WORK(&zone->unaccepted_cleanup, unaccepted_cleanup_work);
+ #endif
+ }
+ 
+--- a/mm/page_alloc.c~mm-page_alloc-fix-deadlock-on-cpu_hotplug_lock-in-__accept_page
++++ a/mm/page_alloc.c
+@@ -6930,6 +6930,11 @@ static DEFINE_STATIC_KEY_FALSE(zones_wit
+ 
+ static bool lazy_accept = true;
+ 
++void unaccepted_cleanup_work(struct work_struct *work)
++{
++	static_branch_dec(&zones_with_unaccepted_pages);
++}
++
+ static int __init accept_memory_parse(char *p)
+ {
+ 	if (!strcmp(p, "lazy")) {
+@@ -6968,8 +6973,27 @@ static void __accept_page(struct zone *z
+ 
+ 	__free_pages_ok(page, MAX_PAGE_ORDER, FPI_TO_TAIL);
+ 
+-	if (last)
+-		static_branch_dec(&zones_with_unaccepted_pages);
++	if (last) {
++		/*
++		 * There are two corner cases:
++		 *
++		 * - If allocation occurs during the CPU bring up,
++		 *   static_branch_dec() cannot be used directly as
++		 *   it causes a deadlock on cpu_hotplug_lock.
++		 *
++		 *   Instead, use schedule_work() to prevent deadlock.
++		 *
++		 * - If allocation occurs before workqueues are initialized,
++		 *   static_branch_dec() should be called directly.
++		 *
++		 *   Workqueues are initialized before CPU bring up, so this
++		 *   will not conflict with the first scenario.
++		 */
++		if (system_wq)
++			schedule_work(&zone->unaccepted_cleanup);
++		else
++			unaccepted_cleanup_work(&zone->unaccepted_cleanup);
++	}
+ }
+ 
+ void accept_page(struct page *page)
+_
