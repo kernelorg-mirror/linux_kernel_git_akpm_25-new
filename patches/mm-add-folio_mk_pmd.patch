@@ -1,0 +1,138 @@
+From: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+Subject: mm: add folio_mk_pmd()
+Date: Wed, 2 Apr 2025 19:17:04 +0100
+
+Removes five conversions from folio to page.  Also removes both callers of
+mk_pmd() that aren't part of mk_huge_pmd(), getting us a step closer to
+removing the confusion between mk_pmd(), mk_huge_pmd() and pmd_mkhuge().
+
+Link: https://lkml.kernel.org/r/20250402181709.2386022-11-willy@infradead.org
+Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andreas Larsson <andreas@gaisler.com>
+Cc: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Cc: Johannes Berg <johannes@sipsolutions.net>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: <x86@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c           |    3 +--
+ include/linux/mm.h |   17 +++++++++++++++++
+ mm/huge_memory.c   |   11 +++++------
+ mm/khugepaged.c    |    2 +-
+ mm/memory.c        |    2 +-
+ 5 files changed, 25 insertions(+), 10 deletions(-)
+
+--- a/fs/dax.c~mm-add-folio_mk_pmd
++++ a/fs/dax.c
+@@ -1421,8 +1421,7 @@ static vm_fault_t dax_pmd_load_hole(stru
+ 		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
+ 		mm_inc_nr_ptes(vma->vm_mm);
+ 	}
+-	pmd_entry = mk_pmd(&zero_folio->page, vmf->vma->vm_page_prot);
+-	pmd_entry = pmd_mkhuge(pmd_entry);
++	pmd_entry = folio_mk_pmd(zero_folio, vmf->vma->vm_page_prot);
+ 	set_pmd_at(vmf->vma->vm_mm, pmd_addr, vmf->pmd, pmd_entry);
+ 	spin_unlock(ptl);
+ 	trace_dax_pmd_load_hole(inode, vmf, zero_folio, *entry);
+--- a/include/linux/mm.h~mm-add-folio_mk_pmd
++++ a/include/linux/mm.h
+@@ -2007,7 +2007,24 @@ static inline pte_t folio_mk_pte(struct
+ {
+ 	return pfn_pte(folio_pfn(folio), pgprot);
+ }
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++/**
++ * folio_mk_pmd - Create a PMD for this folio
++ * @folio: The folio to create a PMD for
++ * @pgprot: The page protection bits to use
++ *
++ * Create a page table entry for the first page of this folio.
++ * This is suitable for passing to set_pmd_at().
++ *
++ * Return: A page table entry suitable for mapping this folio.
++ */
++static inline pmd_t folio_mk_pmd(struct folio *folio, pgprot_t pgprot)
++{
++	return pmd_mkhuge(pfn_pmd(folio_pfn(folio), pgprot));
++}
+ #endif
++#endif /* CONFIG_MMU */
+ 
+ static inline bool folio_has_pincount(const struct folio *folio)
+ {
+--- a/mm/huge_memory.c~mm-add-folio_mk_pmd
++++ a/mm/huge_memory.c
+@@ -1203,7 +1203,7 @@ static void map_anon_folio_pmd(struct fo
+ {
+ 	pmd_t entry;
+ 
+-	entry = mk_huge_pmd(&folio->page, vma->vm_page_prot);
++	entry = folio_mk_pmd(folio, vma->vm_page_prot);
+ 	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 	folio_add_new_anon_rmap(folio, vma, haddr, RMAP_EXCLUSIVE);
+ 	folio_add_lru_vma(folio, vma);
+@@ -1309,8 +1309,7 @@ static void set_huge_zero_folio(pgtable_
+ 		struct folio *zero_folio)
+ {
+ 	pmd_t entry;
+-	entry = mk_pmd(&zero_folio->page, vma->vm_page_prot);
+-	entry = pmd_mkhuge(entry);
++	entry = folio_mk_pmd(zero_folio, vma->vm_page_prot);
+ 	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+ 	set_pmd_at(mm, haddr, pmd, entry);
+ 	mm_inc_nr_ptes(mm);
+@@ -2653,12 +2652,12 @@ int move_pages_huge_pmd(struct mm_struct
+ 		folio_move_anon_rmap(src_folio, dst_vma);
+ 		src_folio->index = linear_page_index(dst_vma, dst_addr);
+ 
+-		_dst_pmd = mk_huge_pmd(&src_folio->page, dst_vma->vm_page_prot);
++		_dst_pmd = folio_mk_pmd(src_folio, dst_vma->vm_page_prot);
+ 		/* Follow mremap() behavior and treat the entry dirty after the move */
+ 		_dst_pmd = pmd_mkwrite(pmd_mkdirty(_dst_pmd), dst_vma);
+ 	} else {
+ 		src_pmdval = pmdp_huge_clear_flush(src_vma, src_addr, src_pmd);
+-		_dst_pmd = mk_huge_pmd(src_page, dst_vma->vm_page_prot);
++		_dst_pmd = folio_mk_pmd(src_folio, dst_vma->vm_page_prot);
+ 	}
+ 	set_pmd_at(mm, dst_addr, dst_pmd, _dst_pmd);
+ 
+@@ -4675,7 +4674,7 @@ void remove_migration_pmd(struct page_vm
+ 
+ 	entry = pmd_to_swp_entry(*pvmw->pmd);
+ 	folio_get(folio);
+-	pmde = mk_huge_pmd(new, READ_ONCE(vma->vm_page_prot));
++	pmde = folio_mk_pmd(folio, READ_ONCE(vma->vm_page_prot));
+ 	if (pmd_swp_soft_dirty(*pvmw->pmd))
+ 		pmde = pmd_mksoft_dirty(pmde);
+ 	if (is_writable_migration_entry(entry))
+--- a/mm/khugepaged.c~mm-add-folio_mk_pmd
++++ a/mm/khugepaged.c
+@@ -1239,7 +1239,7 @@ static int collapse_huge_page(struct mm_
+ 	__folio_mark_uptodate(folio);
+ 	pgtable = pmd_pgtable(_pmd);
+ 
+-	_pmd = mk_huge_pmd(&folio->page, vma->vm_page_prot);
++	_pmd = folio_mk_pmd(folio, vma->vm_page_prot);
+ 	_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
+ 
+ 	spin_lock(pmd_ptl);
+--- a/mm/memory.c~mm-add-folio_mk_pmd
++++ a/mm/memory.c
+@@ -5188,7 +5188,7 @@ vm_fault_t do_set_pmd(struct vm_fault *v
+ 
+ 	flush_icache_pages(vma, page, HPAGE_PMD_NR);
+ 
+-	entry = mk_huge_pmd(page, vma->vm_page_prot);
++	entry = folio_mk_pmd(folio, vma->vm_page_prot);
+ 	if (write)
+ 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+ 
+_

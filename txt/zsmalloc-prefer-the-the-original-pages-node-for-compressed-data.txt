@@ -1,0 +1,80 @@
+From: Nhat Pham <nphamcs@gmail.com>
+Subject: zsmalloc: prefer the the original page's node for compressed data
+Date: Wed, 2 Apr 2025 13:44:16 -0700
+
+Currently, zsmalloc, zswap's and zram's backend memory allocator, does not
+enforce any policy for the allocation of memory for the compressed data,
+instead just adopting the memory policy of the task entering reclaim, or
+the default policy (prefer local node) if no such policy is specified. 
+This can lead to several pathological behaviors in multi-node NUMA
+systems:
+
+1. Systems with CXL-based memory tiering can encounter the following
+   inversion with zswap/zram: the coldest pages demoted to the CXL tier
+   can return to the high tier when they are reclaimed to compressed swap,
+   creating memory pressure on the high tier.
+
+2. Consider a direct reclaimer scanning nodes in order of allocation
+   preference.  If it ventures into remote nodes, the memory it compresses
+   there should stay there.  Trying to shift those contents over to the
+   reclaiming thread's preferred node further *increases* its local
+   pressure, and provoking more spills.  The remote node is also the most
+   likely to refault this data again.  This undesirable behavior was
+   pointed out by Johannes Weiner in [1].
+
+3. For zswap writeback, the zswap entries are organized in
+   node-specific LRUs, based on the node placement of the original pages,
+   allowing for targeted zswap writeback for specific nodes.
+
+   However, the compressed data of a zswap entry can be placed on a
+   different node from the LRU it is placed on.  This means that reclaim
+   targeted at one node might not free up memory used for zswap entries in
+   that node, but instead reclaiming memory in a different node.
+
+All of these issues will be resolved if the compressed data go to the same
+node as the original page.  This patch encourages this behavior by having
+zswap and zram pass the node of the original page to zsmalloc, and have
+zsmalloc prefer the specified node if we need to allocate new (zs)pages
+for the compressed data.
+
+Note that we are not strictly binding the allocation to the preferred
+node.  We still allow the allocation to fall back to other nodes when the
+preferred node is full, or if we have zspages with slots available on a
+different node.  This is OK, and still a strict improvement over the
+status quo:
+
+1. On a system with demotion enabled, we will generally prefer
+   demotions over compressed swapping, and only swap when pages have
+   already gone to the lowest tier.  This patch should achieve the desired
+   effect for the most part.
+
+2. If the preferred node is out of memory, letting the compressed data
+   going to other nodes can be better than the alternative (OOMs, keeping
+   cold memory unreclaimed, disk swapping, etc.).
+
+3. If the allocation go to a separate node because we have a zspage
+   with slots available, at least we're not creating extra immediate
+   memory pressure (since the space is already allocated).
+
+3. While there can be mixings, we generally reclaim pages in same-node
+   batches, which encourage zspage grouping that is more likely to go to
+   the right node.
+
+4. A strict binding would require partitioning zsmalloc by node, which
+   is more complicated, and more prone to regression, since it reduces the
+   storage density of zsmalloc.  We need to evaluate the tradeoff and
+   benchmark carefully before adopting such an involved solution.
+
+[1]: https://lore.kernel.org/linux-mm/20250331165306.GC2110528@cmpxchg.org/
+
+Link: https://lkml.kernel.org/r/20250402204416.3435994-1-nphamcs@gmail.com
+Signed-off-by: Nhat Pham <nphamcs@gmail.com>
+Suggested-by: Gregory Price <gourry@gourry.net>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Dan Willaims <dan.j.williams@intel.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Joanthan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
