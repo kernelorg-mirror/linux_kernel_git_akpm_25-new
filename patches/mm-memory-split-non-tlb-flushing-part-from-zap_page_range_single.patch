@@ -1,0 +1,110 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/memory: split non-tlb flushing part from zap_page_range_single()
+Date: Fri, 4 Apr 2025 14:06:59 -0700
+
+Some of zap_page_range_single() callers such as [process_]madvise() with
+MADV_DONTNEED[_LOCKED] cannot batch tlb flushes because
+zap_page_range_single() flushes tlb for each invocation.  Split out the
+body of zap_page_range_single() except mmu_gather object initialization
+and gathered tlb entries flushing for such batched tlb flushing usage.
+
+To avoid hugetlb pages allocation failures from concurrent page faults,
+the tlb flush should be done before hugetlb faults unlocking, though.
+Do the flush and the unlock inside the split out function in the order
+for hugetlb vma case.  Refer to commit 2820b0f09be9 ("hugetlbfs: close
+race between MADV_DONTNEED and page fault") for more details about the
+concurrent faults' page allocation failure problem.
+
+Link: https://lkml.kernel.org/r/20250404210700.2156-4-sj@kernel.org
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Liam R. Howlett <howlett@gmail.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   49 +++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 39 insertions(+), 10 deletions(-)
+
+--- a/mm/memory.c~mm-memory-split-non-tlb-flushing-part-from-zap_page_range_single
++++ a/mm/memory.c
+@@ -1989,36 +1989,65 @@ void unmap_vmas(struct mmu_gather *tlb,
+ 	mmu_notifier_invalidate_range_end(&range);
+ }
+ 
+-/**
+- * zap_page_range_single - remove user pages in a given range
++/*
++ * notify_unmap_single_vma - remove user pages in a given range
++ * @tlb: pointer to the caller's struct mmu_gather
+  * @vma: vm_area_struct holding the applicable pages
+- * @address: starting address of pages to zap
+- * @size: number of bytes to zap
++ * @address: starting address of pages to remove
++ * @size: number of bytes to remove
+  * @details: details of shared cache invalidation
+  *
+- * The range must fit into one VMA.
++ * @tlb shouldn't be NULL.  The range must fit into one VMA.  If @vma is for
++ * hugetlb, @tlb is flushed and re-initialized by this function.
+  */
+-void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
++static void notify_unmap_single_vma(struct mmu_gather *tlb,
++		struct vm_area_struct *vma, unsigned long address,
+ 		unsigned long size, struct zap_details *details)
+ {
+ 	const unsigned long end = address + size;
+ 	struct mmu_notifier_range range;
+-	struct mmu_gather tlb;
++
++	VM_WARN_ON_ONCE(!tlb);
+ 
+ 	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma->vm_mm,
+ 				address, end);
+ 	hugetlb_zap_begin(vma, &range.start, &range.end);
+-	tlb_gather_mmu(&tlb, vma->vm_mm);
+ 	update_hiwater_rss(vma->vm_mm);
+ 	mmu_notifier_invalidate_range_start(&range);
+ 	/*
+ 	 * unmap 'address-end' not 'range.start-range.end' as range
+ 	 * could have been expanded for hugetlb pmd sharing.
+ 	 */
+-	unmap_single_vma(&tlb, vma, address, end, details, false);
++	unmap_single_vma(tlb, vma, address, end, details, false);
+ 	mmu_notifier_invalidate_range_end(&range);
++	if (is_vm_hugetlb_page(vma)) {
++		/*
++		 * flush tlb and free resources before hugetlb_zap_end(), to
++		 * avoid concurrent page faults' allocation failure
++		 */
++		tlb_finish_mmu(tlb);
++		hugetlb_zap_end(vma, details);
++		tlb_gather_mmu(tlb, vma->vm_mm);
++	}
++}
++
++/**
++ * zap_page_range_single - remove user pages in a given range
++ * @vma: vm_area_struct holding the applicable pages
++ * @address: starting address of pages to zap
++ * @size: number of bytes to zap
++ * @details: details of shared cache invalidation
++ *
++ * The range must fit into one VMA.
++ */
++void zap_page_range_single(struct vm_area_struct *vma, unsigned long address,
++		unsigned long size, struct zap_details *details)
++{
++	struct mmu_gather tlb;
++
++	tlb_gather_mmu(&tlb, vma->vm_mm);
++	notify_unmap_single_vma(&tlb, vma, address, size, details);
+ 	tlb_finish_mmu(&tlb);
+-	hugetlb_zap_end(vma, details);
+ }
+ 
+ /**
+_
