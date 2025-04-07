@@ -1,0 +1,123 @@
+From: Waiman Long <longman@redhat.com>
+Subject: mm/vmscan: skip memcg with !usage in shrink_node_memcgs()
+Date: Sun, 6 Apr 2025 21:41:58 -0400
+
+Patch series "memcg: Fix test_memcg_min/low test failures", v4.
+
+The test_memcontrol selftest consistently fails its test_memcg_low
+sub-test and sporadically fails its test_memcg_min sub-test.  This
+patchset fixes the test_memcg_min and test_memcg_low failures by skipping
+the !usage case in shrink_node_memcgs() and adjust the test_memcontrol
+selftest to fix other causes of the test failures.
+
+Note that I decide not to use the suggested mem_cgroup_usage() call as it
+is a real function call defined in mm/memcontrol.c to be used mainly by
+cgroup v1 code.
+
+
+This patch (of 2):
+
+The test_memcontrol selftest consistently fails its test_memcg_low
+sub-test due to the fact that two of its test child cgroups which have a
+memmory.low of 0 or an effective memory.low of 0 still have low events
+generated for them since mem_cgroup_below_low() use the ">=" operator when
+comparing to elow.
+
+The two failed use cases are as follows:
+
+1) memory.low is set to 0, but low events can still be triggered and
+   so the cgroup may have a non-zero low event count. I doubt users are
+   looking for that as they didn't set memory.low at all.
+
+2) memory.low is set to a non-zero value but the cgroup has no task in
+   it so that it has an effective low value of 0. Again it may have a
+   non-zero low event count if memory reclaim happens. This is probably
+   not a result expected by the users and it is really doubtful that
+   users will check an empty cgroup with no task in it and expecting
+   some non-zero event counts.
+
+In the first case, even though memory.low isn't set, it may still have
+some low protection if memory.low is set in the parent.  So low event may
+still be recorded.  The test_memcontrol.c test has to be modified to
+account for that.
+
+For the second case, it really doesn't make sense to have non-zero low
+event if the cgroup has 0 usage.  So we need to skip this corner case in
+shrink_node_memcgs() by skipping the !usage case.  The "#ifdef
+CONFIG_MEMCG" directive is added to avoid problem with the
+non-CONFIG_MEMCG case.
+
+With this patch applied, the test_memcg_low sub-test finishes successfully
+without failure in most cases.  Though both test_memcg_low and
+test_memcg_min sub-tests may still fail occasionally if the memory.current
+values fall outside of the expected ranges.
+
+Link: https://lkml.kernel.org/r/20250407014159.1291785-1-longman@redhat.com
+Link: https://lkml.kernel.org/r/20250407014159.1291785-2-longman@redhat.com
+Signed-off-by: Waiman Long <longman@redhat.com>
+Suggested-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmscan.c                                      |   10 ++++++++++
+ tools/testing/selftests/cgroup/test_memcontrol.c |    7 ++++++-
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+--- a/mm/vmscan.c~mm-vmscan-skip-memcg-with-usage-in-shrink_node_memcgs
++++ a/mm/vmscan.c
+@@ -5934,6 +5934,7 @@ static inline bool should_continue_recla
+ 	return inactive_lru_pages > pages_for_compaction;
+ }
+ 
++#ifdef CONFIG_MEMCG
+ static void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
+ {
+ 	struct mem_cgroup *target_memcg = sc->target_mem_cgroup;
+@@ -5971,6 +5972,10 @@ static void shrink_node_memcgs(pg_data_t
+ 
+ 		mem_cgroup_calculate_protection(target_memcg, memcg);
+ 
++		/* Skip memcg with no usage */
++		if (!page_counter_read(&memcg->memory))
++			continue;
++
+ 		if (mem_cgroup_below_min(target_memcg, memcg)) {
+ 			/*
+ 			 * Hard protection.
+@@ -6012,6 +6017,11 @@ static void shrink_node_memcgs(pg_data_t
+ 		}
+ 	} while ((memcg = mem_cgroup_iter(target_memcg, memcg, partial)));
+ }
++#else
++static inline void shrink_node_memcgs(pg_data_t *pgdat, struct scan_control *sc)
++{
++}
++#endif /* CONFIG_MEMCG */
+ 
+ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
+ {
+--- a/tools/testing/selftests/cgroup/test_memcontrol.c~mm-vmscan-skip-memcg-with-usage-in-shrink_node_memcgs
++++ a/tools/testing/selftests/cgroup/test_memcontrol.c
+@@ -525,8 +525,13 @@ static int test_memcg_protection(const c
+ 		goto cleanup;
+ 	}
+ 
++	/*
++	 * Child 2 has memory.low=0, but some low protection is still being
++	 * distributed down from its parent with memory.low=50M. So the low
++	 * event count will be non-zero.
++	 */
+ 	for (i = 0; i < ARRAY_SIZE(children); i++) {
+-		int no_low_events_index = 1;
++		int no_low_events_index = 2;
+ 		long low, oom;
+ 
+ 		oom = cg_read_key_long(children[i], "memory.events", "oom ");
+_
