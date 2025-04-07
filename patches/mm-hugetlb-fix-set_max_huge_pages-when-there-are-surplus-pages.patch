@@ -1,0 +1,93 @@
+From: Jinjiang Tu <tujinjiang@huawei.com>
+Subject: mm/hugetlb: fix set_max_huge_pages() when there are surplus pages
+Date: Mon, 7 Apr 2025 20:47:06 +0800
+
+In set_max_huge_pages(), min_count should mean the acquired persistent
+huge pages, but it contains surplus huge pages.  This leads to failing to
+free free huge pages for a Node.
+
+Steps to reproduce:
+
+1) create 5 hugetlb folios in Node0
+2) run a program to use all the hugetlb folios
+3) echo 0 > nr_hugepages for Node0 to free the hugetlb folios.  Thus
+   the 5 hugetlb folios in Node0 are accounted as surplus.
+4) create 5 hugetlb folios in Node1
+5) echo 0 > nr_hugepages for Node1 to free the hugetlb folios
+
+The result:
+        Node0    Node1
+Total     5         5
+Free      0         5
+Surp      5         5
+
+We couldn't subtract surplus_huge_pages from min_mount, since free hugetlb
+folios may be surplus due to HVO.  In __update_and_free_hugetlb_folio(),
+hugetlb_vmemmap_restore_folio() may fail, add the folio back to pool and
+treat it as surplus.  If we directly subtract surplus_huge_pages from
+min_mount, some free folios will be subtracted twice.
+
+To fix it, check if count is less than the num of free huge pages that
+could be destroyed (i.e., available_huge_pages(h)), and remove hugetlb
+folios if so.
+
+Since there may exist free surplus hugetlb folios, we should remove
+surplus folios first to make surplus count correct.
+
+The result with this patch:
+        Node0    Node1
+Total     5         0
+Free      0         0
+Surp      5         0
+
+Link: https://lkml.kernel.org/r/20250407124706.2688092-1-tujinjiang@huawei.com
+Fixes: 9a30523066cd ("hugetlb: add per node hstate attributes")
+Signed-off-by: Jinjiang Tu <tujinjiang@huawei.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/hugetlb.c |   21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+--- a/mm/hugetlb.c~mm-hugetlb-fix-set_max_huge_pages-when-there-are-surplus-pages
++++ a/mm/hugetlb.c
+@@ -3825,6 +3825,7 @@ found:
+ static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ 			      nodemask_t *nodes_allowed)
+ {
++	unsigned long persistent_free_count;
+ 	unsigned long min_count;
+ 	unsigned long allocated;
+ 	struct folio *folio;
+@@ -3959,8 +3960,24 @@ static int set_max_huge_pages(struct hst
+ 	 * though, we'll note that we're not allowed to exceed surplus
+ 	 * and won't grow the pool anywhere else. Not until one of the
+ 	 * sysctls are changed, or the surplus pages go out of use.
+-	 */
+-	min_count = h->resv_huge_pages + h->nr_huge_pages - h->free_huge_pages;
++	 *
++	 * min_count is the expected number of persistent pages, we
++	 * shouldn't calculate min_count by using
++	 * resv_huge_pages + persistent_huge_pages() - free_huge_pages,
++	 * because there may exist free surplus huge pages, and this will
++	 * lead to subtracting twice. Free surplus huge pages come from HVO
++	 * failing to restore vmemmap, see comments in the callers of
++	 * hugetlb_vmemmap_restore_folio(). Thus, we should calculate
++	 * persistent free count first.
++	 */
++	persistent_free_count = h->free_huge_pages;
++	if (h->free_huge_pages > persistent_huge_pages(h)) {
++		if (h->free_huge_pages > h->surplus_huge_pages)
++			persistent_free_count -= h->surplus_huge_pages;
++		else
++			persistent_free_count = 0;
++	}
++	min_count = h->resv_huge_pages + persistent_huge_pages(h) - persistent_free_count;
+ 	min_count = max(count, min_count);
+ 	try_to_free_low(h, min_count, nodes_allowed);
+ 
+_

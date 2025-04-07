@@ -1,0 +1,64 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: page_alloc: speed up fallbacks in rmqueue_bulk()
+Date: Mon, 7 Apr 2025 14:01:53 -0400
+
+The test robot identified c2f6ea38fc1b ("mm: page_alloc: don't steal
+single pages from biggest buddy") as the root cause of a 56.4% regression
+in vm-scalability::lru-file-mmap-read.
+
+Carlos reports an earlier patch, c0cd6f557b90 ("mm: page_alloc: fix
+freelist movement during block conversion"), as the root cause for a
+regression in worst-case zone->lock+irqoff hold times.
+
+Both of these patches modify the page allocator's fallback path to be less
+greedy in an effort to stave off fragmentation.  The flip side of this is
+that fallbacks are also less productive each time around, which means the
+fallback search can run much more frequently.
+
+Carlos' traces point to rmqueue_bulk() specifically, which tries to refill
+the percpu cache by allocating a large batch of pages in a loop.  It
+highlights how once the native freelists are exhausted, the fallback code
+first scans orders top-down for whole blocks to claim, then falls back to
+a bottom-up search for the smallest buddy to steal.  For the next batch
+page, it goes through the same thing again.
+
+This can be made more efficient.  Since rmqueue_bulk() holds the
+zone->lock over the entire batch, the freelists are not subject to outside
+changes; when the search for a block to claim has already failed, there is
+no point in trying again for the next page.
+
+Modify __rmqueue() to remember the last successful fallback mode, and
+restart directly from there on the next rmqueue_bulk() iteration.
+
+Oliver confirms that this improves beyond the regression that the test
+robot reported against c2f6ea38fc1b:
+
+commit:
+  f3b92176f4 ("tools/selftests: add guard region test for /proc/$pid/pagemap")
+  c2f6ea38fc ("mm: page_alloc: don't steal single pages from biggest buddy")
+  acc4d5ff0b ("Merge tag 'net-6.15-rc0' of git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net")
+  2c847f27c3 ("mm: page_alloc: speed up fallbacks in rmqueue_bulk()")   <--- your patch
+
+f3b92176f4f7100f c2f6ea38fc1b640aa7a2e155cc1 acc4d5ff0b61eb1715c498b6536 2c847f27c37da65a93d23c237c5
+---------------- --------------------------- --------------------------- ---------------------------
+         %stddev     %change         %stddev     %change         %stddev     %change         %stddev
+             \          |                \          |                \          |                \
+  25525364 ±  3%     -56.4%   11135467           -57.8%   10779336           +31.6%   33581409        vm-scalability.throughput
+
+Carlos confirms that worst-case times are almost fully recovered
+compared to before the earlier culprit patch:
+
+  2dd482ba627d (before freelist hygiene):    1ms
+  c0cd6f557b90  (after freelist hygiene):   90ms
+ next-20250319    (steal smallest buddy):  280ms
+    this patch                          :    8ms
+
+Link: https://lkml.kernel.org/r/20250407180154.63348-1-hannes@cmpxchg.org
+Fixes: c0cd6f557b90 ("mm: page_alloc: fix freelist movement during block conversion")
+Fixes: c2f6ea38fc1b ("mm: page_alloc: don't steal single pages from biggest buddy")
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Reported-by: kernel test robot <oliver.sang@intel.com>
+Reported-by: Carlos Song <carlos.song@nxp.com>
+Tested-by: kernel test robot <oliver.sang@intel.com>
+Closes: https://lore.kernel.org/oe-lkp/202503271547.fc08b188-lkp@intel.com
+Cc: <stable@vger.kernel.org>	[6.10+]
