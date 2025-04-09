@@ -1,0 +1,163 @@
+From: Chen Yu <yu.c.chen@intel.com>
+Subject: sched/numa: add statistics of numa balance task migration and swap
+Date: Tue, 8 Apr 2025 18:14:44 +0800
+
+On systems with NUMA balancing enabled, it is found that tracking the task
+activities due to NUMA balancing is helpful.  NUMA balancing has two
+mechanisms for task migration: one is to migrate the task to an idle CPU
+in its preferred node, the other is to swap tasks on different nodes if
+they are on each other's preferred node.
+
+The kernel already has NUMA page migration statistics in
+/sys/fs/cgroup/mytest/memory.stat and /proc/{PID}/sched, but does not have
+statistics for task migration/swap.  Add the task migration and swap count
+accordingly.
+
+The following two new fields:
+
+numa_task_migrated
+numa_task_swapped
+
+will be displayed in both
+/sys/fs/cgroup/{GROUP}/memory.stat and /proc/{PID}/sched
+
+Introducing both pertask and permemcg NUMA balancing statistics helps to
+quickly evaluate the performance and resource usage of the target
+workload.  For example, the user can first identify the container which
+has high NUMA balance activity and then narrow down to a specific task
+within that group, and tune the memory policy of that task.  In summary,
+it is plausible to iterate the /proc/$pid/sched to find the offending
+task, but the introduction of per memcg tasks' Numa balancing aggregated
+activity can further help users identify the task in a divide-and-conquer
+way.
+
+Link: https://lkml.kernel.org/r/20250408101444.192519-1-yu.c.chen@intel.com
+Signed-off-by: Chen Yu <yu.c.chen@intel.com>
+Tested-by: K Prateek Nayak <kprateek.nayak@amd.com>
+Tested-by: Madadi Vineeth Reddy <vineethr@linux.ibm.com>
+Cc: Aubrey Li <aubrey.li@intel.com>
+Cc: "Chen, Tim C" <tim.c.chen@intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Mel Gorman <mgorman <mgorman@suse.de>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/cgroup-v2.rst |    6 ++++++
+ include/linux/sched.h                   |    4 ++++
+ include/linux/vm_event_item.h           |    2 ++
+ kernel/sched/core.c                     |   10 ++++++++--
+ kernel/sched/debug.c                    |    4 ++++
+ mm/memcontrol.c                         |    2 ++
+ mm/vmstat.c                             |    2 ++
+ 7 files changed, 28 insertions(+), 2 deletions(-)
+
+--- a/Documentation/admin-guide/cgroup-v2.rst~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/Documentation/admin-guide/cgroup-v2.rst
+@@ -1670,6 +1670,12 @@ The following nested keys are defined.
+ 	  numa_hint_faults (npn)
+ 		Number of NUMA hinting faults.
+ 
++	  numa_task_migrated (npn)
++		Number of task migration by NUMA balancing.
++
++	  numa_task_swapped (npn)
++		Number of task swap by NUMA balancing.
++
+ 	  pgdemote_kswapd
+ 		Number of pages demoted by kswapd.
+ 
+--- a/include/linux/sched.h~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/include/linux/sched.h
+@@ -549,6 +549,10 @@ struct sched_statistics {
+ 	u64				nr_failed_migrations_running;
+ 	u64				nr_failed_migrations_hot;
+ 	u64				nr_forced_migrations;
++#ifdef CONFIG_NUMA_BALANCING
++	u64				numa_task_migrated;
++	u64				numa_task_swapped;
++#endif
+ 
+ 	u64				nr_wakeups;
+ 	u64				nr_wakeups_sync;
+--- a/include/linux/vm_event_item.h~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/include/linux/vm_event_item.h
+@@ -66,6 +66,8 @@ enum vm_event_item { PGPGIN, PGPGOUT, PS
+ 		NUMA_HINT_FAULTS,
+ 		NUMA_HINT_FAULTS_LOCAL,
+ 		NUMA_PAGE_MIGRATE,
++		NUMA_TASK_MIGRATE,
++		NUMA_TASK_SWAP,
+ #endif
+ #ifdef CONFIG_MIGRATION
+ 		PGMIGRATE_SUCCESS, PGMIGRATE_FAIL,
+--- a/kernel/sched/core.c~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/kernel/sched/core.c
+@@ -3352,6 +3352,11 @@ void set_task_cpu(struct task_struct *p,
+ #ifdef CONFIG_NUMA_BALANCING
+ static void __migrate_swap_task(struct task_struct *p, int cpu)
+ {
++	__schedstat_inc(p->stats.numa_task_swapped);
++
++	if (p->mm)
++		count_memcg_events_mm(p->mm, NUMA_TASK_SWAP, 1);
++
+ 	if (task_on_rq_queued(p)) {
+ 		struct rq *src_rq, *dst_rq;
+ 		struct rq_flags srf, drf;
+@@ -7953,8 +7958,9 @@ int migrate_task_to(struct task_struct *
+ 	if (!cpumask_test_cpu(target_cpu, p->cpus_ptr))
+ 		return -EINVAL;
+ 
+-	/* TODO: This is not properly updating schedstats */
+-
++	__schedstat_inc(p->stats.numa_task_migrated);
++	if (p->mm)
++		count_memcg_events_mm(p->mm, NUMA_TASK_MIGRATE, 1);
+ 	trace_sched_move_numa(p, curr_cpu, target_cpu);
+ 	return stop_one_cpu(curr_cpu, migration_cpu_stop, &arg);
+ }
+--- a/kernel/sched/debug.c~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/kernel/sched/debug.c
+@@ -1206,6 +1206,10 @@ void proc_sched_show_task(struct task_st
+ 		P_SCHEDSTAT(nr_failed_migrations_running);
+ 		P_SCHEDSTAT(nr_failed_migrations_hot);
+ 		P_SCHEDSTAT(nr_forced_migrations);
++#ifdef CONFIG_NUMA_BALANCING
++		P_SCHEDSTAT(numa_task_migrated);
++		P_SCHEDSTAT(numa_task_swapped);
++#endif
+ 		P_SCHEDSTAT(nr_wakeups);
+ 		P_SCHEDSTAT(nr_wakeups_sync);
+ 		P_SCHEDSTAT(nr_wakeups_migrate);
+--- a/mm/memcontrol.c~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/mm/memcontrol.c
+@@ -470,6 +470,8 @@ static const unsigned int memcg_vm_event
+ 	NUMA_PAGE_MIGRATE,
+ 	NUMA_PTE_UPDATES,
+ 	NUMA_HINT_FAULTS,
++	NUMA_TASK_MIGRATE,
++	NUMA_TASK_SWAP,
+ #endif
+ };
+ 
+--- a/mm/vmstat.c~sched-numa-add-statistics-of-numa-balance-task-migration-and-swap
++++ a/mm/vmstat.c
+@@ -1347,6 +1347,8 @@ const char * const vmstat_text[] = {
+ 	"numa_hint_faults",
+ 	"numa_hint_faults_local",
+ 	"numa_pages_migrated",
++	"numa_task_migrated",
++	"numa_task_swapped",
+ #endif
+ #ifdef CONFIG_MIGRATION
+ 	"pgmigrate_success",
+_
