@@ -1,0 +1,70 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: memcg: multi-memcg percpu charge cache
+Date: Wed, 16 Apr 2025 11:02:29 -0700
+
+Memory cgroup accounting is expensive and to reduce the cost, the kernel
+maintains per-cpu charge cache for a single memcg.  So, if a charge
+request comes for a different memcg, the kernel will flush the old memcg's
+charge cache and then charge the newer memcg a fixed amount (64 pages),
+subtracts the charge request amount and stores the remaining in the
+per-cpu charge cache for the newer memcg.
+
+This mechanism is based on the assumption that the kernel, for locality,
+keep a process on a CPU for long period of time and most of the charge
+requests from that process will be served by that CPU's local charge
+cache.
+
+However this assumption breaks down for incoming network traffic in a
+multi-tenant machine.  We are in the process of running multiple workloads
+on a single machine and if such workloads are network heavy, we are seeing
+very high network memory accounting cost.  We have observed multiple CPUs
+spending almost 100% of their time in net_rx_action and almost all of that
+time is spent in memcg accounting of the network traffic.
+
+More precisely, net_rx_action is serving packets from multiple workloads
+and is observing/serving mix of packets of these workloads.  The memcg
+switch of per-cpu cache is very expensive and we are observing a lot of
+memcg switches on the machine.  Almost all the time is being spent on
+charging new memcg and flushing older memcg cache.  So, definitely we need
+per-cpu cache that support multiple memcgs for this scenario.
+
+This patch implements a simple (and dumb) multiple memcg percpu charge
+cache.  Actually we started with more sophisticated LRU based approach but
+the dumb one was always better than the sophisticated one by 1% to 3%, so
+going with the simple approach.
+
+Some of the design choices are:
+
+1. Fit all caches memcgs in a single cacheline.
+2. The cache array can be mix of empty slots or memcg charged slots, so
+   the kernel has to traverse the full array.
+3. The cache drain from the reclaim will drain all cached memcgs to keep
+   things simple.
+
+To evaluate the impact of this optimization, on a 72 CPUs machine, we ran
+the following workload where each netperf client runs in a different
+cgroup.  The next-20250415 kernel is used as base.
+
+ $ netserver -6
+ $ netperf -6 -H ::1 -l 60 -t TCP_SENDFILE -- -m 10K
+
+number of clients | Without patch | With patch
+  6               | 42584.1 Mbps  | 48603.4 Mbps (14.13% improvement)
+  12              | 30617.1 Mbps  | 47919.7 Mbps (56.51% improvement)
+  18              | 25305.2 Mbps  | 45497.3 Mbps (79.79% improvement)
+  24              | 20104.1 Mbps  | 37907.7 Mbps (88.55% improvement)
+  30              | 14702.4 Mbps  | 30746.5 Mbps (109.12% improvement)
+  36              | 10801.5 Mbps  | 26476.3 Mbps (145.11% improvement)
+
+The results show drastic improvement for network intensive workloads.
+
+Link: https://lkml.kernel.org/r/20250416180229.2902751-1-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Eric Dumaze <edumazet@google.com>
+Cc: Jakub Kacinski <kuba@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Soheil Hassas Yeganeh <soheil@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
