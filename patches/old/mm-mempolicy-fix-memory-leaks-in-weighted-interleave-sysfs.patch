@@ -1,57 +1,16 @@
 From: Rakie Kim <rakie.kim@sk.com>
 Subject: mm/mempolicy: fix memory leaks in weighted interleave sysfs
-Date: Tue, 8 Apr 2025 16:32:40 +0900
+Date: Wed, 16 Apr 2025 20:31:19 +0900
 
 Patch series "Enhance sysfs handling for memory hotplug in weighted
-interleave", v7.
+interleave", v8.
 
 The following patch series enhances the weighted interleave policy in the
 memory management subsystem by improving sysfs handling, fixing memory
 leaks, and introducing dynamic sysfs updates for memory hotplug support.
 
-### Background
-The weighted interleave policy distributes memory allocations across
-multiple NUMA nodes based on their performance weight, thereby optimizing
-memory bandwidth utilization.  The weight values are configured through
-sysfs.
 
-Previously, sysfs entries for weighted interleave were managed statically
-at initialization. This led to several issues:
-- Memory Leaks: Improper `kobject` teardown caused memory leaks
-  when initialization failed or when nodes were removed.
-- Lack of Dynamic Updates: Sysfs attributes were created only during
-  initialization, preventing nodes added at runtime from being recognized.
-- Handling of Unusable Nodes: Sysfs entries were generated for all
-  possible nodes (`N_POSSIBLE`), including memoryless or unavailable nodes,
-  leading to sysfs entries for unusable nodes and potential
-  misconfigurations.
-
-### Patch Overview
-
-1. [PATCH 1/3] mm/mempolicy: fix memory leaks in weighted interleave sysfs
-   - Ensures proper cleanup of `kobject` allocations.
-   - Adds `kobject_del()` before `kobject_put()` to clean up sysfs
-     state correctly.
-   - Prevents memory/resource leaks and improves teardown behavior.
-
-2. [PATCH 2/3] mm/mempolicy: prepare weighted interleave sysfs for memory hotplug
-   - Refactors static sysfs layout into a new `sysfs_wi_group` structure.
-   - Makes per-node sysfs attributes accessible to external modules.
-   - Lays groundwork for future hotplug support by enabling runtime
-     modification.
-
-3. [PATCH 3/3] mm/mempolicy: support memory hotplug in weighted interleave
-   - Dynamically adds/removes sysfs entries when nodes are
-     online/offline.
-   - Limits sysfs creation to nodes with memory, avoiding unusable
-     node entries.
-   - Hooks into memory hotplug notifier for runtime updates.
-
-These patches have been tested under CXL-based memory configurations,
-including hotplug scenarios, to ensure proper behavior and stability.
-
-
-This patch (of 7):
+This patch (of 3):
 
 Memory leaks occurred when removing sysfs attributes for weighted
 interleave.  Improper kobject deallocation led to unreleased memory when
@@ -67,39 +26,93 @@ cleaned up.  This guarantees that the memory associated with the kobject
 is fully released and avoids resource leaks, thereby improving system
 stability.
 
-Link: https://lkml.kernel.org/r/20250408073243.488-1-rakie.kim@sk.com
-Link: https://lkml.kernel.org/r/20250408073243.488-2-rakie.kim@sk.com
+Additionally, sysfs_remove_file() is no longer called from the release
+function to avoid accessing invalid sysfs state after kobject_del().  All
+attribute removals are now done before kobject_del(), preventing WARN_ON()
+in kernfs and ensuring safe and consistent cleanup of sysfs entries.
+
+Link: https://lkml.kernel.org/r/20250416113123.629-1-rakie.kim@sk.com
+Link: https://lkml.kernel.org/r/20250416113123.629-2-rakie.kim@sk.com
 Fixes: dce41f5ae253 ("mm/mempolicy: implement the sysfs-based weighted_interleave interface")
 Signed-off-by: Rakie Kim <rakie.kim@sk.com>
-Signed-off-by: Honggyu Kim <honggyu.kim@sk.com>
-Signed-off-by: Yunjeong Mun <yunjeong.mun@sk.com>
 Reviewed-by: Gregory Price <gourry@gourry.net>
 Reviewed-by: Joshua Hahn <joshua.hahnjy@gmail.com>
+Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
 Cc: Dan Williams <dan.j.williams@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
+Cc: Honggyu Kim <honggyu.kim@sk.com>
 Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
-Cc: Joanthan Cameron <Jonathan.Cameron@huawei.com>
 Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Yunjeong Mun <yunjeong.mun@sk.com>
+Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mempolicy.c |   66 ++++++++++++++++++++++-------------------------
- 1 file changed, 32 insertions(+), 34 deletions(-)
+ mm/mempolicy.c |  111 +++++++++++++++++++++++++----------------------
+ 1 file changed, 61 insertions(+), 50 deletions(-)
 
 --- a/mm/mempolicy.c~mm-mempolicy-fix-memory-leaks-in-weighted-interleave-sysfs
 +++ a/mm/mempolicy.c
-@@ -3479,7 +3479,9 @@ static void sysfs_wi_release(struct kobj
+@@ -3463,8 +3463,8 @@ static ssize_t node_store(struct kobject
  
- 	for (i = 0; i < nr_node_ids; i++)
- 		sysfs_wi_node_release(node_attrs[i], wi_kobj);
+ static struct iw_node_attr **node_attrs;
+ 
+-static void sysfs_wi_node_release(struct iw_node_attr *node_attr,
+-				  struct kobject *parent)
++static void sysfs_wi_node_delete(struct iw_node_attr *node_attr,
++				 struct kobject *parent)
+ {
+ 	if (!node_attr)
+ 		return;
+@@ -3473,18 +3473,41 @@ static void sysfs_wi_node_release(struct
+ 	kfree(node_attr);
+ }
+ 
+-static void sysfs_wi_release(struct kobject *wi_kobj)
++static void sysfs_wi_node_delete_all(struct kobject *wi_kobj)
+ {
+-	int i;
++	int nid;
+ 
+-	for (i = 0; i < nr_node_ids; i++)
+-		sysfs_wi_node_release(node_attrs[i], wi_kobj);
 -	kobject_put(wi_kobj);
++	for (nid = 0; nid < nr_node_ids; nid++)
++		sysfs_wi_node_delete(node_attrs[nid], wi_kobj);
++}
 +
++static void iw_table_free(void)
++{
++	u8 *old;
++
++	mutex_lock(&iw_table_lock);
++	old = rcu_dereference_protected(iw_table,
++					lockdep_is_held(&iw_table_lock));
++	if (old) {
++		rcu_assign_pointer(iw_table, NULL);
++		mutex_unlock(&iw_table_lock);
++
++		synchronize_rcu();
++		kfree(old);
++	} else
++		mutex_unlock(&iw_table_lock);
++}
++
++static void wi_kobj_release(struct kobject *wi_kobj)
++{
++	iw_table_free();
 +	kfree(node_attrs);
 +	kfree(wi_kobj);
  }
  
  static const struct kobj_type wi_ktype = {
-@@ -3525,27 +3527,37 @@ static int add_weighted_interleave_group
+ 	.sysfs_ops = &kobj_sysfs_ops,
+-	.release = sysfs_wi_release,
++	.release = wi_kobj_release,
+ };
+ 
+ static int add_weight_node(int nid, struct kobject *wi_kobj)
+@@ -3525,41 +3548,42 @@ static int add_weighted_interleave_group
  	struct kobject *wi_kobj;
  	int nid, err;
  
@@ -129,7 +142,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (err) {
  			pr_err("failed to add sysfs [node%d]\n", nid);
 -			break;
-+			goto err_del_kobj;
++			goto err_cleanup_kobj;
  		}
  	}
 -	if (err)
@@ -137,7 +150,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  	return 0;
 +
-+err_del_kobj:
++err_cleanup_kobj:
++	sysfs_wi_node_delete_all(wi_kobj);
 +	kobject_del(wi_kobj);
 +err_put_kobj:
 +	kobject_put(wi_kobj);
@@ -145,15 +159,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void mempolicy_kobj_release(struct kobject *kobj)
-@@ -3559,7 +3571,6 @@ static void mempolicy_kobj_release(struc
- 	mutex_unlock(&iw_table_lock);
- 	synchronize_rcu();
- 	kfree(old);
+ {
+-	u8 *old;
+-
+-	mutex_lock(&iw_table_lock);
+-	old = rcu_dereference_protected(iw_table,
+-					lockdep_is_held(&iw_table_lock));
+-	rcu_assign_pointer(iw_table, NULL);
+-	mutex_unlock(&iw_table_lock);
+-	synchronize_rcu();
+-	kfree(old);
 -	kfree(node_attrs);
  	kfree(kobj);
  }
  
-@@ -3573,37 +3584,24 @@ static int __init mempolicy_sysfs_init(v
+@@ -3573,37 +3597,24 @@ static int __init mempolicy_sysfs_init(v
  	static struct kobject *mempolicy_kobj;
  
  	mempolicy_kobj = kzalloc(sizeof(*mempolicy_kobj), GFP_KERNEL);
