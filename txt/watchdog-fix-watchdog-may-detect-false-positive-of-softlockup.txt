@@ -1,0 +1,56 @@
+From: Luo Gengkun <luogengkun@huaweicloud.com>
+Subject: watchdog: fix watchdog may detect false positive of softlockup
+Date: Mon, 21 Apr 2025 03:50:21 +0000
+
+When updating `watchdog_thresh`, there is a race condition between writing
+the new `watchdog_thresh` value and stopping the old watchdog timer.  If
+the old timer triggers during this window, it may falsely detect a
+softlockup due to the old interval and the new `watchdog_thresh` value
+being used.  The problem can be described as follow:
+
+ # We asuume previous watchdog_thresh is 60, so the watchdog timer is
+ # coming every 24s.
+echo 10 > /proc/sys/kernel/watchdog_thresh (User space)
+|
++------>+ update watchdog_thresh (We are in kernel now)
+	|
+	|	  # using old interval and new `watchdog_thresh`
+	+------>+ watchdog hrtimer (irq context: detect softlockup)
+		|
+		|
+	+-------+
+	|
+	|
+	+ softlockup_stop_all
+
+To fix this problem, introduce a shadow variable for `watchdog_thresh`. 
+The update to the actual `watchdog_thresh` is delayed until after the old
+timer is stopped, preventing false positives.
+
+The following testcase may help to understand this problem.
+
+---------------------------------------------
+echo RT_RUNTIME_SHARE > /sys/kernel/debug/sched/features
+echo -1 > /proc/sys/kernel/sched_rt_runtime_us
+echo 0 > /sys/kernel/debug/sched/fair_server/cpu3/runtime
+echo 60 > /proc/sys/kernel/watchdog_thresh
+taskset -c 3 chrt -r 99 /bin/bash -c "while true;do true; done" &
+echo 10 > /proc/sys/kernel/watchdog_thresh &
+---------------------------------------------
+
+The test case above first removes the throttling restrictions for
+real-time tasks.  It then sets watchdog_thresh to 60 and executes a
+real-time task ,a simple while(1) loop, on cpu3.  Consequently, the final
+command gets blocked because the presence of this real-time thread
+prevents kworker:3 from being selected by the scheduler.  This eventually
+triggers a softlockup detection on cpu3 due to watchdog_timer_fn operating
+with inconsistent variable - using both the old interval and the updated
+watchdog_thresh simultaneously.
+
+Link: https://lkml.kernel.org/r/20250421035021.3507649-1-luogengkun@huaweicloud.com
+Signed-off-by: Luo Gengkun <luogengkun@huaweicloud.com>
+Cc: Doug Anderson <dianders@chromium.org>
+Cc: Joel Granados <joel.granados@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: <stable@vger.kernel.org>
