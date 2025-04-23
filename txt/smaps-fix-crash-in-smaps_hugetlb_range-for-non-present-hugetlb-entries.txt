@@ -1,0 +1,81 @@
+From: Ming Wang <wangming01@loongson.cn>
+Subject: smaps: fix crash in smaps_hugetlb_range for non-present hugetlb entries
+Date: Wed, 23 Apr 2025 09:03:59 +0800
+
+When reading /proc/pid/smaps for a process that has mapped a hugetlbfs
+file with MAP_PRIVATE, the kernel might crash inside
+pfn_swap_entry_to_page.  This occurs on LoongArch under specific
+conditions.
+
+The root cause involves several steps:
+
+1. When the hugetlbfs file is mapped (MAP_PRIVATE), the initial PMD
+   (or relevant level) entry is often populated by the kernel during
+   mmap() with a non-present entry pointing to the architecture's
+   invalid_pte_table On the affected LoongArch system, this address was
+   observed to be 0x90000000031e4000.
+
+2. The smaps walker (walk_hugetlb_range -> smaps_hugetlb_range) reads
+   this entry.
+
+3. The generic is_swap_pte() macro checks `!pte_present() &&
+   !pte_none()`.  The entry (invalid_pte_table address) is not present. 
+   Crucially, the generic pte_none() check (`!(pte_val(pte) &
+   ~_PAGE_GLOBAL)`) returns false because the invalid_pte_table address is
+   non-zero.  Therefore, is_swap_pte() incorrectly returns true.
+
+4. The code enters the `else if (is_swap_pte(...))` block.
+
+5. Inside this block, it checks `is_pfn_swap_entry()`.  Due to a bit
+   pattern coincidence in the invalid_pte_table address on LoongArch, the
+   embedded generic `is_migration_entry()` check happens to return true
+   (misinterpreting parts of the address as a migration type).
+
+6. This leads to a call to pfn_swap_entry_to_page() with the bogus
+   swap entry derived from the invalid table address.
+
+7. pfn_swap_entry_to_page() extracts a meaningless PFN, finds an
+   unrelated struct page, checks its lock status (unlocked), and hits the
+   `BUG_ON(is_migration_entry(entry) && !PageLocked(p))` assertion.
+
+The original code's intent in the `else if` block seems aimed at handling
+potential migration entries, as indicated by the inner
+`is_pfn_swap_entry()` check.  The issue arises because the outer
+`is_swap_pte()` check incorrectly includes the invalid table pointer case
+on LoongArch.
+
+This patch fixes the issue by changing the condition in
+smaps_hugetlb_range() from the broad `is_swap_pte()` to the specific
+`is_hugetlb_entry_migration()`.
+
+The `is_hugetlb_entry_migration()` helper function correctly handles this
+by first checking `huge_pte_none()`.  Architectures like LoongArch can
+provide an override for `huge_pte_none()` that specifically recognizes the
+`invalid_pte_table` address as a "none" state for HugeTLB entries.  This
+ensures `is_hugetlb_entry_migration()` returns false for the invalid
+entry, preventing the code from entering the faulty block.
+
+This change makes the code reflect the likely original intent (handling
+migration) more accurately and leverages architecture-specific helpers
+(`huge_pte_none`) to correctly interpret special PTE/PMD values in the
+HugeTLB context, fixing the crash on LoongArch without altering the
+generic is_swap_pte() behavior.
+
+Link: https://lkml.kernel.org/r/20250423010359.2030576-1-wangming01@loongson.cn
+Fixes: 25ee01a2fca0 ("mm: hugetlb: proc: add hugetlb-related fields to /proc/PID/smaps")
+Co-developed-by: Hongchen Zhang <zhanghongchen@loongson.cn>
+Signed-off-by: Hongchen Zhang <zhanghongchen@loongson.cn>
+Signed-off-by: Ming Wang <wangming01@loongson.cn>
+Cc: Andrii Nakryiko <andrii@kernel.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Huacai Chen <chenhuacai@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Joern Engel <joern@logfs.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.cz>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: <stable@vger.kernel.org>
