@@ -1,17 +1,15 @@
 From: Alexander Gordeev <agordeev@linux.ibm.com>
 Subject: kasan: avoid sleepable page allocation from atomic context
-Date: Tue, 8 Apr 2025 18:07:30 +0200
+Date: Tue, 29 Apr 2025 18:08:41 +0200
 
-Patch series "mm: Fix apply_to_pte_range() vs lazy MMU mode", v2.
+apply_to_pte_range() enters the lazy MMU mode and then invokes
+kasan_populate_vmalloc_pte() callback on each page table walk iteration. 
+However, the callback can go into sleep when trying to allocate a single
+page, e.g.  if an architecutre disables preemption on lazy MMU mode enter.
 
-This series is an attempt to fix the violation of lazy MMU mode context
-requirement as described for arch_enter_lazy_mmu_mode():
-
-    This mode can only be entered and left under the protection of
-    the page table locks for all page tables which may be modified.
-
-On s390 if I make arch_enter_lazy_mmu_mode() -> preempt_enable() and
-arch_leave_lazy_mmu_mode() -> preempt_disable() I am getting this:
+On s390 with the call sequences arch_enter_lazy_mmu_mode() ->
+preempt_enable() and arch_leave_lazy_mmu_mode() -> preempt_disable(), such
+a crash occurs:
 
     [  553.332108] preempt_count: 1, expected: 0
     [  553.332117] no locks held by multipathd/2116.
@@ -41,52 +39,117 @@ arch_leave_lazy_mmu_mode() -> preempt_disable() I am getting this:
     [  553.332419]  [<00000000158e7366>] __do_syscall+0xce/0xf0
     [  553.332428]  [<0000000015913260>] system_call+0x70/0x98
 
-This exposes a KASAN issue fixed with patch 1 and apply_to_pte_range()
-issue fixed with patch 3, while patch 2 is a prerequisite.
+Instead of allocating single pages per-PTE, bulk-allocate the shadow
+memory prior to applying kasan_populate_vmalloc_pte() callback on a page
+range.
 
-Commit b9ef323ea168 ("powerpc/64s: Disable preemption in hash lazy mmu
-mode") looks like powerpc-only fix, yet not entirely conforming to the
-above provided requirement (page tables itself are still not protected). 
-If I am not mistaken, xen and sparc are alike.
-
-
-This patch (of 3):
-
-apply_to_page_range() enters lazy MMU mode and then invokes
-kasan_populate_vmalloc_pte() callback on each page table walk iteration. 
-The lazy MMU mode may only be entered only under protection of the page
-table lock.  However, the callback can go into sleep when trying to
-allocate a single page.
-
-Change __get_free_page() allocation mode from GFP_KERNEL to GFP_ATOMIC to
-avoid scheduling out while in atomic context.
-
-Link: https://lkml.kernel.org/r/cover.1744128123.git.agordeev@linux.ibm.com
-Link: https://lkml.kernel.org/r/2d9f4ac4528701b59d511a379a60107fa608ad30.1744128123.git.agordeev@linux.ibm.com
+Link: https://lkml.kernel.org/r/573a823565734e1eac3aa128fb9d3506ec918a72.1745940843.git.agordeev@linux.ibm.com
 Fixes: 3c5c3cfb9ef4 ("kasan: support backing vmalloc space with real shadow memory")
 Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
-Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
-Cc: Guenetr Roeck <linux@roeck-us.net>
-Cc: Hugh Dickins <hughd@google.com>
-Cc: Jeremy Fitzhardinge <jeremy@goop.org>
-Cc: Juegren Gross <jgross@suse.com>
-Cc: Nicholas Piggin <npiggin@gmail.com>
+Suggested-by: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Daniel Axtens <dja@axtens.net>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
 Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/kasan/shadow.c |    2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
+ mm/kasan/shadow.c |   65 +++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 49 insertions(+), 16 deletions(-)
 
 --- a/mm/kasan/shadow.c~kasan-avoid-sleepable-page-allocation-from-atomic-context
 +++ a/mm/kasan/shadow.c
-@@ -301,7 +301,7 @@ static int kasan_populate_vmalloc_pte(pt
+@@ -292,30 +292,65 @@ void __init __weak kasan_populate_early_
+ {
+ }
+ 
++struct vmalloc_populate_data {
++	unsigned long start;
++	struct page **pages;
++};
++
+ static int kasan_populate_vmalloc_pte(pte_t *ptep, unsigned long addr,
+-				      void *unused)
++				      void *_data)
+ {
+-	unsigned long page;
++	struct vmalloc_populate_data *data = _data;
++	struct page *page;
++	unsigned long pfn;
+ 	pte_t pte;
+ 
  	if (likely(!pte_none(ptep_get(ptep))))
  		return 0;
  
 -	page = __get_free_page(GFP_KERNEL);
-+	page = __get_free_page(GFP_ATOMIC);
- 	if (!page)
- 		return -ENOMEM;
+-	if (!page)
+-		return -ENOMEM;
+-
+-	__memset((void *)page, KASAN_VMALLOC_INVALID, PAGE_SIZE);
+-	pte = pfn_pte(PFN_DOWN(__pa(page)), PAGE_KERNEL);
++	page = data->pages[PFN_DOWN(addr - data->start)];
++	pfn = page_to_pfn(page);
++	__memset(pfn_to_virt(pfn), KASAN_VMALLOC_INVALID, PAGE_SIZE);
++	pte = pfn_pte(pfn, PAGE_KERNEL);
+ 
+ 	spin_lock(&init_mm.page_table_lock);
+-	if (likely(pte_none(ptep_get(ptep)))) {
++	if (likely(pte_none(ptep_get(ptep))))
+ 		set_pte_at(&init_mm, addr, ptep, pte);
+-		page = 0;
+-	}
+ 	spin_unlock(&init_mm.page_table_lock);
+-	if (page)
+-		free_page(page);
++
++	return 0;
++}
++
++static int __kasan_populate_vmalloc(unsigned long start, unsigned long end)
++{
++	unsigned long nr_pages, nr_total = PFN_UP(end - start);
++	struct vmalloc_populate_data data;
++	int ret;
++
++	data.pages = (struct page **)__get_free_page(GFP_KERNEL);
++	if (!data.pages)
++		return -ENOMEM;
++
++	while (nr_total) {
++		nr_pages = min(nr_total, PAGE_SIZE / sizeof(data.pages[0]));
++		__memset(data.pages, 0, nr_pages * sizeof(data.pages[0]));
++		if (nr_pages != alloc_pages_bulk(GFP_KERNEL, nr_pages, data.pages)) {
++			free_page((unsigned long)data.pages);
++			return -ENOMEM;
++		}
++
++		data.start = start;
++		ret = apply_to_page_range(&init_mm, start, nr_pages * PAGE_SIZE,
++					  kasan_populate_vmalloc_pte, &data);
++		if (ret)
++			return ret;
++
++		start += nr_pages * PAGE_SIZE;
++		nr_total -= nr_pages;
++	}
++
++	free_page((unsigned long)data.pages);
++
+ 	return 0;
+ }
+ 
+@@ -348,9 +383,7 @@ int kasan_populate_vmalloc(unsigned long
+ 	shadow_start = PAGE_ALIGN_DOWN(shadow_start);
+ 	shadow_end = PAGE_ALIGN(shadow_end);
+ 
+-	ret = apply_to_page_range(&init_mm, shadow_start,
+-				  shadow_end - shadow_start,
+-				  kasan_populate_vmalloc_pte, NULL);
++	ret = __kasan_populate_vmalloc(shadow_start, shadow_end);
+ 	if (ret)
+ 		return ret;
  
 _
