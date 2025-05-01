@@ -1,6 +1,57 @@
 From: Nico Pache <npache@redhat.com>
 Subject: khugepaged: rename hpage_collapse_* to khugepaged_*
-Date: Wed, 16 Apr 2025 18:02:28 -0600
+Date: Mon, 28 Apr 2025 12:12:07 -0600
+
+Patch series "khugepaged: mTHP support", v5.
+
+The following series provides khugepaged and madvise collapse with the
+capability to collapse anonymous memory regions to mTHPs.
+
+To achieve this we generalize the khugepaged functions to no longer depend
+on PMD_ORDER.  Then during the PMD scan, we keep track of chunks of pages
+(defined by KHUGEPAGED_MTHP_MIN_ORDER) that are utilized.  This info is
+tracked using a bitmap.  After the PMD scan is done, we do binary
+recursion on the bitmap to find the optimal mTHP sizes for the PMD range. 
+The restriction on max_ptes_none is removed during the scan, to make sure
+we account for the whole PMD range.  When no mTHP size is enabled, the
+legacy behavior of khugepaged is maintained.  max_ptes_none will be scaled
+by the attempted collapse order to determine how full a THP must be to be
+eligible.  If a mTHP collapse is attempted, but contains swapped out, or
+shared pages, we dont perform the collapse.
+
+With the default max_ptes_none=511, the code should keep its most of its
+original behavior.  To exercise mTHP collapse we need to set
+max_ptes_none<=255.  With max_ptes_none > HPAGE_PMD_NR/2 you will
+experience collapse "creep" and constantly promote mTHPs to the next
+available size.
+
+Patch 1:     Refactor/rename hpage_collapse
+Patch 2:     Some refactoring to combine madvise_collapse and khugepaged
+Patch 3-5:   Generalize khugepaged functions for arbitrary orders
+Patch 6-9:   The mTHP patches
+Patch 10-11: Tracing/stats
+Patch 12:    Documentation
+
+---------
+ Testing
+---------
+- Built for x86_64, aarch64, ppc64le, and s390x
+- selftests mm
+- I created a test script that I used to push khugepaged to its limits
+   while monitoring a number of stats and tracepoints. The code is
+   available here[1] (Run in legacy mode for these changes and set mthp
+   sizes to inherit)
+   The summary from my testings was that there was no significant
+   regression noticed through this test. In some cases my changes had
+   better collapse latencies, and was able to scan more pages in the same
+   amount of time/work, but for the most part the results were consistent.
+- redis testing. I tested these changes along with my defer changes
+  (see followup post for more details).
+- some basic testing on 64k page size.
+- lots of general use.
+
+
+This patch (of 12):
 
 Functions in khugepaged.c use a mix of hpage_collapse and khugepaged as
 the function prefix.
@@ -8,8 +59,10 @@ the function prefix.
 Rename all of them to khugepaged to keep things consistent and slightly
 shorten the function names.
 
-Link: https://lkml.kernel.org/r/20250417000238.74567-3-npache@redhat.com
+Link: https://lkml.kernel.org/r/20250428181218.85925-1-npache@redhat.com
+Link: https://lkml.kernel.org/r/20250428181218.85925-2-npache@redhat.com
 Signed-off-by: Nico Pache <npache@redhat.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
@@ -24,6 +77,8 @@ Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Kirill A. Shuemov <kirill.shutemov@linux.intel.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
 Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
@@ -34,7 +89,6 @@ Cc: Rafael Aquini <raquini@redhat.com>
 Cc: Randy Dunlap <rdunlap@infradead.org>
 Cc: Reported-by:Takashi Iwai <tiwai@suse.de>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
-Cc: Shuah Khan <shuah@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Thomas Hellstrom <thomas.hellstrom@linux.intel.com>
@@ -43,12 +97,13 @@ Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Cc: Will Deacon <will@kernel.org>
 Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
-Cc: Zi Yan <ziy@nvidia.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: Shuah Khan <shuah@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |   50 +++++++++++++++++++++++-----------------------
- 1 file changed, 25 insertions(+), 25 deletions(-)
+ mm/khugepaged.c |   44 ++++++++++++++++++++++----------------------
+ 1 file changed, 22 insertions(+), 22 deletions(-)
 
 --- a/mm/khugepaged.c~khugepaged-rename-hpage_collapse_-to-khugepaged_
 +++ a/mm/khugepaged.c
@@ -205,30 +260,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				    struct file *file, pgoff_t start,
  				    struct collapse_control *cc)
  {
-@@ -2383,19 +2383,19 @@ static int khugepaged_collapse_single_pm
- 
- 			mmap_read_unlock(mm);
- 			*mmap_locked = false;
--			result = hpage_collapse_scan_file(mm, addr, file, pgoff,
-+			result = khugepaged_scan_file(mm, addr, file, pgoff,
- 							  cc);
- 			fput(file);
- 			if (result == SCAN_PTE_MAPPED_HUGEPAGE) {
- 				mmap_read_lock(mm);
--				if (hpage_collapse_test_exit_or_disable(mm))
-+				if (khugepaged_test_exit_or_disable(mm))
- 					goto end;
- 				result = collapse_pte_mapped_thp(mm, addr,
- 								 !cc->is_khugepaged);
- 				mmap_read_unlock(mm);
- 			}
- 		} else {
--			result = hpage_collapse_scan_pmd(mm, vma, addr,
-+			result = khugepaged_scan_pmd(mm, vma, addr,
- 							 mmap_locked, cc);
- 		}
- 		if (cc->is_khugepaged && result == SCAN_SUCCEED)
-@@ -2443,7 +2443,7 @@ static unsigned int khugepaged_scan_mm_s
+@@ -2401,7 +2401,7 @@ static unsigned int khugepaged_scan_mm_s
  		goto breakouterloop_mmap_lock;
  
  	progress++;
@@ -237,7 +269,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto breakouterloop;
  
  	vma_iter_init(&vmi, mm, khugepaged_scan.address);
-@@ -2451,7 +2451,7 @@ static unsigned int khugepaged_scan_mm_s
+@@ -2409,7 +2409,7 @@ static unsigned int khugepaged_scan_mm_s
  		unsigned long hstart, hend;
  
  		cond_resched();
@@ -246,7 +278,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			progress++;
  			break;
  		}
-@@ -2473,7 +2473,7 @@ skip:
+@@ -2431,7 +2431,7 @@ skip:
  			bool mmap_locked = true;
  
  			cond_resched();
@@ -255,7 +287,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto breakouterloop;
  
  			VM_BUG_ON(khugepaged_scan.address < hstart ||
-@@ -2509,7 +2509,7 @@ breakouterloop_mmap_lock:
+@@ -2491,7 +2491,7 @@ breakouterloop_mmap_lock:
  	 * Release the current mm_slot if this mm is about to die, or
  	 * if we scanned all vmas of this mm.
  	 */

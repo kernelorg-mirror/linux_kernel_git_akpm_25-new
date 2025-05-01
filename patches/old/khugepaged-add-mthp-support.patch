@@ -1,6 +1,6 @@
 From: Nico Pache <npache@redhat.com>
 Subject: khugepaged: add mTHP support
-Date: Wed, 16 Apr 2025 18:02:33 -0600
+Date: Mon, 28 Apr 2025 12:12:13 -0600
 
 Introduce the ability for khugepaged to collapse to different mTHP sizes. 
 While scanning PMD ranges for potential collapse candidates, keep track of
@@ -17,10 +17,11 @@ how full a THP must be to be eligible.
 If a mTHP collapse is attempted, but contains swapped out, or shared
 pages, we dont perform the collapse.
 
-Link: https://lkml.kernel.org/r/20250417000238.74567-8-npache@redhat.com
+Link: https://lkml.kernel.org/r/20250428181218.85925-8-npache@redhat.com
 Signed-off-by: Nico Pache <npache@redhat.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
@@ -33,6 +34,8 @@ Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Kirill A. Shuemov <kirill.shutemov@linux.intel.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
 Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
@@ -56,8 +59,8 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |  118 +++++++++++++++++++++++++++++++++-------------
- 1 file changed, 86 insertions(+), 32 deletions(-)
+ mm/khugepaged.c |  121 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 86 insertions(+), 35 deletions(-)
 
 --- a/mm/khugepaged.c~khugepaged-add-mthp-support
 +++ a/mm/khugepaged.c
@@ -134,7 +137,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * This removes any huge TLB entry from the CPU so we won't allow
  	 * huge and small TLB entries for the same virtual address to
-@@ -1226,10 +1230,10 @@ static int collapse_huge_page(struct mm_
+@@ -1226,18 +1230,16 @@ static int collapse_huge_page(struct mm_
  	mmu_notifier_invalidate_range_end(&range);
  	tlb_remove_table_sync_one();
  
@@ -148,18 +151,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		spin_unlock(pte_ptl);
  	} else {
  		result = SCAN_PMD_NULL;
-@@ -1258,8 +1262,8 @@ static int collapse_huge_page(struct mm_
+ 	}
+ 
+ 	if (unlikely(result != SCAN_SUCCEED)) {
+-		if (pte)
+-			pte_unmap(pte);
+ 		spin_lock(pmd_ptl);
+ 		BUG_ON(!pmd_none(*pmd));
+ 		/*
+@@ -1258,9 +1260,8 @@ static int collapse_huge_page(struct mm_
  	anon_vma_unlock_write(vma->anon_vma);
  
  	result = __collapse_huge_page_copy(pte, folio, pmd, _pmd,
 -					   vma, address, pte_ptl,
 -					   &compound_pagelist, HPAGE_PMD_ORDER);
+-	pte_unmap(pte);
 +					   vma, _address, pte_ptl,
 +					   &compound_pagelist, order);
- 	pte_unmap(pte);
  	if (unlikely(result != SCAN_SUCCEED))
  		goto out_up_write;
-@@ -1270,20 +1274,35 @@ static int collapse_huge_page(struct mm_
+ 
+@@ -1270,25 +1271,42 @@ static int collapse_huge_page(struct mm_
  	 * write.
  	 */
  	__folio_mark_uptodate(folio);
@@ -180,7 +192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		update_mmu_cache_pmd(vma, address, pmd);
 +		deferred_split_folio(folio, false);
 +		spin_unlock(pmd_ptl);
-+	} else { //mTHP
++	} else { /* mTHP collapse */
 +		mthp_pte = mk_pte(&folio->page, vma->vm_page_prot);
 +		mthp_pte = maybe_mkwrite(pte_mkdirty(mthp_pte), vma);
  
@@ -207,7 +219,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	folio = NULL;
  
-@@ -1364,31 +1383,58 @@ static int khugepaged_scan_pmd(struct mm
+ 	result = SCAN_SUCCEED;
+ out_up_write:
++	if (pte)
++		pte_unmap(pte);
+ 	mmap_write_unlock(mm);
+ out_nolock:
+ 	*mmap_locked = false;
+@@ -1364,31 +1382,58 @@ static int khugepaged_scan_pmd(struct mm
  {
  	pmd_t *pmd;
  	pte_t *pte, *_pte;
@@ -269,7 +288,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pte_t pteval = ptep_get(_pte);
  		if (is_swap_pte(pteval)) {
  			++unmapped;
-@@ -1411,10 +1457,11 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1411,10 +1456,11 @@ static int khugepaged_scan_pmd(struct mm
  			}
  		}
  		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
@@ -283,7 +302,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				continue;
  			} else {
  				result = SCAN_EXCEED_NONE_PTE;
-@@ -1510,6 +1557,7 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1510,6 +1556,7 @@ static int khugepaged_scan_pmd(struct mm
  								     address)))
  			referenced++;
  	}
@@ -291,7 +310,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!writable) {
  		result = SCAN_PAGE_RO;
  	} else if (cc->is_khugepaged &&
-@@ -1522,8 +1570,12 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1522,8 +1569,12 @@ static int khugepaged_scan_pmd(struct mm
  out_unmap:
  	pte_unmap_unlock(pte, ptl);
  	if (result == SCAN_SUCCEED) {
@@ -306,18 +325,4 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  out:
  	trace_mm_khugepaged_scan_pmd(mm, folio, writable, referenced,
-@@ -2479,11 +2531,13 @@ static int khugepaged_collapse_single_pm
- 			fput(file);
- 			if (result == SCAN_PTE_MAPPED_HUGEPAGE) {
- 				mmap_read_lock(mm);
-+				*mmap_locked = true;
- 				if (khugepaged_test_exit_or_disable(mm))
- 					goto end;
- 				result = collapse_pte_mapped_thp(mm, addr,
- 								 !cc->is_khugepaged);
- 				mmap_read_unlock(mm);
-+				*mmap_locked = false;
- 			}
- 		} else {
- 			result = khugepaged_scan_pmd(mm, vma, addr,
 _
