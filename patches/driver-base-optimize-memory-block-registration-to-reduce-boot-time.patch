@@ -1,0 +1,244 @@
+From: Donet Tom <donettom@linux.ibm.com>
+Subject: driver/base: optimize memory block registration to reduce boot time
+Date: Sat, 3 May 2025 11:10:12 +0530
+
+Patch series "driver/base: Optimize memory block registration to reduce
+boot time", v3.
+
+
+This patch (of 3):
+
+During node device initialization, `memory blocks` are registered under
+each NUMA node.  The `memory blocks` to be registered are identified using
+the node's start and end PFNs, which are obtained from the node's pg_data
+
+However, not all PFNs within this range necessarily belong to the same
+node—some may belong to other nodes.  Additionally, due to the
+discontiguous nature of physical memory, certain sections within a `memory
+block` may be absent.
+
+As a result, `memory blocks` that fall between a node's start and end PFNs
+may span across multiple nodes, and some sections within those blocks may
+be missing.  `Memory blocks` have a fixed size, which is architecture
+dependent.
+
+Due to these considerations, the memory block registration is currently
+performed as follows:
+
+for_each_online_node(nid):
+    start_pfn = pgdat->node_start_pfn;
+    end_pfn = pgdat->node_start_pfn + node_spanned_pages;
+    for_each_memory_block_between(PFN_PHYS(start_pfn), PFN_PHYS(end_pfn))
+        mem_blk = memory_block_id(pfn_to_section_nr(pfn));
+        pfn_mb_start=section_nr_to_pfn(mem_blk->start_section_nr)
+        pfn_mb_end = pfn_start + memory_block_pfns - 1
+        for (pfn = pfn_mb_start; pfn < pfn_mb_end; pfn++):
+            if (get_nid_for_pfn(pfn) != nid):
+                continue;
+            else
+                do_register_memory_block_under_node(nid, mem_blk,
+                                                        MEMINIT_EARLY);
+
+Here, we derive the start and end PFNs from the node's pg_data, then
+determine the memory blocks that may belong to the node.  For each `memory
+block` in this range, we inspect all PFNs it contains and check their
+associated NUMA node ID.  If a PFN within the block matches the current
+node, the memory block is registered under that node.
+
+If CONFIG_DEFERRED_STRUCT_PAGE_INIT is enabled, get_nid_for_pfn() performs
+a binary search in the `memblock regions` to determine the NUMA node ID
+for a given PFN.  If it is not enabled, the node ID is retrieved directly
+from the struct page.
+
+On large systems, this process can become time-consuming, especially since
+we iterate over each `memory block` and all PFNs within it until a match
+is found.  When CONFIG_DEFERRED_STRUCT_PAGE_INIT is enabled, the
+additional overhead of the binary search increases the execution time
+significantly, potentially leading to soft lockups during boot.
+
+In this patch, we iterate over `memblock region` to identify the `memory
+blocks` that belong to the current NUMA node.  `memblock regions` are
+contiguous memory ranges, each associated with a single NUMA node, and
+they do not span across multiple nodes.
+
+for_each_online_node(nid):
+  for_each_memory_region(r): // r => region
+    if (r->nid != nid):
+      continue;
+    else
+      for_each_memory_block_between(r->base, r->base + r->size - 1):
+        do_register_memory_block_under_node(nid, mem_blk, MEMINIT_EARLY);
+
+We iterate over all `memblock regions` and identify those that belong to
+the current NUMA node.  For each `memblock region` associated with the
+current node, we calculate the start and end `memory blocks` based on the
+region's start and end PFNs.  We then register all `memory blocks` within
+that range under the current node.
+
+Test Results on My system with 32TB RAM
+=======================================
+1. Boot time with CONFIG_DEFERRED_STRUCT_PAGE_INIT enabled.
+
+Without this patch
+------------------
+Startup finished in 1min 16.528s (kernel)
+
+With this patch
+---------------
+Startup finished in 17.236s (kernel) - 78% Improvement
+
+2. Boot time with CONFIG_DEFERRED_STRUCT_PAGE_INIT disabled.
+
+Without this patch
+------------------
+Startup finished in 28.320s (kernel)
+
+With this patch
+---------------
+Startup finished in 15.621s (kernel) - 46% Improvement
+
+Link: https://lkml.kernel.org/r/b49ed289096643ff5b5fbedcf1d1c1be42845a74.1746250339.git.donettom@linux.ibm.com
+Link: https://lkml.kernel.org/r/b49ed289096643ff5b5fbedcf1d1c1be42845a74.1746250339.git.donettom@linux.ibm.com
+Signed-off-by: Donet Tom <donettom@linux.ibm.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
+Cc: Alison Schofield <alison.schofield@intel.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Joanthan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: "Ritesh Harjani (IBM)" <ritesh.list@gmail.com>
+Cc: Yury Norov (NVIDIA) <yury.norov@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/base/memory.c  |    4 ++--
+ drivers/base/node.c    |   38 ++++++++++++++++++++++++++++++++++++++
+ include/linux/memory.h |    2 ++
+ include/linux/node.h   |   11 +++++------
+ 4 files changed, 47 insertions(+), 8 deletions(-)
+
+--- a/drivers/base/memory.c~driver-base-optimize-memory-block-registration-to-reduce-boot-time
++++ a/drivers/base/memory.c
+@@ -60,7 +60,7 @@ static inline unsigned long pfn_to_block
+ 	return memory_block_id(pfn_to_section_nr(pfn));
+ }
+ 
+-static inline unsigned long phys_to_block_id(unsigned long phys)
++unsigned long phys_to_block_id(unsigned long phys)
+ {
+ 	return pfn_to_block_id(PFN_DOWN(phys));
+ }
+@@ -683,7 +683,7 @@ int __weak arch_get_memory_phys_device(u
+  *
+  * Called under device_hotplug_lock.
+  */
+-static struct memory_block *find_memory_block_by_id(unsigned long block_id)
++struct memory_block *find_memory_block_by_id(unsigned long block_id)
+ {
+ 	struct memory_block *mem;
+ 
+--- a/drivers/base/node.c~driver-base-optimize-memory-block-registration-to-reduce-boot-time
++++ a/drivers/base/node.c
+@@ -20,6 +20,7 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/swap.h>
+ #include <linux/slab.h>
++#include <linux/memblock.h>
+ 
+ static const struct bus_type node_subsys = {
+ 	.name = "node",
+@@ -850,6 +851,43 @@ void unregister_memory_block_under_nodes
+ 			  kobject_name(&node_devices[mem_blk->nid]->dev.kobj));
+ }
+ 
++/*
++ * register_memory_blocks_under_node_early : Register the memory
++ *		  blocks under the current node.
++ * @nid : Current node under registration
++ *
++ * This function iterates over all memblock regions and identifies the regions
++ * that belong to the current node. For each region which belongs to current
++ * node, it calculates the start and end memory blocks based on the region's
++ * start and end PFNs. It then registers all memory blocks within that range
++ * under the current node.
++ */
++void register_memory_blocks_under_node_early(int nid)
++{
++	struct memblock_region *r;
++
++	for_each_mem_region(r) {
++		if (r->nid != nid)
++			continue;
++
++		const unsigned long start_block_id = phys_to_block_id(r->base);
++		const unsigned long end_block_id = phys_to_block_id(r->base + r->size - 1);
++		unsigned long block_id;
++
++		for (block_id = start_block_id; block_id <= end_block_id; block_id++) {
++			struct memory_block *mem;
++
++			mem = find_memory_block_by_id(block_id);
++			if (!mem)
++				continue;
++
++			do_register_memory_block_under_node(nid, mem, MEMINIT_EARLY);
++			put_device(&mem->dev);
++		}
++
++	}
++}
++
+ void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
+ 				       unsigned long end_pfn,
+ 				       enum meminit_context context)
+--- a/include/linux/memory.h~driver-base-optimize-memory-block-registration-to-reduce-boot-time
++++ a/include/linux/memory.h
+@@ -179,6 +179,8 @@ struct memory_group *memory_group_find_b
+ typedef int (*walk_memory_groups_func_t)(struct memory_group *, void *);
+ int walk_dynamic_memory_groups(int nid, walk_memory_groups_func_t func,
+ 			       struct memory_group *excluded, void *arg);
++unsigned long phys_to_block_id(unsigned long phys);
++struct memory_block *find_memory_block_by_id(unsigned long block_id);
+ #define hotplug_memory_notifier(fn, pri) ({		\
+ 	static __meminitdata struct notifier_block fn##_mem_nb =\
+ 		{ .notifier_call = fn, .priority = pri };\
+--- a/include/linux/node.h~driver-base-optimize-memory-block-registration-to-reduce-boot-time
++++ a/include/linux/node.h
+@@ -114,12 +114,16 @@ extern struct node *node_devices[];
+ void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
+ 				       unsigned long end_pfn,
+ 				       enum meminit_context context);
++void register_memory_blocks_under_node_early(int nid);
+ #else
+ static inline void register_memory_blocks_under_node(int nid, unsigned long start_pfn,
+ 						     unsigned long end_pfn,
+ 						     enum meminit_context context)
+ {
+ }
++static inline void register_memory_blocks_under_node_early(int nid)
++{
++}
+ #endif
+ 
+ extern void unregister_node(struct node *node);
+@@ -134,15 +138,10 @@ static inline int register_one_node(int
+ 	int error = 0;
+ 
+ 	if (node_online(nid)) {
+-		struct pglist_data *pgdat = NODE_DATA(nid);
+-		unsigned long start_pfn = pgdat->node_start_pfn;
+-		unsigned long end_pfn = start_pfn + pgdat->node_spanned_pages;
+-
+ 		error = __register_one_node(nid);
+ 		if (error)
+ 			return error;
+-		register_memory_blocks_under_node(nid, start_pfn, end_pfn,
+-						  MEMINIT_EARLY);
++		register_memory_blocks_under_node_early(nid);
+ 	}
+ 
+ 	return error;
+_

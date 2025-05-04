@@ -1,0 +1,180 @@
+From: Coiby Xu <coxu@redhat.com>
+Subject: kexec_file: allow to place kexec_buf randomly
+Date: Fri, 2 May 2025 09:12:35 +0800
+
+Patch series "Support kdump with LUKS encryption by reusing LUKS volume
+keys", v9.
+
+LUKS is the standard for Linux disk encryption, widely adopted by users,
+and in some cases, such as Confidential VMs, it is a requirement.  With
+kdump enabled, when the first kernel crashes, the system can boot into the
+kdump/crash kernel to dump the memory image (i.e., /proc/vmcore) to a
+specified target.  However, there are two challenges when dumping vmcore
+to a LUKS-encrypted device:
+
+ - Kdump kernel may not be able to decrypt the LUKS partition. For some
+   machines, a system administrator may not have a chance to enter the
+   password to decrypt the device in kdump initramfs after the 1st kernel
+   crashes; For cloud confidential VMs, depending on the policy the
+   kdump kernel may not be able to unseal the keys with TPM and the
+   console virtual keyboard is untrusted.
+
+ - LUKS2 by default use the memory-hard Argon2 key derivation function
+   which is quite memory-consuming compared to the limited memory reserved
+   for kdump. Take Fedora example, by default, only 256M is reserved for
+   systems having memory between 4G-64G. With LUKS enabled, ~1300M needs
+   to be reserved for kdump. Note if the memory reserved for kdump can't
+   be used by 1st kernel i.e. an user sees ~1300M memory missing in the
+   1st kernel.
+
+Besides users (at least for Fedora) usually expect kdump to work out of
+the box i.e.  no manual password input or custom crashkernel value is
+needed.  And it doesn't make sense to derivate the keys again in kdump
+kernel which seems to be redundant work.
+
+This patchset addresses the above issues by making the LUKS volume keys
+persistent for kdump kernel with the help of cryptsetup's new APIs
+(--link-vk-to-keyring/--volume-key-keyring).  Here is the life cycle of
+the kdump copies of LUKS volume keys,
+
+ 1. After the 1st kernel loads the initramfs during boot, systemd
+    use an user-input passphrase to de-crypt the LUKS volume keys
+    or TPM-sealed key and then save the volume keys to specified keyring
+    (using the --link-vk-to-keyring API) and the key will expire within
+    specified time.
+
+ 2. A user space tool (kdump initramfs loader like kdump-utils) create
+    key items inside /sys/kernel/config/crash_dm_crypt_keys to inform
+    the 1st kernel which keys are needed.
+
+ 3. When the kdump initramfs is loaded by the kexec_file_load
+    syscall, the 1st kernel will iterate created key items, save the
+    keys to kdump reserved memory.
+
+ 4. When the 1st kernel crashes and the kdump initramfs is booted, the
+    kdump initramfs asks the kdump kernel to create a user key using the
+    key stored in kdump reserved memory by writing yes to
+    /sys/kernel/crash_dm_crypt_keys/restore. Then the LUKS encrypted
+    device is unlocked with libcryptsetup's --volume-key-keyring API.
+
+ 5. The system gets rebooted to the 1st kernel after dumping vmcore to
+    the LUKS encrypted device is finished
+
+After libcryptsetup saving the LUKS volume keys to specified keyring,
+whoever takes this should be responsible for the safety of these copies of
+keys.  The keys will be saved in the memory area exclusively reserved for
+kdump where even the 1st kernel has no direct access.  And further more,
+two additional protections are added,
+ - save the copy randomly in kdump reserved memory as suggested by Jan
+ - clear the _PAGE_PRESENT flag of the page that stores the copy as
+   suggested by Pingfan
+
+This patchset only supports x86.  There will be patches to support other
+architectures once this patch set gets merged.
+
+
+This patch (of 9):
+
+Currently, kexec_buf is placed in order which means for the same machine,
+the info in the kexec_buf is always located at the same position each time
+the machine is booted.  This may cause a risk for sensitive information
+like LUKS volume key.  Now struct kexec_buf has a new field random which
+indicates it's supposed to be placed in a random position.
+
+Note this feature is enabled only when CONFIG_CRASH_DUMP is enabled.  So
+it only takes effect for kdump and won't impact kexec reboot.
+
+Link: https://lkml.kernel.org/r/20250502011246.99238-1-coxu@redhat.com
+Link: https://lkml.kernel.org/r/20250502011246.99238-2-coxu@redhat.com
+Signed-off-by: Coiby Xu <coxu@redhat.com>
+Suggested-by: Jan Pazdziora <jpazdziora@redhat.com>
+Acked-by: Baoquan He <bhe@redhat.com>
+Cc: "Daniel P. Berrange" <berrange@redhat.com>
+Cc: Dave Hansen <dave.hansen@intel.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: Liu Pingfan <kernelfans@gmail.com>
+Cc: Milan Broz <gmazyland@gmail.com>
+Cc: Ondrej Kozina <okozina@redhat.com>
+Cc: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kexec.h |   30 ++++++++++++++++++++++++++++++
+ kernel/kexec_file.c   |    3 +++
+ 2 files changed, 33 insertions(+)
+
+--- a/include/linux/kexec.h~kexec_file-allow-to-place-kexec_buf-randomly
++++ a/include/linux/kexec.h
+@@ -25,6 +25,10 @@
+ 
+ extern note_buf_t __percpu *crash_notes;
+ 
++#ifdef CONFIG_CRASH_DUMP
++#include <linux/prandom.h>
++#endif
++
+ #ifdef CONFIG_KEXEC_CORE
+ #include <linux/list.h>
+ #include <linux/compat.h>
+@@ -169,6 +173,7 @@ int kexec_image_post_load_cleanup_defaul
+  * @buf_min:	The buffer can't be placed below this address.
+  * @buf_max:	The buffer can't be placed above this address.
+  * @top_down:	Allocate from top of memory.
++ * @random:	Place the buffer at a random position.
+  */
+ struct kexec_buf {
+ 	struct kimage *image;
+@@ -180,8 +185,33 @@ struct kexec_buf {
+ 	unsigned long buf_min;
+ 	unsigned long buf_max;
+ 	bool top_down;
++#ifdef CONFIG_CRASH_DUMP
++	bool random;
++#endif
+ };
+ 
++
++#ifdef CONFIG_CRASH_DUMP
++static inline void kexec_random_range_start(unsigned long start,
++					    unsigned long end,
++					    struct kexec_buf *kbuf,
++					    unsigned long *temp_start)
++{
++	unsigned short i;
++
++	if (kbuf->random) {
++		get_random_bytes(&i, sizeof(unsigned short));
++		*temp_start = start + (end - start) / USHRT_MAX * i;
++	}
++}
++#else
++static inline void kexec_random_range_start(unsigned long start,
++					    unsigned long end,
++					    struct kexec_buf *kbuf,
++					    unsigned long *temp_start)
++{}
++#endif
++
+ int kexec_load_purgatory(struct kimage *image, struct kexec_buf *kbuf);
+ int kexec_purgatory_get_set_symbol(struct kimage *image, const char *name,
+ 				   void *buf, unsigned int size,
+--- a/kernel/kexec_file.c~kexec_file-allow-to-place-kexec_buf-randomly
++++ a/kernel/kexec_file.c
+@@ -449,6 +449,7 @@ static int locate_mem_hole_top_down(unsi
+ 
+ 	temp_end = min(end, kbuf->buf_max);
+ 	temp_start = temp_end - kbuf->memsz + 1;
++	kexec_random_range_start(temp_start, temp_end, kbuf, &temp_start);
+ 
+ 	do {
+ 		/* align down start */
+@@ -493,6 +494,8 @@ static int locate_mem_hole_bottom_up(uns
+ 
+ 	temp_start = max(start, kbuf->buf_min);
+ 
++	kexec_random_range_start(temp_start, end, kbuf, &temp_start);
++
+ 	do {
+ 		temp_start = ALIGN(temp_start, kbuf->buf_align);
+ 		temp_end = temp_start + kbuf->memsz - 1;
+_
