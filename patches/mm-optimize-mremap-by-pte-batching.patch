@@ -1,0 +1,172 @@
+From: Dev Jain <dev.jain@arm.com>
+Subject: mm: optimize mremap() by PTE batching
+Date: Wed, 7 May 2025 11:32:56 +0530
+
+To use PTE batching, we want to determine whether the folio mapped by the
+PTE is large, thus requiring the use of vm_normal_folio().  We want to
+avoid the cost of vm_normal_folio() if the code path doesn't already
+require the folio.  For arm64, pte_batch_hint() does the job.  To
+generalize this hint, add a helper which will determine whether two
+consecutive PTEs point to consecutive PFNs, in which case there is a high
+probability that the underlying folio is large.
+
+Next, use folio_pte_batch() to optimize move_ptes().  On arm64, if the
+ptes are painted with the contig bit, then ptep_get() will iterate through
+all 16 entries to collect a/d bits.  Hence this optimization will result
+in a 16x reduction in the number of ptep_get() calls.  Next,
+ptep_get_and_clear() will eventually call contpte_try_unfold() on every
+contig block, thus flushing the TLB for the complete large folio range. 
+Instead, use get_and_clear_full_ptes() so as to elide TLBIs on each contig
+block, and only do them on the starting and ending contig block.
+
+Link: https://lkml.kernel.org/r/20250507060256.78278-3-dev.jain@arm.com
+Signed-off-by: Dev Jain <dev.jain@arm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Bang Li <libang.li@antgroup.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: bibo mao <maobibo@loongson.cn>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Ingo Molnar <mingo@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yang Shi <yang@os.amperecomputing.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/pgtable.h |   29 +++++++++++++++++++++++++++++
+ mm/mremap.c             |   37 ++++++++++++++++++++++++++++++-------
+ 2 files changed, 59 insertions(+), 7 deletions(-)
+
+--- a/include/linux/pgtable.h~mm-optimize-mremap-by-pte-batching
++++ a/include/linux/pgtable.h
+@@ -369,6 +369,35 @@ static inline pgd_t pgdp_get(pgd_t *pgdp
+ }
+ #endif
+ 
++/**
++ * maybe_contiguous_pte_pfns - Hint whether the page mapped by the pte belongs
++ * to a large folio.
++ * @ptep: Pointer to the page table entry.
++ * @pte: The page table entry.
++ *
++ * This helper is invoked when the caller wants to batch over a set of ptes
++ * mapping a large folio, but the concerned code path does not already have
++ * the folio. We want to avoid the cost of vm_normal_folio() only to find that
++ * the underlying folio was small; i.e keep the small folio case as fast as
++ * possible.
++ *
++ * The caller must ensure that ptep + 1 exists.
++ */
++static inline bool maybe_contiguous_pte_pfns(pte_t *ptep, pte_t pte)
++{
++	pte_t *next_ptep, next_pte;
++
++	if (pte_batch_hint(ptep, pte) != 1)
++		return true;
++
++	next_ptep = ptep + 1;
++	next_pte = ptep_get(next_ptep);
++	if (!pte_present(next_pte))
++		return false;
++
++	return unlikely(pte_pfn(next_pte) - pte_pfn(pte) == 1);
++}
++
+ #ifndef __HAVE_ARCH_PTEP_TEST_AND_CLEAR_YOUNG
+ static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
+ 					    unsigned long address,
+--- a/mm/mremap.c~mm-optimize-mremap-by-pte-batching
++++ a/mm/mremap.c
+@@ -170,6 +170,23 @@ static pte_t move_soft_dirty_pte(pte_t p
+ 	return pte;
+ }
+ 
++/* mremap a batch of PTEs mapping the same large folio */
++static int mremap_folio_pte_batch(struct vm_area_struct *vma, unsigned long addr,
++		pte_t *ptep, pte_t pte, int max_nr)
++{
++	const fpb_t flags = FPB_IGNORE_DIRTY | FPB_IGNORE_SOFT_DIRTY;
++	struct folio *folio;
++	int nr = 1;
++
++	if ((max_nr != 1) && maybe_contiguous_pte_pfns(ptep, pte)) {
++		folio = vm_normal_folio(vma, addr, pte);
++		if (folio && folio_test_large(folio))
++			nr = folio_pte_batch(folio, addr, ptep, pte, max_nr,
++					     flags, NULL, NULL, NULL);
++	}
++	return nr;
++}
++
+ static int move_ptes(struct pagetable_move_control *pmc,
+ 		unsigned long extent, pmd_t *old_pmd, pmd_t *new_pmd)
+ {
+@@ -177,7 +194,7 @@ static int move_ptes(struct pagetable_mo
+ 	bool need_clear_uffd_wp = vma_has_uffd_without_event_remap(vma);
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pte_t *old_ptep, *new_ptep;
+-	pte_t pte;
++	pte_t old_pte, pte;
+ 	pmd_t dummy_pmdval;
+ 	spinlock_t *old_ptl, *new_ptl;
+ 	bool force_flush = false;
+@@ -186,6 +203,7 @@ static int move_ptes(struct pagetable_mo
+ 	unsigned long old_end = old_addr + extent;
+ 	unsigned long len = old_end - old_addr;
+ 	int err = 0;
++	int max_nr;
+ 
+ 	/*
+ 	 * When need_rmap_locks is true, we take the i_mmap_rwsem and anon_vma
+@@ -236,12 +254,13 @@ static int move_ptes(struct pagetable_mo
+ 	flush_tlb_batched_pending(vma->vm_mm);
+ 	arch_enter_lazy_mmu_mode();
+ 
+-	for (; old_addr < old_end; old_ptep++, old_addr += PAGE_SIZE,
+-				   new_ptep++, new_addr += PAGE_SIZE) {
+-		if (pte_none(ptep_get(old_ptep)))
++	for (int nr = 1; old_addr < old_end; old_ptep += nr, old_addr += nr * PAGE_SIZE,
++				   new_ptep += nr, new_addr += nr * PAGE_SIZE) {
++		max_nr = (old_end - old_addr) >> PAGE_SHIFT;
++		old_pte = ptep_get(old_ptep);
++		if (pte_none(old_pte))
+ 			continue;
+ 
+-		pte = ptep_get_and_clear(mm, old_addr, old_ptep);
+ 		/*
+ 		 * If we are remapping a valid PTE, make sure
+ 		 * to flush TLB before we drop the PTL for the
+@@ -253,8 +272,12 @@ static int move_ptes(struct pagetable_mo
+ 		 * the TLB entry for the old mapping has been
+ 		 * flushed.
+ 		 */
+-		if (pte_present(pte))
++		if (pte_present(old_pte)) {
++			nr = mremap_folio_pte_batch(vma, old_addr, old_ptep,
++						    old_pte, max_nr);
+ 			force_flush = true;
++		}
++		pte = get_and_clear_full_ptes(mm, old_addr, old_ptep, nr, 0);
+ 		pte = move_pte(pte, old_addr, new_addr);
+ 		pte = move_soft_dirty_pte(pte);
+ 
+@@ -267,7 +290,7 @@ static int move_ptes(struct pagetable_mo
+ 				else if (is_swap_pte(pte))
+ 					pte = pte_swp_clear_uffd_wp(pte);
+ 			}
+-			set_pte_at(mm, new_addr, new_ptep, pte);
++			set_ptes(mm, new_addr, new_ptep, pte, nr);
+ 		}
+ 	}
+ 
+_
