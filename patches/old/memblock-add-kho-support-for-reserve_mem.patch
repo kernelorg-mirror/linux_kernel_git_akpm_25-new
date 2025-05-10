@@ -1,6 +1,6 @@
 From: Alexander Graf <graf@amazon.com>
 Subject: memblock: add KHO support for reserve_mem
-Date: Thu, 10 Apr 2025 22:37:43 -0700
+Date: Thu, 1 May 2025 15:54:23 -0700
 
 Linux has recently gained support for "reserve_mem": A mechanism to
 allocate a region of memory early enough in boot that we can cross our
@@ -16,7 +16,7 @@ This is an example user for KHO in the KHO patch set to ensure we have at
 least one (not very controversial) user in the tree before extending KHO's
 use to more subsystems.
 
-Link: https://lkml.kernel.org/r/20250411053745.1817356-13-changyuanl@google.com
+Link: https://lkml.kernel.org/r/20250501225425.635167-17-changyuanl@google.com
 Signed-off-by: Alexander Graf <graf@amazon.com>
 Co-developed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
@@ -29,6 +29,7 @@ Cc: Ashish Kalra <ashish.kalra@amd.com>
 Cc: Ben Herrenschmidt <benh@kernel.crashing.org>
 Cc: Borislav Betkov <bp@alien8.de>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: David Woodhouse <dwmw2@infradead.org>
 Cc: Eric Biederman <ebiederm@xmission.com>
 Cc: "H. Peter Anvin" <hpa@zytor.com>
@@ -37,7 +38,7 @@ Cc: James Gowans <jgowans@amazon.com>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Krzysztof Kozlowski <krzk@kernel.org>
-Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Marc Rutland <mark.rutland@arm.com>
 Cc: Paolo Bonzini <pbonzini@redhat.com>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
 Cc: Peter Zijlstra <peterz@infradead.org>
@@ -49,13 +50,11 @@ Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Thomas Gleinxer <tglx@linutronix.de>
 Cc: Thomas Lendacky <thomas.lendacky@amd.com>
 Cc: Will Deacon <will@kernel.org>
-Cc: Baoquan He <bhe@redhat.com>
-Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memblock.c |  205 ++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 205 insertions(+)
+ mm/memblock.c |  200 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 200 insertions(+)
 
 --- a/mm/memblock.c~memblock-add-kho-support-for-reserve_mem
 +++ a/mm/memblock.c
@@ -71,7 +70,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <asm/sections.h>
  #include <linux/io.h>
  
-@@ -2475,6 +2480,201 @@ int reserve_mem_release_by_name(const ch
+@@ -2485,6 +2490,196 @@ int reserve_mem_release_by_name(const ch
  	return 1;
  }
  
@@ -85,22 +84,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	int err = 0, i;
 +
-+	if (!reserved_mem_count)
-+		return NOTIFY_DONE;
-+
-+	if (IS_ERR(kho_fdt)) {
-+		err = PTR_ERR(kho_fdt);
-+		pr_err("memblock FDT was not prepared successfully: %d\n", err);
-+		return notifier_from_errno(err);
-+	}
-+
 +	for (i = 0; i < reserved_mem_count; i++) {
 +		struct reserve_mem_table *map = &reserved_mem_table[i];
 +
-+		err |= kho_preserve_phys(ser, map->start, map->size);
++		err |= kho_preserve_phys(map->start, map->size);
 +	}
 +
-+	err |= kho_preserve_folio(ser, page_folio(kho_fdt));
++	err |= kho_preserve_folio(page_folio(kho_fdt));
 +	err |= kho_add_subtree(ser, MEMBLOCK_KHO_FDT, page_to_virt(kho_fdt));
 +
 +	return notifier_from_errno(err);
@@ -123,19 +113,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	.notifier_call = reserve_mem_kho_notifier,
 +};
 +
-+static void __init prepare_kho_fdt(void)
++static int __init prepare_kho_fdt(void)
 +{
 +	int err = 0, i;
 +	void *fdt;
 +
-+	if (!reserved_mem_count)
-+		return;
-+
 +	kho_fdt = alloc_page(GFP_KERNEL);
-+	if (!kho_fdt) {
-+		kho_fdt = ERR_PTR(-ENOMEM);
-+		return;
-+	}
++	if (!kho_fdt)
++		return -ENOMEM;
 +
 +	fdt = page_to_virt(kho_fdt);
 +
@@ -160,51 +145,64 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (err) {
 +		pr_err("failed to prepare memblock FDT for KHO: %d\n", err);
 +		put_page(kho_fdt);
-+		kho_fdt = ERR_PTR(-EINVAL);
++		kho_fdt = NULL;
 +	}
++
++	return err;
 +}
 +
 +static int __init reserve_mem_init(void)
 +{
-+	if (!kho_is_enabled())
++	int err;
++
++	if (!kho_is_enabled() || !reserved_mem_count)
 +		return 0;
 +
-+	prepare_kho_fdt();
++	err = prepare_kho_fdt();
++	if (err)
++		return err;
 +
-+	return register_kho_notifier(&reserve_mem_kho_nb);
++	err = register_kho_notifier(&reserve_mem_kho_nb);
++	if (err) {
++		put_page(kho_fdt);
++		kho_fdt = NULL;
++	}
++
++	return err;
 +}
 +late_initcall(reserve_mem_init);
-+
-+static void *kho_fdt_in __initdata;
 +
 +static void *__init reserve_mem_kho_retrieve_fdt(void)
 +{
 +	phys_addr_t fdt_phys;
 +	struct folio *fdt_folio;
-+	void *fdt;
 +	int err;
++	static void *fdt;
++
++	if (fdt)
++		return fdt;
 +
 +	err = kho_retrieve_subtree(MEMBLOCK_KHO_FDT, &fdt_phys);
 +	if (err) {
 +		if (err != -ENOENT)
 +			pr_warn("failed to retrieve FDT '%s' from KHO: %d\n",
 +				MEMBLOCK_KHO_FDT, err);
-+		return ERR_PTR(err);
++		return NULL;
 +	}
 +
 +	fdt_folio = kho_restore_folio(fdt_phys);
 +	if (!fdt_folio) {
 +		pr_warn("failed to restore memblock KHO FDT (0x%llx)\n", fdt_phys);
-+		return ERR_PTR(-EFAULT);
++		return NULL;
 +	}
 +
-+	fdt = page_to_virt(folio_page(fdt_folio, 0));
++	fdt = folio_address(fdt_folio);
 +
 +	err = fdt_node_check_compatible(fdt, 0, MEMBLOCK_KHO_NODE_COMPATIBLE);
 +	if (err) {
 +		pr_warn("FDT '%s' is incompatible with '%s': %d\n",
 +			MEMBLOCK_KHO_FDT, MEMBLOCK_KHO_NODE_COMPATIBLE, err);
-+		return ERR_PTR(-EINVAL);
++		fdt = NULL;
 +	}
 +
 +	return fdt;
@@ -217,13 +215,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	const phys_addr_t *p_start, *p_size;
 +	const void *fdt;
 +
-+	if (!kho_fdt_in)
-+		kho_fdt_in = reserve_mem_kho_retrieve_fdt();
-+
-+	if (IS_ERR(kho_fdt_in))
++	fdt = reserve_mem_kho_retrieve_fdt();
++	if (!fdt)
 +		return false;
-+
-+	fdt = kho_fdt_in;
 +
 +	offset = fdt_subnode_offset(fdt, 0, name);
 +	if (offset < 0) {
@@ -273,7 +267,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Parse reserve_mem=nn:align:name
   */
-@@ -2530,6 +2730,11 @@ static int __init reserve_mem(char *p)
+@@ -2540,6 +2735,11 @@ static int __init reserve_mem(char *p)
  	if (reserve_mem_find_by_name(name, &start, &tmp))
  		return -EBUSY;
  

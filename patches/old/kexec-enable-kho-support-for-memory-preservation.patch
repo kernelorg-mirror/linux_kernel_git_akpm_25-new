@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: kexec: enable KHO support for memory preservation
-Date: Thu, 10 Apr 2025 22:37:37 -0700
+Date: Thu, 1 May 2025 15:54:14 -0700
 
 Introduce APIs allowing KHO users to preserve memory across kexec and get
 access to that memory after boot of the kexeced kernel
@@ -25,7 +25,7 @@ The next kernel then processes that list, reserves the memory ranges and
 later, when a user requests a folio or a physical range, KHO restores
 corresponding memory map entries.
 
-Link: https://lkml.kernel.org/r/20250411053745.1817356-7-changyuanl@google.com
+Link: https://lkml.kernel.org/r/20250501225425.635167-8-changyuanl@google.com
 Suggested-by: Jason Gunthorpe <jgg@nvidia.com>
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Co-developed-by: Changyuan Lyu <changyuanl@google.com>
@@ -38,6 +38,7 @@ Cc: Ashish Kalra <ashish.kalra@amd.com>
 Cc: Ben Herrenschmidt <benh@kernel.crashing.org>
 Cc: Borislav Betkov <bp@alien8.de>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Cc: David Woodhouse <dwmw2@infradead.org>
 Cc: Eric Biederman <ebiederm@xmission.com>
 Cc: "H. Peter Anvin" <hpa@zytor.com>
@@ -45,7 +46,7 @@ Cc: Ingo Molnar <mingo@redhat.com>
 Cc: James Gowans <jgowans@amazon.com>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Krzysztof Kozlowski <krzk@kernel.org>
-Cc: Mark Rutland <mark.rutland@arm.com>
+Cc: Marc Rutland <mark.rutland@arm.com>
 Cc: Paolo Bonzini <pbonzini@redhat.com>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
 Cc: Peter Zijlstra <peterz@infradead.org>
@@ -57,18 +58,16 @@ Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Thomas Gleinxer <tglx@linutronix.de>
 Cc: Thomas Lendacky <thomas.lendacky@amd.com>
 Cc: Will Deacon <will@kernel.org>
-Cc: Baoquan He <bhe@redhat.com>
-Cc: Dave Hansen <dave.hansen@linux.intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/kexec_handover.h |   39 +++
- kernel/kexec_handover.c        |  401 +++++++++++++++++++++++++++++++
- 2 files changed, 440 insertions(+)
+ include/linux/kexec_handover.h |   36 ++
+ kernel/kexec_handover.c        |  406 +++++++++++++++++++++++++++++++
+ 2 files changed, 442 insertions(+)
 
 --- a/include/linux/kexec_handover.h~kexec-enable-kho-support-for-memory-preservation
 +++ a/include/linux/kexec_handover.h
-@@ -15,13 +15,35 @@ enum kho_event {
+@@ -16,13 +16,34 @@ enum kho_event {
  	KEXEC_KHO_ABORT = 1,
  };
  
@@ -97,25 +96,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_KEXEC_HANDOVER
  bool kho_is_enabled(void);
  
-+int kho_preserve_folio(struct kho_serialization *ser, struct folio *folio);
-+int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
-+		      size_t size);
++int kho_preserve_folio(struct folio *folio);
++int kho_preserve_phys(phys_addr_t phys, size_t size);
 +struct folio *kho_restore_folio(phys_addr_t phys);
  int kho_add_subtree(struct kho_serialization *ser, const char *name, void *fdt);
  int kho_retrieve_subtree(const char *name, phys_addr_t *phys);
  
-@@ -38,6 +60,23 @@ static inline bool kho_is_enabled(void)
+@@ -39,6 +60,21 @@ static inline bool kho_is_enabled(void)
  	return false;
  }
  
-+static inline int kho_preserve_folio(struct kho_serialization *ser,
-+				     struct folio *folio)
++static inline int kho_preserve_folio(struct folio *folio)
 +{
 +	return -EOPNOTSUPP;
 +}
 +
-+static inline int kho_preserve_phys(struct kho_serialization *ser,
-+				    phys_addr_t phys, size_t size)
++static inline int kho_preserve_phys(phys_addr_t phys, size_t size)
 +{
 +	return -EOPNOTSUPP;
 +}
@@ -138,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/debugfs.h>
  #include <linux/kexec.h>
  #include <linux/kexec_handover.h>
-@@ -41,12 +42,369 @@ static int __init kho_parse_enable(char
+@@ -44,12 +45,307 @@ static int __init kho_parse_enable(char
  }
  early_param("kho", kho_parse_enable);
  
@@ -185,8 +181,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct kho_mem_track track;
 +	/* First chunk of serialized preserved memory map */
 +	struct khoser_mem_chunk *preserved_mem_map;
-+};
-+
+ };
+ 
 +static void *xa_load_or_alloc(struct xarray *xa, unsigned long index, size_t sz)
 +{
 +	void *elm, *res;
@@ -259,68 +255,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return 0;
 +}
 +
-+/**
-+ * kho_preserve_folio - preserve a folio across kexec.
-+ * @ser: serialization control object passed by KHO notifiers.
-+ * @folio: folio to preserve.
-+ *
-+ * Instructs KHO to preserve the whole folio across kexec. The order
-+ * will be preserved as well.
-+ *
-+ * Return: 0 on success, error code on failure
-+ */
-+int kho_preserve_folio(struct kho_serialization *ser, struct folio *folio)
-+{
-+	const unsigned long pfn = folio_pfn(folio);
-+	const unsigned int order = folio_order(folio);
-+
-+	return __kho_preserve_order(&ser->track, pfn, order);
-+}
-+EXPORT_SYMBOL_GPL(kho_preserve_folio);
-+
-+/**
-+ * kho_preserve_phys - preserve a physically contiguous range across kexec.
-+ * @ser: serialization control object passed by KHO notifiers.
-+ * @phys: physical address of the range.
-+ * @size: size of the range.
-+ *
-+ * Instructs KHO to preserve the memory range from @phys to @phys + @size
-+ * across kexec.
-+ *
-+ * Return: 0 on success, error code on failure
-+ */
-+int kho_preserve_phys(struct kho_serialization *ser, phys_addr_t phys,
-+		      size_t size)
-+{
-+	unsigned long pfn = PHYS_PFN(phys);
-+	unsigned long failed_pfn = 0;
-+	const unsigned long start_pfn = pfn;
-+	const unsigned long end_pfn = PHYS_PFN(phys + size);
-+	int err = 0;
-+
-+	if (!PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
-+		return -EINVAL;
-+
-+	while (pfn < end_pfn) {
-+		const unsigned int order =
-+			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
-+
-+		err = __kho_preserve_order(&ser->track, pfn, order);
-+		if (err) {
-+			failed_pfn = pfn;
-+			break;
-+		}
-+
-+		pfn += 1 << order;
-+	}
-+
-+	if (err)
-+		__kho_unpreserve(&ser->track, start_pfn, failed_pfn);
-+
-+	return err;
-+}
-+EXPORT_SYMBOL_GPL(kho_preserve_phys);
-+
 +/* almost as free_reserved_page(), just don't free the page */
 +static void kho_restore_page(struct page *page)
 +{
@@ -389,8 +323,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +struct khoser_mem_chunk {
 +	struct khoser_mem_chunk_hdr hdr;
 +	struct khoser_mem_bitmap_ptr bitmaps[KHOSER_BITMAP_SIZE];
- };
- 
++};
++
 +static_assert(sizeof(struct khoser_mem_chunk) == PAGE_SIZE);
 +
 +static struct khoser_mem_chunk *new_chunk(struct khoser_mem_chunk *cur_chunk,
@@ -508,7 +442,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * With KHO enabled, memory can become fragmented because KHO regions may
   * be anywhere in physical address space. The scratch regions give us a
-@@ -321,6 +679,9 @@ static struct kho_out kho_out = {
+@@ -324,6 +620,9 @@ static struct kho_out kho_out = {
  	.lock = __MUTEX_INITIALIZER(kho_out.lock),
  	.ser = {
  		.fdt_list = LIST_HEAD_INIT(kho_out.ser.fdt_list),
@@ -518,7 +452,81 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	},
  	.finalized = false,
  };
-@@ -363,6 +724,25 @@ static int kho_out_update_debugfs_fdt(vo
+@@ -340,6 +639,73 @@ int unregister_kho_notifier(struct notif
+ }
+ EXPORT_SYMBOL_GPL(unregister_kho_notifier);
+ 
++/**
++ * kho_preserve_folio - preserve a folio across kexec.
++ * @folio: folio to preserve.
++ *
++ * Instructs KHO to preserve the whole folio across kexec. The order
++ * will be preserved as well.
++ *
++ * Return: 0 on success, error code on failure
++ */
++int kho_preserve_folio(struct folio *folio)
++{
++	const unsigned long pfn = folio_pfn(folio);
++	const unsigned int order = folio_order(folio);
++	struct kho_mem_track *track = &kho_out.ser.track;
++
++	if (kho_out.finalized)
++		return -EBUSY;
++
++	return __kho_preserve_order(track, pfn, order);
++}
++EXPORT_SYMBOL_GPL(kho_preserve_folio);
++
++/**
++ * kho_preserve_phys - preserve a physically contiguous range across kexec.
++ * @phys: physical address of the range.
++ * @size: size of the range.
++ *
++ * Instructs KHO to preserve the memory range from @phys to @phys + @size
++ * across kexec.
++ *
++ * Return: 0 on success, error code on failure
++ */
++int kho_preserve_phys(phys_addr_t phys, size_t size)
++{
++	unsigned long pfn = PHYS_PFN(phys);
++	unsigned long failed_pfn = 0;
++	const unsigned long start_pfn = pfn;
++	const unsigned long end_pfn = PHYS_PFN(phys + size);
++	int err = 0;
++	struct kho_mem_track *track = &kho_out.ser.track;
++
++	if (kho_out.finalized)
++		return -EBUSY;
++
++	if (!PAGE_ALIGNED(phys) || !PAGE_ALIGNED(size))
++		return -EINVAL;
++
++	while (pfn < end_pfn) {
++		const unsigned int order =
++			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
++
++		err = __kho_preserve_order(track, pfn, order);
++		if (err) {
++			failed_pfn = pfn;
++			break;
++		}
++
++		pfn += 1 << order;
++	}
++
++	if (err)
++		__kho_unpreserve(track, start_pfn, failed_pfn);
++
++	return err;
++}
++EXPORT_SYMBOL_GPL(kho_preserve_phys);
++
+ /* Handling for debug/kho/out */
+ 
+ static struct dentry *debugfs_root;
+@@ -366,6 +732,25 @@ static int kho_out_update_debugfs_fdt(vo
  static int kho_abort(void)
  {
  	int err;
@@ -544,7 +552,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	err = blocking_notifier_call_chain(&kho_out.chain_head, KEXEC_KHO_ABORT,
  					   NULL);
-@@ -377,12 +757,25 @@ static int kho_abort(void)
+@@ -380,12 +765,25 @@ static int kho_abort(void)
  static int kho_finalize(void)
  {
  	int err = 0;
@@ -566,11 +574,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (err)
 +		goto abort;
 +
-+	err = kho_preserve_folio(&kho_out.ser, page_folio(kho_out.ser.fdt));
++	err = kho_preserve_folio(page_folio(kho_out.ser.fdt));
  	if (err)
  		goto abort;
  
-@@ -392,6 +785,12 @@ static int kho_finalize(void)
+@@ -395,6 +793,12 @@ static int kho_finalize(void)
  	if (err)
  		goto abort;
  
@@ -583,7 +591,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	err |= fdt_end_node(fdt);
  	err |= fdt_finish(fdt);
  
-@@ -697,6 +1096,8 @@ void __init kho_memory_init(void)
+@@ -700,6 +1104,8 @@ void __init kho_memory_init(void)
  	if (kho_in.scratch_phys) {
  		kho_scratch = phys_to_virt(kho_in.scratch_phys);
  		kho_release_scratch();
