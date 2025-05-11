@@ -58,8 +58,17 @@ number of clients | Without patch | With patch
 
 The results show drastic improvement for network intensive workloads.
 
+[shakeel.butt@linux.dev: add BUILD_BUG_ON() for MEMCG_CHARGE_BATCH]
+  Link: https://lkml.kernel.org/r/rlsgeosg3j7v5nihhbxxxbv3xfy4ejvigihj7lkkbt3n6imyne@2apxx2jm2e57
+[shakeel.butt@linux.dev: simplify refill_stock]
+  Link: https://lkml.kernel.org/r/as5cdsm4lraxupg3t6onep2ixql72za25hvd4x334dsoyo4apr@zyzl4vkuevuv
+[hughd@google.com: it's better to stock nr_pages than the uninitialized stock_pages]
+  Link: https://lkml.kernel.org/r/d542d18f-1caa-6fea-e2c3-3555c87bcf64@google.com
+[shakeel.butt@linux.dev: add comment per Michal and use DEFINE_PER_CPU_ALIGNED instead of DEFINE_PER_CPU per Vlastimil]
+  Link: https://lkml.kernel.org/r/dieeei3squ2gcnqxdjayvxbvzldr266rhnvtl3vjzsqevxkevf@ckui5vjzl2qg
 Link: https://lkml.kernel.org/r/20250416180229.2902751-1-shakeel.butt@linux.dev
 Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Hugh Dickins <hughd@google.com>
 Acked-by: Jakub Kicinski <kuba@kernel.org>
 Acked-by: Michal Hocko <mhocko@suse.com>
 Cc: Eric Dumaze <edumazet@google.com>
@@ -68,20 +77,23 @@ Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Soheil Hassas Yeganeh <soheil@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Hugh Dickins <hughd@google.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memcontrol.c |  128 ++++++++++++++++++++++++++++++++--------------
- 1 file changed, 91 insertions(+), 37 deletions(-)
+ mm/memcontrol.c |  144 +++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 106 insertions(+), 38 deletions(-)
 
 --- a/mm/memcontrol.c~memcg-multi-memcg-percpu-charge-cache
 +++ a/mm/memcontrol.c
-@@ -1769,10 +1769,11 @@ void mem_cgroup_print_oom_group(struct m
+@@ -1769,10 +1769,15 @@ void mem_cgroup_print_oom_group(struct m
  	pr_cont(" are going to be killed due to memory.oom.group set\n");
  }
  
++/*
++ * The value of NR_MEMCG_STOCK is selected to keep the cached memcgs and their
++ * nr_pages in a single cacheline. This may change in future.
++ */
 +#define NR_MEMCG_STOCK 7
  struct memcg_stock_pcp {
  	local_trylock_t stock_lock;
@@ -92,7 +104,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	struct obj_cgroup *cached_objcg;
  	struct pglist_data *cached_pgdat;
-@@ -1809,9 +1810,10 @@ static bool consume_stock(struct mem_cgr
+@@ -1784,7 +1789,7 @@ struct memcg_stock_pcp {
+ 	unsigned long flags;
+ #define FLUSHING_CACHED_CHARGE	0
+ };
+-static DEFINE_PER_CPU(struct memcg_stock_pcp, memcg_stock) = {
++static DEFINE_PER_CPU_ALIGNED(struct memcg_stock_pcp, memcg_stock) = {
+ 	.stock_lock = INIT_LOCAL_TRYLOCK(stock_lock),
+ };
+ static DEFINE_MUTEX(percpu_charge_mutex);
+@@ -1809,9 +1814,10 @@ static bool consume_stock(struct mem_cgr
  			  gfp_t gfp_mask)
  {
  	struct memcg_stock_pcp *stock;
@@ -104,7 +125,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (nr_pages > MEMCG_CHARGE_BATCH)
  		return ret;
-@@ -1822,10 +1824,17 @@ static bool consume_stock(struct mem_cgr
+@@ -1822,10 +1828,17 @@ static bool consume_stock(struct mem_cgr
  		return ret;
  
  	stock = this_cpu_ptr(&memcg_stock);
@@ -126,7 +147,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	local_unlock_irqrestore(&memcg_stock.stock_lock, flags);
-@@ -1843,21 +1852,30 @@ static void memcg_uncharge(struct mem_cg
+@@ -1843,21 +1856,30 @@ static void memcg_uncharge(struct mem_cg
  /*
   * Returns stocks cached in percpu and reset cached information.
   */
@@ -162,7 +183,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void drain_local_stock(struct work_struct *dummy)
-@@ -1874,7 +1892,7 @@ static void drain_local_stock(struct wor
+@@ -1874,7 +1896,7 @@ static void drain_local_stock(struct wor
  
  	stock = this_cpu_ptr(&memcg_stock);
  	drain_obj_stock(stock);
@@ -171,7 +192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	clear_bit(FLUSHING_CACHED_CHARGE, &stock->flags);
  
  	local_unlock_irqrestore(&memcg_stock.stock_lock, flags);
-@@ -1883,35 +1901,81 @@ static void drain_local_stock(struct wor
+@@ -1883,35 +1905,91 @@ static void drain_local_stock(struct wor
  static void refill_stock(struct mem_cgroup *memcg, unsigned int nr_pages)
  {
  	struct memcg_stock_pcp *stock;
@@ -179,8 +200,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct mem_cgroup *cached;
 +	uint8_t stock_pages;
  	unsigned long flags;
-+	bool evict = true;
++	bool success = false;
++	int empty_slot = -1;
 +	int i;
++
++	/*
++	 * For now limit MEMCG_CHARGE_BATCH to 127 and less. In future if we
++	 * decide to increase it more than 127 then we will need more careful
++	 * handling of nr_pages[] in struct memcg_stock_pcp.
++	 */
++	BUILD_BUG_ON(MEMCG_CHARGE_BATCH > S8_MAX);
  
  	VM_WARN_ON_ONCE(mem_cgroup_is_root(memcg));
  
@@ -203,18 +232,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		css_get(&memcg->css);
 -		WRITE_ONCE(stock->cached, memcg);
 +	for (i = 0; i < NR_MEMCG_STOCK; ++i) {
-+again:
 +		cached = READ_ONCE(stock->cached[i]);
-+		if (!cached) {
-+			css_get(&memcg->css);
-+			WRITE_ONCE(stock->cached[i], memcg);
-+		}
-+		if (!cached || memcg == READ_ONCE(stock->cached[i])) {
++		if (!cached && empty_slot == -1)
++			empty_slot = i;
++		if (memcg == READ_ONCE(stock->cached[i])) {
 +			stock_pages = READ_ONCE(stock->nr_pages[i]) + nr_pages;
 +			WRITE_ONCE(stock->nr_pages[i], stock_pages);
 +			if (stock_pages > MEMCG_CHARGE_BATCH)
 +				drain_stock(stock, i);
-+			evict = false;
++			success = true;
 +			break;
 +		}
  	}
@@ -223,10 +249,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -	if (stock_pages > MEMCG_CHARGE_BATCH)
 -		drain_stock(stock);
-+	if (evict) {
-+		i = get_random_u32_below(NR_MEMCG_STOCK);
-+		drain_stock(stock, i);
-+		goto again;
++	if (!success) {
++		i = empty_slot;
++		if (i == -1) {
++			i = get_random_u32_below(NR_MEMCG_STOCK);
++			drain_stock(stock, i);
++		}
++		css_get(&memcg->css);
++		WRITE_ONCE(stock->cached[i], memcg);
++		WRITE_ONCE(stock->nr_pages[i], nr_pages);
 +	}
  
  	local_unlock_irqrestore(&memcg_stock.stock_lock, flags);
@@ -265,7 +296,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Drains all per-CPU charge caches for given root_memcg resp. subtree
   * of the hierarchy under it.
-@@ -1933,17 +1997,7 @@ void drain_all_stock(struct mem_cgroup *
+@@ -1933,17 +2011,7 @@ void drain_all_stock(struct mem_cgroup *
  	curcpu = smp_processor_id();
  	for_each_online_cpu(cpu) {
  		struct memcg_stock_pcp *stock = &per_cpu(memcg_stock, cpu);
@@ -284,7 +315,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		if (flush &&
  		    !test_and_set_bit(FLUSHING_CACHED_CHARGE, &stock->flags)) {
-@@ -1969,7 +2023,7 @@ static int memcg_hotplug_cpu_dead(unsign
+@@ -1969,7 +2037,7 @@ static int memcg_hotplug_cpu_dead(unsign
  	drain_obj_stock(stock);
  	local_unlock_irqrestore(&memcg_stock.stock_lock, flags);
  
