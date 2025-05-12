@@ -1,0 +1,229 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: fix incorrectly disallowed anonymous VMA merges
+Date: Tue, 8 Apr 2025 10:29:31 +0100
+
+Patch series "fix incorrectly disallowed anonymous VMA merges", v2.
+
+It appears that we have been incorrectly rejecting merge cases for 15
+years, apparently by mistake.
+
+Imagine a range of anonymous mapped momemory divided into two VMAs like
+this, with incompatible protection bits:
+
+              RW         RWX
+	  unfaulted    faulted
+	|-----------|-----------|
+	|    prev   |    vma    |
+	|-----------|-----------|
+	             mprotect(RW)
+
+Now imagine mprotect()'ing vma so it is RW. This appears as if it should
+merge, it does not.
+
+Neither does this case, again mprotect()'ing vma RW:
+
+              RWX        RW
+	   faulted    unfaulted
+	|-----------|-----------|
+	|    vma    |   next    |
+	|-----------|-----------|
+	 mprotect(RW)
+
+Nor:
+
+              RW         RWX          RW
+	  unfaulted    faulted    unfaulted
+	|-----------|-----------|-----------|
+	|    prev   |    vma    |    next   |
+	|-----------|-----------|-----------|
+	             mprotect(RW)
+
+What's going on here?
+
+In commit 5beb49305251 ("mm: change anon_vma linking to fix multi-process
+server scalability issue"), from 2010, Rik von Riel took careful care to
+account for these cases - commenting that '[this is] easily overlooked:
+when mprotect shifts the boundary, make sure the expanding vma has
+anon_vma set if the shrinking vma had, to cover any anon pages imported.'
+
+However, commit 965f55dea0e3 ("mmap: avoid merging cloned VMAs")
+introduced a little over a year later, appears to have accidentally
+disallowed this.
+
+By adjusting the is_mergeable_anon_vma() function to avoid lock contention
+across large trees of forked anon_vma's, this commit wrongly assumed the
+VMA being checked (the ostensible merge 'target') should be faulted, that
+is, have an anon_vma, and thus an anon_vma_chain list established, but
+only of length 1.
+
+This appears to have been unintentional, as disallowing empty target VMAs
+like this across the board makes no sense.
+
+We already have logic that accounts for this case, the same logic Rik
+introduced in 2010, now via dup_anon_vma() (and ultimately
+anon_vma_clone()), so there is no problem permitting this.
+
+This series fixes this mistake and also ensures that scalability concerns
+remain addressed by explicitly checking that whatever VMA is being merged
+has not been forked.
+
+A full set of self tests which reproduce the issue are provided, as well
+as updating userland VMA tests to assert this behaviour.
+
+The self tests additionally assert scalability concerns are addressed.
+
+
+This patch (of 3):
+
+anon_vma_chain's were introduced by Rik von Riel in commit 5beb49305251
+("mm: change anon_vma linking to fix multi-process server scalability
+issue").
+
+This patch was introduced in March 2010.  As part of this change, careful
+attention was made to the instance of mprotect() causing a VMA merge, with
+one faulted (i.e.  having anon_vma set) and another not:
+
+		/*
+		 * Easily overlooked: when mprotect shifts the boundary,
+		 * make sure the expanding vma has anon_vma set if the
+		 * shrinking vma had, to cover any anon pages imported.
+		 */
+
+In the modern VMA code, this is handled in dup_anon_vma() (and ultimately
+anon_vma_clone()).
+
+This case is one of the three configurations of adjacent VMA anon_vma
+state that we might encounter on merge (where dst is the VMA which will be
+merged into and src the one being merged into dst):
+
+1.  dst->anon_vma,  src->anon_vma - These must be equal, no-op.
+2.  dst->anon_vma, !src->anon_vma - We simply use dst->anon_vma, no-op.
+3. !dst->anon_vma,  src->anon_vma - The case in question here.
+
+In case 3, the instance addressed here - we duplicate the AVC connections
+from src and place into dst.
+
+However, in practice, we very often do NOT do this.
+
+This appears to be due to an inadvertent consequence of the change
+introduced by commit 965f55dea0e3 ("mmap: avoid merging cloned VMAs"),
+introduced in May 2011.
+
+This implies that this merge case was functional only for a little over a
+year, and has since been broken for ~15 years.
+
+Here, lock scalability concerns lead to us restricting anonymous merges
+only to those VMAs with 1 entry in their vma->anon_vma_chain, that is, a
+VMA that is not connected to any parent process's anon_vma.
+
+The mergeability test looks like this:
+
+static inline bool is_mergeable_anon_vma(struct anon_vma *anon_vma1,
+		 struct anon_vma *anon_vma2, struct vm_area_struct *vma)
+{
+	if ((!anon_vma1 || !anon_vma2) && (!vma ||
+		!vma->anon_vma || list_is_singular(&vma->anon_vma_chain)))
+		return true;
+	return anon_vma1 == anon_vma2;
+}
+
+However, we have a problem here - typically the vma passed here is the
+destination VMA.
+
+For instance in vma_merge_existing_range() we invoke:
+
+can_vma_merge_left()
+-> [ check that there is an immediately adjacent prior VMA ]
+-> can_vma_merge_after()
+  -> is_mergeable_vma() for general attribute check
+-> is_mergeable_anon_vma([ proposed anon_vma ], prev->anon_vma, prev)
+
+So if we were considering a target unfaulted 'prev':
+
+	  unfaulted    faulted
+	|-----------|-----------|
+	|    prev   |    vma    |
+	|-----------|-----------|
+
+This would call is_mergeable_anon_vma(NULL, vma->anon_vma, prev).
+
+The list_is_singular() check for vma->anon_vma_chain, an empty list on
+fault, would cause this merge to _fail_ even though all else indicates a
+merge.
+
+Equally a simple merge into a next VMA would hit the same problem:
+
+	   faulted    unfaulted
+	|-----------|-----------|
+	|    vma    |    next   |
+	|-----------|-----------|
+
+can_vma_merge_right()
+-> [ check that there is an immediately adjacent succeeding VMA ]
+-> can_vma_merge_before()
+  -> is_mergeable_vma() for general attribute check
+-> is_mergeable_anon_vma([ proposed anon_vma ], next->anon_vma, next)
+
+For a 3-way merge, we'd also hit the same problem if it was configured like
+this for instance:
+
+	  unfaulted    faulted    unfaulted
+	|-----------|-----------|-----------|
+	|    prev   |    vma    |    next   |
+	|-----------|-----------|-----------|
+
+As we'd call can_vma_merge_left() for prev, and can_vma_merge_right() for
+next, both of which would fail.
+
+vma_merge_new_range() (and relatedly, vma_expand()) are not impacted, as
+the new VMA would never already be faulted (it is a proposed new range).
+
+Because we already handle each of the aforementioned merge cases, and can
+absolutely therefore deal with an existing VMA merge with !dst->anon_vma,
+src->anon_vma, there is absolutely no reason to disallow this kind of
+merge.
+
+It seems that the intention of this patch is to ensure that, in the
+instance of merging unfaulted VMAs with faulted ones, we never wish to do
+so with those with multiple AVCs due to the fact that anon_vma lock's are
+held across both parent and child anon_vma's (actually, the 'root' parent
+anon_vma's lock is used).
+
+In fact, the original commit alludes to this - "find_mergeable_anon_vma()
+already considers this case".
+
+In find_mergeable_anon_vma() however, we check the anon_vma which will be
+merged from, if it is set, then we check
+list_is_singular(vma->anon_vma_chain).
+
+So to match this logic, update is_mergeable_anon_vma() to perform this
+scalability check on the VMA whose anon_vma we ultimately merge into.
+
+This matches existing behaviour with forked VMAs, only we no longer
+wrongly disallow ALL empty target merges.
+
+So we both allow merge cases and ensure the scalability check is correctly
+applied.
+
+We may wish to revisit these lock scalability concerns at a later date and
+ensure they are still valid.
+
+Additionally, correct userland VMA tests which were mistakenly not
+asserting these cases correctly previously to now correctly assert this,
+and to ensure vmg->anon_vma state is always consistent to account for
+newly introduced asserts.
+
+Link: https://lkml.kernel.org/r/cover.1744104124.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/18c756fc9eaf7ad082a710c91133b8346f8cd9a8.1744104124.git.lorenzo.stoakes@oracle.com
+Fixes: 965f55dea0e3 ("mmap: avoid merging cloned VMAs")
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Yeoreum Yun <yeoreum.yun@arm.com>
+Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
