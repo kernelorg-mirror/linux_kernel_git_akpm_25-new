@@ -54,6 +54,10 @@ interface was said to reset the weight to the system default.  Before this
 patch, the default for all weights were 1, which meant that writing 0 and
 1 were functionally equivalent.  With this patch, writing 0 is invalid.
 
+[joshua.hahnjy@gmail.com: wordsmithing changes, simplification, fixes]
+  Link: https://lkml.kernel.org/r/20250511025840.2410154-1-joshua.hahnjy@gmail.com
+[joshua.hahnjy@gmail.com: remove auto_kobj_attr field from struct sysfs_wi_group]
+  Link: https://lkml.kernel.org/r/20250512142511.3959833-1-joshua.hahnjy@gmail.com
 https://lore.kernel.org/linux-mm/20240202170238.90004-1-gregory.price@memverge.com/ [1]
 Link: https://lkml.kernel.org/r/20250505182328.4148265-1-joshua.hahnjy@gmail.com
 Co-developed-by: Gregory Price <gourry@gourry.net>
@@ -75,11 +79,11 @@ Cc: Len Brown <lenb@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- Documentation/ABI/testing/sysfs-kernel-mm-mempolicy-weighted-interleave |   35 +
+ Documentation/ABI/testing/sysfs-kernel-mm-mempolicy-weighted-interleave |   35 -
  drivers/base/node.c                                                     |    9 
- include/linux/mempolicy.h                                               |   13 
- mm/mempolicy.c                                                          |  311 ++++++++--
- 4 files changed, 307 insertions(+), 61 deletions(-)
+ include/linux/mempolicy.h                                               |    4 
+ mm/mempolicy.c                                                          |  326 ++++++++--
+ 4 files changed, 311 insertions(+), 63 deletions(-)
 
 --- a/Documentation/ABI/testing/sysfs-kernel-mm-mempolicy-weighted-interleave~mm-mempolicy-weighted-interleave-auto-tuning
 +++ a/Documentation/ABI/testing/sysfs-kernel-mm-mempolicy-weighted-interleave
@@ -94,7 +98,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		empty string, ...) will return -EINVAL.
 +
 +		Changing the weight to a valid value will automatically
-+		update the system to manual mode as well.
++		switch the system to manual mode as well.
 +
 +What:		/sys/kernel/mm/mempolicy/weighted_interleave/auto
 +Date:		May 2025
@@ -157,23 +161,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/nodemask.h>
  #include <linux/pagemap.h>
  #include <uapi/linux/mempolicy.h>
-@@ -57,6 +58,15 @@ struct mempolicy {
- };
- 
- /*
-+ * A null weighted_interleave_state is interpted as having .mode = "auto",
-+ * and .iw_table is interpreted as an array of 1s with length nr_node_ids.
-+ */
-+struct weighted_interleave_state {
-+	bool mode_auto;
-+	u8 iw_table[];
-+};
-+
-+/*
-  * Support for managing mempolicy data objects (clone, copy, destroy)
-  * The default fast path of a NULL MPOL_DEFAULT policy is always inlined.
-  */
-@@ -178,6 +188,9 @@ static inline bool mpol_is_preferred_man
+@@ -178,6 +179,9 @@ static inline bool mpol_is_preferred_man
  
  extern bool apply_policy_zone(struct mempolicy *policy, enum zone_type zone);
  
@@ -193,7 +181,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include <asm/tlbflush.h>
  #include <asm/tlb.h>
-@@ -140,31 +141,130 @@ static struct mempolicy default_policy =
+@@ -140,31 +141,138 @@ static struct mempolicy default_policy =
  static struct mempolicy preferred_node_policy[MAX_NUMNODES];
  
  /*
@@ -210,15 +198,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + */
 +static const int weightiness = 32;
 +
++/*
++ * A null weighted_interleave_state is interpreted as having .mode="auto",
++ * and .iw_table is interpreted as an array of 1s with length nr_node_ids.
+  */
+-static u8 __rcu *iw_table;
+-static DEFINE_MUTEX(iw_table_lock);
++struct weighted_interleave_state {
++	bool mode_auto;
++	u8 iw_table[];
++};
 +static struct weighted_interleave_state __rcu *wi_state;
 +static unsigned int *node_bw_table;
 +
 +/*
 + * wi_state_lock protects both wi_state and node_bw_table.
 + * node_bw_table is only used by writers to update wi_state.
-  */
--static u8 __rcu *iw_table;
--static DEFINE_MUTEX(iw_table_lock);
++ */
 +static DEFINE_MUTEX(wi_state_lock);
  
  static u8 get_il_weight(int node)
@@ -339,7 +335,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * numa_nearest_node - Find nearest node by state
   * @node: Node id to start the search
-@@ -2023,26 +2123,28 @@ static unsigned int read_once_policy_nod
+@@ -2023,26 +2131,28 @@ static unsigned int read_once_policy_nod
  
  static unsigned int weighted_interleave_nid(struct mempolicy *pol, pgoff_t ilx)
  {
@@ -377,7 +373,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Calculate the node offset based on totals */
  	target = ilx % weight_total;
-@@ -2050,7 +2152,6 @@ static unsigned int weighted_interleave_
+@@ -2050,7 +2160,6 @@ static unsigned int weighted_interleave_
  	while (target) {
  		/* detect system default usage */
  		weight = table ? table[nid] : 1;
@@ -385,7 +381,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (target < weight)
  			break;
  		target -= weight;
-@@ -2451,13 +2552,14 @@ static unsigned long alloc_pages_bulk_we
+@@ -2451,13 +2560,14 @@ static unsigned long alloc_pages_bulk_we
  		struct mempolicy *pol, unsigned long nr_pages,
  		struct page **page_array)
  {
@@ -401,7 +397,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned int weight_total = 0;
  	unsigned long rem_pages = nr_pages;
  	nodemask_t nodes;
-@@ -2507,17 +2609,19 @@ static unsigned long alloc_pages_bulk_we
+@@ -2507,17 +2617,19 @@ static unsigned long alloc_pages_bulk_we
  		return total_allocated;
  
  	rcu_read_lock();
@@ -429,15 +425,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Calculate rounds/partial rounds to minimize __alloc_pages_bulk calls.
-@@ -3431,6 +3535,7 @@ struct iw_node_attr {
- struct sysfs_wi_group {
- 	struct kobject wi_kobj;
- 	struct mutex kobj_lock;
-+	struct kobj_attribute auto_kobj_attr;
- 	struct iw_node_attr *nattrs[];
- };
- 
-@@ -3450,31 +3555,104 @@ static ssize_t node_show(struct kobject
+@@ -3450,31 +3562,109 @@ static ssize_t node_show(struct kobject
  static ssize_t node_store(struct kobject *kobj, struct kobj_attribute *attr,
  			  const char *buf, size_t count)
  {
@@ -449,10 +437,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	int i;
  
  	node_attr = container_of(attr, struct iw_node_attr, kobj_attr);
- 	if (count == 0 || sysfs_streq(buf, ""))
- 		weight = 0;
+-	if (count == 0 || sysfs_streq(buf, ""))
+-		weight = 0;
 -	else if (kstrtou8(buf, 0, &weight))
-+	else if (kstrtou8(buf, 0, &weight) || weight == 0)
++	if (count == 0 || sysfs_streq(buf, "") ||
++	    kstrtou8(buf, 0, &weight) || weight == 0)
  		return -EINVAL;
  
 -	new = kzalloc(nr_node_ids, GFP_KERNEL);
@@ -531,9 +520,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (!input) {
 +		old_wi_state = rcu_dereference_protected(wi_state,
 +					lockdep_is_held(&wi_state_lock));
-+		if (old_wi_state)
-+			memcpy(new_wi_state->iw_table, old_wi_state->iw_table,
-+					nr_node_ids * sizeof(u8));
++		if (!old_wi_state)
++			goto update_wi_state;
++		if (input == old_wi_state->mode_auto) {
++			mutex_unlock(&wi_state_lock);
++			return count;
++		}
++
++		memcpy(new_wi_state->iw_table, old_wi_state->iw_table,
++					       nr_node_ids * sizeof(u8));
 +		goto update_wi_state;
 +	}
 +
@@ -557,7 +552,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return count;
  }
  
-@@ -3508,23 +3686,31 @@ static void sysfs_wi_node_delete_all(voi
+@@ -3508,23 +3698,35 @@ static void sysfs_wi_node_delete_all(voi
  		sysfs_wi_node_delete(nid);
  }
  
@@ -590,33 +585,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	kfree(&wi_group->wi_kobj);
  }
  
++static struct kobj_attribute wi_auto_attr =
++	__ATTR(auto, 0664, weighted_interleave_auto_show,
++			   weighted_interleave_auto_store);
++
  static void wi_cleanup(void) {
-+	sysfs_remove_file(&wi_group->wi_kobj, &wi_group->auto_kobj_attr.attr);
++	sysfs_remove_file(&wi_group->wi_kobj, &wi_auto_attr.attr);
  	sysfs_wi_node_delete_all();
 -	iw_table_free();
 +	wi_state_free();
  }
  
  static void wi_kobj_release(struct kobject *wi_kobj)
-@@ -3612,6 +3798,10 @@ static int wi_node_notifier(struct notif
- 	return NOTIFY_OK;
- }
- 
-+static struct kobj_attribute wi_auto_attr =
-+	__ATTR(auto, 0664, weighted_interleave_auto_show,
-+			   weighted_interleave_auto_store);
-+
- static int __init add_weighted_interleave_group(struct kobject *mempolicy_kobj)
- {
- 	int nid, err;
-@@ -3627,6 +3817,11 @@ static int __init add_weighted_interleav
+@@ -3627,6 +3829,10 @@ static int __init add_weighted_interleav
  	if (err)
  		goto err_put_kobj;
  
 +	err = sysfs_create_file(&wi_group->wi_kobj, &wi_auto_attr.attr);
 +	if (err)
 +		goto err_put_kobj;
-+	wi_group->auto_kobj_attr = wi_auto_attr;
 +
  	for_each_online_node(nid) {
  		if (!node_state(nid, N_MEMORY))

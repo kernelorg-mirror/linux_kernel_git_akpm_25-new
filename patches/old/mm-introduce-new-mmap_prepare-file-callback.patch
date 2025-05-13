@@ -1,8 +1,8 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: introduce new .mmap_prepare() file callback
-Date: Wed, 7 May 2025 12:03:34 +0100
+Date: Fri, 9 May 2025 13:13:34 +0100
 
-Patch series "eliminate mmap() retry merge, add .mmap_prepare hook".
+Patch series "eliminate mmap() retry merge, add .mmap_prepare hook", v2.
 
 During the mmap() of a file-backed mapping, we invoke the underlying
 driver file's mmap() callback in order to perform driver/file system
@@ -157,9 +157,10 @@ exclusive, so we permit only one to be invoked at a time.
 
 Update vma userland test stubs to account for changes.
 
-Link: https://lkml.kernel.org/r/cover.1746615512.git.lorenzo.stoakes@oracle.com
-Link: https://lkml.kernel.org/r/c958ac6932eb8dd9ddbd2363bc2d242ff244341b.1746615512.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/cover.1746792520.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/adb36a7c4affd7393b2fc4b54cc5cfe211e41f71.1746792520.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Al Viro <viro@zeniv.linux.org.uk>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: David Hildenbrand <david@redhat.com>
@@ -170,17 +171,16 @@ Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/fs.h               |   38 +++++++++++++
- include/linux/mm_types.h         |   24 ++++++++
+ include/linux/fs.h               |   25 ++++++++++
+ include/linux/mm_types.h         |   24 ++++++++++
  mm/memory.c                      |    3 -
  mm/mmap.c                        |    2 
- mm/vma.c                         |   70 +++++++++++++++++++++++++
- tools/testing/vma/vma_internal.h |   79 +++++++++++++++++++++++++++--
- 6 files changed, 208 insertions(+), 8 deletions(-)
+ mm/vma.c                         |   68 ++++++++++++++++++++++++++++-
+ tools/testing/vma/vma_internal.h |   66 ++++++++++++++++++++++++++--
+ 6 files changed, 180 insertions(+), 8 deletions(-)
 
 --- a/include/linux/fs.h~mm-introduce-new-mmap_prepare-file-callback
 +++ a/include/linux/fs.h
@@ -192,32 +192,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  } __randomize_layout;
  
  /* Supports async buffered reads */
-@@ -2238,11 +2239,48 @@ struct inode_operations {
+@@ -2238,11 +2239,35 @@ struct inode_operations {
  	struct offset_ctx *(*get_offset_ctx)(struct inode *inode);
  } ____cacheline_aligned;
  
-+static inline bool file_has_deprecated_mmap_hook(struct file *file)
-+{
-+	return file->f_op->mmap;
-+}
-+
-+static inline bool file_has_mmap_prepare_hook(struct file *file)
-+{
-+	return file->f_op->mmap_prepare;
-+}
-+
 +/* Did the driver provide valid mmap hook configuration? */
 +static inline bool file_has_valid_mmap_hooks(struct file *file)
 +{
-+	bool has_mmap = file_has_deprecated_mmap_hook(file);
-+	bool has_mmap_prepare = file_has_mmap_prepare_hook(file);
++	bool has_mmap = file->f_op->mmap;
++	bool has_mmap_prepare = file->f_op->mmap_prepare;
 +
 +	/* Hooks are mutually exclusive. */
-+	if (has_mmap && has_mmap_prepare)
++	if (WARN_ON_ONCE(has_mmap && has_mmap_prepare))
 +		return false;
-+
-+	/* But at least one must be specified. */
-+	if (!has_mmap && !has_mmap_prepare)
++	if (WARN_ON_ONCE(!has_mmap && !has_mmap_prepare))
 +		return false;
 +
 +	return true;
@@ -225,8 +213,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
  {
-+	/* If the driver specifies .mmap_prepare() this call is invalid. */
-+	if (file_has_mmap_prepare_hook(file))
++	if (WARN_ON_ONCE(file->f_op->mmap_prepare))
 +		return -EINVAL;
 +
  	return file->f_op->mmap(file, vma);
@@ -327,7 +314,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	vma->vm_file = get_file(map->file);
 +
-+	if (!file_has_deprecated_mmap_hook(map->file))
++	if (!map->file->f_op->mmap)
 +		return 0;
 +
  	error = mmap_file(vma->vm_file, vma);
@@ -342,7 +329,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (vma_iter_prealloc(vmi, vma)) {
  		error = -ENOMEM;
-@@ -2528,6 +2538,58 @@ static void __mmap_complete(struct mmap_
+@@ -2528,6 +2538,56 @@ static void __mmap_complete(struct mmap_
  	vma_set_page_prot(vma);
  }
  
@@ -370,8 +357,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		.vm_flags = map->flags,
 +		.page_prot = map->page_prot,
 +	};
-+
-+	VM_WARN_ON(!file_has_valid_mmap_hooks(map->file));
 +
 +	/* Invoke the hook. */
 +	err = __call_mmap_prepare(map->file, &desc);
@@ -401,11 +386,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static unsigned long __mmap_region(struct file *file, unsigned long addr,
  		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
  		struct list_head *uf)
-@@ -2535,10 +2597,13 @@ static unsigned long __mmap_region(struc
+@@ -2535,10 +2595,13 @@ static unsigned long __mmap_region(struc
  	struct mm_struct *mm = current->mm;
  	struct vm_area_struct *vma = NULL;
  	int error;
-+	bool have_mmap_prepare = file && file_has_mmap_prepare_hook(file);
++	bool have_mmap_prepare = file && file->f_op->mmap_prepare;
  	VMA_ITERATOR(vmi, mm, addr);
  	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file);
  
@@ -415,7 +400,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (error)
  		goto abort_munmap;
  
-@@ -2556,6 +2621,9 @@ static unsigned long __mmap_region(struc
+@@ -2556,6 +2619,9 @@ static unsigned long __mmap_region(struc
  			goto unacct_error;
  	}
  
@@ -480,32 +465,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline int shmem_zero_setup(struct vm_area_struct *)
  {
  	return 0;
-@@ -1405,4 +1432,46 @@ static inline void free_anon_vma_name(st
+@@ -1405,4 +1432,33 @@ static inline void free_anon_vma_name(st
  	(void)vma;
  }
  
-+static inline bool file_has_deprecated_mmap_hook(struct file *file)
-+{
-+	return file->f_op->mmap;
-+}
-+
-+static inline bool file_has_mmap_prepare_hook(struct file *file)
-+{
-+	return file->f_op->mmap_prepare;
-+}
-+
 +/* Did the driver provide valid mmap hook configuration? */
 +static inline bool file_has_valid_mmap_hooks(struct file *file)
 +{
-+	bool has_mmap = file_has_deprecated_mmap_hook(file);
-+	bool has_mmap_prepare = file_has_mmap_prepare_hook(file);
++	bool has_mmap = file->f_op->mmap;
++	bool has_mmap_prepare = file->f_op->mmap_prepare;
 +
 +	/* Hooks are mutually exclusive. */
-+	if (has_mmap && has_mmap_prepare)
++	if (WARN_ON_ONCE(has_mmap && has_mmap_prepare))
 +		return false;
-+
-+	/* But at least one must be specified. */
-+	if (!has_mmap && !has_mmap_prepare)
++	if (WARN_ON_ONCE(!has_mmap && !has_mmap_prepare))
 +		return false;
 +
 +	return true;
@@ -513,8 +486,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static inline int call_mmap(struct file *file, struct vm_area_struct *vma)
 +{
-+	/* If the driver specifies .mmap_prepare() this call is invalid. */
-+	if (file_has_mmap_prepare_hook(file))
++	if (WARN_ON_ONCE(file->f_op->mmap_prepare))
 +		return -EINVAL;
 +
 +	return file->f_op->mmap(file, vma);
