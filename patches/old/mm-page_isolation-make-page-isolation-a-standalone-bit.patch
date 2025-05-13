@@ -1,8 +1,8 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/page_isolation: make page isolation a standalone bit
-Date: Wed, 7 May 2025 17:10:56 -0400
+Date: Fri, 9 May 2025 16:01:08 -0400
 
-Patch series "Make MIGRATE_ISOLATE a standalone bit", v3.
+Patch series "Make MIGRATE_ISOLATE a standalone bit", v4.
 
 This patchset moves MIGRATE_ISOLATE to a standalone bit to avoid being
 overwritten during pageblock isolation process.  Currently,
@@ -24,6 +24,7 @@ change is observed:
 2. I used perf to collect stats of dd from /dev/random to a 40GB tmpfs
    file and find get_pfnblock_flags_mask() takes about 0.05% of the
    process with and without this patchset across 3 runs.
+
 
 Design
 ======
@@ -47,7 +48,8 @@ PB_migrate_skip, so that migratetype is not lost during pageblock
 isolation.  pageblock bits needs to be word aligned, so expand the number
 of pageblock bits from 4 to 8 and make PB_migrate_isolate bit 7.
 
-Link: https://lkml.kernel.org/r/20250507211059.2211628-2-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250509200111.3372279-1-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250509200111.3372279-2-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Brendan Jackman <jackmanb@google.com>
@@ -63,15 +65,15 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mmzone.h          |   17 +++++++++---
- include/linux/page-isolation.h  |    2 -
- include/linux/pageblock-flags.h |   33 +++++++++++++++++++++++-
- mm/page_alloc.c                 |   41 +++++++++++++++++++++++++++++-
- 4 files changed, 86 insertions(+), 7 deletions(-)
+ include/linux/mmzone.h          |   15 +++++++-----
+ include/linux/pageblock-flags.h |    9 ++++++-
+ mm/page_alloc.c                 |   36 +++++++++++++++++++++++++++++-
+ mm/page_isolation.c             |   11 +++++++++
+ 4 files changed, 63 insertions(+), 8 deletions(-)
 
 --- a/include/linux/mmzone.h~mm-page_isolation-make-page-isolation-a-standalone-bit
 +++ a/include/linux/mmzone.h
-@@ -106,14 +106,23 @@ static inline bool migratetype_is_mergea
+@@ -106,14 +106,17 @@ static inline bool migratetype_is_mergea
  
  extern int page_group_by_mobility_disabled;
  
@@ -82,20 +84,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define MIGRATETYPE_MASK (BIT(PB_migratetype_bits) - 1)
 +#endif
  
-+#ifdef CONFIG_MEMORY_ISOLATION
+-#define get_pageblock_migratetype(page)					\
+-	get_pfnblock_flags_mask(page, page_to_pfn(page), MIGRATETYPE_MASK)
 +unsigned long get_pageblock_migratetype(const struct page *page);
-+#else
- #define get_pageblock_migratetype(page)					\
- 	get_pfnblock_flags_mask(page, page_to_pfn(page), MIGRATETYPE_MASK)
++
++#define folio_migratetype(folio)					\
++	get_pageblock_migratetype(&folio->page)
  
 -#define folio_migratetype(folio)				\
 -	get_pfnblock_flags_mask(&folio->page, folio_pfn(folio),		\
 -			MIGRATETYPE_MASK)
-+#endif
-+
-+#define folio_migratetype(folio)					\
-+	get_pageblock_migratetype(&folio->page)
-+
  struct free_area {
  	struct list_head	free_list[MIGRATE_TYPES];
  	unsigned long		nr_free;
@@ -124,90 +122,42 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #if defined(CONFIG_HUGETLB_PAGE)
  
  #ifdef CONFIG_HUGETLB_PAGE_SIZE_VARIABLE
-@@ -99,4 +106,28 @@ static inline void set_pageblock_skip(st
- }
- #endif /* CONFIG_COMPACTION */
- 
-+#ifdef CONFIG_MEMORY_ISOLATION
-+#define get_pageblock_isolate(page) \
-+	get_pfnblock_flags_mask(page, page_to_pfn(page),	\
-+			PB_migrate_isolate_bit)
-+#define clear_pageblock_isolate(page) \
-+	set_pfnblock_flags_mask(page, 0, page_to_pfn(page),	\
-+			PB_migrate_isolate_bit)
-+#define set_pageblock_isolate(page) \
-+	set_pfnblock_flags_mask(page, PB_migrate_isolate_bit,	\
-+			page_to_pfn(page),			\
-+			PB_migrate_isolate_bit)
-+#else
-+static inline bool get_pageblock_isolate(struct page *page)
-+{
-+	return false;
-+}
-+static inline void clear_pageblock_isolate(struct page *page)
-+{
-+}
-+static inline void set_pageblock_isolate(struct page *page)
-+{
-+}
-+#endif /* CONFIG_MEMORY_ISOLATION */
-+
- #endif	/* PAGEBLOCK_FLAGS_H */
---- a/include/linux/page-isolation.h~mm-page_isolation-make-page-isolation-a-standalone-bit
-+++ a/include/linux/page-isolation.h
-@@ -5,7 +5,7 @@
- #ifdef CONFIG_MEMORY_ISOLATION
- static inline bool is_migrate_isolate_page(struct page *page)
- {
--	return get_pageblock_migratetype(page) == MIGRATE_ISOLATE;
-+	return get_pageblock_isolate(page);
- }
- static inline bool is_migrate_isolate(int migratetype)
- {
 --- a/mm/page_alloc.c~mm-page_isolation-make-page-isolation-a-standalone-bit
 +++ a/mm/page_alloc.c
-@@ -381,12 +381,40 @@ unsigned long get_pfnblock_flags_mask(co
+@@ -381,10 +381,31 @@ unsigned long get_pfnblock_flags_mask(co
  	return (word >> bitidx) & mask;
  }
  
-+#ifdef CONFIG_MEMORY_ISOLATION
 +unsigned long get_pageblock_migratetype(const struct page *page)
 +{
 +	unsigned long flags;
 +
 +	flags = get_pfnblock_flags_mask(page, page_to_pfn(page),
 +			MIGRATETYPE_MASK);
++#ifdef CONFIG_MEMORY_ISOLATION
 +	if (flags & PB_migrate_isolate_bit)
 +		return MIGRATE_ISOLATE;
-+
++#endif
 +	return flags;
 +}
 +
-+static __always_inline int get_pfnblock_migratetype(const struct page *page,
-+					unsigned long pfn)
-+{
+ static __always_inline int get_pfnblock_migratetype(const struct page *page,
+ 					unsigned long pfn)
+ {
+-	return get_pfnblock_flags_mask(page, pfn, MIGRATETYPE_MASK);
 +	unsigned long flags;
 +
 +	flags = get_pfnblock_flags_mask(page, pfn,
 +			MIGRATETYPE_MASK);
++#ifdef CONFIG_MEMORY_ISOLATION
 +	if (flags & PB_migrate_isolate_bit)
 +		return MIGRATE_ISOLATE;
-+
++#endif
 +	return flags;
-+}
-+#else
- static __always_inline int get_pfnblock_migratetype(const struct page *page,
- 					unsigned long pfn)
- {
- 	return get_pfnblock_flags_mask(page, pfn, MIGRATETYPE_MASK);
  }
  
-+#endif
-+
  /**
-  * set_pfnblock_flags_mask - Set the requested group of flags for a pageblock_nr_pages block of pages
-  * @page: The page within the block of interest
-@@ -402,8 +430,14 @@ void set_pfnblock_flags_mask(struct page
+@@ -402,8 +423,14 @@ void set_pfnblock_flags_mask(struct page
  	unsigned long bitidx, word_bitidx;
  	unsigned long word;
  
@@ -222,18 +172,38 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	bitmap = get_pageblock_bitmap(page, pfn);
  	bitidx = pfn_to_bitidx(page, pfn);
-@@ -426,7 +460,12 @@ void set_pageblock_migratetype(struct pa
+@@ -426,6 +453,13 @@ void set_pageblock_migratetype(struct pa
  		     migratetype < MIGRATE_PCPTYPES))
  		migratetype = MIGRATE_UNMOVABLE;
  
--	set_pfnblock_flags_mask(page, (unsigned long)migratetype,
 +#ifdef CONFIG_MEMORY_ISOLATION
-+	if (migratetype == MIGRATE_ISOLATE)
-+		set_pageblock_isolate(page);
-+	else
++	if (migratetype == MIGRATE_ISOLATE) {
++		set_pfnblock_flags_mask(page, PB_migrate_isolate_bit,
++				page_to_pfn(page), PB_migrate_isolate_bit);
++		return;
++	}
 +#endif
-+		set_pfnblock_flags_mask(page, (unsigned long)migratetype,
+ 	set_pfnblock_flags_mask(page, (unsigned long)migratetype,
  				page_to_pfn(page), MIGRATETYPE_MASK);
  }
+--- a/mm/page_isolation.c~mm-page_isolation-make-page-isolation-a-standalone-bit
++++ a/mm/page_isolation.c
+@@ -15,6 +15,17 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/page_isolation.h>
  
++static inline bool __maybe_unused get_pageblock_isolate(struct page *page)
++{
++	return get_pfnblock_flags_mask(page, page_to_pfn(page),
++			PB_migrate_isolate_bit);
++}
++static inline void clear_pageblock_isolate(struct page *page)
++{
++	set_pfnblock_flags_mask(page, 0, page_to_pfn(page),
++			PB_migrate_isolate_bit);
++}
++
+ /*
+  * This function checks whether the range [start_pfn, end_pfn) includes
+  * unmovable pages or not. The range must fall into a single pageblock and
 _
