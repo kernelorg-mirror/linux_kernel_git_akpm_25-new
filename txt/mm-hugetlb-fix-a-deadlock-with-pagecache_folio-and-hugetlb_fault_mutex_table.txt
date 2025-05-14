@@ -1,0 +1,143 @@
+From: Gavin Guo <gavinguo@igalia.com>
+Subject: mm/hugetlb: fix a deadlock with pagecache_folio and hugetlb_fault_mutex_table
+Date: Tue, 13 May 2025 17:34:48 +0800
+
+Fix a deadlock which can be triggered by an internal syzkaller [1]
+reproducer and captured by bpftrace script [2] and its log [3] in this
+scenario:
+
+Process 1                              Process 2
+---				       ---
+hugetlb_fault
+  mutex_lock(B) // take B
+  filemap_lock_hugetlb_folio
+    filemap_lock_folio
+      __filemap_get_folio
+        folio_lock(A) // take A
+  hugetlb_wp
+    mutex_unlock(B) // release B
+    ...                                hugetlb_fault
+    ...                                  mutex_lock(B) // take B
+                                         filemap_lock_hugetlb_folio
+                                           filemap_lock_folio
+                                             __filemap_get_folio
+                                               folio_lock(A) // blocked
+    unmap_ref_private
+    ...
+    mutex_lock(B) // retake and blocked
+
+This is a ABBA deadlock involving two locks:
+- Lock A: pagecache_folio lock
+- Lock B: hugetlb_fault_mutex_table lock
+
+The deadlock occurs between two processes as follows:
+
+1. The first process (let's call it Process 1) is handling a
+   copy-on-write (COW) operation on a hugepage via hugetlb_wp.  Due to
+   insufficient reserved hugetlb pages, Process 1, owner of the reserved
+   hugetlb page, attempts to unmap a hugepage owned by another process
+   (non-owner) to satisfy the reservation.  Before unmapping, Process 1
+   acquires lock B (hugetlb_fault_mutex_table lock) and then lock A
+   (pagecache_folio lock).  To proceed with the unmap, it releases Lock B
+   but retains Lock A.  After the unmap, Process 1 tries to reacquire Lock
+   B.  However, at this point, Lock B has already been acquired by another
+   process.
+
+2. The second process (Process 2) enters the hugetlb_fault handler
+   during the unmap operation.  It successfully acquires Lock B
+   (hugetlb_fault_mutex_table lock) that was just released by Process 1,
+   but then attempts to acquire Lock A (pagecache_folio lock), which is
+   still held by Process 1.
+
+As a result, Process 1 (holding Lock A) is blocked waiting for Lock B
+(held by Process 2), while Process 2 (holding Lock B) is blocked waiting
+for Lock A (held by Process 1), constructing a ABBA deadlock scenario.
+
+The solution here is to unlock the pagecache_folio and provide the
+pagecache_folio_unlocked variable to the caller to have the visibility
+over the pagecache_folio status for subsequent handling.
+
+The error message:
+INFO: task repro_20250402_:13229 blocked for more than 64 seconds.
+      Not tainted 6.15.0-rc3+ #24
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:repro_20250402_ state:D stack:25856 pid:13229 tgid:13228 ppid:3513   task_flags:0x400040 flags:0x00004006
+Call Trace:
+ <TASK>
+ __schedule+0x1755/0x4f50
+ schedule+0x158/0x330
+ schedule_preempt_disabled+0x15/0x30
+ __mutex_lock+0x75f/0xeb0
+ hugetlb_wp+0xf88/0x3440
+ hugetlb_fault+0x14c8/0x2c30
+ trace_clock_x86_tsc+0x20/0x20
+ do_user_addr_fault+0x61d/0x1490
+ exc_page_fault+0x64/0x100
+ asm_exc_page_fault+0x26/0x30
+RIP: 0010:__put_user_4+0xd/0x20
+ copy_process+0x1f4a/0x3d60
+ kernel_clone+0x210/0x8f0
+ __x64_sys_clone+0x18d/0x1f0
+ do_syscall_64+0x6a/0x120
+ entry_SYSCALL_64_after_hwframe+0x76/0x7e
+RIP: 0033:0x41b26d
+ </TASK>
+INFO: task repro_20250402_:13229 is blocked on a mutex likely owned by task repro_20250402_:13250.
+task:repro_20250402_ state:D stack:28288 pid:13250 tgid:13228 ppid:3513   task_flags:0x400040 flags:0x00000006
+Call Trace:
+ <TASK>
+ __schedule+0x1755/0x4f50
+ schedule+0x158/0x330
+ io_schedule+0x92/0x110
+ folio_wait_bit_common+0x69a/0xba0
+ __filemap_get_folio+0x154/0xb70
+ hugetlb_fault+0xa50/0x2c30
+ trace_clock_x86_tsc+0x20/0x20
+ do_user_addr_fault+0xace/0x1490
+ exc_page_fault+0x64/0x100
+ asm_exc_page_fault+0x26/0x30
+RIP: 0033:0x402619
+ </TASK>
+INFO: task repro_20250402_:13250 blocked for more than 65 seconds.
+      Not tainted 6.15.0-rc3+ #24
+"echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+task:repro_20250402_ state:D stack:28288 pid:13250 tgid:13228 ppid:3513   task_flags:0x400040 flags:0x00000006
+Call Trace:
+ <TASK>
+ __schedule+0x1755/0x4f50
+ schedule+0x158/0x330
+ io_schedule+0x92/0x110
+ folio_wait_bit_common+0x69a/0xba0
+ __filemap_get_folio+0x154/0xb70
+ hugetlb_fault+0xa50/0x2c30
+ trace_clock_x86_tsc+0x20/0x20
+ do_user_addr_fault+0xace/0x1490
+ exc_page_fault+0x64/0x100
+ asm_exc_page_fault+0x26/0x30
+RIP: 0033:0x402619
+ </TASK>
+
+Showing all locks held in the system:
+1 lock held by khungtaskd/35:
+ #0: ffffffff879a7440 (rcu_read_lock){....}-{1:3}, at: debug_show_all_locks+0x30/0x180
+2 locks held by repro_20250402_/13229:
+ #0: ffff888017d801e0 (&mm->mmap_lock){++++}-{4:4}, at: lock_mm_and_find_vma+0x37/0x300
+ #1: ffff888000fec848 (&hugetlb_fault_mutex_table[i]){+.+.}-{4:4}, at: hugetlb_wp+0xf88/0x3440
+3 locks held by repro_20250402_/13250:
+ #0: ffff8880177f3d08 (vm_lock){++++}-{0:0}, at: do_user_addr_fault+0x41b/0x1490
+ #1: ffff888000fec848 (&hugetlb_fault_mutex_table[i]){+.+.}-{4:4}, at: hugetlb_fault+0x3b8/0x2c30
+ #2: ffff8880129500e8 (&resv_map->rw_sema){++++}-{4:4}, at: hugetlb_fault+0x494/0x2c30
+
+Link: https://drive.google.com/file/d/1DVRnIW-vSayU5J1re9Ct_br3jJQU6Vpb/view?usp=drive_link [1]
+Link: https://github.com/bboymimi/bpftracer/blob/master/scripts/hugetlb_lock_debug.bt [2]
+Link: https://drive.google.com/file/d/1bWq2-8o-BJAuhoHWX7zAhI6ggfhVzQUI/view?usp=sharing [3]
+Link: https://lkml.kernel.org/r/20250513093448.592150-1-gavinguo@igalia.com
+Fixes: 40549ba8f8e0 ("hugetlb: use new vma_lock for pmd sharing synchronization")
+Signed-off-by: Gavin Guo <gavinguo@igalia.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Florent Revest <revest@google.com>
+Cc: Gavin Shan <gshan@redhat.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: <stable@vger.kernel.org>
