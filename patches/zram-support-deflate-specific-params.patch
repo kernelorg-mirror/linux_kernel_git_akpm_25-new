@@ -1,0 +1,152 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: support deflate-specific params
+Date: Wed, 14 May 2025 11:47:51 +0900
+
+Introduce support of algorithm specific parameters in algorithm_params
+device attribute.  The expected format is algorithm.param=value.
+
+For starters, add support for deflate.winbits parameter.
+
+Link: https://lkml.kernel.org/r/20250514024825.1745489-3-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Reviewed-by: Mikhail Zaslonko <zaslonko@linux.ibm.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/block/zram/backend_deflate.c |   10 ++++++----
+ drivers/block/zram/zcomp.h           |    7 +++++++
+ drivers/block/zram/zram_drv.c        |   17 +++++++++++++++--
+ 3 files changed, 28 insertions(+), 6 deletions(-)
+
+--- a/drivers/block/zram/backend_deflate.c~zram-support-deflate-specific-params
++++ a/drivers/block/zram/backend_deflate.c
+@@ -8,7 +8,7 @@
+ #include "backend_deflate.h"
+ 
+ /* Use the same value as crypto API */
+-#define DEFLATE_DEF_WINBITS		11
++#define DEFLATE_DEF_WINBITS		(-11)
+ #define DEFLATE_DEF_MEMLEVEL		MAX_MEM_LEVEL
+ 
+ struct deflate_ctx {
+@@ -24,6 +24,8 @@ static int deflate_setup_params(struct z
+ {
+ 	if (params->level == ZCOMP_PARAM_NOT_SET)
+ 		params->level = Z_DEFAULT_COMPRESSION;
++	if (params->deflate.winbits == ZCOMP_PARAM_NOT_SET)
++		params->deflate.winbits = DEFLATE_DEF_WINBITS;
+ 
+ 	return 0;
+ }
+@@ -57,13 +59,13 @@ static int deflate_create(struct zcomp_p
+ 		return -ENOMEM;
+ 
+ 	ctx->context = zctx;
+-	sz = zlib_deflate_workspacesize(-DEFLATE_DEF_WINBITS, MAX_MEM_LEVEL);
++	sz = zlib_deflate_workspacesize(params->deflate.winbits, MAX_MEM_LEVEL);
+ 	zctx->cctx.workspace = vzalloc(sz);
+ 	if (!zctx->cctx.workspace)
+ 		goto error;
+ 
+ 	ret = zlib_deflateInit2(&zctx->cctx, params->level, Z_DEFLATED,
+-				-DEFLATE_DEF_WINBITS, DEFLATE_DEF_MEMLEVEL,
++				params->deflate.winbits, DEFLATE_DEF_MEMLEVEL,
+ 				Z_DEFAULT_STRATEGY);
+ 	if (ret != Z_OK)
+ 		goto error;
+@@ -73,7 +75,7 @@ static int deflate_create(struct zcomp_p
+ 	if (!zctx->dctx.workspace)
+ 		goto error;
+ 
+-	ret = zlib_inflateInit2(&zctx->dctx, -DEFLATE_DEF_WINBITS);
++	ret = zlib_inflateInit2(&zctx->dctx, params->deflate.winbits);
+ 	if (ret != Z_OK)
+ 		goto error;
+ 
+--- a/drivers/block/zram/zcomp.h~zram-support-deflate-specific-params
++++ a/drivers/block/zram/zcomp.h
+@@ -7,6 +7,10 @@
+ 
+ #define ZCOMP_PARAM_NOT_SET	INT_MIN
+ 
++struct deflate_params {
++	s32 winbits;
++};
++
+ /*
+  * Immutable driver (backend) parameters. The driver may attach private
+  * data to it (e.g. driver representation of the dictionary, etc.).
+@@ -17,6 +21,9 @@ struct zcomp_params {
+ 	void *dict;
+ 	size_t dict_sz;
+ 	s32 level;
++	union {
++		struct deflate_params deflate;
++	};
+ 
+ 	void *drv_data;
+ };
+--- a/drivers/block/zram/zram_drv.c~zram-support-deflate-specific-params
++++ a/drivers/block/zram/zram_drv.c
+@@ -1277,12 +1277,14 @@ static void comp_params_reset(struct zra
+ 
+ 	vfree(params->dict);
+ 	params->level = ZCOMP_PARAM_NOT_SET;
++	params->deflate.winbits = ZCOMP_PARAM_NOT_SET;
+ 	params->dict_sz = 0;
+ 	params->dict = NULL;
+ }
+ 
+ static int comp_params_store(struct zram *zram, u32 prio, s32 level,
+-			     const char *dict_path)
++			     const char *dict_path,
++			     struct deflate_params *deflate_params)
+ {
+ 	ssize_t sz = 0;
+ 
+@@ -1300,6 +1302,7 @@ static int comp_params_store(struct zram
+ 
+ 	zram->params[prio].dict_sz = sz;
+ 	zram->params[prio].level = level;
++	zram->params[prio].deflate.winbits = deflate_params->winbits;
+ 	return 0;
+ }
+ 
+@@ -1310,9 +1313,12 @@ static ssize_t algorithm_params_store(st
+ {
+ 	s32 prio = ZRAM_PRIMARY_COMP, level = ZCOMP_PARAM_NOT_SET;
+ 	char *args, *param, *val, *algo = NULL, *dict_path = NULL;
++	struct deflate_params deflate_params;
+ 	struct zram *zram = dev_to_zram(dev);
+ 	int ret;
+ 
++	deflate_params.winbits = ZCOMP_PARAM_NOT_SET;
++
+ 	args = skip_spaces(buf);
+ 	while (*args) {
+ 		args = next_arg(args, &param, &val);
+@@ -1343,6 +1349,13 @@ static ssize_t algorithm_params_store(st
+ 			dict_path = val;
+ 			continue;
+ 		}
++
++		if (!strcmp(param, "deflate.winbits")) {
++			ret = kstrtoint(val, 10, &deflate_params.winbits);
++			if (ret)
++				return ret;
++			continue;
++		}
+ 	}
+ 
+ 	/* Lookup priority by algorithm name */
+@@ -1364,7 +1377,7 @@ static ssize_t algorithm_params_store(st
+ 	if (prio < ZRAM_PRIMARY_COMP || prio >= ZRAM_MAX_COMPS)
+ 		return -EINVAL;
+ 
+-	ret = comp_params_store(zram, prio, level, dict_path);
++	ret = comp_params_store(zram, prio, level, dict_path, &deflate_params);
+ 	return ret ? ret : len;
+ }
+ 
+_
