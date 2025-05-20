@@ -1,0 +1,142 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: memcg: nmi safe memcg stats for specific archs
+Date: Sun, 18 May 2025 23:31:39 -0700
+
+There are archs which have NMI but does not support this_cpu_* ops safely
+in the nmi context but they support safe atomic ops in nmi context.  For
+such archs, let's add infra to use atomic ops for the memcg stats which
+can be updated in nmi.
+
+At the moment, the memcg stats which get updated in the objcg charging
+path are MEMCG_KMEM, NR_SLAB_RECLAIMABLE_B & NR_SLAB_UNRECLAIMABLE_B. 
+Rather than adding support for all memcg stats to be nmi safe, let's just
+add infra to make these three stats nmi safe which this patch is doing.
+
+Link: https://lkml.kernel.org/r/20250519063142.111219-3-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memcontrol.h |   10 +++++++
+ init/Kconfig               |    7 +++++
+ mm/memcontrol.c            |   49 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 66 insertions(+)
+
+--- a/include/linux/memcontrol.h~memcg-nmi-safe-memcg-stats-for-specific-archs
++++ a/include/linux/memcontrol.h
+@@ -113,6 +113,12 @@ struct mem_cgroup_per_node {
+ 	CACHELINE_PADDING(_pad2_);
+ 	unsigned long		lru_zone_size[MAX_NR_ZONES][NR_LRU_LISTS];
+ 	struct mem_cgroup_reclaim_iter	iter;
++
++#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
++	/* slab stats for nmi context */
++	atomic_t		slab_reclaimable;
++	atomic_t		slab_unreclaimable;
++#endif
+ };
+ 
+ struct mem_cgroup_threshold {
+@@ -236,6 +242,10 @@ struct mem_cgroup {
+ 	atomic_long_t		memory_events[MEMCG_NR_MEMORY_EVENTS];
+ 	atomic_long_t		memory_events_local[MEMCG_NR_MEMORY_EVENTS];
+ 
++#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
++	/* MEMCG_KMEM for nmi context */
++	atomic_t		kmem_stat;
++#endif
+ 	/*
+ 	 * Hint of reclaim pressure for socket memroy management. Note
+ 	 * that this indicator should NOT be used in legacy cgroup mode
+--- a/init/Kconfig~memcg-nmi-safe-memcg-stats-for-specific-archs
++++ a/init/Kconfig
+@@ -1013,6 +1013,13 @@ config MEMCG_NMI_UNSAFE
+ 	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && !ARCH_HAVE_NMI_SAFE_CMPXCHG
+ 	default y
+ 
++config MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
++	bool
++	depends on MEMCG
++	depends on HAVE_NMI
++	depends on !ARCH_HAS_NMI_SAFE_THIS_CPU_OPS && ARCH_HAVE_NMI_SAFE_CMPXCHG
++	default y
++
+ config MEMCG_V1
+ 	bool "Legacy cgroup v1 memory controller"
+ 	depends on MEMCG
+--- a/mm/memcontrol.c~memcg-nmi-safe-memcg-stats-for-specific-archs
++++ a/mm/memcontrol.c
+@@ -3968,6 +3968,53 @@ static void mem_cgroup_stat_aggregate(st
+ 	}
+ }
+ 
++#ifdef CONFIG_MEMCG_NMI_SAFETY_REQUIRES_ATOMIC
++static void flush_nmi_stats(struct mem_cgroup *memcg, struct mem_cgroup *parent,
++			    int cpu)
++{
++	int nid;
++
++	if (atomic_read(&memcg->kmem_stat)) {
++		int kmem = atomic_xchg(&memcg->kmem_stat, 0);
++		int index = memcg_stats_index(MEMCG_KMEM);
++
++		memcg->vmstats->state[index] += kmem;
++		if (parent)
++			parent->vmstats->state_pending[index] += kmem;
++	}
++
++	for_each_node_state(nid, N_MEMORY) {
++		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
++		struct lruvec_stats *lstats = pn->lruvec_stats;
++		struct lruvec_stats *plstats = NULL;
++
++		if (parent)
++			plstats = parent->nodeinfo[nid]->lruvec_stats;
++
++		if (atomic_read(&pn->slab_reclaimable)) {
++			int slab = atomic_xchg(&pn->slab_reclaimable, 0);
++			int index = memcg_stats_index(NR_SLAB_RECLAIMABLE_B);
++
++			lstats->state[index] += slab;
++			if (plstats)
++				plstats->state_pending[index] += slab;
++		}
++		if (atomic_read(&pn->slab_unreclaimable)) {
++			int slab = atomic_xchg(&pn->slab_unreclaimable, 0);
++			int index = memcg_stats_index(NR_SLAB_UNRECLAIMABLE_B);
++
++			lstats->state[index] += slab;
++			if (plstats)
++				plstats->state_pending[index] += slab;
++		}
++	}
++}
++#else
++static void flush_nmi_stats(struct mem_cgroup *memcg, struct mem_cgroup *parent,
++			    int cpu)
++{}
++#endif
++
+ static void mem_cgroup_css_rstat_flush(struct cgroup_subsys_state *css, int cpu)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+@@ -3976,6 +4023,8 @@ static void mem_cgroup_css_rstat_flush(s
+ 	struct aggregate_control ac;
+ 	int nid;
+ 
++	flush_nmi_stats(memcg, parent, cpu);
++
+ 	statc = per_cpu_ptr(memcg->vmstats_percpu, cpu);
+ 
+ 	ac = (struct aggregate_control) {
+_
