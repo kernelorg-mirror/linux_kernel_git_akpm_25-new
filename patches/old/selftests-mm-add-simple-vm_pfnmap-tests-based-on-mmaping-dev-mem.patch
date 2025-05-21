@@ -1,6 +1,6 @@
 From: David Hildenbrand <david@redhat.com>
 Subject: selftests/mm: add simple VM_PFNMAP tests based on mmap'ing /dev/mem
-Date: Fri, 9 May 2025 00:20:41 +0200
+Date: Fri, 9 May 2025 17:30:32 +0200
 
 Let's test some basic functionality using /dev/mem.  These tests will
 implicitly cover some PAT (Page Attribute Handling) handling on x86.
@@ -12,27 +12,28 @@ skipped.
 On current x86-64 with PAT inside a VM, all tests pass:
 
 	TAP version 13
-	1..19
-	ok 1 madvise(MADV_DONTNEED) should be disallowed
-	ok 2 madvise(MADV_DONTNEED_LOCKED) should be disallowed
-	ok 3 madvise(MADV_FREE) should be disallowed
-	ok 4 madvise(MADV_WIPEONFORK) should be disallowed
-	ok 5 madvise(MADV_COLD) should be disallowed
-	ok 6 madvise(MADV_PAGEOUT) should be disallowed
-	ok 7 madvise(MADV_POPULATE_READ) should be disallowed
-	ok 8 madvise(MADV_POPULATE_WRITE) should be disallowed
-	ok 9 munmap() splitting
-	ok 10 mmap() after splitting
-	ok 11 mremap(MREMAP_FIXED)
-	ok 12 mremap() shrinking
-	ok 13 mremap() growing should be disallowed
-	ok 14 mprotect(PROT_NONE)
-	ok 15 SIGSEGV expected
-	ok 16 mprotect(PROT_READ)
-	ok 17 SIGSEGV not expected
-	ok 18 fork()
-	ok 19 SIGSEGV in child not expected
-	# Totals: pass:19 fail:0 xfail:0 xpass:0 skip:0 error:0
+	1..6
+	# Starting 6 tests from 1 test cases.
+	#  RUN           pfnmap.madvise_disallowed ...
+	#            OK  pfnmap.madvise_disallowed
+	ok 1 pfnmap.madvise_disallowed
+	#  RUN           pfnmap.munmap_split ...
+	#            OK  pfnmap.munmap_split
+	ok 2 pfnmap.munmap_split
+	#  RUN           pfnmap.mremap_fixed ...
+	#            OK  pfnmap.mremap_fixed
+	ok 3 pfnmap.mremap_fixed
+	#  RUN           pfnmap.mremap_shrink ...
+	#            OK  pfnmap.mremap_shrink
+	ok 4 pfnmap.mremap_shrink
+	#  RUN           pfnmap.mremap_expand ...
+	#            OK  pfnmap.mremap_expand
+	ok 5 pfnmap.mremap_expand
+	#  RUN           pfnmap.fork ...
+	#            OK  pfnmap.fork
+	ok 6 pfnmap.fork
+	# PASSED: 6 / 6 tests passed.
+	# Totals: pass:6 fail:0 xfail:0 xpass:0 skip:0 error:0
 
 However, we are able to trigger:
 
@@ -42,19 +43,32 @@ There are probably more things worth testing in the future, such as
 MAP_PRIVATE handling.  But this set of tests is sufficient to cover most
 of the things we will rework regarding PAT handling.
 
-Link: https://lkml.kernel.org/r/20250508222041.1647645-1-david@redhat.com
+Link: https://lkml.kernel.org/r/20250509153033.952746-1-david@redhat.com
 Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Shuah Khan <shuah@kernel.org>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Peter Xu <peterx@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/mm/Makefile |    1 
- tools/testing/selftests/mm/pfnmap.c |  278 ++++++++++++++++++++++++++
- 2 files changed, 279 insertions(+)
+ tools/testing/selftests/mm/.gitignore     |    1 
+ tools/testing/selftests/mm/Makefile       |    1 
+ tools/testing/selftests/mm/pfnmap.c       |  196 ++++++++++++++++++++
+ tools/testing/selftests/mm/run_vmtests.sh |    4 
+ 4 files changed, 202 insertions(+)
 
+--- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-simple-vm_pfnmap-tests-based-on-mmaping-dev-mem
++++ a/tools/testing/selftests/mm/.gitignore
+@@ -20,6 +20,7 @@ mremap_test
+ on-fault-limit
+ transhuge-stress
+ pagemap_ioctl
++pfnmap
+ *.tmp*
+ protection_keys
+ protection_keys_32
 --- a/tools/testing/selftests/mm/Makefile~selftests-mm-add-simple-vm_pfnmap-tests-based-on-mmaping-dev-mem
 +++ a/tools/testing/selftests/mm/Makefile
 @@ -84,6 +84,7 @@ TEST_GEN_FILES += mremap_test
@@ -69,7 +83,7 @@ diff --git a/tools/testing/selftests/mm/pfnmap.c a/tools/testing/selftests/mm/pf
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/pfnmap.c
-@@ -0,0 +1,278 @@
+@@ -0,0 +1,196 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Basic VM_PFNMAP tests relying on mmap() of '/dev/mem'
@@ -91,261 +105,199 @@ new file mode 100644
 +#include <sys/mman.h>
 +#include <sys/wait.h>
 +
-+#include "../kselftest.h"
++#include "../kselftest_harness.h"
 +#include "vm_util.h"
 +
-+static size_t pagesize;
-+static int pagemap_fd;
-+static int dev_mem_fd;
-+static sigjmp_buf env;
++static sigjmp_buf sigjmp_buf_env;
 +
 +static void signal_handler(int sig)
 +{
-+	if (sig == SIGSEGV)
-+		siglongjmp(env, 1);
-+	siglongjmp(env, 2);
++	siglongjmp(sigjmp_buf_env, -EFAULT);
 +}
 +
-+static void sense_support(void)
++static int test_read_access(char *addr, size_t size, size_t pagesize)
 +{
-+	char *addr, tmp;
++	size_t offs;
 +	int ret;
 +
-+	dev_mem_fd = open("/dev/mem", O_RDONLY);
-+	if (dev_mem_fd < 0)
-+		ksft_exit_skip("Cannot open '/dev/mem': %s\n", strerror(errno));
++	if (signal(SIGSEGV, signal_handler) == SIG_ERR)
++		return -EINVAL;
 +
-+	/* We'll require the first two pages throughout our tests ... */
-+	addr = mmap(0, pagesize * 2, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_skip("Cannot mmap '/dev/mem'");
-+
-+	/* ... and want to be able to read from them. */
-+	ret = sigsetjmp(env, 1);
++	ret = sigsetjmp(sigjmp_buf_env, 1);
 +	if (!ret) {
-+		tmp = *addr + *(addr + pagesize);
-+		asm volatile("" : "+r" (tmp));
++		for (offs = 0; offs < size; offs += pagesize)
++			/* Force a read that the compiler cannot optimize out. */
++			*((volatile char *)(addr + offs));
 +	}
-+	if (ret)
-+		ksft_exit_skip("Cannot read-access mmap'ed '/dev/mem'");
++	if (signal(SIGSEGV, signal_handler) == SIG_ERR)
++		return -EINVAL;
 +
-+	munmap(addr, pagesize * 2);
++	return ret;
 +}
 +
-+static void test_madvise(void)
++FIXTURE(pfnmap)
 +{
-+#define INIT_ADVICE(nr) { nr, #nr}
-+	const struct {
-+		int nr;
-+		const char *name;
-+	} advices[] = {
-+		INIT_ADVICE(MADV_DONTNEED),
-+		INIT_ADVICE(MADV_DONTNEED_LOCKED),
-+		INIT_ADVICE(MADV_FREE),
-+		INIT_ADVICE(MADV_WIPEONFORK),
-+		INIT_ADVICE(MADV_COLD),
-+		INIT_ADVICE(MADV_PAGEOUT),
-+		INIT_ADVICE(MADV_POPULATE_READ),
-+		INIT_ADVICE(MADV_POPULATE_WRITE),
-+	};
-+	char *addr;
-+	int ret, i;
++	size_t pagesize;
++	int dev_mem_fd;
++	char *addr1;
++	size_t size1;
++	char *addr2;
++	size_t size2;
++};
 +
-+	addr = mmap(0, pagesize, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
++FIXTURE_SETUP(pfnmap)
++{
++	self->pagesize = getpagesize();
++
++	self->dev_mem_fd = open("/dev/mem", O_RDONLY);
++	if (self->dev_mem_fd < 0)
++		SKIP(return, "Cannot open '/dev/mem'\n");
++
++	/* We'll require the first two pages throughout our tests ... */
++	self->size1 = self->pagesize * 2;
++	self->addr1 = mmap(NULL, self->size1, PROT_READ, MAP_SHARED,
++			   self->dev_mem_fd, 0);
++	if (self->addr1 == MAP_FAILED)
++		SKIP(return, "Cannot mmap '/dev/mem'\n");
++
++	/* ... and want to be able to read from them. */
++	if (test_read_access(self->addr1, self->size1, self->pagesize))
++		SKIP(return, "Cannot read-access mmap'ed '/dev/mem'\n");
++
++	self->size2 = 0;
++	self->addr2 = MAP_FAILED;
++}
++
++FIXTURE_TEARDOWN(pfnmap)
++{
++	if (self->addr2 != MAP_FAILED)
++		munmap(self->addr2, self->size2);
++	if (self->addr1 != MAP_FAILED)
++		munmap(self->addr1, self->size1);
++	if (self->dev_mem_fd >= 0)
++		close(self->dev_mem_fd);
++}
++
++TEST_F(pfnmap, madvise_disallowed)
++{
++	int advices[] = {
++		MADV_DONTNEED,
++		MADV_DONTNEED_LOCKED,
++		MADV_FREE,
++		MADV_WIPEONFORK,
++		MADV_COLD,
++		MADV_PAGEOUT,
++		MADV_POPULATE_READ,
++		MADV_POPULATE_WRITE,
++	};
++	int i;
 +
 +	/* All these advices must be rejected. */
 +	for (i = 0; i < ARRAY_SIZE(advices); i++) {
-+		ret = madvise(addr, pagesize, advices[i].nr);
-+		ksft_test_result(ret && errno == EINVAL,
-+				 "madvise(%s) should be disallowed\n",
-+				 advices[i].name);
++		EXPECT_LT(madvise(self->addr1, self->pagesize, advices[i]), 0);
++		EXPECT_EQ(errno, EINVAL);
 +	}
-+
-+	munmap(addr, pagesize);
 +}
 +
-+static void test_munmap_splitting(void)
++TEST_F(pfnmap, munmap_split)
 +{
-+	char *addr1, *addr2;
-+	int ret;
++	/*
++	 * Unmap the first page. This munmap() call is not really expected to
++	 * fail, but we might be able to trigger other internal issues.
++	 */
++	ASSERT_EQ(munmap(self->addr1, self->pagesize), 0);
 +
-+	addr1 = mmap(0, pagesize * 2, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr1 == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
-+
-+	/* Unmap the first pages. */
-+	ret = munmap(addr1, pagesize);
-+	ksft_test_result(!ret, "munmap() splitting\n");
-+
-+	/* Remap the first page while the second page is still mapped. */
-+	addr2 = mmap(0, pagesize, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	ksft_test_result(addr2 != MAP_FAILED, "mmap() after splitting\n");
-+
-+	if (addr2 != MAP_FAILED)
-+		munmap(addr2, pagesize);
-+	if (!ret)
-+		munmap(addr1 + pagesize, pagesize);
-+	else
-+		munmap(addr1, pagesize * 2);
++	/*
++	 * Remap the first page while the second page is still mapped. This
++	 * makes sure that any PAT tracking on x86 will allow for mmap()'ing
++	 * a page again while some parts of the first mmap() are still
++	 * around.
++	 */
++	self->size2 = self->pagesize;
++	self->addr2 = mmap(NULL, self->pagesize, PROT_READ, MAP_SHARED,
++			   self->dev_mem_fd, 0);
++	ASSERT_NE(self->addr2, MAP_FAILED);
 +}
 +
-+static void test_mremap_fixed(void)
++TEST_F(pfnmap, mremap_fixed)
 +{
-+	char *addr, *new_addr, *ret;
-+
-+	addr = mmap(0, pagesize * 2, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
++	char *ret;
 +
 +	/* Reserve a destination area. */
-+	new_addr = mmap(0, pagesize * 2, PROT_READ, MAP_ANON | MAP_PRIVATE, -1, 0);
-+	if (new_addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
++	self->size2 = self->size1;
++	self->addr2 = mmap(NULL, self->size2, PROT_READ, MAP_ANON | MAP_PRIVATE,
++			   -1, 0);
++	ASSERT_NE(self->addr2, MAP_FAILED);
 +
 +	/* mremap() over our destination. */
-+	ret = mremap(addr, pagesize * 2, pagesize * 2,
-+		     MREMAP_FIXED | MREMAP_MAYMOVE, new_addr);
-+	ksft_test_result(ret == new_addr, "mremap(MREMAP_FIXED)\n");
-+	if (ret != new_addr)
-+		munmap(new_addr, pagesize * 2);
-+	munmap(addr, pagesize * 2);
++	ret = mremap(self->addr1, self->size1, self->size2,
++		     MREMAP_FIXED | MREMAP_MAYMOVE, self->addr2);
++	ASSERT_NE(ret, MAP_FAILED);
 +}
 +
-+static void test_mremap_shrinking(void)
++TEST_F(pfnmap, mremap_shrink)
 +{
-+	char *addr, *ret;
-+
-+	addr = mmap(0, pagesize * 2, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
++	char *ret;
 +
 +	/* Shrinking is expected to work. */
-+	ret = mremap(addr, pagesize * 2, pagesize, 0);
-+	ksft_test_result(ret == addr, "mremap() shrinking\n");
-+	if (ret != addr)
-+		munmap(addr, pagesize * 2);
-+	else
-+		munmap(addr, pagesize);
++	ret = mremap(self->addr1, self->size1, self->size1 - self->pagesize, 0);
++	ASSERT_NE(ret, MAP_FAILED);
 +}
 +
-+static void test_mremap_growing(void)
++TEST_F(pfnmap, mremap_expand)
 +{
-+	char *addr, *ret;
-+
-+	addr = mmap(0, pagesize, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
-+
-+	/* Growing is not expected to work. */
-+	ret = mremap(addr, pagesize, pagesize * 2, MREMAP_MAYMOVE);
-+	ksft_test_result(ret == MAP_FAILED,
-+			 "mremap() growing should be disallowed\n");
-+	if (ret == MAP_FAILED)
-+		munmap(addr, pagesize);
-+	else
-+		munmap(ret, pagesize * 2);
++	/*
++	 * Growing is not expected to work, and getting it right would
++	 * be challenging. So this test primarily serves as an early warning
++	 * that something that probably should never work suddenly works.
++	 */
++	self->size2 = self->size1 + self->pagesize;
++	self->addr2 = mremap(self->addr1, self->size1, self->size2, MREMAP_MAYMOVE);
++	ASSERT_EQ(self->addr2, MAP_FAILED);
 +}
 +
-+static void test_mprotect(void)
++TEST_F(pfnmap, fork)
 +{
-+	char *addr, tmp;
++	pid_t pid;
 +	int ret;
 +
-+	addr = mmap(0, pagesize, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
++	/* fork() a child and test if the child can access the pages. */
++	pid = fork();
++	ASSERT_GE(pid, 0);
 +
-+	/* With PROT_NONE, read access must result in SIGSEGV. */
-+	ret = mprotect(addr, pagesize, PROT_NONE);
-+	ksft_test_result(!ret, "mprotect(PROT_NONE)\n");
-+
-+	ret = sigsetjmp(env, 1);
-+	if (!ret) {
-+		tmp = *addr;
-+		asm volatile("" : "+r" (tmp));
++	if (!pid) {
++		EXPECT_EQ(test_read_access(self->addr1, self->size1,
++					   self->pagesize), 0);
++		exit(0);
 +	}
-+	ksft_test_result(ret == 1, "SIGSEGV expected\n");
 +
-+	/* With PROT_READ, read access must again succeed. */
-+	ret = mprotect(addr, pagesize, PROT_READ);
-+	ksft_test_result(!ret, "mprotect(PROT_READ)\n");
-+
-+	ret = sigsetjmp(env, 1);
-+	if (!ret) {
-+		tmp = *addr;
-+		asm volatile("" : "+r" (tmp));
-+	}
-+	ksft_test_result(!ret, "SIGSEGV not expected\n");
-+
-+	munmap(addr, pagesize);
-+}
-+
-+static void test_fork(void)
-+{
-+	char *addr, tmp;
-+	int ret;
-+
-+	addr = mmap(0, pagesize, PROT_READ, MAP_SHARED, dev_mem_fd, 0);
-+	if (addr == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap() failed: %s\n", strerror(errno));
-+
-+	/* fork() a child and test if the child can access the page. */
-+	ret = fork();
-+	if (ret < 0) {
-+		ksft_test_result_fail("fork()\n");
-+		goto out;
-+	} else if (!ret) {
-+		ret = sigsetjmp(env, 1);
-+		if (!ret) {
-+			tmp = *addr;
-+			asm volatile("" : "+r" (tmp));
-+		}
-+		/* Return the result to the parent. */
-+		exit(ret);
-+	}
-+	ksft_test_result_pass("fork()\n");
-+
-+	/* Wait for our child and obtain the result. */
 +	wait(&ret);
 +	if (WIFEXITED(ret))
 +		ret = WEXITSTATUS(ret);
 +	else
 +		ret = -EINVAL;
-+
-+	ksft_test_result(!ret, "SIGSEGV in child not expected\n");
-+out:
-+	munmap(addr, pagesize);
++	ASSERT_EQ(ret, 0);
 +}
 +
-+int main(int argc, char **argv)
-+{
-+	int err;
++TEST_HARNESS_MAIN
+--- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-add-simple-vm_pfnmap-tests-based-on-mmaping-dev-mem
++++ a/tools/testing/selftests/mm/run_vmtests.sh
+@@ -63,6 +63,8 @@ separated by spaces:
+ 	test soft dirty page bit semantics
+ - pagemap
+ 	test pagemap_scan IOCTL
++- pfnmap
++	tests for VM_PFNMAP handling
+ - cow
+ 	test copy-on-write semantics
+ - thp
+@@ -472,6 +474,8 @@ fi
+ 
+ CATEGORY="pagemap" run_test ./pagemap_ioctl
+ 
++CATEGORY="pfnmap" run_test ./pfnmap
 +
-+	ksft_print_header();
-+	ksft_set_plan(19);
-+
-+	pagesize = getpagesize();
-+	pagemap_fd = open("/proc/self/pagemap", O_RDONLY);
-+	if (pagemap_fd < 0)
-+		ksft_exit_fail_msg("opening pagemap failed\n");
-+	if (signal(SIGSEGV, signal_handler) == SIG_ERR)
-+		ksft_exit_fail_msg("signal() failed: %s\n", strerror(errno));
-+
-+	sense_support();
-+	test_madvise();
-+	test_munmap_splitting();
-+	test_mremap_fixed();
-+	test_mremap_shrinking();
-+	test_mremap_growing();
-+	test_mprotect();
-+	test_fork();
-+
-+	err = ksft_get_fail_cnt();
-+	if (err)
-+		ksft_exit_fail_msg("%d out of %d tests failed\n",
-+				   err, ksft_test_num());
-+	ksft_exit_pass();
-+}
+ # COW tests
+ CATEGORY="cow" run_test ./cow
+ 
 _
