@@ -1,0 +1,137 @@
+From: Kemeng Shi <shikemeng@huaweicloud.com>
+Subject: mm: swap: correctly use maxpages in swapon syscall to avoid potensial deadloop
+Date: Thu, 22 May 2025 20:25:52 +0800
+
+We use maxpages from read_swap_header() to initialize swap_info_struct,
+however the maxpages might be reduced in setup_swap_extents() and the
+si->max is assigned with the reduced maxpages from the
+setup_swap_extents().
+
+Obviously, this could lead to memory waste as we allocated memory based on
+larger maxpages, besides, this could lead to a potensial deadloop as
+following:
+
+1) When calling setup_clusters() with larger maxpages, unavailable
+   pages within range [si->max, larger maxpages) are not accounted with
+   inc_cluster_info_page().  As a result, these pages are assumed
+   available but can not be allocated.  The cluster contains these pages
+   can be moved to frag_clusters list after it's all available pages were
+   allocated.
+
+2) When the cluster mentioned in 1) is the only cluster in
+   frag_clusters list, cluster_alloc_swap_entry() assume order 0
+   allocation will never failed and will enter a deadloop by keep trying
+   to allocate page from the only cluster in frag_clusters which contains
+   no actually available page.
+
+Call setup_swap_extents() to get the final maxpages before
+swap_info_struct initialization to fix the issue.
+
+Link: https://lkml.kernel.org/r/20250522122554.12209-3-shikemeng@huaweicloud.com
+Fixes: 661383c6111a3 ("mm: swap: relaim the cached parts that got scanned")
+Signed-off-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: <stable@vger.kernel.org>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kairui Song <kasong@tencent.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/swapfile.c |   47 ++++++++++++++++++++---------------------------
+ 1 file changed, 20 insertions(+), 27 deletions(-)
+
+--- a/mm/swapfile.c~mm-swap-correctly-use-maxpages-in-swapon-syscall-to-avoid-potensial-deadloop
++++ a/mm/swapfile.c
+@@ -3141,43 +3141,30 @@ static unsigned long read_swap_header(st
+ 	return maxpages;
+ }
+ 
+-static int setup_swap_map_and_extents(struct swap_info_struct *si,
+-					union swap_header *swap_header,
+-					unsigned char *swap_map,
+-					unsigned long maxpages,
+-					sector_t *span)
++static int setup_swap_map(struct swap_info_struct *si,
++			  union swap_header *swap_header,
++			  unsigned char *swap_map,
++			  unsigned long maxpages)
+ {
+-	unsigned int nr_good_pages;
+ 	unsigned long i;
+-	int nr_extents;
+-
+-	nr_good_pages = maxpages - 1;	/* omit header page */
+ 
++	swap_map[0] = SWAP_MAP_BAD; /* omit header page */
+ 	for (i = 0; i < swap_header->info.nr_badpages; i++) {
+ 		unsigned int page_nr = swap_header->info.badpages[i];
+ 		if (page_nr == 0 || page_nr > swap_header->info.last_page)
+ 			return -EINVAL;
+ 		if (page_nr < maxpages) {
+ 			swap_map[page_nr] = SWAP_MAP_BAD;
+-			nr_good_pages--;
++			si->pages--;
+ 		}
+ 	}
+ 
+-	if (nr_good_pages) {
+-		swap_map[0] = SWAP_MAP_BAD;
+-		si->max = maxpages;
+-		si->pages = nr_good_pages;
+-		nr_extents = setup_swap_extents(si, span);
+-		if (nr_extents < 0)
+-			return nr_extents;
+-		nr_good_pages = si->pages;
+-	}
+-	if (!nr_good_pages) {
++	if (!si->pages) {
+ 		pr_warn("Empty swap-file\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	return nr_extents;
++	return 0;
+ }
+ 
+ #define SWAP_CLUSTER_INFO_COLS						\
+@@ -3217,7 +3204,7 @@ static struct swap_cluster_info *setup_c
+ 	 * Mark unusable pages as unavailable. The clusters aren't
+ 	 * marked free yet, so no list operations are involved yet.
+ 	 *
+-	 * See setup_swap_map_and_extents(): header page, bad pages,
++	 * See setup_swap_map(): header page, bad pages,
+ 	 * and the EOF part of the last cluster.
+ 	 */
+ 	inc_cluster_info_page(si, cluster_info, 0);
+@@ -3354,6 +3341,15 @@ SYSCALL_DEFINE2(swapon, const char __use
+ 		goto bad_swap_unlock_inode;
+ 	}
+ 
++	si->max = maxpages;
++	si->pages = maxpages - 1;
++	nr_extents = setup_swap_extents(si, &span);
++	if (nr_extents < 0) {
++		error = nr_extents;
++		goto bad_swap_unlock_inode;
++	}
++	maxpages = si->max;
++
+ 	/* OK, set up the swap map and apply the bad block list */
+ 	swap_map = vzalloc(maxpages);
+ 	if (!swap_map) {
+@@ -3365,12 +3361,9 @@ SYSCALL_DEFINE2(swapon, const char __use
+ 	if (error)
+ 		goto bad_swap_unlock_inode;
+ 
+-	nr_extents = setup_swap_map_and_extents(si, swap_header, swap_map,
+-						maxpages, &span);
+-	if (unlikely(nr_extents < 0)) {
+-		error = nr_extents;
++	error = setup_swap_map(si, swap_header, swap_map, maxpages);
++	if (error)
+ 		goto bad_swap_unlock_inode;
+-	}
+ 
+ 	/*
+ 	 * Use kvmalloc_array instead of bitmap_zalloc as the allocation order might
+_
