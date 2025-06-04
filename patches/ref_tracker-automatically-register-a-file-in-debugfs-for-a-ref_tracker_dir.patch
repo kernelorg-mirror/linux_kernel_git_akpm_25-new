@@ -1,0 +1,193 @@
+From: Jeff Layton <jlayton@kernel.org>
+Subject: ref_tracker: automatically register a file in debugfs for a ref_tracker_dir
+Date: Tue, 03 Jun 2025 07:27:17 -0400
+
+Currently, there is no convenient way to see the info that the
+ref_tracking infrastructure collects.  Attempt to create a file in debugfs
+when called from ref_tracker_dir_init().
+
+The file is given the name "class@%px", as having the unmodified address
+is helpful for debugging.  This should be safe since this directory is
+only accessible by root
+
+If debugfs file creation fails, a pr_warn will be isssued.
+
+Link: https://lkml.kernel.org/r/20250603-reftrack-dbgfs-v13-6-7b2a425019d8@kernel.org
+Signed-off-by: Jeff Layton <jlayton@kernel.org>
+Cc: Andrew Lunn <andrew@lunn.ch>
+Cc: Dave Airlie <airlied@gmail.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumaze <edumazet@google.com>
+Cc: Jakub Kacinski <kuba@kernel.org>
+Cc: Jani Nikula <jani.nikula@linux.intel.com>
+Cc: Jonas Lahtinen <joonas.lahtinen@linux.intel.com>
+Cc: Krzysztof Karas <krzysztof.karas@intel.com>
+Cc: Kuniyuki Iwashima <kuniyu@amazon.com>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Maxime Ripard <mripard@kernel.org>
+Cc: Nathan Chancellor <nathan@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Qasim Ijaz <qasdev00@gmail.com>
+Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Thomas Weißschuh <thomas.weissschuh@linutronix.de>
+Cc: Thomas Zimemrmann <tzimmermann@suse.de>
+Cc: Tvrtko Ursulin <tursulin@ursulin.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/ref_tracker.h |   23 +++++++++++
+ lib/ref_tracker.c           |   67 ++++++++++++++++++++++++++++++++--
+ 2 files changed, 88 insertions(+), 2 deletions(-)
+
+--- a/include/linux/ref_tracker.h~ref_tracker-automatically-register-a-file-in-debugfs-for-a-ref_tracker_dir
++++ a/include/linux/ref_tracker.h
+@@ -20,12 +20,27 @@ struct ref_tracker_dir {
+ 	struct list_head	list; /* List of active trackers */
+ 	struct list_head	quarantine; /* List of dead trackers */
+ 	const char		*class; /* object classname */
++#ifdef CONFIG_DEBUG_FS
++	struct dentry		*dentry;
++#endif
+ 	char			name[32];
+ #endif
+ };
+ 
+ #ifdef CONFIG_REF_TRACKER
+ 
++#ifdef CONFIG_DEBUG_FS
++
++void ref_tracker_dir_debugfs(struct ref_tracker_dir *dir);
++
++#else /* CONFIG_DEBUG_FS */
++
++static inline void ref_tracker_dir_debugfs(struct ref_tracker_dir *dir)
++{
++}
++
++#endif /* CONFIG_DEBUG_FS */
++
+ static inline void ref_tracker_dir_init(struct ref_tracker_dir *dir,
+ 					unsigned int quarantine_count,
+ 					const char *class,
+@@ -39,7 +54,11 @@ static inline void ref_tracker_dir_init(
+ 	refcount_set(&dir->untracked, 1);
+ 	refcount_set(&dir->no_tracker, 1);
+ 	dir->class = class;
++#ifdef CONFIG_DEBUG_FS
++	dir->dentry = NULL;
++#endif
+ 	strscpy(dir->name, name, sizeof(dir->name));
++	ref_tracker_dir_debugfs(dir);
+ 	stack_depot_init();
+ }
+ 
+@@ -68,6 +87,10 @@ static inline void ref_tracker_dir_init(
+ {
+ }
+ 
++static inline void ref_tracker_dir_debugfs(struct ref_tracker_dir *dir)
++{
++}
++
+ static inline void ref_tracker_dir_exit(struct ref_tracker_dir *dir)
+ {
+ }
+--- a/lib/ref_tracker.c~ref_tracker-automatically-register-a-file-in-debugfs-for-a-ref_tracker_dir
++++ a/lib/ref_tracker.c
+@@ -29,6 +29,14 @@ struct ref_tracker_dir_stats {
+ 	} stacks[];
+ };
+ 
++#ifdef CONFIG_DEBUG_FS
++static void ref_tracker_debugfs_remove(struct ref_tracker_dir *dir);
++#else
++static inline void ref_tracker_debugfs_remove(struct ref_tracker_dir *dir)
++{
++}
++#endif
++
+ static struct ref_tracker_dir_stats *
+ ref_tracker_get_stats(struct ref_tracker_dir *dir, unsigned int limit)
+ {
+@@ -185,6 +193,7 @@ void ref_tracker_dir_exit(struct ref_tra
+ 	bool leak = false;
+ 
+ 	dir->dead = true;
++	ref_tracker_debugfs_remove(dir);
+ 	spin_lock_irqsave(&dir->lock, flags);
+ 	list_for_each_entry_safe(tracker, n, &dir->quarantine, head) {
+ 		list_del(&tracker->head);
+@@ -312,8 +321,7 @@ static void __ostream_printf pr_ostream_
+ 	va_end(args);
+ }
+ 
+-static __maybe_unused int
+-ref_tracker_dir_seq_print(struct ref_tracker_dir *dir, struct seq_file *seq)
++static int ref_tracker_dir_seq_print(struct ref_tracker_dir *dir, struct seq_file *seq)
+ {
+ 	struct ostream os = { .func = pr_ostream_seq,
+ 			      .prefix = "",
+@@ -327,6 +335,61 @@ ref_tracker_dir_seq_print(struct ref_tra
+ 	return os.used;
+ }
+ 
++static int ref_tracker_debugfs_show(struct seq_file *f, void *v)
++{
++	struct ref_tracker_dir *dir = f->private;
++
++	return ref_tracker_dir_seq_print(dir, f);
++}
++
++static int ref_tracker_debugfs_open(struct inode *inode, struct file *filp)
++{
++	struct ref_tracker_dir *dir = inode->i_private;
++
++	return single_open(filp, ref_tracker_debugfs_show, dir);
++}
++
++static const struct file_operations ref_tracker_debugfs_fops = {
++	.owner		= THIS_MODULE,
++	.open		= ref_tracker_debugfs_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++/**
++ * ref_tracker_dir_debugfs - create debugfs file for ref_tracker_dir
++ * @dir: ref_tracker_dir to be associated with debugfs file
++ *
++ * In most cases, a debugfs file will be created automatically for every
++ * ref_tracker_dir. If the object was created before debugfs is brought up
++ * then that may fail. In those cases, it is safe to call this at a later
++ * time to create the file.
++ */
++void ref_tracker_dir_debugfs(struct ref_tracker_dir *dir)
++{
++	char name[NAME_MAX + 1];
++	int ret;
++
++	/* No-op if already created */
++	if (!IS_ERR_OR_NULL(dir->dentry))
++		return;
++
++	ret = snprintf(name, sizeof(name), "%s@%px", dir->class, dir);
++	name[sizeof(name) - 1] = '\0';
++
++	if (ret < sizeof(name))
++		dir->dentry = debugfs_create_file(name, S_IFREG | 0400,
++						  ref_tracker_debug_dir, dir,
++						  &ref_tracker_debugfs_fops);
++}
++EXPORT_SYMBOL(ref_tracker_dir_debugfs);
++
++static void ref_tracker_debugfs_remove(struct ref_tracker_dir *dir)
++{
++	debugfs_remove(dir->dentry);
++}
++
+ static int __init ref_tracker_debugfs_init(void)
+ {
+ 	ref_tracker_debug_dir = debugfs_create_dir("ref_tracker", NULL);
+_
