@@ -1,0 +1,103 @@
+From: Donet Tom <donettom@linux.ibm.com>
+Subject: drivers/base/node: optimize memory block registration to reduce boot time
+Date: Wed, 28 May 2025 12:18:00 -0500
+
+Patch series "drivers/base/node.c: optimization and cleanups", v7.
+
+
+This patch (of 7)
+
+During node device initialization, `memory blocks` are registered under
+each NUMA node.  The `memory blocks` to be registered are identified using
+the node's start and end PFNs, which are obtained from the node's pg_data
+
+However, not all PFNs within this range necessarily belong to the same
+node—some may belong to other nodes.  Additionally, due to the
+discontiguous nature of physical memory, certain sections within a `memory
+block` may be absent.
+
+As a result, `memory blocks` that fall between a node's start and end PFNs
+may span across multiple nodes, and some sections within those blocks may
+be missing.  `Memory blocks` have a fixed size, which is architecture
+dependent.
+
+Due to these considerations, the memory block registration is currently
+performed as follows:
+
+for_each_online_node(nid):
+    start_pfn = pgdat->node_start_pfn;
+    end_pfn = pgdat->node_start_pfn + node_spanned_pages;
+    for_each_memory_block_between(PFN_PHYS(start_pfn), PFN_PHYS(end_pfn))
+        mem_blk = memory_block_id(pfn_to_section_nr(pfn));
+        pfn_mb_start=section_nr_to_pfn(mem_blk->start_section_nr)
+        pfn_mb_end = pfn_start + memory_block_pfns - 1
+        for (pfn = pfn_mb_start; pfn < pfn_mb_end; pfn++):
+            if (get_nid_for_pfn(pfn) != nid):
+                continue;
+            else
+                do_register_memory_block_under_node(nid, mem_blk,
+                                                        MEMINIT_EARLY);
+
+Here, we derive the start and end PFNs from the node's pg_data, then
+determine the memory blocks that may belong to the node.  For each `memory
+block` in this range, we inspect all PFNs it contains and check their
+associated NUMA node ID.  If a PFN within the block matches the current
+node, the memory block is registered under that node.
+
+If CONFIG_DEFERRED_STRUCT_PAGE_INIT is enabled, get_nid_for_pfn() performs
+a binary search in the `memblock regions` to determine the NUMA node ID
+for a given PFN.  If it is not enabled, the node ID is retrieved directly
+from the struct page.
+
+On large systems, this process can become time-consuming, especially since
+we iterate over each `memory block` and all PFNs within it until a match
+is found.  When CONFIG_DEFERRED_STRUCT_PAGE_INIT is enabled, the
+additional overhead of the binary search increases the execution time
+significantly, potentially leading to soft lockups during boot.
+
+In this patch, we iterate over `memblock region` to identify the `memory
+blocks` that belong to the current NUMA node.  `memblock regions` are
+contiguous memory ranges, each associated with a single NUMA node, and
+they do not span across multiple nodes.
+
+for_each_memory_region(r): // r => region
+  if (!node_online(r->nid)):
+    continue;
+  else
+    for_each_memory_block_between(r->base, r->base + r->size - 1):
+      do_register_memory_block_under_node(r->nid, mem_blk, MEMINIT_EARLY);
+
+We iterate over all memblock regions, and if the node associated with the
+region is online, we calculate the start and end memory blocks based on
+the region's start and end PFNs.  We then register all the memory blocks
+within that range under the region node.
+
+Test Results on My system with 32TB RAM
+=======================================
+1. Boot time with CONFIG_DEFERRED_STRUCT_PAGE_INIT enabled.
+
+Without this patch
+------------------
+Startup finished in 1min 16.528s (kernel)
+
+With this patch
+---------------
+Startup finished in 17.236s (kernel) - 78% Improvement
+
+2. Boot time with CONFIG_DEFERRED_STRUCT_PAGE_INIT disabled.
+
+Without this patch
+------------------
+Startup finished in 28.320s (kernel)
+
+With this patch
+---------------
+Startup finished in 15.621s (kernel) - 46% Improvement
+
+Link: https://lkml.kernel.org/r/2a0a05c2dffc62a742bf1dd030098be4ce99be28.1748452241.git.donettom@linux.ibm.com
+Link: https://lkml.kernel.org/r/2a0a05c2dffc62a742bf1dd030098be4ce99be28.1748452241.git.donettom@linux.ibm.com
+Signed-off-by: Donet Tom <donettom@linux.ibm.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Oscar Salvador <osalvador@suse.de>
+Acked-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Acked-by: Zi Yan <ziy@nvidia.com>
