@@ -1,0 +1,98 @@
+From: Pratyush Yadav <ptyadav@amazon.de>
+Subject: kho: initialize tail pages for higher order folios properly
+Date: Thu, 5 Jun 2025 19:11:41 +0200
+
+Currently, when restoring higher order folios, kho_restore_folio() only
+calls prep_compound_page() on all the pages.  That is not enough to
+properly initialize the folios.  The managed page count does not get
+updated, the reserved flag does not get dropped, and page count does not
+get initialized properly.
+
+Restoring a higher order folio with it results in the following BUG with
+CONFIG_DEBUG_VM when attempting to free the folio:
+
+    BUG: Bad page state in process test  pfn:104e2b
+    page: refcount:1 mapcount:0 mapping:0000000000000000 index:0xffffffffffffffff pfn:0x104e2b
+    flags: 0x2fffff80000000(node=0|zone=2|lastcpupid=0x1fffff)
+    raw: 002fffff80000000 0000000000000000 00000000ffffffff 0000000000000000
+    raw: ffffffffffffffff 0000000000000000 00000001ffffffff 0000000000000000
+    page dumped because: nonzero _refcount
+    [...]
+    Call Trace:
+    <TASK>
+    dump_stack_lvl+0x4b/0x70
+    bad_page.cold+0x97/0xb2
+    __free_frozen_pages+0x616/0x850
+    [...]
+
+Combine the path for 0-order and higher order folios, initialize the tail
+pages with a count of zero, and call adjust_managed_page_count() to
+account for all the pages instead of just missing them.
+
+In addition, since all the KHO-preserved pages get marked with
+MEMBLOCK_RSRV_NOINIT by deserialize_bitmap(), the reserved flag is not
+actually set (as can also be seen from the flags of the dumped page in the
+logs above).  So drop the ClearPageReserved() calls.
+
+Link: https://lkml.kernel.org/r/20250605171143.76963-1-pratyush@kernel.org
+Fixes: fc33e4b44b271 ("kexec: enable KHO support for memory preservation")
+Signed-off-by: Pratyush Yadav <ptyadav@amazon.de>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Changyuan Lyu <changyuanl@google.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/kexec_handover.c |   29 +++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 12 deletions(-)
+
+--- a/kernel/kexec_handover.c~kho-initialize-tail-pages-for-higher-order-folios-properly
++++ a/kernel/kexec_handover.c
+@@ -164,11 +164,21 @@ static int __kho_preserve_order(struct k
+ }
+ 
+ /* almost as free_reserved_page(), just don't free the page */
+-static void kho_restore_page(struct page *page)
++static void kho_restore_page(struct page *page, unsigned int order)
+ {
+-	ClearPageReserved(page);
+-	init_page_count(page);
+-	adjust_managed_page_count(page, 1);
++	unsigned int i, nr_pages = (1 << order);
++
++	/* Head page gets refcount of 1. */
++	set_page_count(page, 1);
++
++	/* For higher order folios, tail pages get a page count of zero. */
++	for (i = 1; i < nr_pages; i++)
++		set_page_count(page + i, 0);
++
++	if (order > 0)
++		prep_compound_page(page, order);
++
++	adjust_managed_page_count(page, nr_pages);
+ }
+ 
+ /**
+@@ -186,15 +196,10 @@ struct folio *kho_restore_folio(phys_add
+ 		return NULL;
+ 
+ 	order = page->private;
+-	if (order) {
+-		if (order > MAX_PAGE_ORDER)
+-			return NULL;
+-
+-		prep_compound_page(page, order);
+-	} else {
+-		kho_restore_page(page);
+-	}
++	if (order > MAX_PAGE_ORDER)
++		return NULL;
+ 
++	kho_restore_page(page, order);
+ 	return page_folio(page);
+ }
+ EXPORT_SYMBOL_GPL(kho_restore_folio);
+_
