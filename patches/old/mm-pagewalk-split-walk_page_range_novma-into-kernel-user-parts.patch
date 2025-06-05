@@ -1,9 +1,9 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/pagewalk: split walk_page_range_novma() into kernel/user parts
-Date: Tue, 3 Jun 2025 20:22:13 +0100
+Date: Wed, 4 Jun 2025 15:19:58 +0100
 
-walk_page_range_novma() is rather confusing - it supports two modes, one
-used often, the other used only for debugging.
+The walk_page_range_novma() function is rather confusing - it supports two
+modes, one used often, the other used only for debugging.
 
 The first mode is the common case of traversal of kernel page tables,
 which is what nearly all callers use this for.
@@ -12,9 +12,8 @@ Secondly it provides an unusual debugging interface that allows for the
 traversal of page tables in a userland range of memory even for that
 memory which is not described by a VMA.
 
-This is highly unusual and it is far from certain that such page tables
-should even exist, but perhaps this is precisely why it is useful as a
-debugging mechanism.
+It is far from certain that such page tables should even exist, but
+perhaps this is precisely why it is useful as a debugging mechanism.
 
 As a result, this is utilised by ptdump only.  Historically, things were
 reversed - ptdump was the only user, and other parts of the kernel evolved
@@ -27,24 +26,21 @@ Doing this also provide self-documentation as to the intent of the caller
 - are they doing something rather unusual or are they simply doing a
 standard kernel page table walk?
 
-We therefore maintain walk_page_range_novma() for this single usage, and
-document the function as such.
+We therefore establish two separate functions - walk_page_range_debug()
+for this single usage, and walk_kernel_page_table_range() for general
+kernel page table walking.
+
+We additionally make walk_page_range_debug() internal to mm.
 
 Note that ptdump uses the precise same function for kernel walking as a
 convenience, so we permit this but make it very explicit by having
-walk_page_range_novma() invoke walk_page_range_kernel() in this case.
+walk_page_range_novma() invoke walk_kernel_page_table_range() in this
+case.
 
-We introduce walk_page_range_kernel() for the far more common case of
-kernel page table traversal.
-
-While it would result in less churn to keep the function signature the
-same for the kernel version, it doesn't make sense to pass an mm_struct in
-the kernel case (it's always &init_mm), so we must modify the signature
-accordingly.
-
-Link: https://lkml.kernel.org/r/20250603192213.182931-1-lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/20250604141958.111300-1-lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Acked-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
 Cc: Albert Ou <aou@eecs.berkeley.edu>
 Cc: Alexandre Ghiti <alex@ghiti.fr>
 Cc: Barry Song <baohua@kernel.org>
@@ -60,7 +56,6 @@ Cc: Palmer Dabbelt <palmer@dabbelt.com>
 Cc: Paul Walmsley <paul.walmsley@sifive.com>
 Cc: Stafford Horne <shorne@gmail.com>
 Cc: Stefan Kristiansson <stefan.kristiansson@saunalahti.fi>
-Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: WANG Xuerui <kernel@xen0n.name>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -69,10 +64,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/loongarch/mm/pageattr.c |    2 
  arch/openrisc/kernel/dma.c   |    4 -
  arch/riscv/mm/pageattr.c     |    8 +-
- include/linux/pagewalk.h     |    3 +
+ include/linux/pagewalk.h     |    7 +-
  mm/hugetlb_vmemmap.c         |    2 
- mm/pagewalk.c                |   96 ++++++++++++++++++++++-----------
- 6 files changed, 75 insertions(+), 40 deletions(-)
+ mm/internal.h                |    4 +
+ mm/pagewalk.c                |   98 +++++++++++++++++++++------------
+ mm/ptdump.c                  |    3 -
+ 8 files changed, 82 insertions(+), 46 deletions(-)
 
 --- a/arch/loongarch/mm/pageattr.c~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
 +++ a/arch/loongarch/mm/pageattr.c
@@ -81,7 +78,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	mmap_write_lock(&init_mm);
 -	ret = walk_page_range_novma(&init_mm, start, end, &pageattr_ops, NULL, &masks);
-+	ret = walk_page_range_kernel(start, end, &pageattr_ops, NULL, &masks);
++	ret = walk_kernel_page_table_range(start, end, &pageattr_ops, NULL, &masks);
  	mmap_write_unlock(&init_mm);
  
  	flush_tlb_kernel_range(start, end);
@@ -92,7 +89,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 */
  	mmap_write_lock(&init_mm);
 -	error = walk_page_range_novma(&init_mm, va, va + size,
-+	error = walk_page_range_kernel(va, va + size,
++	error = walk_kernel_page_table_range(va, va + size,
  			&set_nocache_walk_ops, NULL, NULL);
  	mmap_write_unlock(&init_mm);
  
@@ -101,7 +98,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mmap_write_lock(&init_mm);
  	/* walk_page_range shouldn't be able to fail here */
 -	WARN_ON(walk_page_range_novma(&init_mm, va, va + size,
-+	WARN_ON(walk_page_range_kernel(va, va + size,
++	WARN_ON(walk_kernel_page_table_range(va, va + size,
  			&clear_nocache_walk_ops, NULL, NULL));
  	mmap_write_unlock(&init_mm);
  }
@@ -112,7 +109,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto unlock;
  
 -			ret = walk_page_range_novma(&init_mm, lm_start, lm_end,
-+			ret = walk_page_range_kernel(lm_start, lm_end,
++			ret = walk_kernel_page_table_range(lm_start, lm_end,
  						    &pageattr_ops, NULL, &masks);
  			if (ret)
  				goto unlock;
@@ -121,14 +118,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto unlock;
  
 -		ret = walk_page_range_novma(&init_mm, lm_start, lm_end,
-+		ret = walk_page_range_kernel(lm_start, lm_end,
++		ret = walk_kernel_page_table_range(lm_start, lm_end,
  					    &pageattr_ops, NULL, &masks);
  		if (ret)
  			goto unlock;
  	}
  
 -	ret =  walk_page_range_novma(&init_mm, start, end, &pageattr_ops, NULL,
-+	ret =  walk_page_range_kernel(start, end, &pageattr_ops, NULL,
++	ret =  walk_kernel_page_table_range(start, end, &pageattr_ops, NULL,
  				     &masks);
  
  unlock:
@@ -137,22 +134,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	flush_tlb_all();
  #else
 -	ret =  walk_page_range_novma(&init_mm, start, end, &pageattr_ops, NULL,
-+	ret =  walk_page_range_kernel(start, end, &pageattr_ops, NULL,
++	ret =  walk_kernel_page_table_range(start, end, &pageattr_ops, NULL,
  				     &masks);
  
  	mmap_write_unlock(&init_mm);
 --- a/include/linux/pagewalk.h~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
 +++ a/include/linux/pagewalk.h
-@@ -129,6 +129,9 @@ struct mm_walk {
+@@ -129,10 +129,9 @@ struct mm_walk {
  int walk_page_range(struct mm_struct *mm, unsigned long start,
  		unsigned long end, const struct mm_walk_ops *ops,
  		void *private);
-+int walk_page_range_kernel(unsigned long start,
+-int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
+-			  unsigned long end, const struct mm_walk_ops *ops,
+-			  pgd_t *pgd,
+-			  void *private);
++int walk_kernel_page_table_range(unsigned long start,
 +		unsigned long end, const struct mm_walk_ops *ops,
 +		pgd_t *pgd, void *private);
- int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
- 			  unsigned long end, const struct mm_walk_ops *ops,
- 			  pgd_t *pgd,
+ int walk_page_range_vma(struct vm_area_struct *vma, unsigned long start,
+ 			unsigned long end, const struct mm_walk_ops *ops,
+ 			void *private);
 --- a/mm/hugetlb_vmemmap.c~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
 +++ a/mm/hugetlb_vmemmap.c
 @@ -166,7 +166,7 @@ static int vmemmap_remap_range(unsigned
@@ -160,10 +161,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	mmap_read_lock(&init_mm);
 -	ret = walk_page_range_novma(&init_mm, start, end, &vmemmap_remap_ops,
-+	ret = walk_page_range_kernel(start, end, &vmemmap_remap_ops,
++	ret = walk_kernel_page_table_range(start, end, &vmemmap_remap_ops,
  				    NULL, walk);
  	mmap_read_unlock(&init_mm);
  	if (ret)
+--- a/mm/internal.h~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
++++ a/mm/internal.h
+@@ -1605,6 +1605,10 @@ static inline void accept_page(struct pa
+ int walk_page_range_mm(struct mm_struct *mm, unsigned long start,
+ 		unsigned long end, const struct mm_walk_ops *ops,
+ 		void *private);
++int walk_page_range_debug(struct mm_struct *mm, unsigned long start,
++			  unsigned long end, const struct mm_walk_ops *ops,
++			  pgd_t *pgd,
++			  void *private);
+ 
+ /* pt_reclaim.c */
+ bool try_get_and_clear_pmd(struct mm_struct *mm, pmd_t *pmd, pmd_t *pmdval);
 --- a/mm/pagewalk.c~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
 +++ a/mm/pagewalk.c
 @@ -584,9 +584,28 @@ int walk_page_range(struct mm_struct *mm
@@ -193,7 +207,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
 - * walk_page_range_novma - walk a range of pagetables not backed by a vma
 - * @mm:		mm_struct representing the target process of page table walk
-+ * walk_page_range_kernel - walk a range of kernel pagetables.
++ * walk_kernel_page_table_range - walk a range of kernel pagetables.
   * @start:	start address of the virtual address range
   * @end:	end address of the virtual address range
   * @ops:	operation to call during the walk
@@ -209,7 +223,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * the intermediate kernel page tables belonging to the specified address range
   * from being freed (e.g. memory hot-remove).
   */
-+int walk_page_range_kernel(unsigned long start, unsigned long end,
+-int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
++int walk_kernel_page_table_range(unsigned long start, unsigned long end,
 +		const struct mm_walk_ops *ops, pgd_t *pgd, void *private)
 +{
 +	struct mm_struct *mm = &init_mm;
@@ -228,7 +243,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/**
-+ * walk_page_range_novma - walk a range of pagetables not backed by a vma
++ * walk_page_range_debug - walk a range of pagetables not backed by a vma
 + * @mm:		mm_struct representing the target process of page table walk
 + * @start:	start address of the virtual address range
 + * @end:	end address of the virtual address range
@@ -242,7 +257,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *
 + * This is for debugging purposes ONLY.
 + */
- int walk_page_range_novma(struct mm_struct *mm, unsigned long start,
++int walk_page_range_debug(struct mm_struct *mm, unsigned long start,
  			  unsigned long end, const struct mm_walk_ops *ops,
  			  pgd_t *pgd,
  			  void *private)
@@ -264,7 +279,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * mappings.
 +	 */
 +	if (mm == &init_mm)
-+		return walk_page_range_kernel(start, end, ops, pgd, private);
++		return walk_kernel_page_table_range(start, end, ops, pgd, private);
  
  	/*
 -	 * 1) For walking the user virtual address space:
@@ -297,4 +312,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  int walk_page_range_vma(struct vm_area_struct *vma, unsigned long start,
+--- a/mm/ptdump.c~mm-pagewalk-split-walk_page_range_novma-into-kernel-user-parts
++++ a/mm/ptdump.c
+@@ -4,6 +4,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/ptdump.h>
+ #include <linux/kasan.h>
++#include "internal.h"
+ 
+ #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+ /*
+@@ -177,7 +178,7 @@ void ptdump_walk_pgd(struct ptdump_state
+ 
+ 	mmap_write_lock(mm);
+ 	while (range->start != range->end) {
+-		walk_page_range_novma(mm, range->start, range->end,
++		walk_page_range_debug(mm, range->start, range->end,
+ 				      &ptdump_ops, pgd, st);
+ 		range++;
+ 	}
 _
