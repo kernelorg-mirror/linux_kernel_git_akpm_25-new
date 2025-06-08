@@ -1,16 +1,18 @@
 From: Oscar Salvador <osalvador@suse.de>
 Subject: mm,memory_hotplug: implement numa node notifier
-Date: Tue, 3 Jun 2025 13:08:49 +0200
+Date: Thu, 5 Jun 2025 16:22:54 +0200
 
 There are at least six consumers of hotplug_memory_notifier that what they
 really are interested in is whether any numa node changed its state, e.g:
-going from being memory aware to becoming memoryless and vice versa.
+going from having memory to not having memory and vice versa.
 
 Implement a specific notifier for numa nodes when their state gets
-changed, and have those consumers that only care about numa node state
-changes use it.
+changed, which will later be used by those consumers that are only
+interested in numa node state changes.
 
-Link: https://lkml.kernel.org/r/20250603110850.192912-3-osalvador@suse.de
+Add documentation as well.
+
+Link: https://lkml.kernel.org/r/20250605142305.244465-4-osalvador@suse.de
 Signed-off-by: Oscar Salvador <osalvador@suse.de>
 Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
 Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
@@ -21,45 +23,97 @@ Cc: Rakie Kim <rakie.kim@sk.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/acpi/numa/hmat.c  |    6 -
- drivers/base/node.c       |   21 ++++
- drivers/cxl/core/region.c |   14 +--
- drivers/cxl/cxl.h         |    4 
- include/linux/memory.h    |   38 ++++++++
- kernel/cgroup/cpuset.c    |    2 
- mm/memory-tiers.c         |    8 -
- mm/memory_hotplug.c       |  161 +++++++++++++++---------------------
- mm/mempolicy.c            |    8 -
- mm/slub.c                 |   13 +-
- 10 files changed, 155 insertions(+), 120 deletions(-)
+ Documentation/core-api/memory-hotplug.rst |   66 ++++++++
+ drivers/base/node.c                       |   21 ++
+ include/linux/node.h                      |   42 +++++
+ mm/memory_hotplug.c                       |  155 +++++++++-----------
+ 4 files changed, 202 insertions(+), 82 deletions(-)
 
---- a/drivers/acpi/numa/hmat.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/drivers/acpi/numa/hmat.c
-@@ -962,10 +962,10 @@ static int hmat_callback(struct notifier
- 			 unsigned long action, void *arg)
- {
- 	struct memory_target *target;
--	struct memory_notify *mnb = arg;
-+	struct node_notify *mnb = arg;
- 	int pxm, nid = mnb->status_change_nid;
+--- a/Documentation/core-api/memory-hotplug.rst~mmmemory_hotplug-implement-numa-node-notifier
++++ a/Documentation/core-api/memory-hotplug.rst
+@@ -9,6 +9,9 @@ Memory hotplug event notifier
  
--	if (nid == NUMA_NO_NODE || action != MEM_ONLINE)
-+	if (nid == NUMA_NO_NODE || action != NODE_BECAME_MEM_AWARE)
- 		return NOTIFY_OK;
+ Hotplugging events are sent to a notification queue.
  
- 	pxm = node_to_pxm(nid);
-@@ -1118,7 +1118,7 @@ static __init int hmat_init(void)
- 	hmat_register_targets();
++Memory notifier
++----------------
++
+ There are six types of notification defined in ``include/linux/memory.h``:
  
- 	/* Keep the table and structures if the notifier may use them */
--	if (hotplug_memory_notifier(hmat_callback, HMAT_CALLBACK_PRI))
-+	if (hotplug_node_notifier(hmat_callback, HMAT_CALLBACK_PRI))
- 		goto out_put;
+ MEM_GOING_ONLINE
+@@ -80,6 +83,69 @@ further processing of the notification q
  
- 	if (!hmat_set_default_dram_perf())
+ NOTIFY_STOP stops further processing of the notification queue.
+ 
++Numa node notifier
++------------------
++
++There are six types of notification defined in ``include/linux/node.h``:
++
++NODE_ADDING_FIRST_MEMORY
++ Generated before memory becomes available to this node for the first time.
++
++NODE_CANCEL_ADDING_FIRST_MEMORY
++ Generated if NODE_ADDING_FIRST_MEMORY fails.
++
++NODE_ADDED_FIRST_MEMORY
++ Generated when memory has become available fo this node for the first time.
++
++NODE_REMOVING_LAST_MEMORY
++ Generated when the last memory available to this node is about to be offlined.
++
++NODE_CANCEL_REMOVING_LAST_MEMORY
++ Generated when NODE_CANCEL_REMOVING_LAST_MEMORY fails.
++
++NODE_REMOVED_LAST_MEMORY
++ Generated when the last memory available to this node has been offlined.
++
++A callback routine can be registered by calling::
++
++  hotplug_node_notifier(callback_func, priority)
++
++Callback functions with higher values of priority are called before callback
++functions with lower values.
++
++A callback function must have the following prototype::
++
++  int callback_func(
++
++    struct notifier_block *self, unsigned long action, void *arg);
++
++The first argument of the callback function (self) is a pointer to the block
++of the notifier chain that points to the callback function itself.
++The second argument (action) is one of the event types described above.
++The third argument (arg) passes a pointer of struct node_notify::
++
++        struct node_notify {
++                int nid;
++        }
++
++- nid is the node we are adding or removing memory to.
++
++  If nid >= 0, callback should create/discard structures for the
++  node if necessary.
++
++The callback routine shall return one of the values
++NOTIFY_DONE, NOTIFY_OK, NOTIFY_BAD, NOTIFY_STOP
++defined in ``include/linux/notifier.h``
++
++NOTIFY_DONE and NOTIFY_OK have no effect on the further processing.
++
++NOTIFY_BAD is used as response to the NODE_ADDING_FIRST_MEMORY,
++NODE_REMOVING_LAST_MEMORY, NODE_ADDED_FIRST_MEMORY or
++NODE_REMOVED_LAST_MEMORY action to cancel hotplugging.
++It stops further processing of the notification queue.
++
++NOTIFY_STOP stops further processing of the notification queue.
++
+ Locking Internals
+ =================
+ 
 --- a/drivers/base/node.c~mmmemory_hotplug-implement-numa-node-notifier
 +++ a/drivers/base/node.c
-@@ -111,6 +111,27 @@ static const struct attribute_group *nod
+@@ -112,6 +112,27 @@ static const struct attribute_group *nod
  	NULL,
  };
  
@@ -87,100 +141,36 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void node_remove_accesses(struct node *node)
  {
  	struct node_access_nodes *c, *cnext;
---- a/drivers/cxl/core/region.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/drivers/cxl/core/region.c
-@@ -2432,12 +2432,12 @@ static int cxl_region_perf_attrs_callbac
- 					  unsigned long action, void *arg)
- {
- 	struct cxl_region *cxlr = container_of(nb, struct cxl_region,
--					       memory_notifier);
--	struct memory_notify *mnb = arg;
-+					       node_notifier);
-+	struct node_notify *mnb = arg;
- 	int nid = mnb->status_change_nid;
- 	int region_nid;
+--- a/include/linux/node.h~mmmemory_hotplug-implement-numa-node-notifier
++++ a/include/linux/node.h
+@@ -125,6 +125,48 @@ static inline void register_memory_block
+ #endif
  
--	if (nid == NUMA_NO_NODE || action != MEM_ONLINE)
-+	if (nid == NUMA_NO_NODE || action != NODE_BECAME_MEM_AWARE)
- 		return NOTIFY_DONE;
- 
- 	/*
-@@ -3484,7 +3484,7 @@ static void shutdown_notifiers(void *_cx
- {
- 	struct cxl_region *cxlr = _cxlr;
- 
--	unregister_memory_notifier(&cxlr->memory_notifier);
-+	unregister_node_notifier(&cxlr->node_notifier);
- 	unregister_mt_adistance_algorithm(&cxlr->adist_notifier);
- }
- 
-@@ -3523,9 +3523,9 @@ out:
- 	if (rc)
- 		return rc;
- 
--	cxlr->memory_notifier.notifier_call = cxl_region_perf_attrs_callback;
--	cxlr->memory_notifier.priority = CXL_CALLBACK_PRI;
--	register_memory_notifier(&cxlr->memory_notifier);
-+	cxlr->node_notifier.notifier_call = cxl_region_perf_attrs_callback;
-+	cxlr->node_notifier.priority = CXL_CALLBACK_PRI;
-+	register_node_notifier(&cxlr->node_notifier);
- 
- 	cxlr->adist_notifier.notifier_call = cxl_region_calculate_adistance;
- 	cxlr->adist_notifier.priority = 100;
---- a/drivers/cxl/cxl.h~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/drivers/cxl/cxl.h
-@@ -513,7 +513,7 @@ enum cxl_partition_mode {
-  * @flags: Region state flags
-  * @params: active + config params for the region
-  * @coord: QoS access coordinates for the region
-- * @memory_notifier: notifier for setting the access coordinates to node
-+ * @node_notifier: notifier for setting the access coordinates to node
-  * @adist_notifier: notifier for calculating the abstract distance of node
-  */
- struct cxl_region {
-@@ -526,7 +526,7 @@ struct cxl_region {
- 	unsigned long flags;
- 	struct cxl_region_params params;
- 	struct access_coordinate coord[ACCESS_COORDINATE_MAX];
--	struct notifier_block memory_notifier;
-+	struct notifier_block node_notifier;
- 	struct notifier_block adist_notifier;
- };
- 
---- a/include/linux/memory.h~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/include/linux/memory.h
-@@ -99,6 +99,14 @@ int set_memory_block_size_order(unsigned
- #define	MEM_PREPARE_ONLINE	(1<<6)
- #define	MEM_FINISH_OFFLINE	(1<<7)
- 
-+/* These states are used for numa node notifiers */
-+#define NODE_BECOMING_MEM_AWARE		(1<<0)
-+#define NODE_BECAME_MEM_AWARE		(1<<1)
-+#define NODE_BECOMING_MEMORYLESS	(1<<2)
-+#define NODE_BECAME_MEMORYLESS		(1<<3)
-+#define NODE_CANCEL_MEM_AWARE		(1<<4)
-+#define NODE_CANCEL_MEMORYLESS		(1<<5)
+ extern void unregister_node(struct node *node);
 +
- struct memory_notify {
- 	/*
- 	 * The altmap_start_pfn and altmap_nr_pages fields are designated for
-@@ -109,7 +117,10 @@ struct memory_notify {
- 	unsigned long altmap_nr_pages;
- 	unsigned long start_pfn;
- 	unsigned long nr_pages;
--	int status_change_nid_normal;
-+	int status_change_nid;
++#ifdef CONFIG_MEMORY_HOTPLUG
++struct node_notify {
++	int nid;
 +};
 +
-+struct node_notify {
- 	int status_change_nid;
- };
- 
-@@ -157,15 +168,34 @@ static inline unsigned long memory_block
- {
- 	return 0;
- }
++#define NODE_ADDING_FIRST_MEMORY                (1<<0)
++#define NODE_ADDED_FIRST_MEMORY                 (1<<1)
++#define NODE_CANCEL_ADDING_FIRST_MEMORY         (1<<2)
++#define NODE_REMOVING_LAST_MEMORY               (1<<3)
++#define NODE_REMOVED_LAST_MEMORY                (1<<4)
++#define NODE_CANCEL_REMOVING_LAST_MEMORY        (1<<5)
 +
++#if defined(CONFIG_MEMORY_HOTPLUG) && defined(CONFIG_NUMA)
++extern int register_node_notifier(struct notifier_block *nb);
++extern void unregister_node_notifier(struct notifier_block *nb);
++extern int node_notify(unsigned long val, void *v);
++
++#define hotplug_node_notifier(fn, pri) ({		\
++	static __meminitdata struct notifier_block fn##_node_nb =\
++		{ .notifier_call = fn, .priority = pri };\
++	register_node_notifier(&fn##_node_nb);			\
++})
++#else
 +static inline int register_node_notifier(struct notifier_block *nb)
 +{
 +	return 0;
@@ -196,48 +186,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	return 0;
 +}
- #else /* CONFIG_MEMORY_HOTPLUG */
- extern int register_memory_notifier(struct notifier_block *nb);
-+extern int register_node_notifier(struct notifier_block *nb);
- extern void unregister_memory_notifier(struct notifier_block *nb);
-+extern void unregister_node_notifier(struct notifier_block *nb);
- int create_memory_block_devices(unsigned long start, unsigned long size,
- 				struct vmem_altmap *altmap,
- 				struct memory_group *group);
- void remove_memory_block_devices(unsigned long start, unsigned long size);
- extern void memory_dev_init(void);
- extern int memory_notify(unsigned long val, void *v);
-+extern int node_notify(unsigned long val, void *v);
- extern struct memory_block *find_memory_block(unsigned long section_nr);
- typedef int (*walk_memory_blocks_func_t)(struct memory_block *, void *);
- extern int walk_memory_blocks(unsigned long start, unsigned long size,
-@@ -185,6 +215,12 @@ int walk_dynamic_memory_groups(int nid,
- 	register_memory_notifier(&fn##_mem_nb);			\
- })
- 
-+#define hotplug_node_notifier(fn, pri) ({		\
-+	static __meminitdata struct notifier_block fn##_node_nb =\
-+		{ .notifier_call = fn, .priority = pri };\
-+	register_node_notifier(&fn##_node_nb);			\
-+})
++#endif
++#endif
 +
  #ifdef CONFIG_NUMA
- void memory_block_add_nid(struct memory_block *mem, int nid,
- 			  enum meminit_context context);
---- a/kernel/cgroup/cpuset.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/kernel/cgroup/cpuset.c
-@@ -4051,7 +4051,7 @@ void __init cpuset_init_smp(void)
- 	cpumask_copy(top_cpuset.effective_cpus, cpu_active_mask);
- 	top_cpuset.effective_mems = node_states[N_MEMORY];
- 
--	hotplug_memory_notifier(cpuset_track_online_nodes, CPUSET_CALLBACK_PRI);
-+	hotplug_node_notifier(cpuset_track_online_nodes, CPUSET_CALLBACK_PRI);
- 
- 	cpuset_migrate_mm_wq = alloc_ordered_workqueue("cpuset_migrate_mm", 0);
- 	BUG_ON(!cpuset_migrate_mm_wq);
+ extern void node_dev_init(void);
+ /* Core of the node registration - only memory hotplug should use this */
 --- a/mm/memory_hotplug.c~mmmemory_hotplug-implement-numa-node-notifier
 +++ a/mm/memory_hotplug.c
-@@ -699,30 +699,6 @@ static void online_pages_range(unsigned
+@@ -35,6 +35,7 @@
+ #include <linux/compaction.h>
+ #include <linux/rmap.h>
+ #include <linux/module.h>
++#include <linux/node.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -699,24 +700,6 @@ static void online_pages_range(unsigned
  	online_mem_sections(start_pfn, end_pfn);
  }
  
@@ -248,19 +213,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	int nid = zone_to_nid(zone);
 -
 -	arg->status_change_nid = NUMA_NO_NODE;
--	arg->status_change_nid_normal = NUMA_NO_NODE;
 -
 -	if (!node_state(nid, N_MEMORY))
 -		arg->status_change_nid = nid;
--	if (zone_idx(zone) <= ZONE_NORMAL && !node_state(nid, N_NORMAL_MEMORY))
--		arg->status_change_nid_normal = nid;
 -}
 -
 -static void node_states_set_node(int node, struct memory_notify *arg)
 -{
--	if (arg->status_change_nid_normal >= 0)
--		node_set_state(node, N_NORMAL_MEMORY);
--
 -	if (arg->status_change_nid >= 0)
 -		node_set_state(node, N_MEMORY);
 -}
@@ -268,7 +227,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void __meminit resize_zone_range(struct zone *zone, unsigned long start_pfn,
  		unsigned long nr_pages)
  {
-@@ -1177,7 +1153,9 @@ int online_pages(unsigned long pfn, unsi
+@@ -1171,7 +1154,9 @@ int online_pages(unsigned long pfn, unsi
  	int need_zonelists_rebuild = 0;
  	const int nid = zone_to_nid(zone);
  	int ret;
@@ -279,53 +238,50 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * {on,off}lining is constrained to full memory sections (or more
-@@ -1194,11 +1172,22 @@ int online_pages(unsigned long pfn, unsi
+@@ -1188,11 +1173,22 @@ int online_pages(unsigned long pfn, unsi
  	/* associate pfn range with the zone */
  	move_pfn_range_to_zone(zone, pfn, nr_pages, NULL, MIGRATE_ISOLATE);
  
 -	arg.start_pfn = pfn;
 -	arg.nr_pages = nr_pages;
 -	node_states_check_changes_online(nr_pages, zone, &arg);
-+	node_arg.status_change_nid = NUMA_NO_NODE;
++	node_arg.nid = NUMA_NO_NODE;
 +	if (!node_state(nid, N_MEMORY)) {
-+		/* Node is becoming memory aware. Notify consumers */
++		/* Adding memory to the node for the first time */
 +		cancel_node_notifier_on_err = true;
-+		node_arg.status_change_nid = nid;
-+		ret = node_notify(NODE_BECOMING_MEM_AWARE, &node_arg);
++		node_arg.nid = nid;
++		ret = node_notify(NODE_ADDING_FIRST_MEMORY, &node_arg);
 +		ret = notifier_to_errno(ret);
 +		if (ret)
 +			goto failed_addition;
 +	}
  
 -	ret = memory_notify(MEM_GOING_ONLINE, &arg);
-+	cancel_mem_notifier_on_err = true;
 +	mem_arg.start_pfn = pfn;
 +	mem_arg.nr_pages = nr_pages;
-+	mem_arg.status_change_nid = node_arg.status_change_nid;
++	mem_arg.status_change_nid = node_arg.nid;
++	cancel_mem_notifier_on_err = true;
 +	ret = memory_notify(MEM_GOING_ONLINE, &mem_arg);
  	ret = notifier_to_errno(ret);
  	if (ret)
  		goto failed_addition;
-@@ -1224,7 +1213,8 @@ int online_pages(unsigned long pfn, unsi
+@@ -1218,7 +1214,8 @@ int online_pages(unsigned long pfn, unsi
  	online_pages_range(pfn, nr_pages);
  	adjust_present_page_count(pfn_to_page(pfn), group, nr_pages);
  
 -	node_states_set_node(nid, &arg);
-+	if (node_arg.status_change_nid >= 0)
++	if (node_arg.nid >= 0)
 +		node_set_state(nid, N_MEMORY);
  	if (need_zonelists_rebuild)
  		build_all_zonelists(NULL);
  
-@@ -1245,16 +1235,26 @@ int online_pages(unsigned long pfn, unsi
+@@ -1239,16 +1236,23 @@ int online_pages(unsigned long pfn, unsi
  	kswapd_run(nid);
  	kcompactd_run(nid);
  
-+	if (node_arg.status_change_nid >= 0)
-+		/*
-+		 * Node went from memoryless to having memory. Notify interested
-+		 * consumers
-+		 */
-+		node_notify(NODE_BECAME_MEM_AWARE, &node_arg);
++	if (node_arg.nid >= 0)
++		/* First memory added successfully. Notify consumers. */
++		node_notify(NODE_ADDED_FIRST_MEMORY, &node_arg);
 +
  	writeback_set_ratelimit();
  
@@ -341,11 +297,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (cancel_mem_notifier_on_err)
 +		memory_notify(MEM_CANCEL_ONLINE, &mem_arg);
 +	if (cancel_node_notifier_on_err)
-+		node_notify(NODE_CANCEL_MEM_AWARE, &node_arg);
++		node_notify(NODE_CANCEL_ADDING_FIRST_MEMORY, &node_arg);
  	remove_pfn_range_from_zone(zone, pfn, nr_pages);
  	return ret;
  }
-@@ -1886,54 +1886,6 @@ static int __init cmdline_parse_movable_
+@@ -1879,48 +1883,6 @@ static int __init cmdline_parse_movable_
  }
  early_param("movable_node", cmdline_parse_movable_node);
  
@@ -358,7 +314,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	enum zone_type zt;
 -
 -	arg->status_change_nid = NUMA_NO_NODE;
--	arg->status_change_nid_normal = NUMA_NO_NODE;
 -
 -	/*
 -	 * Check whether node_states[N_NORMAL_MEMORY] will be changed.
@@ -370,8 +325,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 */
 -	for (zt = 0; zt <= ZONE_NORMAL; zt++)
 -		present_pages += pgdat->node_zones[zt].present_pages;
--	if (zone_idx(zone) <= ZONE_NORMAL && nr_pages >= present_pages)
--		arg->status_change_nid_normal = zone_to_nid(zone);
 -
 -	/*
 -	 * We have accounted the pages from [0..ZONE_NORMAL); ZONE_HIGHMEM
@@ -390,9 +343,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -
 -static void node_states_clear_node(int node, struct memory_notify *arg)
 -{
--	if (arg->status_change_nid_normal >= 0)
--		node_clear_state(node, N_NORMAL_MEMORY);
--
 -	if (arg->status_change_nid >= 0)
 -		node_clear_state(node, N_MEMORY);
 -}
@@ -400,24 +350,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int count_system_ram_pages_cb(unsigned long start_pfn,
  				     unsigned long nr_pages, void *data)
  {
-@@ -1950,10 +1902,14 @@ int offline_pages(unsigned long start_pf
+@@ -1936,13 +1898,17 @@ static int count_system_ram_pages_cb(uns
+ int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
  			struct zone *zone, struct memory_group *group)
  {
- 	const unsigned long end_pfn = start_pfn + nr_pages;
+-	const unsigned long end_pfn = start_pfn + nr_pages;
 -	unsigned long pfn, managed_pages, system_ram_pages = 0;
-+	unsigned long pfn, managed_pages, system_ram_pages = 0, present_pages = 0;
- 	const int node = zone_to_nid(zone);
-+	struct pglist_data *pgdat = zone->zone_pgdat;
- 	unsigned long flags;
+-	const int node = zone_to_nid(zone);
+-	unsigned long flags;
 -	struct memory_notify arg;
+-	char *reason;
+ 	int ret;
++	char *reason;
++	enum zone_type zt;
++	unsigned long flags;
 +	struct memory_notify mem_arg;
 +	struct node_notify node_arg;
++	const int node = zone_to_nid(zone);
++	struct pglist_data *pgdat = zone->zone_pgdat;
++	const unsigned long end_pfn = start_pfn + nr_pages;
++	unsigned long pfn, managed_pages, system_ram_pages = 0, present_pages = 0;
 +	bool cancel_mem_notifier_on_err = false, cancel_node_notifier_on_err = false;
-+	enum zone_type zt;
- 	char *reason;
- 	int ret;
  
-@@ -2012,11 +1968,30 @@ int offline_pages(unsigned long start_pf
+ 	/*
+ 	 * {on,off}lining is constrained to full memory sections (or more
+@@ -1999,11 +1965,30 @@ int offline_pages(unsigned long start_pf
  		goto failed_removal_pcplists_disabled;
  	}
  
@@ -428,36 +385,36 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * Here we count the possible pages within the range [0..ZONE_MOVABLE].
 +	 * If after having accounted all the pages, we see that the nr_pages to
 +	 * be offlined is greater or equal to the accounted pages, we know that the
-+	 * node will become empty, and so, we can clear it for N_MEMORY.
++	 * node will become empty, and so, we will clear N_MEMORY for it.
 +	 */
-+	node_arg.status_change_nid = NUMA_NO_NODE;
++	node_arg.nid = NUMA_NO_NODE;
 +	for (zt = 0; zt <= ZONE_MOVABLE; zt++)
 +		present_pages += pgdat->node_zones[zt].present_pages;
-+	if (nr_pages >= present_pages)
-+		node_arg.status_change_nid = node;
-+	if (node_arg.status_change_nid >= 0) {
++
++	if (nr_pages >= present_pages) {
++		node_arg.nid = node;
 +		cancel_node_notifier_on_err = true;
-+		ret = node_notify(NODE_BECOMING_MEMORYLESS, &node_arg);
++		ret = node_notify(NODE_REMOVING_LAST_MEMORY, &node_arg);
 +		ret = notifier_to_errno(ret);
 +		if (ret)
 +			goto failed_removal_isolated;
 +	}
  
 -	ret = memory_notify(MEM_GOING_OFFLINE, &arg);
-+	cancel_mem_notifier_on_err = true;
 +	mem_arg.start_pfn = start_pfn;
 +	mem_arg.nr_pages = nr_pages;
-+	mem_arg.status_change_nid = node_arg.status_change_nid;
++	mem_arg.status_change_nid = node_arg.nid;
++	cancel_mem_notifier_on_err = true;
 +	ret = memory_notify(MEM_GOING_OFFLINE, &mem_arg);
  	ret = notifier_to_errno(ret);
  	if (ret) {
  		reason = "notifier failure";
-@@ -2096,27 +2071,33 @@ int offline_pages(unsigned long start_pf
+@@ -2083,27 +2068,33 @@ int offline_pages(unsigned long start_pf
  	 * Make sure to mark the node as memory-less before rebuilding the zone
  	 * list. Otherwise this node would still appear in the fallback lists.
  	 */
 -	node_states_clear_node(node, &arg);
-+	if (node_arg.status_change_nid >= 0)
++	if (node_arg.nid >= 0)
 +		node_clear_state(node, N_MEMORY);
  	if (!populated_zone(zone)) {
  		zone_pcp_reset(zone);
@@ -465,11 +422,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
 -	if (arg.status_change_nid >= 0) {
-+	if (node_arg.status_change_nid >= 0) {
++	if (node_arg.nid >= 0) {
  		kcompactd_stop(node);
  		kswapd_stop(node);
-+		/* Node went memoryless. Notify interested consumers */
-+		node_notify(NODE_BECAME_MEMORYLESS, &node_arg);
++		/* Node went memoryless. Notify consumers */
++		node_notify(NODE_REMOVED_LAST_MEMORY, &node_arg);
  	}
  
  	writeback_set_ratelimit();
@@ -486,119 +443,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (cancel_mem_notifier_on_err)
 +		memory_notify(MEM_CANCEL_OFFLINE, &mem_arg);
 +	if (cancel_node_notifier_on_err)
-+		node_notify(NODE_CANCEL_MEMORYLESS, &node_arg);
++		node_notify(NODE_CANCEL_REMOVING_LAST_MEMORY, &node_arg);
  failed_removal_pcplists_disabled:
  	lru_cache_enable();
  	zone_pcp_enable(zone);
---- a/mm/memory-tiers.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/mm/memory-tiers.c
-@@ -872,7 +872,7 @@ static int __meminit memtier_hotplug_cal
- 					      unsigned long action, void *_arg)
- {
- 	struct memory_tier *memtier;
--	struct memory_notify *arg = _arg;
-+	struct node_notify *arg = _arg;
- 
- 	/*
- 	 * Only update the node migration order when a node is
-@@ -882,13 +882,13 @@ static int __meminit memtier_hotplug_cal
- 		return notifier_from_errno(0);
- 
- 	switch (action) {
--	case MEM_OFFLINE:
-+	case NODE_BECAME_MEMORYLESS:
- 		mutex_lock(&memory_tier_lock);
- 		if (clear_node_memory_tier(arg->status_change_nid))
- 			establish_demotion_targets();
- 		mutex_unlock(&memory_tier_lock);
- 		break;
--	case MEM_ONLINE:
-+	case NODE_BECAME_MEM_AWARE:
- 		mutex_lock(&memory_tier_lock);
- 		memtier = set_node_memory_tier(arg->status_change_nid);
- 		if (!IS_ERR(memtier))
-@@ -929,7 +929,7 @@ static int __init memory_tier_init(void)
- 	nodes_and(default_dram_nodes, node_states[N_MEMORY],
- 		  node_states[N_CPU]);
- 
--	hotplug_memory_notifier(memtier_hotplug_callback, MEMTIER_HOTPLUG_PRI);
-+	hotplug_node_notifier(memtier_hotplug_callback, MEMTIER_HOTPLUG_PRI);
- 	return 0;
- }
- subsys_initcall(memory_tier_init);
---- a/mm/mempolicy.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/mm/mempolicy.c
-@@ -3788,20 +3788,20 @@ static int wi_node_notifier(struct notif
- 			       unsigned long action, void *data)
- {
- 	int err;
--	struct memory_notify *arg = data;
-+	struct node_notify *arg = data;
- 	int nid = arg->status_change_nid;
- 
- 	if (nid < 0)
- 		return NOTIFY_OK;
- 
- 	switch (action) {
--	case MEM_ONLINE:
-+	case NODE_BECAME_MEM_AWARE:
- 		err = sysfs_wi_node_add(nid);
- 		if (err)
- 			pr_err("failed to add sysfs for node%d during hotplug: %d\n",
- 			       nid, err);
- 		break;
--	case MEM_OFFLINE:
-+	case NODE_BECAME_MEMORYLESS:
- 		sysfs_wi_node_delete(nid);
- 		break;
- 	}
-@@ -3840,7 +3840,7 @@ static int __init add_weighted_interleav
- 		}
- 	}
- 
--	hotplug_memory_notifier(wi_node_notifier, DEFAULT_CALLBACK_PRI);
-+	hotplug_node_notifier(wi_node_notifier, DEFAULT_CALLBACK_PRI);
- 	return 0;
- 
- err_cleanup_kobj:
---- a/mm/slub.c~mmmemory_hotplug-implement-numa-node-notifier
-+++ a/mm/slub.c
-@@ -6164,8 +6164,8 @@ static int slab_mem_going_online_callbac
- {
- 	struct kmem_cache_node *n;
- 	struct kmem_cache *s;
--	struct memory_notify *marg = arg;
--	int nid = marg->status_change_nid;
-+	struct node_notify *narg = arg;
-+	int nid = narg->status_change_nid;
- 	int ret = 0;
- 
- 	/*
-@@ -6217,15 +6217,12 @@ static int slab_memory_callback(struct n
- 	int ret = 0;
- 
- 	switch (action) {
--	case MEM_GOING_ONLINE:
-+	case NODE_BECOMING_MEM_AWARE:
- 		ret = slab_mem_going_online_callback(arg);
- 		break;
--	case MEM_GOING_OFFLINE:
-+	case NODE_BECOMING_MEMORYLESS:
- 		ret = slab_mem_going_offline_callback(arg);
- 		break;
--	case MEM_ONLINE:
--	case MEM_CANCEL_OFFLINE:
--		break;
- 	}
- 	if (ret)
- 		ret = notifier_from_errno(ret);
-@@ -6300,7 +6297,7 @@ void __init kmem_cache_init(void)
- 			sizeof(struct kmem_cache_node),
- 			SLAB_HWCACHE_ALIGN | SLAB_NO_OBJ_EXT, 0, 0);
- 
--	hotplug_memory_notifier(slab_memory_callback, SLAB_CALLBACK_PRI);
-+	hotplug_node_notifier(slab_memory_callback, SLAB_CALLBACK_PRI);
- 
- 	/* Able to allocate the per node structures */
- 	slab_state = PARTIAL;
 _
