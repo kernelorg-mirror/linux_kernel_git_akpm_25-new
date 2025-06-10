@@ -1,0 +1,122 @@
+From: Ryan Roberts <ryan.roberts@arm.com>
+Subject: mm/filemap: allow arch to request folio size for exec memory
+Date: Mon, 9 Jun 2025 10:27:27 +0100
+
+Change the readahead config so that if it is being requested for an
+executable mapping, do a synchronous read into a set of folios with an
+arch-specified order and in a naturally aligned manner.  We no longer
+center the read on the faulting page but simply align it down to the
+previous natural boundary.  Additionally, we don't bother with an
+asynchronous part.
+
+On arm64 if memory is physically contiguous and naturally aligned to the
+"contpte" size, we can use contpte mappings, which improves utilization of
+the TLB.  When paired with the "multi-size THP" feature, this works well
+to reduce dTLB pressure.  However iTLB pressure is still high due to
+executable mappings having a low likelihood of being in the required folio
+size and mapping alignment, even when the filesystem supports readahead
+into large folios (e.g.  XFS).
+
+The reason for the low likelihood is that the current readahead algorithm
+starts with an order-0 folio and increases the folio order by 2 every time
+the readahead mark is hit.  But most executable memory tends to be
+accessed randomly and so the readahead mark is rarely hit and most
+executable folios remain order-0.
+
+So let's special-case the read(ahead) logic for executable mappings.  The
+trade-off is performance improvement (due to more efficient storage of the
+translations in iTLB) vs potential for making reclaim more difficult (due
+to the folios being larger so if a part of the folio is hot the whole
+thing is considered hot).  But executable memory is a small portion of the
+overall system memory so I doubt this will even register from a reclaim
+perspective.
+
+I've chosen 64K folio size for arm64 which benefits both the 4K and 16K
+base page size configs.  Crucially the same amount of data is still read
+(usually 128K) so I'm not expecting any read amplification issues.  I
+don't anticipate any write amplification because text is always RO.
+
+Note that the text region of an ELF file could be populated into the page
+cache for other reasons than taking a fault in a mmapped area.  The most
+common case is due to the loader read()ing the header which can be shared
+with the beginning of text.  So some text will still remain in small
+folios, but this simple, best effort change provides good performance
+improvements as is.
+
+Confine this special-case approach to the bounds of the VMA.  This
+prevents wasting memory for any padding that might exist in the file
+between sections.  Previously the padding would have been contained in
+order-0 folios and would be easy to reclaim.  But now it would be part of
+a larger folio so more difficult to reclaim.  Solve this by simply not
+reading it into memory in the first place.
+
+Benchmarking
+============
+
+The below shows pgbench and redis benchmarks on Graviton3 arm64 system.
+
+First, confirmation that this patch causes more text to be contained in
+64K folios:
+
++----------------------+---------------+---------------+---------------+
+| File-backed folios by|  system boot  |    pgbench    |     redis     |
+| size as percentage of+-------+-------+-------+-------+-------+-------+
+| all mapped text mem  |before | after |before | after |before | after |
++======================+=======+=======+=======+=======+=======+=======+
+| base-page-4kB        |   78% |   30% |   78% |   11% |   73% |   14% |
+| thp-aligned-8kB      |    1% |    0% |    0% |    0% |    1% |    0% |
+| thp-aligned-16kB     |   17% |    4% |   17% |    3% |   20% |    4% |
+| thp-aligned-32kB     |    1% |    1% |    1% |    2% |    1% |    1% |
+| thp-aligned-64kB     |    3% |   63% |    3% |   81% |    4% |   77% |
+| thp-aligned-128kB    |    0% |    1% |    1% |    1% |    1% |    2% |
+| thp-unaligned-64kB   |    0% |    0% |    0% |    1% |    0% |    1% |
+| thp-unaligned-128kB  |    0% |    1% |    0% |    0% |    0% |    0% |
+| thp-partial          |    0% |    0% |    0% |    1% |    0% |    1% |
++----------------------+-------+-------+-------+-------+-------+-------+
+| cont-aligned-64kB    |    4% |   65% |    4% |   83% |    6% |   79% |
++----------------------+-------+-------+-------+-------+-------+-------+
+
+The above shows that for both workloads (each isolated with cgroups) as
+well as the general system state after boot, the amount of text backed by
+4K and 16K folios reduces and the amount backed by 64K folios increases
+significantly.  And the amount of text that is contpte-mapped
+significantly increases (see last row).
+
+And this is reflected in performance improvement.  "(I)" indicates a
+statistically significant improvement.  Note TPS and Reqs/sec are rates so
+bigger is better, ms is time so smaller is better:
+
++-------------+-------------------------------------------+------------+
+| Benchmark   | Result Class                              | Improvemnt |
++=============+===========================================+============+
+| pts/pgbench | Scale: 1 Clients: 1 RO (TPS)              |  (I) 3.47% |
+|             | Scale: 1 Clients: 1 RO - Latency (ms)     |     -2.88% |
+|             | Scale: 1 Clients: 250 RO (TPS)            |  (I) 5.02% |
+|             | Scale: 1 Clients: 250 RO - Latency (ms)   | (I) -4.79% |
+|             | Scale: 1 Clients: 1000 RO (TPS)           |  (I) 6.16% |
+|             | Scale: 1 Clients: 1000 RO - Latency (ms)  | (I) -5.82% |
+|             | Scale: 100 Clients: 1 RO (TPS)            |      2.51% |
+|             | Scale: 100 Clients: 1 RO - Latency (ms)   |     -3.51% |
+|             | Scale: 100 Clients: 250 RO (TPS)          |  (I) 4.75% |
+|             | Scale: 100 Clients: 250 RO - Latency (ms) | (I) -4.44% |
+|             | Scale: 100 Clients: 1000 RO (TPS)         |  (I) 6.34% |
+|             | Scale: 100 Clients: 1000 RO - Latency (ms)| (I) -5.95% |
++-------------+-------------------------------------------+------------+
+| pts/redis   | Test: GET Connections: 50 (Reqs/sec)      |  (I) 3.20% |
+|             | Test: GET Connections: 1000 (Reqs/sec)    |  (I) 2.55% |
+|             | Test: LPOP Connections: 50 (Reqs/sec)     |  (I) 4.59% |
+|             | Test: LPOP Connections: 1000 (Reqs/sec)   |  (I) 4.81% |
+|             | Test: LPUSH Connections: 50 (Reqs/sec)    |  (I) 5.31% |
+|             | Test: LPUSH Connections: 1000 (Reqs/sec)  |  (I) 4.36% |
+|             | Test: SADD Connections: 50 (Reqs/sec)     |  (I) 2.64% |
+|             | Test: SADD Connections: 1000 (Reqs/sec)   |  (I) 4.15% |
+|             | Test: SET Connections: 50 (Reqs/sec)      |  (I) 3.11% |
+|             | Test: SET Connections: 1000 (Reqs/sec)    |  (I) 3.36% |
++-------------+-------------------------------------------+------------+
+
+Link: https://lkml.kernel.org/r/20250609092729.274960-6-ryan.roberts@arm.com
+Signed-off-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Acked-by: Will Deacon <will@kernel.org>
+Cc: Chaitanya S Prakash <chaitanyas.prakash@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
