@@ -1,0 +1,186 @@
+From: Christoph Hellwig <hch@lst.de>
+Subject: mm: stop passing a writeback_control structure to shmem_writeout
+Date: Tue, 10 Jun 2025 07:49:38 +0200
+
+shmem_writeout only needs the swap_iocb cookie and the split folio list. 
+Pass those explicitly and remove the now unused list member from struct
+writeback_control.
+
+Link: https://lkml.kernel.org/r/20250610054959.2057526-3-hch@lst.de
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/gpu/drm/i915/gem/i915_gem_shmem.c |    2 -
+ drivers/gpu/drm/ttm/ttm_backup.c          |    9 ------
+ include/linux/shmem_fs.h                  |    5 +++
+ include/linux/writeback.h                 |    3 --
+ mm/shmem.c                                |   26 +++++++++++---------
+ mm/vmscan.c                               |   12 +++------
+ 6 files changed, 26 insertions(+), 31 deletions(-)
+
+--- a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/drivers/gpu/drm/i915/gem/i915_gem_shmem.c
+@@ -317,7 +317,7 @@ void __shmem_writeback(size_t size, stru
+ 		if (folio_mapped(folio))
+ 			folio_redirty_for_writepage(&wbc, folio);
+ 		else
+-			error = shmem_writeout(folio, &wbc);
++			error = shmem_writeout(folio, NULL, NULL);
+ 	}
+ }
+ 
+--- a/drivers/gpu/drm/ttm/ttm_backup.c~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/drivers/gpu/drm/ttm/ttm_backup.c
+@@ -112,15 +112,8 @@ ttm_backup_backup_page(struct file *back
+ 
+ 	if (writeback && !folio_mapped(to_folio) &&
+ 	    folio_clear_dirty_for_io(to_folio)) {
+-		struct writeback_control wbc = {
+-			.sync_mode = WB_SYNC_NONE,
+-			.nr_to_write = SWAP_CLUSTER_MAX,
+-			.range_start = 0,
+-			.range_end = LLONG_MAX,
+-			.for_reclaim = 1,
+-		};
+ 		folio_set_reclaim(to_folio);
+-		ret = shmem_writeout(to_folio, &wbc);
++		ret = shmem_writeout(to_folio, NULL, NULL);
+ 		if (!folio_test_writeback(to_folio))
+ 			folio_clear_reclaim(to_folio);
+ 		/*
+--- a/include/linux/shmem_fs.h~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/include/linux/shmem_fs.h
+@@ -11,6 +11,8 @@
+ #include <linux/fs_parser.h>
+ #include <linux/userfaultfd_k.h>
+ 
++struct swap_iocb;
++
+ /* inode in-kernel data */
+ 
+ #ifdef CONFIG_TMPFS_QUOTA
+@@ -107,7 +109,8 @@ static inline bool shmem_mapping(struct
+ void shmem_unlock_mapping(struct address_space *mapping);
+ struct page *shmem_read_mapping_page_gfp(struct address_space *mapping,
+ 					pgoff_t index, gfp_t gfp_mask);
+-int shmem_writeout(struct folio *folio, struct writeback_control *wbc);
++int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
++		struct list_head *folio_list);
+ void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end);
+ int shmem_unuse(unsigned int type);
+ 
+--- a/include/linux/writeback.h~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/include/linux/writeback.h
+@@ -79,9 +79,6 @@ struct writeback_control {
+ 	 */
+ 	struct swap_iocb **swap_plug;
+ 
+-	/* Target list for splitting a large folio */
+-	struct list_head *list;
+-
+ 	/* internal fields used by the ->writepages implementation: */
+ 	struct folio_batch fbatch;
+ 	pgoff_t index;
+--- a/mm/shmem.c~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/mm/shmem.c
+@@ -1540,11 +1540,13 @@ start_over:
+ /**
+  * shmem_writeout - Write the folio to swap
+  * @folio: The folio to write
+- * @wbc: How writeback is to be done
++ * @plug: swap plug
++ * @folio_list: list to put back folios on split
+  *
+  * Move the folio from the page cache to the swap cache.
+  */
+-int shmem_writeout(struct folio *folio, struct writeback_control *wbc)
++int shmem_writeout(struct folio *folio, struct swap_iocb **plug,
++		struct list_head *folio_list)
+ {
+ 	struct address_space *mapping = folio->mapping;
+ 	struct inode *inode = mapping->host;
+@@ -1554,9 +1556,6 @@ int shmem_writeout(struct folio *folio,
+ 	int nr_pages;
+ 	bool split = false;
+ 
+-	if (WARN_ON_ONCE(!wbc->for_reclaim))
+-		goto redirty;
+-
+ 	if ((info->flags & VM_LOCKED) || sbinfo->noswap)
+ 		goto redirty;
+ 
+@@ -1583,7 +1582,7 @@ int shmem_writeout(struct folio *folio,
+ try_split:
+ 		/* Ensure the subpages are still dirty */
+ 		folio_test_set_dirty(folio);
+-		if (split_folio_to_list(folio, wbc->list))
++		if (split_folio_to_list(folio, folio_list))
+ 			goto redirty;
+ 		folio_clear_dirty(folio);
+ 	}
+@@ -1636,13 +1635,21 @@ try_split:
+ 		list_add(&info->swaplist, &shmem_swaplist);
+ 
+ 	if (!folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN)) {
++		struct writeback_control wbc = {
++			.sync_mode	= WB_SYNC_NONE,
++			.nr_to_write	= SWAP_CLUSTER_MAX,
++			.range_start	= 0,
++			.range_end	= LLONG_MAX,
++			.for_reclaim	= 1,
++			.swap_plug	= plug,
++		};
+ 		shmem_recalc_inode(inode, 0, nr_pages);
+ 		swap_shmem_alloc(folio->swap, nr_pages);
+ 		shmem_delete_from_page_cache(folio, swp_to_radix_entry(folio->swap));
+ 
+ 		mutex_unlock(&shmem_swaplist_mutex);
+ 		BUG_ON(folio_mapped(folio));
+-		return swap_writeout(folio, wbc);
++		return swap_writeout(folio, &wbc);
+ 	}
+ 	if (!info->swapped)
+ 		list_del_init(&info->swaplist);
+@@ -1651,10 +1658,7 @@ try_split:
+ 		goto try_split;
+ redirty:
+ 	folio_mark_dirty(folio);
+-	if (wbc->for_reclaim)
+-		return AOP_WRITEPAGE_ACTIVATE;	/* Return with folio locked */
+-	folio_unlock(folio);
+-	return 0;
++	return AOP_WRITEPAGE_ACTIVATE;	/* Return with folio locked */
+ }
+ EXPORT_SYMBOL_GPL(shmem_writeout);
+ 
+--- a/mm/vmscan.c~mm-stop-passing-a-writeback_control-structure-to-shmem_writeout
++++ a/mm/vmscan.c
+@@ -669,15 +669,13 @@ static pageout_t writeout(struct folio *
+ 
+ 	/*
+ 	 * The large shmem folio can be split if CONFIG_THP_SWAP is not enabled
+-	 * or we failed to allocate contiguous swap entries.
++	 * or we failed to allocate contiguous swap entries, in which case
++	 * the split out folios get added back to folio_list.
+ 	 */
+-	if (shmem_mapping(mapping)) {
+-		if (folio_test_large(folio))
+-			wbc.list = folio_list;
+-		res = shmem_writeout(folio, &wbc);
+-	} else {
++	if (shmem_mapping(mapping))
++		res = shmem_writeout(folio, plug, folio_list);
++	else
+ 		res = swap_writeout(folio, &wbc);
+-	}
+ 
+ 	if (res < 0)
+ 		handle_write_error(mapping, folio, res);
+_
