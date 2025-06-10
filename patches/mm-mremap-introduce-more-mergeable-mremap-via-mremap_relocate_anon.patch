@@ -1,0 +1,1113 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/mremap: introduce more mergeable mremap via MREMAP_RELOCATE_ANON
+Date: Mon, 9 Jun 2025 14:26:35 +0100
+
+Patch series "mm/mremap: introduce more mergeable mremap via
+MREMAP_RELOCATE_ANON".
+
+A longstanding issue with VMA merging of anonymous VMAs is the requirement
+to maintain both vma->vm_pgoff and anon_vma compatibility between merge
+candidates.
+
+For anonymous mappings, vma->vm_pgoff (and consequently, folio->index)
+refer to virtual page offsets, that is, va >> PAGE_SHIFT.
+
+However upon mremap() of an anonymous mapping that has been faulted (that
+is, where vma->anon_vma != NULL), we would then need to walk page tables
+to be able to access let alone manipulate folio->index, mapping fields to
+permit an update of this virtual page offset.
+
+Therefore in these instances, we do not do so, instead retaining the
+virtual page offset the VMA was first faulted in at as it's vma->vm_pgoff
+field, and of course consequently folio->index.
+
+On each occasion we use linear_page_index() to determine the appropriate
+offset, cleverly offset the vma->vm_pgoff field by the difference between
+the virtual address and actual VMA start.
+
+Doing so in effect fragments the virtual address space, meaning that we
+are no longer able to merge these VMAs with adjacent ones that could, at
+least theoretically, be merged.
+
+This also creates a difference in behaviour, often surprising to users,
+between mappings which are faulted and those which are not - as for the
+latter we adjust vma->vm_pgoff upon mremap() to aid mergeability.
+
+This is problematic firstly because this proliferates kernel allocations
+that are pure memory pressure - unreclaimable and unmovable - i.e. 
+vm_area_struct, anon_vma, anon_vma_chain objects that need not exist.
+
+Secondly, mremap() exhibits an implicit uAPI in that it does not permit
+remaps which span multiple VMAs (though it does permit remaps that
+constitute a part of a single VMA).
+
+This means that a user must concern themselves with whether merges succeed
+or not should they wish to use mremap() in such a way which causes
+multiple mremap() calls to be performed upon mappings.
+
+This series provides users with an option to accept the overhead of
+actually updating the VMA and underlying folios via the
+MREMAP_RELOCATE_ANON flag.
+
+If MREMAP_RELOCATE_ANON is specified, but an ordinary merge would result
+in the mremap() succeeding, then no attempt is made at relocation of
+folios as this is not required.
+
+Even if no merge is possible upon moving of the region, vma->vm_pgoff and
+folio->index fields are appropriately updated in order that subsequent
+mremap() or mprotect() calls will succeed in merging.
+
+This flag falls back to the ordinary means of mremap() should the
+operation not be feasible.  It also transparently undoes the operation,
+carefully holding rmap locks such that no racing rmap operation encounters
+incorrect or missing VMAs.
+
+In addition, the MREMAP_MUST_RELOCATE_ANON flag is supplied in case the
+user needs to know whether or not the operation succeeded - this flag is
+identical to MREMAP_RELOCATE_ANON, only if the operation cannot succeed,
+the mremap() fails with -EFAULT.
+
+Note that no-op mremap() operations (such as an unpopulated range, or a
+merge that would trivially succeed already) will succeed under
+MREMAP_MUST_RELOCATE_ANON.
+
+mremap() already walks page tables, so it isn't an order of magntitude
+increase in workload, but constitutes the need to walk to page table leaf
+level and manipulate folios.
+
+The operations all succeed under THP and in general are compatible with
+underlying large folios of any size.  In fact, the larger the folio, the
+more efficient the operation is.
+
+Performance testing indicate that time taken using MREMAP_RELOCATE_ANON is
+on the same order of magnitude of ordinary mremap() operations, with both
+exhibiting time to the proportion of the mapping which is populated.
+
+Of course, mremap() operations that are entirely aligned are significantly
+faster as they need only move a VMA and a smaller number of higher order
+page tables, but this is unavoidable.
+
+Previous efforts in this area
+=============================
+
+An approach addressing this issue was previously suggested by Jakub Matena
+in a series posted a few years ago in [0] (and discussed in a masters
+thesis).
+
+However this was a more general effort which attempted to always make
+anonymous mappings more mergeable, and therefore was not quite ready for
+the upstream limelight.  In addition, large folio work which has occurred
+since requires us to carefully consider and account for this.
+
+This series is more conservative and targeted (one must specific a flag to
+get this behaviour) and additionally goes to great efforts to handle large
+folios and account all of the nitty gritty locking concerns that might
+arise in current kernel code.
+
+Thanks goes out to Jakub for his efforts however, and hopefully this
+effort to take a slightly different approach to the same problem is
+pleasing to him regardless :)
+
+[0]:https://lore.kernel.org/all/20220311174602.288010-1-matenajakub@gmail.com/
+
+Use-cases
+=========
+
+* ZGC is a concurrent GC shipped with OpenJDK.  A prototype is being
+  worked upon which makes use of extensive mremap() operations to perform
+  defragmentation of objects, taking advantage of the plentiful available
+  virtual address space in a 64-bit system.
+
+  In instances where one VMA is faulted in and another not, merging is
+  not possible, which leads to significant, unreclaimable, kernel metadata
+  overhead and contention on the vm.max_map_count limit.
+
+  This series eliminates the issue entirely.
+
+* It was indicated that Android similarly moves memory around and
+  encounters the very same issues as ZGC.  * SUSE indicate they have
+  encountered similar issues as pertains to an internal client.
+
+Past approaches
+===============
+
+In discussions at LSF/MM/BPF It was suggested that we could make this an
+madvise() operation, however at this point it will be too late to
+correctly perform the merge, requiring an unmap/remap which would be
+egregious.
+
+It was further suggested that we simply defer the operation to the point
+at which an mremap() is attempted on multiple immediately adjacent VMAs
+(that is - to allow VMA fragmentation up until the point where it might
+cause perceptible issues with uAPI).
+
+This is problematic in that in the first instance - you accrue
+fragmentation, and only if you were to try to move the fragmented objects
+again would you resolve it.
+
+Additionally you would not be able to handle the mprotect() case, and
+you'd have the same issue as the madvise() approach in that you'd need to
+essentially re-map each VMA.
+
+Additionally it would become non-trivial to correctly merge the VMAs - if
+there were more than 3, we would need to invent a new merging mechanism
+specifically for this, hold locks carefully over each to avoid them
+disappearing from beneath us and introduce a great deal of non-optional
+complexity.
+
+While imperfect, the mremap flag approach seems the least invasive most
+workable solution (until further rework of the anon_vma mechanism can be
+achieved!)
+
+Testing
+=======
+
+* Significantly expanded self-tests, all of which are passing.
+* Explicit testing of forked cases including anon_vma reuse, all passing
+  correctly.
+* Ran all self tests with MREMAP_RELOCATE_ANON forced on for all anonymous
+  mremap()'s.
+* Ran heavy workloads with MREMAP_RELOCATE_ANON forced on on real hardware
+  (kernel compilation, etc.)
+* Ran stress-ng --mremap 32 for an hour with MREMAP_RELOCATE_ANON forced on
+  on real hardware.
+
+
+This patch (of 11):
+
+When mremap() moves a mapping around in memory, it goes to great lengths
+to avoid having to walk page tables as this is expensive and
+time-consuming.
+
+Rather, if the VMA was faulted (that is vma->anon_vma != NULL), the
+virtual page offset stored in the VMA at vma->vm_pgoff will remain the
+same, as well all the folio indexes pointed at the associated anon_vma
+object.
+
+This means the VMA and page tables can simply be moved and this affects
+the change (and if we can move page tables at a higher page table level,
+this is even faster).
+
+While this is efficient, it does lead to big problems with VMA merging -
+in essence it causes faulted anonymous VMAs to not be mergeable under many
+circumstances once moved.
+
+This is limiting and leads to both a proliferation of unreclaimable,
+unmovable kernel metadata (VMAs, anon_vma's, anon_vma_chain's) and has an
+impact on further use of mremap(), which has a requirement that the VMA
+moved (which can also be a partial range within a VMA) may span only a
+single VMA.
+
+This makes the mergeability or not of VMAs in effect a uAPI concern.
+
+In some use cases, users may wish to accept the overhead of actually going
+to the trouble of updating VMAs and folios to affect mremap() moves. 
+Let's provide them with the choice.
+
+This patch add a new MREMAP_RELOCATE_ANON flag to do just that, which
+attempts to perform such an operation.  If it is unable to do so, it
+cleanly falls back to the usual method.
+
+It carefully takes the rmap locks such that at no time will a racing rmap
+user encounter incorrect or missing VMAs.
+
+It is also designed to interact cleanly with the existing mremap() error
+fallback mechanism (inverting the remap should the page table move fail).
+
+Also, if we could merge cleanly without such a change, we do so, avoiding
+the overhead of the operation if it is not required.
+
+In the instance that no merge may occur when the move is performed, we
+still perform the folio and VMA updates to ensure that future mremap() or
+mprotect() calls will result in merges.
+
+In this implementation, we simply give up if we encounter large folios.  A
+subsequent commit will extend the functionality to allow for these cases.
+
+We restrict this flag to purely anonymous memory only.
+
+We separate out the vma_had_uncowed_parents() helper function for checking
+in should_relocate_anon() and introduce a new function
+vma_maybe_has_shared_anon_folios() which combines a check against this and
+any forked child anon_vma's.
+
+We carefully check for pinned folios in case a caller who holds a pin
+might make assumptions about index, mapping fields which we are about to
+manipulate.
+
+Link: https://lkml.kernel.org/r/cover.1749473726.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/22a80f22ba2082b28ee0b0a925eb3dbb37c2a786.1749473726.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jakub Matěna <matenajakub@gmail.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/rmap.h             |    4 
+ include/uapi/linux/mman.h        |    1 
+ mm/internal.h                    |    1 
+ mm/mremap.c                      |  403 +++++++++++++++++++++++++++--
+ mm/vma.c                         |   79 ++++-
+ mm/vma.h                         |   36 ++
+ tools/testing/vma/vma.c          |    5 
+ tools/testing/vma/vma_internal.h |   38 ++
+ 8 files changed, 522 insertions(+), 45 deletions(-)
+
+--- a/include/linux/rmap.h~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/include/linux/rmap.h
+@@ -147,6 +147,10 @@ static inline void anon_vma_unlock_read(
+ 	up_read(&anon_vma->root->rwsem);
+ }
+ 
++static inline void anon_vma_assert_locked(const struct anon_vma *anon_vma)
++{
++	rwsem_assert_held(&anon_vma->root->rwsem);
++}
+ 
+ /*
+  * anon_vma helper functions.
+--- a/include/uapi/linux/mman.h~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/include/uapi/linux/mman.h
+@@ -9,6 +9,7 @@
+ #define MREMAP_MAYMOVE		1
+ #define MREMAP_FIXED		2
+ #define MREMAP_DONTUNMAP	4
++#define MREMAP_RELOCATE_ANON	8
+ 
+ #define OVERCOMMIT_GUESS		0
+ #define OVERCOMMIT_ALWAYS		1
+--- a/mm/internal.h~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/mm/internal.h
+@@ -46,6 +46,7 @@ struct folio_batch;
+ struct pagetable_move_control {
+ 	struct vm_area_struct *old; /* Source VMA. */
+ 	struct vm_area_struct *new; /* Destination VMA. */
++	struct vm_area_struct *relocate_locked; /* VMA which is rmap locked. */
+ 	unsigned long old_addr; /* Address from which the move begins. */
+ 	unsigned long old_end; /* Exclusive address at which old range ends. */
+ 	unsigned long new_addr; /* Address to move page tables to. */
+--- a/mm/mremap.c~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/mm/mremap.c
+@@ -71,6 +71,15 @@ struct vma_remap_struct {
+ 	unsigned long charged;		/* If VM_ACCOUNT, # pages to account. */
+ };
+ 
++/* Represents local PTE state. */
++struct pte_state {
++	unsigned long old_addr;
++	unsigned long new_addr;
++	unsigned long old_end;
++	pte_t *ptep;
++	spinlock_t *ptl;
++};
++
+ static pud_t *get_old_pud(struct mm_struct *mm, unsigned long addr)
+ {
+ 	pgd_t *pgd;
+@@ -139,18 +148,50 @@ static pmd_t *alloc_new_pmd(struct mm_st
+ 	return pmd;
+ }
+ 
+-static void take_rmap_locks(struct vm_area_struct *vma)
++/*
++ * Determine whether the old and new VMAs share the same anon_vma. If so, this
++ * has implications around locking and to avoid deadlock we need to tread
++ * carefully.
++ */
++static bool has_shared_anon_vma(struct pagetable_move_control *pmc)
++{
++	struct vm_area_struct *vma = pmc->old;
++	struct vm_area_struct *locked = pmc->relocate_locked;
++
++	if (!locked)
++		return false;
++
++	return vma->anon_vma->root == locked->anon_vma->root;
++}
++
++static void maybe_take_rmap_locks(struct pagetable_move_control *pmc)
+ {
++	struct vm_area_struct *vma;
++	struct anon_vma *anon_vma;
++
++	if (!pmc->need_rmap_locks)
++		return;
++
++	vma = pmc->old;
++	anon_vma = vma->anon_vma;
+ 	if (vma->vm_file)
+ 		i_mmap_lock_write(vma->vm_file->f_mapping);
+-	if (vma->anon_vma)
+-		anon_vma_lock_write(vma->anon_vma);
++	if (anon_vma && !has_shared_anon_vma(pmc))
++		anon_vma_lock_write(anon_vma);
+ }
+ 
+-static void drop_rmap_locks(struct vm_area_struct *vma)
++static void maybe_drop_rmap_locks(struct pagetable_move_control *pmc)
+ {
+-	if (vma->anon_vma)
+-		anon_vma_unlock_write(vma->anon_vma);
++	struct vm_area_struct *vma;
++	struct anon_vma *anon_vma;
++
++	if (!pmc->need_rmap_locks)
++		return;
++
++	vma = pmc->old;
++	anon_vma = vma->anon_vma;
++	if (anon_vma && !has_shared_anon_vma(pmc))
++		anon_vma_unlock_write(anon_vma);
+ 	if (vma->vm_file)
+ 		i_mmap_unlock_write(vma->vm_file->f_mapping);
+ }
+@@ -204,8 +245,7 @@ static int move_ptes(struct pagetable_mo
+ 	 *   serialize access to individual ptes, but only rmap traversal
+ 	 *   order guarantees that we won't miss both the old and new ptes).
+ 	 */
+-	if (pmc->need_rmap_locks)
+-		take_rmap_locks(vma);
++	maybe_take_rmap_locks(pmc);
+ 
+ 	/*
+ 	 * We don't have to worry about the ordering of src and dst
+@@ -280,8 +320,7 @@ static int move_ptes(struct pagetable_mo
+ 	pte_unmap(new_pte - 1);
+ 	pte_unmap_unlock(old_pte - 1, old_ptl);
+ out:
+-	if (pmc->need_rmap_locks)
+-		drop_rmap_locks(vma);
++	maybe_drop_rmap_locks(pmc);
+ 	return err;
+ }
+ 
+@@ -539,15 +578,14 @@ static __always_inline unsigned long get
+  * Should move_pgt_entry() acquire the rmap locks? This is either expressed in
+  * the PMC, or overridden in the case of normal, larger page tables.
+  */
+-static bool should_take_rmap_locks(struct pagetable_move_control *pmc,
+-				   enum pgt_entry entry)
++static bool should_take_rmap_locks(enum pgt_entry entry)
+ {
+ 	switch (entry) {
+ 	case NORMAL_PMD:
+ 	case NORMAL_PUD:
+ 		return true;
+ 	default:
+-		return pmc->need_rmap_locks;
++		return false;
+ 	}
+ }
+ 
+@@ -559,11 +597,15 @@ static bool move_pgt_entry(struct pageta
+ 			   enum pgt_entry entry, void *old_entry, void *new_entry)
+ {
+ 	bool moved = false;
+-	bool need_rmap_locks = should_take_rmap_locks(pmc, entry);
++	bool override_locks = false;
+ 
+-	/* See comment in move_ptes() */
+-	if (need_rmap_locks)
+-		take_rmap_locks(pmc->old);
++	if (!pmc->need_rmap_locks && should_take_rmap_locks(entry)) {
++		override_locks = true;
++
++		pmc->need_rmap_locks = true;
++		/* See comment in move_ptes() */
++		maybe_take_rmap_locks(pmc);
++	}
+ 
+ 	switch (entry) {
+ 	case NORMAL_PMD:
+@@ -587,8 +629,9 @@ static bool move_pgt_entry(struct pageta
+ 		break;
+ 	}
+ 
+-	if (need_rmap_locks)
+-		drop_rmap_locks(pmc->old);
++	maybe_drop_rmap_locks(pmc);
++	if (override_locks)
++		pmc->need_rmap_locks = false;
+ 
+ 	return moved;
+ }
+@@ -754,6 +797,209 @@ static unsigned long pmc_progress(struct
+ 	return old_addr < orig_old_addr ? 0 : old_addr - orig_old_addr;
+ }
+ 
++/*
++ * If the folio mapped at the specified pte entry can have its index and mapping
++ * relocated, then do so.
++ *
++ * Returns the number of pages we have traversed, or 0 if the operation failed.
++ */
++static unsigned long relocate_anon_pte(struct pagetable_move_control *pmc,
++		struct pte_state *state, bool undo)
++{
++	struct folio *folio;
++	struct vm_area_struct *old, *new;
++	pgoff_t new_index;
++	pte_t pte;
++	unsigned long ret = 1;
++	unsigned long old_addr = state->old_addr;
++	unsigned long new_addr = state->new_addr;
++
++	old = pmc->old;
++	new = pmc->new;
++
++	pte = ptep_get(state->ptep);
++
++	/* Ensure we have truly got an anon folio. */
++	folio = vm_normal_folio(old, old_addr, pte);
++	if (!folio)
++		return ret;
++
++	folio_lock(folio);
++
++	/* No-op. */
++	if (!folio_test_anon(folio) || folio_test_ksm(folio))
++		goto out;
++
++	/*
++	 * This should never be the case as we have already checked to ensure
++	 * that the anon_vma is not forked, and we have just asserted that it is
++	 * anonymous.
++	 */
++	if (WARN_ON_ONCE(folio_maybe_mapped_shared(folio)))
++		goto out;
++	/* The above check should imply these. */
++	VM_WARN_ON_ONCE(folio_mapcount(folio) > folio_nr_pages(folio));
++	VM_WARN_ON_ONCE(!PageAnonExclusive(folio_page(folio, 0)));
++
++	/*
++	 * A pinned folio implies that it will be used for a duration longer
++	 * than that over which the mmap_lock is held, meaning that another part
++	 * of the kernel may be making use of this folio.
++	 *
++	 * Since we are about to manipulate index & mapping fields, we cannot
++	 * safely proceed because whatever has pinned this folio may then
++	 * incorrectly assume these do not change.
++	 */
++	if (folio_maybe_dma_pinned(folio))
++		goto out;
++
++	/*
++	 * This should not happen as we explicitly disallow this, but check
++	 * anyway.
++	 */
++	if (folio_test_large(folio)) {
++		ret = 0;
++		goto out;
++	}
++
++	if (!undo)
++		new_index = linear_page_index(new, new_addr);
++	else
++		new_index = linear_page_index(old, old_addr);
++
++	/*
++	 * The PTL should keep us safe from unmapping, and the fact the folio is
++	 * a PTE keeps the folio referenced.
++	 *
++	 * The mmap/VMA locks should keep us safe from fork and other processes.
++	 *
++	 * The rmap locks should keep us safe from anything happening to the
++	 * VMA/anon_vma.
++	 *
++	 * The folio lock should keep us safe from reclaim, migration, etc.
++	 */
++	folio_move_anon_rmap(folio, undo ? old : new);
++	WRITE_ONCE(folio->index, new_index);
++
++out:
++	folio_unlock(folio);
++	return ret;
++}
++
++static bool pte_done(struct pte_state *state)
++{
++	return state->old_addr >= state->old_end;
++}
++
++static void pte_next(struct pte_state *state, unsigned long nr_pages)
++{
++	state->old_addr += nr_pages * PAGE_SIZE;
++	state->new_addr += nr_pages * PAGE_SIZE;
++	state->ptep += nr_pages;
++}
++
++static bool relocate_anon_ptes(struct pagetable_move_control *pmc,
++		unsigned long extent, pmd_t *pmdp, bool undo)
++{
++	struct mm_struct *mm = current->mm;
++	struct pte_state state = {
++		.old_addr = pmc->old_addr,
++		.new_addr = pmc->new_addr,
++		.old_end = pmc->old_addr + extent,
++	};
++	pte_t *ptep_start;
++	bool ret;
++	unsigned long nr_pages;
++
++	ptep_start = pte_offset_map_lock(mm, pmdp, pmc->old_addr, &state.ptl);
++	/*
++	 * We prevent faults with mmap write lock, hold the rmap lock and should
++	 * not fail to obtain this lock. Just give up if we can't.
++	 */
++	if (!ptep_start)
++		return false;
++
++	state.ptep = ptep_start;
++	for (; !pte_done(&state); pte_next(&state, nr_pages)) {
++		pte_t pte = ptep_get(state.ptep);
++
++		if (pte_none(pte) || !pte_present(pte)) {
++			nr_pages = 1;
++			continue;
++		}
++
++		nr_pages = relocate_anon_pte(pmc, &state, undo);
++		if (!nr_pages) {
++			ret = false;
++			goto out;
++		}
++	}
++
++	ret = true;
++out:
++	pte_unmap_unlock(ptep_start, state.ptl);
++	return ret;
++}
++
++static bool __relocate_anon_folios(struct pagetable_move_control *pmc, bool undo)
++{
++	pud_t *pudp;
++	pmd_t *pmdp;
++	unsigned long extent;
++	struct mm_struct *mm = current->mm;
++
++	if (!pmc->len_in)
++		return true;
++
++	for (; !pmc_done(pmc); pmc_next(pmc, extent)) {
++		pmd_t pmd;
++		pud_t pud;
++
++		extent = get_extent(NORMAL_PUD, pmc);
++
++		pudp = get_old_pud(mm, pmc->old_addr);
++		if (!pudp)
++			continue;
++		pud = pudp_get(pudp);
++
++		if (pud_trans_huge(pud) || pud_devmap(pud))
++			return false;
++
++		extent = get_extent(NORMAL_PMD, pmc);
++		pmdp = get_old_pmd(mm, pmc->old_addr);
++		if (!pmdp)
++			continue;
++		pmd = pmdp_get(pmdp);
++
++		if (is_swap_pmd(pmd) || pmd_trans_huge(pmd) ||
++		    pmd_devmap(pmd))
++			return false;
++
++		if (pmd_none(pmd))
++			continue;
++
++		if (!relocate_anon_ptes(pmc, extent, pmdp, undo))
++			return false;
++	}
++
++	return true;
++}
++
++static bool relocate_anon_folios(struct pagetable_move_control *pmc, bool undo)
++{
++	unsigned long old_addr = pmc->old_addr;
++	unsigned long new_addr = pmc->new_addr;
++	bool ret;
++
++	ret = __relocate_anon_folios(pmc, undo);
++
++	/* Reset state ready for retry. */
++	pmc->old_addr = old_addr;
++	pmc->new_addr = new_addr;
++
++	return ret;
++}
++
+ unsigned long move_page_tables(struct pagetable_move_control *pmc)
+ {
+ 	unsigned long extent;
+@@ -1135,6 +1381,67 @@ static void unmap_source_vma(struct vma_
+ }
+ 
+ /*
++ * Should we attempt to relocate anonymous folios to the location that the VMA
++ * is being moved to by updating index and mapping fields accordingly?
++ */
++static bool should_relocate_anon(struct vma_remap_struct *vrm,
++	struct pagetable_move_control *pmc)
++{
++	struct vm_area_struct *old = vrm->vma;
++
++	/* Currently we only do this if requested. */
++	if (!(vrm->flags & MREMAP_RELOCATE_ANON))
++		return false;
++
++	/* We can't deal with special or hugetlb mappings. */
++	if (old->vm_flags & (VM_SPECIAL | VM_HUGETLB))
++		return false;
++
++	/* We only support anonymous mappings. */
++	if (!vma_is_anonymous(old))
++		return false;
++
++	/* If no folios are mapped, then no need to attempt this. */
++	if (!old->anon_vma)
++		return false;
++
++	/* We don't allow relocation of non-exclusive folios. */
++	if (vma_maybe_has_shared_anon_folios(old))
++		return false;
++
++	/* Otherwise, we're good to go! */
++	return true;
++}
++
++static void lock_new_anon_vma(struct vm_area_struct *new_vma)
++{
++	/*
++	 * We have a new VMA to reassign folios to. We take a lock on
++	 * its anon_vma so reclaim doesn't fail to unmap mappings.
++	 *
++	 * We have acquired a VMA write lock by now (in vma_link()), so
++	 * we do not have to worry about racing faults.
++	 *
++	 * NOTE: we do NOT need to acquire an rmap lock on the old VMA,
++	 * as forks require an mmap write lock, which we hold.
++	 */
++	anon_vma_lock_write(new_vma->anon_vma);
++
++	/*
++	 * lockdep is unable to differentiate between the anon_vma lock we take
++	 * in the old VMA and the one we are taking here in the new VMA.
++	 *
++	 * In each instance where the old VMA might have its anon_vma
++	 * lock taken, we explicitly check to ensure they are not one
++	 * and the same, avoiding deadlock.
++	 *
++	 * Express this to lockdep through a subclass.
++	 */
++	lock_set_subclass(&new_vma->anon_vma->root->rwsem.dep_map, 1,
++			  _THIS_IP_);
++}
++
++/*
+  * Copy vrm->vma over to vrm->new_addr possibly adjusting size as part of the
+  * process. Additionally handle an error occurring on moving of page tables,
+  * where we reset vrm state to cause unmapping of the new VMA.
+@@ -1153,9 +1460,11 @@ static int copy_vma_and_data(struct vma_
+ 	struct vm_area_struct *new_vma;
+ 	int err = 0;
+ 	PAGETABLE_MOVE(pmc, NULL, NULL, vrm->addr, vrm->new_addr, vrm->old_len);
++	bool relocate_anon = should_relocate_anon(vrm, &pmc);
+ 
++again:
+ 	new_vma = copy_vma(&vma, vrm->new_addr, vrm->new_len, new_pgoff,
+-			   &pmc.need_rmap_locks);
++			   &pmc.need_rmap_locks, &relocate_anon);
+ 	if (!new_vma) {
+ 		vrm_uncharge(vrm);
+ 		*new_vma_ptr = NULL;
+@@ -1165,12 +1474,59 @@ static int copy_vma_and_data(struct vma_
+ 	pmc.old = vma;
+ 	pmc.new = new_vma;
+ 
++	if (relocate_anon) {
++		lock_new_anon_vma(new_vma);
++		pmc.relocate_locked = new_vma;
++
++		if (!relocate_anon_folios(&pmc, /* undo= */false)) {
++			unsigned long start = new_vma->vm_start;
++			unsigned long size = new_vma->vm_end - start;
++
++			/* Undo if fails. */
++			relocate_anon_folios(&pmc, /* undo= */true);
++			vrm_stat_account(vrm, vrm->new_len);
++
++			anon_vma_unlock_write(new_vma->anon_vma);
++			pmc.relocate_locked = NULL;
++
++			do_munmap(current->mm, start, size, NULL);
++			relocate_anon = false;
++			goto again;
++		}
++	}
++
+ 	moved_len = move_page_tables(&pmc);
+ 	if (moved_len < vrm->old_len)
+ 		err = -ENOMEM;
+ 	else if (vma->vm_ops && vma->vm_ops->mremap)
+ 		err = vma->vm_ops->mremap(new_vma);
+ 
++	if (unlikely(err && relocate_anon)) {
++		relocate_anon_folios(&pmc, /* undo= */true);
++		anon_vma_unlock_write(new_vma->anon_vma);
++		pmc.relocate_locked = NULL;
++	} else if (relocate_anon /* && !err */) {
++		unsigned long addr = vrm->new_addr;
++		unsigned long end = addr + vrm->new_len;
++		VMA_ITERATOR(vmi, vma->vm_mm, addr);
++		VMG_VMA_STATE(vmg, &vmi, NULL, new_vma, addr, end);
++		struct vm_area_struct *merged;
++
++		/*
++		 * Now we have successfully copied page tables and set up
++		 * folios, we can safely drop the anon_vma lock.
++		 */
++		anon_vma_unlock_write(new_vma->anon_vma);
++		pmc.relocate_locked = NULL;
++
++		/* Let's try merge again... */
++		vmg.prev = vma_prev(&vmi);
++		vma_next(&vmi);
++		merged = vma_merge_existing_range(&vmg);
++		if (merged)
++			new_vma = merged;
++	}
++
+ 	if (unlikely(err)) {
+ 		PAGETABLE_MOVE(pmc_revert, new_vma, vma, vrm->new_addr,
+ 			       vrm->addr, moved_len);
+@@ -1483,7 +1839,8 @@ static unsigned long check_mremap_params
+ 	unsigned long flags = vrm->flags;
+ 
+ 	/* Ensure no unexpected flag values. */
+-	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP))
++	if (flags & ~(MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP |
++		      MREMAP_RELOCATE_ANON))
+ 		return -EINVAL;
+ 
+ 	/* Start address must be page-aligned. */
+@@ -1498,6 +1855,10 @@ static unsigned long check_mremap_params
+ 	if (!PAGE_ALIGN(vrm->new_len))
+ 		return -EINVAL;
+ 
++	/* We can't relocate without allowing a move. */
++	if ((flags & MREMAP_RELOCATE_ANON) && !(flags & MREMAP_MAYMOVE))
++		return -EINVAL;
++
+ 	/* Remainder of checks are for cases with specific new_addr. */
+ 	if (!vrm_implies_new_addr(vrm))
+ 		return 0;
+--- a/mm/vma.c~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/mm/vma.c
+@@ -62,22 +62,6 @@ struct mmap_state {
+ 		.state = VMA_MERGE_START,				\
+ 	}
+ 
+-/*
+- * If, at any point, the VMA had unCoW'd mappings from parents, it will maintain
+- * more than one anon_vma_chain connecting it to more than one anon_vma. A merge
+- * would mean a wider range of folios sharing the root anon_vma lock, and thus
+- * potential lock contention, we do not wish to encourage merging such that this
+- * scales to a problem.
+- */
+-static bool vma_had_uncowed_parents(struct vm_area_struct *vma)
+-{
+-	/*
+-	 * The list_is_singular() test is to avoid merging VMA cloned from
+-	 * parents. This can improve scalability caused by anon_vma lock.
+-	 */
+-	return vma && vma->anon_vma && !list_is_singular(&vma->anon_vma_chain);
+-}
+-
+ static inline bool is_mergeable_vma(struct vma_merge_struct *vmg, bool merge_next)
+ {
+ 	struct vm_area_struct *vma = merge_next ? vmg->next : vmg->prev;
+@@ -801,8 +785,7 @@ static bool can_merge_remove_vma(struct
+  * - The caller must hold a WRITE lock on the mm_struct->mmap_lock.
+  * - vmi must be positioned within [@vmg->middle->vm_start, @vmg->middle->vm_end).
+  */
+-static __must_check struct vm_area_struct *vma_merge_existing_range(
+-		struct vma_merge_struct *vmg)
++struct vm_area_struct *vma_merge_existing_range(struct vma_merge_struct *vmg)
+ {
+ 	struct vm_area_struct *middle = vmg->middle;
+ 	struct vm_area_struct *prev = vmg->prev;
+@@ -1803,7 +1786,7 @@ int vma_link(struct mm_struct *mm, struc
+  */
+ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 	unsigned long addr, unsigned long len, pgoff_t pgoff,
+-	bool *need_rmap_locks)
++	bool *need_rmap_locks, bool *relocate_anon)
+ {
+ 	struct vm_area_struct *vma = *vmap;
+ 	unsigned long vma_start = vma->vm_start;
+@@ -1837,7 +1820,19 @@ struct vm_area_struct *copy_vma(struct v
+ 	vmg.middle = NULL; /* New VMA range. */
+ 	vmg.pgoff = pgoff;
+ 	vmg.next = vma_iter_next_rewind(&vmi, NULL);
++
+ 	new_vma = vma_merge_new_range(&vmg);
++	if (*relocate_anon) {
++		/*
++		 * If merge succeeds, no need to relocate. Otherwise, reset
++		 * pgoff for newly established VMA which we will relocate folios
++		 * to.
++		 */
++		if (new_vma)
++			*relocate_anon = false;
++		else
++			pgoff = addr >> PAGE_SHIFT;
++	}
+ 
+ 	if (new_vma) {
+ 		/*
+@@ -1868,7 +1863,9 @@ struct vm_area_struct *copy_vma(struct v
+ 		vma_set_range(new_vma, addr, addr + len, pgoff);
+ 		if (vma_dup_policy(vma, new_vma))
+ 			goto out_free_vma;
+-		if (anon_vma_clone(new_vma, vma))
++		if (*relocate_anon)
++			new_vma->anon_vma = NULL;
++		else if (anon_vma_clone(new_vma, vma))
+ 			goto out_free_mempol;
+ 		if (new_vma->vm_file)
+ 			get_file(new_vma->vm_file);
+@@ -1876,6 +1873,21 @@ struct vm_area_struct *copy_vma(struct v
+ 			new_vma->vm_ops->open(new_vma);
+ 		if (vma_link(mm, new_vma))
+ 			goto out_vma_link;
++		/*
++		 * If we're attempting to relocate anonymous VMAs, we
++		 * don't want to reuse an anon_vma as set by
++		 * vm_area_dup(), or copy anon_vma_chain or anything
++		 * like this.
++		 */
++		if (*relocate_anon && __anon_vma_prepare(new_vma)) {
++			/*
++			 * We have already linked this VMA, so we must now unmap
++			 * it to unwind this. This is best effort.
++			 */
++			do_munmap(mm, addr, len, NULL);
++			return NULL;
++		}
++
+ 		*need_rmap_locks = false;
+ 	}
+ 	return new_vma;
+@@ -3153,7 +3165,8 @@ int __vm_munmap(unsigned long start, siz
+ 	return ret;
+ }
+ 
+-/* Insert vm structure into process list sorted by address
++/*
++ * Insert vm structure into process list sorted by address
+  * and into the inode's i_mmap tree.  If vm_file is non-NULL
+  * then i_mmap_rwsem is taken here.
+  */
+@@ -3194,3 +3207,27 @@ int insert_vm_struct(struct mm_struct *m
+ 
+ 	return 0;
+ }
++bool vma_maybe_has_shared_anon_folios(struct vm_area_struct *vma)
++{
++	struct anon_vma *anon_vma = vma->anon_vma;
++	unsigned long expected_children;
++
++	/* Trivially fine. */
++	if (!anon_vma)
++		return false;
++
++	/* Currently or previously shares unCoW'd memory with parent(s). */
++	if (vma_had_uncowed_parents(vma))
++		return true;
++
++	/* mmap lock is sufficient as it would prevent num_children changing. */
++	if (!rwsem_is_locked(&vma->vm_mm->mmap_lock))
++		anon_vma_assert_locked(anon_vma);
++
++	expected_children = 0;
++	/* The root anon_vma is self-parented. */
++	if (anon_vma == anon_vma->root)
++		expected_children++;
++
++	return anon_vma->num_children > expected_children;
++}
+--- a/mm/vma.h~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/mm/vma.h
+@@ -322,6 +322,9 @@ __must_check struct vm_area_struct
+ *vma_merge_new_range(struct vma_merge_struct *vmg);
+ 
+ __must_check struct vm_area_struct
++*vma_merge_existing_range(struct vma_merge_struct *vmg);
++
++__must_check struct vm_area_struct
+ *vma_merge_extend(struct vma_iterator *vmi,
+ 		  struct vm_area_struct *vma,
+ 		  unsigned long delta);
+@@ -341,7 +344,7 @@ int vma_link(struct mm_struct *mm, struc
+ 
+ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
+ 	unsigned long addr, unsigned long len, pgoff_t pgoff,
+-	bool *need_rmap_locks);
++	bool *need_rmap_locks, bool *relocate_anon);
+ 
+ struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma);
+ 
+@@ -559,6 +562,37 @@ struct vm_area_struct *vma_iter_next_rew
+ 	return next;
+ }
+ 
++/*
++ * Is this VMA either the parent of forked processes or the child of a forking
++ * process which may possess an unCOW'd reference to a shared folio?
++ */
++bool vma_maybe_has_shared_anon_folios(struct vm_area_struct *vma);
++
++/*
++ * If, at any point, the VMA had unCoW'd mappings from parents, it will maintain
++ * more than one anon_vma_chain connecting it to more than one anon_vma. A merge
++ * would mean a wider range of folios sharing the root anon_vma lock, and thus
++ * potential lock contention, we do not wish to encourage merging such that this
++ * scales to a problem.
++ *
++ * Assumes VMA is locked.
++ */
++static inline bool vma_had_uncowed_parents(struct vm_area_struct *vma)
++{
++	/*
++	 * The list_is_singular() test is to avoid merging VMA cloned from
++	 * parents. This can improve scalability caused by anon_vma lock.
++	 */
++	return vma && vma->anon_vma && !list_is_singular(&vma->anon_vma_chain);
++}
++
++/*
++ * If, at any point, folios mapped by the VMA had unCoW'd mappings potentially
++ * present in child processes forked from this one, then the underlying mapped
++ * folios may be non-exclusively mapped.
++ */
++bool vma_had_uncowed_children(struct vm_area_struct *vma);
++
+ #ifdef CONFIG_64BIT
+ 
+ static inline bool vma_is_sealed(struct vm_area_struct *vma)
+--- a/tools/testing/vma/vma.c~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/tools/testing/vma/vma.c
+@@ -1551,13 +1551,14 @@ static bool test_copy_vma(void)
+ 	unsigned long flags = VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE;
+ 	struct mm_struct mm = {};
+ 	bool need_locks = false;
++	bool relocate_anon = false;
+ 	VMA_ITERATOR(vmi, &mm, 0);
+ 	struct vm_area_struct *vma, *vma_new, *vma_next;
+ 
+ 	/* Move backwards and do not merge. */
+ 
+ 	vma = alloc_and_link_vma(&mm, 0x3000, 0x5000, 3, flags);
+-	vma_new = copy_vma(&vma, 0, 0x2000, 0, &need_locks);
++	vma_new = copy_vma(&vma, 0, 0x2000, 0, &need_locks, &relocate_anon);
+ 	ASSERT_NE(vma_new, vma);
+ 	ASSERT_EQ(vma_new->vm_start, 0);
+ 	ASSERT_EQ(vma_new->vm_end, 0x2000);
+@@ -1570,7 +1571,7 @@ static bool test_copy_vma(void)
+ 
+ 	vma = alloc_and_link_vma(&mm, 0, 0x2000, 0, flags);
+ 	vma_next = alloc_and_link_vma(&mm, 0x6000, 0x8000, 6, flags);
+-	vma_new = copy_vma(&vma, 0x4000, 0x2000, 4, &need_locks);
++	vma_new = copy_vma(&vma, 0x4000, 0x2000, 4, &need_locks, &relocate_anon);
+ 	vma_assert_attached(vma_new);
+ 
+ 	ASSERT_EQ(vma_new, vma_next);
+--- a/tools/testing/vma/vma_internal.h~mm-mremap-introduce-more-mergeable-mremap-via-mremap_relocate_anon
++++ a/tools/testing/vma/vma_internal.h
+@@ -26,6 +26,7 @@
+ #include <linux/mm.h>
+ #include <linux/rbtree.h>
+ #include <linux/refcount.h>
++#include <linux/rwsem.h>
+ 
+ extern unsigned long stack_guard_gap;
+ #ifdef CONFIG_MMU
+@@ -204,6 +205,8 @@ struct anon_vma {
+ 	struct anon_vma *root;
+ 	struct rb_root_cached rb_root;
+ 
++	unsigned long num_children;
++
+ 	/* Test fields. */
+ 	bool was_cloned;
+ 	bool was_unlinked;
+@@ -259,6 +262,8 @@ struct mm_struct {
+ 	unsigned long def_flags;
+ 
+ 	unsigned long flags; /* Must use atomic bitops to access */
++
++	struct rw_semaphore mmap_lock;
+ };
+ 
+ struct vm_area_struct;
+@@ -1409,6 +1414,17 @@ static inline int ksm_execve(struct mm_s
+ 	return 0;
+ }
+ 
++static int do_munmap(struct mm_struct *mm, unsigned long start, size_t len,
++		struct list_head *uf)
++{
++	(void)mm;
++	(void)start;
++	(void)len;
++	(void)uf;
++
++	return 0;
++}
++
+ static inline void ksm_exit(struct mm_struct *mm)
+ {
+ 	(void)mm;
+@@ -1495,4 +1511,26 @@ static inline vm_flags_t ksm_vma_flags(c
+ 	return vm_flags;
+ }
+ 
++static inline int rwsem_is_locked(struct rw_semaphore *sem)
++{
++	(void)sem;
++
++	return 0;
++}
++
++static inline void anon_vma_lock_read(struct anon_vma *anon_vma)
++{
++	(void)anon_vma;
++}
++
++static inline void anon_vma_unlock_read(struct anon_vma *anon_vma)
++{
++	(void)anon_vma;
++}
++
++static inline void anon_vma_assert_locked(const struct anon_vma *anon_vma)
++{
++	(void)anon_vma;
++}
++
+ #endif	/* __MM_VMA_INTERNAL_H */
+_

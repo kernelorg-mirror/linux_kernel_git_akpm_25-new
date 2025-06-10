@@ -1,0 +1,420 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: tools/testing/selftests: add MREMAP_RELOCATE_ANON fork tests
+Date: Mon, 9 Jun 2025 14:26:45 +0100
+
+Add tests explicitly asserting that mremap() fails on forked VMAs whether
+they have parent anon_vma's or whether they have child ones, as these are
+cases where the folio might be mapped by multiple processes - in this case
+we don't even try to relocate folio metadata, but rather simply disallow
+the operation.
+
+The tests use MREMAP_MUST_RELOCATE_ANON so we can detect the failure
+correctly.
+
+Were the mremap()'s to succeed, a merge would occur, so it remains
+appropriate to keep these in the merge test suite.
+
+We also explicitly test the anon_vma reuse case.  This is one where a
+munmap() occurs on a parent anon_vma which still has children.  We keep
+the empty anon_vma around, and then attempt to reuse it on the next fork
+of a VMA whose anon_vma references this empty anon_vma.
+
+Consider the first case over 3 forks:
+
+FORK 3 TIMES ONE AFTER ANOTHER
+==============================
+
+Process 1
+
+     |-------------|
+     | avc*        v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|
+     | anon_vma    ^
+     |             |
+     v     rb_root |
+  |---------------------|
+  | refcount = 1        |<--|
+  | num_children = 1    |   |
+  | num_active_vmas = 1 |---| parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|
+     | anon_vma    ^
+     |             |--------------------|
+     v     rb_root |                    |
+  |---------------------|               |
+  | refcount = 2        | (self-parent) |
+  | num_children = 2    |<--------------x----|
+  | num_active_vmas = 1 |               |    |
+  |---------------------|               |    |
+                           |------------|    |
+Process 2                  |                 |
+                           |                 |
+     |-------------|       |                 |
+     | avc         v       v                 |
+  |-----|   vma |-----| |-----|              |
+  |  B  |<------| avc |.| avc |              |
+  |-----|       |-----| |-----|              |
+     | anon_vma    ^                         |
+     |             |                         |
+     v     rb_root |                         |
+  |---------------------|                    |
+  | refcount = 1        |                    |
+  | num_children = 0    |--------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|        |--------------------------|
+     | anon_vma    ^           |                          |
+     |             |--------------------|                 |
+     v     rb_root |                    |                 |
+  |---------------------|               |                 |
+  | refcount = 3        | (self-parent) |                 |
+  | num_children = 2    |<--------------x----|            |
+  | num_active_vmas = 1 |               |    |            |
+  |---------------------|               |    |            |
+                           |------------|    |            |
+Process 2                  |                 |            |
+                           |                 |            |
+     |-------------|       |                 |            |
+     | avc         v       v                 |            |
+  |-----|   vma |-----| |-----|              |            |
+  |  B  |<------| avc |.| avc |              |            |
+  |-----|       |-----| |-----|              |            |
+     | anon_vma    ^                         |            |
+     |             |-------------------------x--------|   |
+     v     rb_root |                         |        |   |
+  |---------------------|                    |        |   |
+  | refcount = 1        |<-------------------x----|   |   |
+  | num_children = 1    |--------------------|    |   |   |
+  | num_active_vmas = 1 | parent                  |   |   |
+  |---------------------|                         |   |   |
+                                                  |   |   |
+Process 3                                         |   |   |
+                           |----------------------x---|   |
+     |-------------|       |       |--------------x-------|
+     | avc         v       v       v              |
+  |-----|   vma |-----| |-----| |-----|           |
+  |  C  |<------| avc |.| avc |.| avc |           |
+  |-----|       |-----| |-----| |-----|           |
+     | anon_vma    ^                              |
+     |             |                              |
+     v     rb_root |                              |
+  |---------------------|                         |
+  | refcount = 1        |                         |
+  | num_children = 0    |-------------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|             |---------------------------------|
+  |  A  |<------| avc |             |                                 |
+  |-----|       |-----|        |--------------------------|           |
+     | anon_vma    ^           |                          |           |
+     |             |--------------------|                 |           |
+     v     rb_root |                    |                 |           |
+  |---------------------|               |                 |           |
+  | refcount = 4        | (self-parent) |                 |           |
+  | num_children = 2    |<--------------x----|            |           |
+  | num_active_vmas = 1 |               |    |            |           |
+  |---------------------|               |    |            |           |
+                           |------------|    |            |           |
+Process 2                  |                 |            |           |
+                           |                 |            |           |
+     |-------------|       |                 |            |           |
+     | avc         v       v                 |            |           |
+  |-----|   vma |-----| |-----|              |            |           |
+  |  B  |<------| avc |.| avc |              |            |           |
+  |-----|       |-----| |-----|     |--------x------------x-------|   |
+     | anon_vma    ^                |        |            |       |   |
+     |             |-------------------------x--------|   |       |   |
+     v     rb_root |                         |        |   |       |   |
+  |---------------------|                    |        |   |       |   |
+  | refcount = 1        |<-------------------x----|   |   |       |   |
+  | num_children = 1    |--------------------|    |   |   |       |   |
+  | num_active_vmas = 1 | parent                  |   |   |       |   |
+  |---------------------|                         |   |   |       |   |
+                                                  |   |   |       |   |
+Process 3                                         |   |   |       |   |
+                           |----------------------x---|   |       |   |
+     |-------------|       |       |--------------x-------|       |   |
+     | avc         v       v       v              |               |   |
+  |-----|   vma |-----| |-----| |-----|           |               |   |
+  |  C  |<------| avc |.| avc |.| avc |           |               |   |
+  |-----|       |-----| |-----| |-----|           |               |   |
+     | anon_vma    ^                              |               |   |
+     |             |------------------------------x-----------|   |   |
+     v     rb_root |                              |           |   |   |
+  |---------------------|                         |           |   |   |
+  | refcount = 1        |<------------------------x---|       |   |   |
+  | num_children = 1    |-------------------------|   |       |   |   |
+  | num_active_vmas = 1 | parent                      |       |   |   |
+  |---------------------|                             |       |   |   |
+                                                      |       |   |   |
+Process 4                                             |       |   |   |
+                           |--------------------------x-------|   |   |
+     |-------------|       |       |------------------x-----------|   |
+     | avc         v       v       v       v----------x---------------|
+  |-----|   vma |-----| |-----| |-----| |-----|       |
+  |  D  |<------| avc |.| avc |.| avc |.| avc |       |
+  |-----|       |-----| |-----| |-----| |-----|       |
+     | anon_vma    ^                                  |
+     |             |                                  |
+     v     rb_root |                                  |
+  |---------------------|                             |
+  | refcount = 1        |                             |
+  | num_children = 0    |-----------------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+We can see that at no point do we lack either a raised num_children count
+or anon_vma_chain list count.
+
+Equally with anon_vma reuse:
+
+FORK 3 TIMES ONE AFTER ANOTHER, UNMAPPING AFTER FORK FOR ANON_VMA REUSE
+=======================================================================
+
+Process 1
+
+     |-------------|
+     | avc*        v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|
+     | anon_vma    ^
+     |             |
+     v     rb_root |
+  |---------------------|
+  | refcount = 1        |<--|
+  | num_children = 1    |   |
+  | num_active_vmas = 1 |---| parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|
+     | anon_vma    ^
+     |             |--------------------|
+     v     rb_root |                    |
+  |---------------------|               |
+  | refcount = 2        | (self-parent) |
+  | num_children = 2    |<--------------x----|
+  | num_active_vmas = 1 |               |    |
+  |---------------------|               |    |
+                           |------------|    |
+Process 2                  |                 |
+                           |                 |
+     |-------------|       |                 |
+     | avc         v       v                 |
+  |-----|   vma |-----| |-----|              |
+  |  B  |<------| avc |.| avc |              |
+  |-----|       |-----| |-----|              |
+     | anon_vma    ^                         |
+     |             |                         |
+     v     rb_root |                         |
+  |---------------------|                    |
+  | refcount = 1        |                    |
+  | num_children = 0    |--------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|        |--------------------------|
+     | anon_vma    ^           |                          |
+     |             |--------------------|                 |
+     v     rb_root |                    |                 |
+  |---------------------|               |                 |
+  | refcount = 3        | (self-parent) |                 |
+  | num_children = 2    |<--------------x----|            |
+  | num_active_vmas = 1 |               |    |            |
+  |---------------------|               |    |            |
+                           |------------|    |            |
+Process 2                  |                 |            |
+                           |                 |            |
+     |-------------|       |                 |            |
+     | avc         v       v                 |            |
+  |-----|   vma |-----| |-----|              |            |
+  |  B  |<------| avc |.| avc |              |            |
+  |-----|       |-----| |-----|              |            |
+     | anon_vma    ^                         |            |
+     |             |-------------------------x--------|   |
+     v     rb_root |                         |        |   |
+  |---------------------|                    |        |   |
+  | refcount = 1        |<-------------------x----|   |   |
+  | num_children = 1    |--------------------|    |   |   |
+  | num_active_vmas = 1 | parent                  |   |   |
+  |---------------------|                         |   |   |
+                                                  |   |   |
+Process 3                                         |   |   |
+                           |----------------------x---|   |
+     |-------------|       |       |--------------x-------|
+     | avc         v       v       v              |
+  |-----|   vma |-----| |-----| |-----|           |
+  |  C  |<------| avc |.| avc |.| avc |           |
+  |-----|       |-----| |-----| |-----|           |
+     | anon_vma    ^                              |
+     |             |                              |
+     v     rb_root |                              |
+  |---------------------|                         |
+  | refcount = 1        |                         |
+  | num_children = 0    |-------------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+UNMAP B
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|
+  |  A  |<------| avc |
+  |-----|       |-----|        |--------------------------|
+     | anon_vma    ^           |                          |
+     |             |------------                          |
+     v     rb_root |                                      |
+  |---------------------|                                 |
+  | refcount = 3        | (self-parent)                   |
+  | num_children = 2    |<-------------------|            |
+  | num_active_vmas = 1 |                    |            |
+  |---------------------|                    |            |
+                                             |            |
+Process 2                                    |            |
+                                             |            |
+                   |-------------------------x--------|   |
+           rb_root |                         |        |   |
+  |---------------------|                    |        |   |
+  | refcount = 1        |<-------------------x----|   |   | We keep empty
+  | num_children = 1    |--------------------|    |   |   | anon_vma round.
+  | num_active_vmas = 0 | parent                  |   |   |
+  |---------------------|                         |   |   |
+                                                  |   |   |
+Process 3                                         |   |   |
+                           |----------------------x---|   |
+     |-------------|       |       |--------------x-------|
+     | avc         v       v       v              |
+  |-----|   vma |-----| |-----| |-----|           |
+  |  C  |<------| avc |.| avc |.| avc |           |
+  |-----|       |-----| |-----| |-----|           |
+     | anon_vma    ^                              |
+     |             |                              |
+     v     rb_root |                              |
+  |---------------------|                         |
+  | refcount = 1        |                         |
+  | num_children = 0    |-------------------------|
+  | num_active_vmas = 1 | parent
+  |---------------------|
+
+FORK
+
+Process 1
+
+     |-------------|
+     | avc         v
+  |-----|   vma |-----|             |-----------------------------|
+  |  A  |<------| avc |             |                             |
+  |-----|       |-----|        |--------------------------|       |
+     | anon_vma    ^           |                          |       |
+     |             |-----------|                          |       |
+     v     rb_root |                                      |       |
+  |---------------------|                                 |       |
+  | refcount = 3        | (self-parent)                   |       |
+  | num_children = 2    |<-------------------|            |       |
+  | num_active_vmas = 1 |                    |            |       |
+  |---------------------|                    |            |       |
+                                             |            |       |
+Process 2               |--------------------x------------x-------x-------|
+                        |                    |            |       |       |
+                   |-------------------------x--------|   |       |       |
+           rb_root |                         |        |   |       |       |
+  |---------------------|<-------------------x--------x---x-------x---|   |
+  | refcount = 1        |<-------------------x----|   |   |       |   |   |
+  | num_children = 1    |--------------------|    |   |   |       |   |   |
+  | num_active_vmas = 1 | parent                  |   |   |       |   |   |
+  |---------------------|                         |   |   |       |   |   |
+                                                  |   |   |       |   |   |
+Process 3                                         |   |   |       |   |   |
+                           |----------------------x---|   |       |   |   |
+     |-------------|       |       |--------------x-------|       |   |   |
+     | avc         v       v       v              |               |   |   |
+  |-----|   vma |-----| |-----| |-----|           |               |   |   |
+  |  C  |<------| avc |.| avc |.| avc |           |               |   |   |
+  |-----|       |-----| |-----| |-----|           |               |   |   |
+     | anon_vma    ^                              |               |   |   |
+     |             |------------------------------x-----------|   |   |   |
+     v     rb_root |                              |           |   |   |   |
+  |---------------------|                         |           |   |   |   |
+  | refcount = 1        |                         |           |   |   |   |
+  | num_children = 0    |-------------------------|           |   |   |   |
+  | num_active_vmas = 1 | parent                              |   |   |   |
+  |---------------------|                                     |   |   |   |
+                                                              |   |   |   |
+Process 4                                                     |   |   |   |
+                           |----------------------------------|   |   |   |
+     |-------------|       |       |------------------------------|   |   |
+     | avc         v       v       v                                  |   |
+  |-----|   vma |-----| |-----| |-----|                               |   |
+  |  D  |<------| avc |.| avc |.| avc |                               |   |
+  |-----|       |-----| |-----| |-----|                               |   |
+     | anon_vma    ^                                                  |   |
+     |             |--------------------------------------------------x---|
+     |                                                                |
+     |----------------------------------------------------------------|
+
+We reuse the empty anon_vma from VMA B.  Note that process 3 is now
+parented to process 4's (and 2's) anon_vma.
+
+Link: https://lkml.kernel.org/r/d52a781999622ed2f1de073d72ea4d9debbfe198.1749473726.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jakub Matěna <matenajakub@gmail.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>

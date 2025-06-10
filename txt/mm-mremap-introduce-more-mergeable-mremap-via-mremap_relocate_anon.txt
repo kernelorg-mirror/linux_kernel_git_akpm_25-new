@@ -1,0 +1,255 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/mremap: introduce more mergeable mremap via MREMAP_RELOCATE_ANON
+Date: Mon, 9 Jun 2025 14:26:35 +0100
+
+Patch series "mm/mremap: introduce more mergeable mremap via
+MREMAP_RELOCATE_ANON".
+
+A longstanding issue with VMA merging of anonymous VMAs is the requirement
+to maintain both vma->vm_pgoff and anon_vma compatibility between merge
+candidates.
+
+For anonymous mappings, vma->vm_pgoff (and consequently, folio->index)
+refer to virtual page offsets, that is, va >> PAGE_SHIFT.
+
+However upon mremap() of an anonymous mapping that has been faulted (that
+is, where vma->anon_vma != NULL), we would then need to walk page tables
+to be able to access let alone manipulate folio->index, mapping fields to
+permit an update of this virtual page offset.
+
+Therefore in these instances, we do not do so, instead retaining the
+virtual page offset the VMA was first faulted in at as it's vma->vm_pgoff
+field, and of course consequently folio->index.
+
+On each occasion we use linear_page_index() to determine the appropriate
+offset, cleverly offset the vma->vm_pgoff field by the difference between
+the virtual address and actual VMA start.
+
+Doing so in effect fragments the virtual address space, meaning that we
+are no longer able to merge these VMAs with adjacent ones that could, at
+least theoretically, be merged.
+
+This also creates a difference in behaviour, often surprising to users,
+between mappings which are faulted and those which are not - as for the
+latter we adjust vma->vm_pgoff upon mremap() to aid mergeability.
+
+This is problematic firstly because this proliferates kernel allocations
+that are pure memory pressure - unreclaimable and unmovable - i.e. 
+vm_area_struct, anon_vma, anon_vma_chain objects that need not exist.
+
+Secondly, mremap() exhibits an implicit uAPI in that it does not permit
+remaps which span multiple VMAs (though it does permit remaps that
+constitute a part of a single VMA).
+
+This means that a user must concern themselves with whether merges succeed
+or not should they wish to use mremap() in such a way which causes
+multiple mremap() calls to be performed upon mappings.
+
+This series provides users with an option to accept the overhead of
+actually updating the VMA and underlying folios via the
+MREMAP_RELOCATE_ANON flag.
+
+If MREMAP_RELOCATE_ANON is specified, but an ordinary merge would result
+in the mremap() succeeding, then no attempt is made at relocation of
+folios as this is not required.
+
+Even if no merge is possible upon moving of the region, vma->vm_pgoff and
+folio->index fields are appropriately updated in order that subsequent
+mremap() or mprotect() calls will succeed in merging.
+
+This flag falls back to the ordinary means of mremap() should the
+operation not be feasible.  It also transparently undoes the operation,
+carefully holding rmap locks such that no racing rmap operation encounters
+incorrect or missing VMAs.
+
+In addition, the MREMAP_MUST_RELOCATE_ANON flag is supplied in case the
+user needs to know whether or not the operation succeeded - this flag is
+identical to MREMAP_RELOCATE_ANON, only if the operation cannot succeed,
+the mremap() fails with -EFAULT.
+
+Note that no-op mremap() operations (such as an unpopulated range, or a
+merge that would trivially succeed already) will succeed under
+MREMAP_MUST_RELOCATE_ANON.
+
+mremap() already walks page tables, so it isn't an order of magntitude
+increase in workload, but constitutes the need to walk to page table leaf
+level and manipulate folios.
+
+The operations all succeed under THP and in general are compatible with
+underlying large folios of any size.  In fact, the larger the folio, the
+more efficient the operation is.
+
+Performance testing indicate that time taken using MREMAP_RELOCATE_ANON is
+on the same order of magnitude of ordinary mremap() operations, with both
+exhibiting time to the proportion of the mapping which is populated.
+
+Of course, mremap() operations that are entirely aligned are significantly
+faster as they need only move a VMA and a smaller number of higher order
+page tables, but this is unavoidable.
+
+Previous efforts in this area
+=============================
+
+An approach addressing this issue was previously suggested by Jakub Matena
+in a series posted a few years ago in [0] (and discussed in a masters
+thesis).
+
+However this was a more general effort which attempted to always make
+anonymous mappings more mergeable, and therefore was not quite ready for
+the upstream limelight.  In addition, large folio work which has occurred
+since requires us to carefully consider and account for this.
+
+This series is more conservative and targeted (one must specific a flag to
+get this behaviour) and additionally goes to great efforts to handle large
+folios and account all of the nitty gritty locking concerns that might
+arise in current kernel code.
+
+Thanks goes out to Jakub for his efforts however, and hopefully this
+effort to take a slightly different approach to the same problem is
+pleasing to him regardless :)
+
+[0]:https://lore.kernel.org/all/20220311174602.288010-1-matenajakub@gmail.com/
+
+Use-cases
+=========
+
+* ZGC is a concurrent GC shipped with OpenJDK.  A prototype is being
+  worked upon which makes use of extensive mremap() operations to perform
+  defragmentation of objects, taking advantage of the plentiful available
+  virtual address space in a 64-bit system.
+
+  In instances where one VMA is faulted in and another not, merging is
+  not possible, which leads to significant, unreclaimable, kernel metadata
+  overhead and contention on the vm.max_map_count limit.
+
+  This series eliminates the issue entirely.
+
+* It was indicated that Android similarly moves memory around and
+  encounters the very same issues as ZGC.  * SUSE indicate they have
+  encountered similar issues as pertains to an internal client.
+
+Past approaches
+===============
+
+In discussions at LSF/MM/BPF It was suggested that we could make this an
+madvise() operation, however at this point it will be too late to
+correctly perform the merge, requiring an unmap/remap which would be
+egregious.
+
+It was further suggested that we simply defer the operation to the point
+at which an mremap() is attempted on multiple immediately adjacent VMAs
+(that is - to allow VMA fragmentation up until the point where it might
+cause perceptible issues with uAPI).
+
+This is problematic in that in the first instance - you accrue
+fragmentation, and only if you were to try to move the fragmented objects
+again would you resolve it.
+
+Additionally you would not be able to handle the mprotect() case, and
+you'd have the same issue as the madvise() approach in that you'd need to
+essentially re-map each VMA.
+
+Additionally it would become non-trivial to correctly merge the VMAs - if
+there were more than 3, we would need to invent a new merging mechanism
+specifically for this, hold locks carefully over each to avoid them
+disappearing from beneath us and introduce a great deal of non-optional
+complexity.
+
+While imperfect, the mremap flag approach seems the least invasive most
+workable solution (until further rework of the anon_vma mechanism can be
+achieved!)
+
+Testing
+=======
+
+* Significantly expanded self-tests, all of which are passing.
+* Explicit testing of forked cases including anon_vma reuse, all passing
+  correctly.
+* Ran all self tests with MREMAP_RELOCATE_ANON forced on for all anonymous
+  mremap()'s.
+* Ran heavy workloads with MREMAP_RELOCATE_ANON forced on on real hardware
+  (kernel compilation, etc.)
+* Ran stress-ng --mremap 32 for an hour with MREMAP_RELOCATE_ANON forced on
+  on real hardware.
+
+
+This patch (of 11):
+
+When mremap() moves a mapping around in memory, it goes to great lengths
+to avoid having to walk page tables as this is expensive and
+time-consuming.
+
+Rather, if the VMA was faulted (that is vma->anon_vma != NULL), the
+virtual page offset stored in the VMA at vma->vm_pgoff will remain the
+same, as well all the folio indexes pointed at the associated anon_vma
+object.
+
+This means the VMA and page tables can simply be moved and this affects
+the change (and if we can move page tables at a higher page table level,
+this is even faster).
+
+While this is efficient, it does lead to big problems with VMA merging -
+in essence it causes faulted anonymous VMAs to not be mergeable under many
+circumstances once moved.
+
+This is limiting and leads to both a proliferation of unreclaimable,
+unmovable kernel metadata (VMAs, anon_vma's, anon_vma_chain's) and has an
+impact on further use of mremap(), which has a requirement that the VMA
+moved (which can also be a partial range within a VMA) may span only a
+single VMA.
+
+This makes the mergeability or not of VMAs in effect a uAPI concern.
+
+In some use cases, users may wish to accept the overhead of actually going
+to the trouble of updating VMAs and folios to affect mremap() moves. 
+Let's provide them with the choice.
+
+This patch add a new MREMAP_RELOCATE_ANON flag to do just that, which
+attempts to perform such an operation.  If it is unable to do so, it
+cleanly falls back to the usual method.
+
+It carefully takes the rmap locks such that at no time will a racing rmap
+user encounter incorrect or missing VMAs.
+
+It is also designed to interact cleanly with the existing mremap() error
+fallback mechanism (inverting the remap should the page table move fail).
+
+Also, if we could merge cleanly without such a change, we do so, avoiding
+the overhead of the operation if it is not required.
+
+In the instance that no merge may occur when the move is performed, we
+still perform the folio and VMA updates to ensure that future mremap() or
+mprotect() calls will result in merges.
+
+In this implementation, we simply give up if we encounter large folios.  A
+subsequent commit will extend the functionality to allow for these cases.
+
+We restrict this flag to purely anonymous memory only.
+
+We separate out the vma_had_uncowed_parents() helper function for checking
+in should_relocate_anon() and introduce a new function
+vma_maybe_has_shared_anon_folios() which combines a check against this and
+any forked child anon_vma's.
+
+We carefully check for pinned folios in case a caller who holds a pin
+might make assumptions about index, mapping fields which we are about to
+manipulate.
+
+Link: https://lkml.kernel.org/r/cover.1749473726.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/22a80f22ba2082b28ee0b0a925eb3dbb37c2a786.1749473726.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jakub Matěna <matenajakub@gmail.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
