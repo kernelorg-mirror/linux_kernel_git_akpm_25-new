@@ -1,0 +1,141 @@
+From: Kuan-Wei Chiu <visitorckw@gmail.com>
+Subject: lib min_heap: add equal-elements-aware sift_down variant
+Date: Wed, 11 Jun 2025 05:55:09 +0800
+
+Patch series "Fix bcache regression with equality-aware heap APIs".
+
+This patch series introduces equality-aware variants of the min heap API
+that use a top-down heapify strategy to improve performance when many
+elements are equal under the comparison function.  It also updates the
+documentation accordingly and modifies bcache to use the new APIs to fix a
+performance regression caused by the switch to the generic min heap
+library.
+
+In particular, invalidate_buckets_lru() in bcache suffered from increased
+comparison overhead due to the bottom-up strategy introduced in commit
+866898efbb25 ("bcache: remove heap-related macros and switch to generic
+min_heap").  The regression is addressed by switching to the
+equality-aware variants and using the inline versions to avoid function
+call overhead in this hot path.
+
+
+This patch (of 8):
+
+The existing min_heap_sift_down() uses the bottom-up heapify variant,
+which reduces the number of comparisons from ~2 * log2(n) to ~1 * log2(n)
+when all elements are distinct.  However, in workloads where the heap
+contains many equal elements, this bottom-up variant can degenerate and
+perform up to 2 * log2(n) comparisons, while the traditional top-down
+variant needs only O(1) comparisons in such cases.
+
+To address this, introduce min_heap_sift_down_eqaware(), a top-down
+heapify variant optimized for scenarios with many equal elements.  This
+variant avoids unnecessary comparisons and swaps when elements are already
+equal or in the correct position.
+
+Link: https://lkml.kernel.org/r/20250610215516.1513296-1-visitorckw@gmail.com
+Link: https://lkml.kernel.org/r/20250610215516.1513296-2-visitorckw@gmail.com
+Signed-off-by: Kuan-Wei Chiu <visitorckw@gmail.com>
+Cc: Ching-Chun (Jim) Huang <jserv@ccns.ncku.edu.tw>
+Cc: Coly Li <colyli@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Robert Pang <robertpang@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/min_heap.h |   51 +++++++++++++++++++++++++++++++++++++
+ lib/min_heap.c           |    7 +++++
+ 2 files changed, 58 insertions(+)
+
+--- a/include/linux/min_heap.h~lib-min_heap-add-equal-elements-aware-sift_down-variant
++++ a/include/linux/min_heap.h
+@@ -292,6 +292,52 @@ void __min_heap_sift_down_inline(min_hea
+ 	__min_heap_sift_down_inline(container_of(&(_heap)->nr, min_heap_char, nr), _pos,	\
+ 				    __minheap_obj_size(_heap), _func, _args)
+ 
++/*
++ * Sift the element at pos down the heap.
++ *
++ * Variants of heap functions using an equal-elements-aware sift_down.
++ * These may perform better when the heap contains many equal elements.
++ */
++static __always_inline
++void __min_heap_sift_down_eqaware_inline(min_heap_char * heap, size_t pos, size_t elem_size,
++					 const struct min_heap_callbacks *func, void *args)
++{
++	void *data = heap->data;
++	void (*swp)(void *lhs, void *rhs, void *args) = func->swp;
++	/* pre-scale counters for performance */
++	size_t a = pos * elem_size;
++	size_t b, c, smallest;
++	size_t n = heap->nr * elem_size;
++
++	if (!swp)
++		swp = select_swap_func(data, elem_size);
++
++	for (;;) {
++		b = 2 * a + elem_size;
++		c = b + elem_size;
++		smallest = a;
++
++		if (b >= n)
++			break;
++
++		if (func->less(data + b, data + smallest, args))
++			smallest = b;
++
++		if (c < n && func->less(data + c, data + smallest, args))
++			smallest = c;
++
++		if (smallest == a)
++			break;
++
++		do_swap(data + a, data + smallest, elem_size, swp, args);
++		a = smallest;
++	}
++}
++
++#define min_heap_sift_down_eqaware_inline(_heap, _pos, _func, _args)	\
++	__min_heap_sift_down_inline(container_of(&(_heap)->nr, min_heap_char, nr), _pos,	\
++				    __minheap_obj_size(_heap), _func, _args)
++
+ /* Sift up ith element from the heap, O(log2(nr)). */
+ static __always_inline
+ void __min_heap_sift_up_inline(min_heap_char *heap, size_t elem_size, size_t idx,
+@@ -433,6 +479,8 @@ void *__min_heap_peek(struct min_heap_ch
+ bool __min_heap_full(min_heap_char *heap);
+ void __min_heap_sift_down(min_heap_char *heap, size_t pos, size_t elem_size,
+ 			  const struct min_heap_callbacks *func, void *args);
++void __min_heap_sift_down_eqaware(min_heap_char *heap, size_t pos, size_t elem_size,
++				  const struct min_heap_callbacks *func, void *args);
+ void __min_heap_sift_up(min_heap_char *heap, size_t elem_size, size_t idx,
+ 			const struct min_heap_callbacks *func, void *args);
+ void __min_heapify_all(min_heap_char *heap, size_t elem_size,
+@@ -455,6 +503,9 @@ bool __min_heap_del(min_heap_char *heap,
+ #define min_heap_sift_down(_heap, _pos, _func, _args)	\
+ 	__min_heap_sift_down(container_of(&(_heap)->nr, min_heap_char, nr), _pos,	\
+ 			     __minheap_obj_size(_heap), _func, _args)
++#define min_heap_sift_down_eqaware(_heap, _pos, _func, _args)	\
++	__min_heap_sift_down_eqaware(container_of(&(_heap)->nr, min_heap_char, nr), _pos,	\
++			     __minheap_obj_size(_heap), _func, _args)
+ #define min_heap_sift_up(_heap, _idx, _func, _args)	\
+ 	__min_heap_sift_up(container_of(&(_heap)->nr, min_heap_char, nr),	\
+ 			   __minheap_obj_size(_heap), _idx, _func, _args)
+--- a/lib/min_heap.c~lib-min_heap-add-equal-elements-aware-sift_down-variant
++++ a/lib/min_heap.c
+@@ -27,6 +27,13 @@ void __min_heap_sift_down(min_heap_char
+ }
+ EXPORT_SYMBOL(__min_heap_sift_down);
+ 
++void __min_heap_sift_down_eqaware(min_heap_char *heap, size_t pos, size_t elem_size,
++				  const struct min_heap_callbacks *func, void *args)
++{
++	__min_heap_sift_down_eqaware_inline(heap, pos, elem_size, func, args);
++}
++EXPORT_SYMBOL(__min_heap_sift_down_eqaware);
++
+ void __min_heap_sift_up(min_heap_char *heap, size_t elem_size, size_t idx,
+ 			const struct min_heap_callbacks *func, void *args)
+ {
+_
