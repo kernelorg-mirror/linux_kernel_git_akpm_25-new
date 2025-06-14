@@ -1,0 +1,178 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: use vmg->target to specify target VMA for new VMA merge
+Date: Fri, 13 Jun 2025 19:48:07 +0100
+
+In commit 3a75ccba047b ("mm: simplify vma merge structure and expand
+comments") we introduced the vmg->target field to make the merging of
+existing VMAs simpler - clarifying precisely which VMA would eventually
+become the merged VMA once the merge operation was complete.
+
+New VMA merging did not get quite the same treatment, retaining the rather
+confusing convention of storing the target VMA in vmg->middle.
+
+This patch corrects this state of affairs, utilising vmg->target for this
+purpose for both vma_merge_new_range() and also for vma_expand().
+
+We retain the WARN_ON for vmg->middle being specified in
+vma_merge_new_range() as doing so would make no sense, but add an
+additional debug assert for setting vmg->target.
+
+This patch additionally updates VMA userland testing to account for this
+change.
+
+Link: https://lkml.kernel.org/r/20250613184807.108089-1-lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vma.c                |   36 +++++++++++++++++++-----------------
+ mm/vma_exec.c           |    2 +-
+ tools/testing/vma/vma.c |    6 +++---
+ 3 files changed, 23 insertions(+), 21 deletions(-)
+
+--- a/mm/vma.c~mm-vma-use-vmg-target-to-specify-target-vma-for-new-vma-merge
++++ a/mm/vma.c
+@@ -1028,6 +1028,7 @@ struct vm_area_struct *vma_merge_new_ran
+ 
+ 	mmap_assert_write_locked(vmg->mm);
+ 	VM_WARN_ON_VMG(vmg->middle, vmg);
++	VM_WARN_ON_VMG(vmg->target, vmg);
+ 	/* vmi must point at or before the gap. */
+ 	VM_WARN_ON_VMG(vma_iter_addr(vmg->vmi) > end, vmg);
+ 
+@@ -1043,13 +1044,13 @@ struct vm_area_struct *vma_merge_new_ran
+ 	/* If we can merge with the next VMA, adjust vmg accordingly. */
+ 	if (can_merge_right) {
+ 		vmg->end = next->vm_end;
+-		vmg->middle = next;
++		vmg->target = next;
+ 	}
+ 
+ 	/* If we can merge with the previous VMA, adjust vmg accordingly. */
+ 	if (can_merge_left) {
+ 		vmg->start = prev->vm_start;
+-		vmg->middle = prev;
++		vmg->target = prev;
+ 		vmg->pgoff = prev->vm_pgoff;
+ 
+ 		/*
+@@ -1071,10 +1072,10 @@ struct vm_area_struct *vma_merge_new_ran
+ 	 * Now try to expand adjacent VMA(s). This takes care of removing the
+ 	 * following VMA if we have VMAs on both sides.
+ 	 */
+-	if (vmg->middle && !vma_expand(vmg)) {
+-		khugepaged_enter_vma(vmg->middle, vmg->flags);
++	if (vmg->target && !vma_expand(vmg)) {
++		khugepaged_enter_vma(vmg->target, vmg->flags);
+ 		vmg->state = VMA_MERGE_SUCCESS;
+-		return vmg->middle;
++		return vmg->target;
+ 	}
+ 
+ 	return NULL;
+@@ -1086,27 +1087,29 @@ struct vm_area_struct *vma_merge_new_ran
+  * @vmg: Describes a VMA expansion operation.
+  *
+  * Expand @vma to vmg->start and vmg->end.  Can expand off the start and end.
+- * Will expand over vmg->next if it's different from vmg->middle and vmg->end ==
+- * vmg->next->vm_end.  Checking if the vmg->middle can expand and merge with
++ * Will expand over vmg->next if it's different from vmg->target and vmg->end ==
++ * vmg->next->vm_end.  Checking if the vmg->target can expand and merge with
+  * vmg->next needs to be handled by the caller.
+  *
+  * Returns: 0 on success.
+  *
+  * ASSUMPTIONS:
+- * - The caller must hold a WRITE lock on vmg->middle->mm->mmap_lock.
+- * - The caller must have set @vmg->middle and @vmg->next.
++ * - The caller must hold a WRITE lock on vmg->target->mm->mmap_lock.
++ * - The caller must have set @vmg->target and @vmg->next.
+  */
+ int vma_expand(struct vma_merge_struct *vmg)
+ {
+ 	struct vm_area_struct *anon_dup = NULL;
+ 	bool remove_next = false;
+-	struct vm_area_struct *middle = vmg->middle;
++	struct vm_area_struct *target = vmg->target;
+ 	struct vm_area_struct *next = vmg->next;
+ 
++	VM_WARN_ON_VMG(!target, vmg);
++
+ 	mmap_assert_write_locked(vmg->mm);
+ 
+-	vma_start_write(middle);
+-	if (next && (middle != next) && (vmg->end == next->vm_end)) {
++	vma_start_write(target);
++	if (next && (target != next) && (vmg->end == next->vm_end)) {
+ 		int ret;
+ 
+ 		remove_next = true;
+@@ -1117,19 +1120,18 @@ int vma_expand(struct vma_merge_struct *
+ 		 * In this case we don't report OOM, so vmg->give_up_on_mm is
+ 		 * safe.
+ 		 */
+-		ret = dup_anon_vma(middle, next, &anon_dup);
++		ret = dup_anon_vma(target, next, &anon_dup);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+ 	/* Not merging but overwriting any part of next is not handled. */
+ 	VM_WARN_ON_VMG(next && !remove_next &&
+-		       next != middle && vmg->end > next->vm_start, vmg);
++		       next != target && vmg->end > next->vm_start, vmg);
+ 	/* Only handles expanding */
+-	VM_WARN_ON_VMG(middle->vm_start < vmg->start ||
+-		       middle->vm_end > vmg->end, vmg);
++	VM_WARN_ON_VMG(target->vm_start < vmg->start ||
++		       target->vm_end > vmg->end, vmg);
+ 
+-	vmg->target = middle;
+ 	if (remove_next)
+ 		vmg->__remove_next = true;
+ 
+--- a/mm/vma_exec.c~mm-vma-use-vmg-target-to-specify-target-vma-for-new-vma-merge
++++ a/mm/vma_exec.c
+@@ -54,7 +54,7 @@ int relocate_vma_down(struct vm_area_str
+ 	/*
+ 	 * cover the whole range: [new_start, old_end)
+ 	 */
+-	vmg.middle = vma;
++	vmg.target = vma;
+ 	if (vma_expand(&vmg))
+ 		return -ENOMEM;
+ 
+--- a/tools/testing/vma/vma.c~mm-vma-use-vmg-target-to-specify-target-vma-for-new-vma-merge
++++ a/tools/testing/vma/vma.c
+@@ -400,7 +400,7 @@ static bool test_simple_expand(void)
+ 	VMA_ITERATOR(vmi, &mm, 0);
+ 	struct vma_merge_struct vmg = {
+ 		.vmi = &vmi,
+-		.middle = vma,
++		.target = vma,
+ 		.start = 0,
+ 		.end = 0x3000,
+ 		.pgoff = 0,
+@@ -1318,7 +1318,7 @@ static bool test_dup_anon_vma(void)
+ 	vma_next->anon_vma = &dummy_anon_vma;
+ 
+ 	vmg_set_range(&vmg, 0, 0x5000, 0, flags);
+-	vmg.middle = vma_prev;
++	vmg.target = vma_prev;
+ 	vmg.next = vma_next;
+ 
+ 	ASSERT_EQ(expand_existing(&vmg), 0);
+@@ -1501,7 +1501,7 @@ static bool test_vmi_prealloc_fail(void)
+ 	vma->anon_vma = &dummy_anon_vma;
+ 
+ 	vmg_set_range(&vmg, 0, 0x5000, 3, flags);
+-	vmg.middle = vma_prev;
++	vmg.target = vma_prev;
+ 	vmg.next = vma;
+ 
+ 	fail_prealloc = true;
+_
