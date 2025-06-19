@@ -1,0 +1,140 @@
+From: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Subject: mm/hugetlb: make hugetlb_reserve_pages() return nr of entries updated
+Date: Tue, 17 Jun 2025 22:30:53 -0700
+
+Patch series "mm/memfd: Reserve hugetlb folios before allocation", v4.
+
+There are cases when we try to pin a folio but discover that it has not
+been faulted-in.  So, we try to allocate it in memfd_alloc_folio() but the
+allocation request may not succeed if there are no active reservations in
+the system at that instant.
+
+Therefore, making a reservation (by calling hugetlb_reserve_pages())
+associated with the allocation will ensure that our request would not fail
+due to lack of reservations.  This will also ensure that proper
+region/subpool accounting is done with our allocation.
+
+
+This patch (of 3):
+
+Currently, hugetlb_reserve_pages() returns a bool to indicate whether the
+reservation map update for the range [from, to] was successful or not. 
+This is not sufficient for the case where the caller needs to determine
+how many entries were updated for the range.
+
+Therefore, have hugetlb_reserve_pages() return the number of entries
+updated in the reservation map associated with the range [from, to]. 
+Also, update the callers of hugetlb_reserve_pages() to handle the new
+return value.
+
+Link: https://lkml.kernel.org/r/20250618053415.1036185-1-vivek.kasireddy@intel.com
+Link: https://lkml.kernel.org/r/20250618053415.1036185-2-vivek.kasireddy@intel.com
+Signed-off-by: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/hugetlbfs/inode.c    |    8 ++++----
+ include/linux/hugetlb.h |    2 +-
+ mm/hugetlb.c            |   19 +++++++++++++------
+ 3 files changed, 18 insertions(+), 11 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~mm-hugetlb-make-hugetlb_reserve_pages-return-nr-of-entries-updated
++++ a/fs/hugetlbfs/inode.c
+@@ -150,10 +150,10 @@ static int hugetlbfs_file_mmap(struct fi
+ 	if (inode->i_flags & S_PRIVATE)
+ 		vm_flags |= VM_NORESERVE;
+ 
+-	if (!hugetlb_reserve_pages(inode,
++	if (hugetlb_reserve_pages(inode,
+ 				vma->vm_pgoff >> huge_page_order(h),
+ 				len >> huge_page_shift(h), vma,
+-				vm_flags))
++				vm_flags) < 0)
+ 		goto out;
+ 
+ 	ret = 0;
+@@ -1561,9 +1561,9 @@ struct file *hugetlb_file_setup(const ch
+ 	inode->i_size = size;
+ 	clear_nlink(inode);
+ 
+-	if (!hugetlb_reserve_pages(inode, 0,
++	if (hugetlb_reserve_pages(inode, 0,
+ 			size >> huge_page_shift(hstate_inode(inode)), NULL,
+-			acctflag))
++			acctflag) < 0)
+ 		file = ERR_PTR(-ENOMEM);
+ 	else
+ 		file = alloc_file_pseudo(inode, mnt, name, O_RDWR,
+--- a/include/linux/hugetlb.h~mm-hugetlb-make-hugetlb_reserve_pages-return-nr-of-entries-updated
++++ a/include/linux/hugetlb.h
+@@ -149,7 +149,7 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_
+ 			     uffd_flags_t flags,
+ 			     struct folio **foliop);
+ #endif /* CONFIG_USERFAULTFD */
+-bool hugetlb_reserve_pages(struct inode *inode, long from, long to,
++long hugetlb_reserve_pages(struct inode *inode, long from, long to,
+ 						struct vm_area_struct *vma,
+ 						vm_flags_t vm_flags);
+ long hugetlb_unreserve_pages(struct inode *inode, long start, long end,
+--- a/mm/hugetlb.c~mm-hugetlb-make-hugetlb_reserve_pages-return-nr-of-entries-updated
++++ a/mm/hugetlb.c
+@@ -7244,8 +7244,15 @@ long hugetlb_change_protection(struct vm
+ 	return pages > 0 ? (pages << h->order) : pages;
+ }
+ 
+-/* Return true if reservation was successful, false otherwise.  */
+-bool hugetlb_reserve_pages(struct inode *inode,
++/*
++ * Update the reservation map for the range [from, to].
++ *
++ * Returns the number of entries that would be added to the reservation map
++ * associated with the range [from, to].  This number is greater or equal to
++ * zero. -EINVAL or -ENOMEM is returned in case of any errors.
++ */
++
++long hugetlb_reserve_pages(struct inode *inode,
+ 					long from, long to,
+ 					struct vm_area_struct *vma,
+ 					vm_flags_t vm_flags)
+@@ -7260,7 +7267,7 @@ bool hugetlb_reserve_pages(struct inode
+ 	/* This should never happen */
+ 	if (from > to) {
+ 		VM_WARN(1, "%s called with a negative range\n", __func__);
+-		return false;
++		return -EINVAL;
+ 	}
+ 
+ 	/*
+@@ -7275,7 +7282,7 @@ bool hugetlb_reserve_pages(struct inode
+ 	 * without using reserves
+ 	 */
+ 	if (vm_flags & VM_NORESERVE)
+-		return true;
++		return 0;
+ 
+ 	/*
+ 	 * Shared mappings base their reservation on the number of pages that
+@@ -7382,7 +7389,7 @@ bool hugetlb_reserve_pages(struct inode
+ 			hugetlb_cgroup_put_rsvd_cgroup(h_cg);
+ 		}
+ 	}
+-	return true;
++	return chg;
+ 
+ out_put_pages:
+ 	spool_resv = chg - gbl_reserve;
+@@ -7410,7 +7417,7 @@ out_err:
+ 		kref_put(&resv_map->refs, resv_map_release);
+ 		set_vma_resv_map(vma, NULL);
+ 	}
+-	return false;
++	return chg < 0 ? chg : add < 0 ? add : -EINVAL;
+ }
+ 
+ long hugetlb_unreserve_pages(struct inode *inode, long start, long end,
+_
