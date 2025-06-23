@@ -1,0 +1,222 @@
+From: Davidlohr Bueso <dave@stgolabs.net>
+Subject: mm: introduce per-node proactive reclaim interface
+Date: Mon, 23 Jun 2025 11:58:51 -0700
+
+This adds support for allowing proactive reclaim in general on a NUMA
+system.  A per-node interface extends support for beyond a memcg-specific
+interface, respecting the current semantics of memory.reclaim: respecting
+aging LRU and not supporting artificially triggering eviction on nodes
+belonging to non-bottom tiers.
+
+This patch allows userspace to do:
+
+     echo "512M swappiness=10" > /sys/devices/system/node/nodeX/reclaim
+
+One of the premises for this is to semantically align as best as possible
+with memory.reclaim.  During a brief time memcg did support nodemask until
+55ab834a86a9 (Revert "mm: add nodes= arg to memory.reclaim"), for which
+semantics around reclaim (eviction) vs demotion were not clear, rendering
+charging expectations to be broken.
+
+With this approach:
+
+1. Users who do not use memcg can benefit from proactive reclaim.  The
+   memcg interface is not NUMA aware and there are usecases that are
+   focusing on NUMA balancing rather than workload memory footprint.
+
+2. Proactive reclaim on top tiers will trigger demotion, for which
+   memory is still byte-addressable.  Reclaiming on the bottom nodes will
+   trigger evicting to swap (the traditional sense of reclaim).  This
+   follows the semantics of what is today part of the aging process on
+   tiered memory, mirroring what every other form of reclaim does
+   (reactive and memcg proactive reclaim).  Furthermore per-node proactive
+   reclaim is not as susceptible to the memcg charging problem mentioned
+   above.
+
+3. Unlike the nodes= arg, this interface avoids confusing semantics,
+   such as what exactly the user wants when mixing top-tier and low-tier
+   nodes in the nodemask.  Further per-node interface is less exposed to
+   "free up memory in my container" usecases, where eviction is intended.
+
+4. Users that *really* want to free up memory can use proactive
+   reclaim on nodes knowingly to be on the bottom tiers to force eviction
+   in a natural way - higher access latencies are still better than swap. 
+   If compelled, while no guarantees and perhaps not worth the effort,
+   users could also also potentially follow a ladder-like approach to
+   eventually free up the memory.  Alternatively, perhaps an 'evict'
+   option could be added to the parameters for both memory.reclaim and
+   per-node interfaces to force this action unconditionally.
+
+Link: https://lkml.kernel.org/r/20250623185851.830632-5-dave@stgolabs.net
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/ABI/stable/sysfs-devices-node |    9 +++
+ drivers/base/node.c                         |    2 
+ include/linux/swap.h                        |   16 +++++
+ mm/vmscan.c                                 |   53 +++++++++++++++---
+ 4 files changed, 74 insertions(+), 6 deletions(-)
+
+--- a/Documentation/ABI/stable/sysfs-devices-node~mm-introduce-per-node-proactive-reclaim-interface
++++ a/Documentation/ABI/stable/sysfs-devices-node
+@@ -227,3 +227,12 @@ Contact:	Jiaqi Yan <jiaqiyan@google.com>
+ Description:
+ 		Of the raw poisoned pages on a NUMA node, how many pages are
+ 		recovered by memory error recovery attempt.
++
++What:		/sys/devices/system/node/nodeX/reclaim
++Date:		June 2025
++Contact:	Linux Memory Management list <linux-mm@kvack.org>
++Description:
++		Perform user-triggered proactive reclaim on a NUMA node.
++		This interface is equivalent to the memcg variant.
++
++		See Documentation/admin-guide/cgroup-v2.rst
+--- a/drivers/base/node.c~mm-introduce-per-node-proactive-reclaim-interface
++++ a/drivers/base/node.c
+@@ -659,6 +659,7 @@ static int register_node(struct node *no
+ 	} else {
+ 		hugetlb_register_node(node);
+ 		compaction_register_node(node);
++		reclaim_register_node(node);
+ 	}
+ 
+ 	return error;
+@@ -675,6 +676,7 @@ void unregister_node(struct node *node)
+ {
+ 	hugetlb_unregister_node(node);
+ 	compaction_unregister_node(node);
++	reclaim_unregister_node(node);
+ 	node_remove_accesses(node);
+ 	node_remove_caches(node);
+ 	device_unregister(&node->dev);
+--- a/include/linux/swap.h~mm-introduce-per-node-proactive-reclaim-interface
++++ a/include/linux/swap.h
+@@ -431,6 +431,22 @@ extern unsigned long shrink_all_memory(u
+ extern int vm_swappiness;
+ long remove_mapping(struct address_space *mapping, struct folio *folio);
+ 
++#if defined(CONFIG_SYSFS) && defined(CONFIG_NUMA)
++extern int reclaim_register_node(struct node *node);
++extern void reclaim_unregister_node(struct node *node);
++
++#else
++
++static inline int reclaim_register_node(struct node *node)
++{
++	return 0;
++}
++
++static inline void reclaim_unregister_node(struct node *node)
++{
++}
++#endif /* CONFIG_SYSFS && CONFIG_NUMA */
++
+ #ifdef CONFIG_NUMA
+ extern int sysctl_min_unmapped_ratio;
+ extern int sysctl_min_slab_ratio;
+--- a/mm/vmscan.c~mm-introduce-per-node-proactive-reclaim-interface
++++ a/mm/vmscan.c
+@@ -94,10 +94,8 @@ struct scan_control {
+ 	unsigned long	anon_cost;
+ 	unsigned long	file_cost;
+ 
+-#ifdef CONFIG_MEMCG
+ 	/* Swappiness value for proactive reclaim. Always use sc_swappiness()! */
+ 	int *proactive_swappiness;
+-#endif
+ 
+ 	/* Can active folios be deactivated as part of reclaim? */
+ #define DEACTIVATE_ANON 1
+@@ -121,7 +119,7 @@ struct scan_control {
+ 	/* Has cache_trim_mode failed at least once? */
+ 	unsigned int cache_trim_mode_failed:1;
+ 
+-	/* Proactive reclaim invoked by userspace through memory.reclaim */
++	/* Proactive reclaim invoked by userspace */
+ 	unsigned int proactive:1;
+ 
+ 	/*
+@@ -7730,13 +7728,15 @@ static const match_table_t tokens = {
+ 	{ MEMORY_RECLAIM_NULL, NULL },
+ };
+ 
+-int user_proactive_reclaim(char *buf, struct mem_cgroup *memcg, pg_data_t *pgdat)
++int user_proactive_reclaim(char *buf,
++			   struct mem_cgroup *memcg, pg_data_t *pgdat)
+ {
+ 	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+ 	unsigned long nr_to_reclaim, nr_reclaimed = 0;
+ 	int swappiness = -1;
+ 	char *old_buf, *start;
+ 	substring_t args[MAX_OPT_ARGS];
++	gfp_t gfp_mask = GFP_KERNEL;
+ 
+ 	if (!buf || (!memcg && !pgdat))
+ 		return -EINVAL;
+@@ -7790,11 +7790,29 @@ int user_proactive_reclaim(char *buf, st
+ 			reclaim_options = MEMCG_RECLAIM_MAY_SWAP |
+ 					  MEMCG_RECLAIM_PROACTIVE;
+ 			reclaimed = try_to_free_mem_cgroup_pages(memcg,
+-						 batch_size, GFP_KERNEL,
++						 batch_size, gfp_mask,
+ 						 reclaim_options,
+ 						 swappiness == -1 ? NULL : &swappiness);
+ 		} else {
+-			return -EINVAL;
++			struct scan_control sc = {
++				.gfp_mask = current_gfp_context(gfp_mask),
++				.reclaim_idx = gfp_zone(gfp_mask),
++				.proactive_swappiness = swappiness == -1 ? NULL : &swappiness,
++				.priority = DEF_PRIORITY,
++				.may_writepage = !laptop_mode,
++				.nr_to_reclaim = max(batch_size, SWAP_CLUSTER_MAX),
++				.may_unmap = 1,
++				.may_swap = 1,
++				.proactive = 1,
++			};
++
++			if (test_and_set_bit_lock(PGDAT_RECLAIM_LOCKED,
++						  &pgdat->flags))
++				return -EAGAIN;
++
++			reclaimed = __node_reclaim(pgdat, gfp_mask,
++						   batch_size, &sc);
++			clear_bit_unlock(PGDAT_RECLAIM_LOCKED, &pgdat->flags);
+ 		}
+ 
+ 		if (!reclaimed && !nr_retries--)
+@@ -7853,3 +7871,26 @@ void check_move_unevictable_folios(struc
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(check_move_unevictable_folios);
++
++#if defined(CONFIG_SYSFS) && defined(CONFIG_NUMA)
++static ssize_t reclaim_store(struct device *dev,
++			     struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	int ret, nid = dev->id;
++
++	ret = user_proactive_reclaim((char *)buf, NULL, NODE_DATA(nid));
++	return ret ? -EAGAIN : count;
++}
++
++static DEVICE_ATTR_WO(reclaim);
++int reclaim_register_node(struct node *node)
++{
++	return device_create_file(&node->dev, &dev_attr_reclaim);
++}
++
++void reclaim_unregister_node(struct node *node)
++{
++	return device_remove_file(&node->dev, &dev_attr_reclaim);
++}
++#endif
+_

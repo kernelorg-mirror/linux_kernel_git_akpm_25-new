@@ -1,0 +1,96 @@
+From: Yicong Yang <yangyicong@hisilicon.com>
+Subject: arm64/watchdog_hld: add a cpufreq notifier for update watchdog thresh
+Date: Thu, 19 Jun 2025 19:48:05 +0800
+
+arm64 depends on the cpufreq driver to gain the maximum cpu frequency to
+convert the watchdog_thresh to perf event period.  cpufreq drivers like
+cppc_cpufreq will be initialized lately after the initializing of the hard
+lockup detector so just use a safe cpufreq which will be inaccurency.  Use
+a cpufreq notifier to adjust the event's period to a more accurate one.
+
+Link: https://lkml.kernel.org/r/20250619114805.16968-3-yangyicong@huawei.com
+Signed-off-by: Yicong Yang <yangyicong@hisilicon.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Doug Anderson <dianders@chromium.org>
+Cc: Jie Zhan <zhanjie9@hisilicon.com>
+Cc: Joanthan Cameron <Jonathan.Cameron@huawei.com>
+Cc: Lecopzer Chen <lecopzer.chen@mediatek.com>
+Cc: Liu Pingfan <kernelfans@gmail.com>
+Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+Cc: Song Liu <song@kernel.org>
+Cc: Sumit Garg <sumit.garg@linaro.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: Viresh Kumar <viresh.kumar@linaro.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Zeng Tao <prime.zeng@hisilicon.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/kernel/watchdog_hld.c |   58 +++++++++++++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+--- a/arch/arm64/kernel/watchdog_hld.c~arm64-watchdog_hld-add-a-cpufreq-notifier-for-update-watchdog-thresh
++++ a/arch/arm64/kernel/watchdog_hld.c
+@@ -34,3 +34,61 @@ bool __init arch_perf_nmi_is_available(v
+ 	 */
+ 	return arm_pmu_irq_is_nmi();
+ }
++
++static int watchdog_perf_update_period(void *data)
++{
++	int cpu = raw_smp_processor_id();
++	u64 max_cpu_freq, new_period;
++
++	max_cpu_freq = cpufreq_get_hw_max_freq(cpu) * 1000UL;
++	if (!max_cpu_freq)
++		return 0;
++
++	new_period = watchdog_thresh * max_cpu_freq;
++	hardlockup_detector_perf_adjust_period(cpu, new_period);
++
++	return 0;
++}
++
++static int watchdog_freq_notifier_callback(struct notifier_block *nb,
++					   unsigned long val, void *data)
++{
++	struct cpufreq_policy *policy = data;
++	int cpu;
++
++	if (val != CPUFREQ_CREATE_POLICY)
++		return NOTIFY_DONE;
++
++	/*
++	 * Let each online CPU related to the policy update the period by their
++	 * own. This will serialize with the framework on start/stop the lockup
++	 * detector (softlockup_{start,stop}_all) and avoid potential race
++	 * condition. Otherwise we may have below theoretical race condition:
++	 * (core 0/1 share the same policy)
++	 * [core 0]                      [core 1]
++	 *                               hardlockup_detector_event_create()
++	 *                                 hw_nmi_get_sample_period()
++	 * (cpufreq registered, notifier callback invoked)
++	 * watchdog_freq_notifier_callback()
++	 *   watchdog_perf_update_period()
++	 *   (since core 1's event's not yet created,
++	 *    the period is not set)
++	 *                                 perf_event_create_kernel_counter()
++	 *                                 (event's period is SAFE_MAX_CPU_FREQ)
++	 */
++	for_each_cpu(cpu, policy->cpus)
++		smp_call_on_cpu(cpu, watchdog_perf_update_period, NULL, false);
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block watchdog_freq_notifier = {
++	.notifier_call = watchdog_freq_notifier_callback,
++};
++
++static int __init init_watchdog_freq_notifier(void)
++{
++	return cpufreq_register_notifier(&watchdog_freq_notifier,
++					 CPUFREQ_POLICY_NOTIFIER);
++}
++core_initcall(init_watchdog_freq_notifier);
+_

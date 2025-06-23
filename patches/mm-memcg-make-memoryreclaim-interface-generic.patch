@@ -1,0 +1,248 @@
+From: Davidlohr Bueso <dave@stgolabs.net>
+Subject: mm/memcg: make memory.reclaim interface generic
+Date: Mon, 23 Jun 2025 11:58:49 -0700
+
+This adds a general call for both parsing as well as the common reclaim
+semantics.  memcg is still the only user and no change in semantics.
+
+Link: https://lkml.kernel.org/r/20250623185851.830632-3-dave@stgolabs.net
+Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/internal.h   |    2 
+ mm/memcontrol.c |   77 +-----------------------------------
+ mm/vmscan.c     |   98 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 104 insertions(+), 73 deletions(-)
+
+--- a/mm/internal.h~mm-memcg-make-memoryreclaim-interface-generic
++++ a/mm/internal.h
+@@ -517,6 +517,8 @@ extern unsigned long highest_memmap_pfn;
+ bool folio_isolate_lru(struct folio *folio);
+ void folio_putback_lru(struct folio *folio);
+ extern void reclaim_throttle(pg_data_t *pgdat, enum vmscan_throttle_state reason);
++int user_proactive_reclaim(char *buf,
++			   struct mem_cgroup *memcg, pg_data_t *pgdat);
+ 
+ /*
+  * in mm/rmap.c:
+--- a/mm/memcontrol.c~mm-memcg-make-memoryreclaim-interface-generic
++++ a/mm/memcontrol.c
+@@ -51,7 +51,6 @@
+ #include <linux/spinlock.h>
+ #include <linux/fs.h>
+ #include <linux/seq_file.h>
+-#include <linux/parser.h>
+ #include <linux/vmpressure.h>
+ #include <linux/memremap.h>
+ #include <linux/mm_inline.h>
+@@ -4566,83 +4565,15 @@ static ssize_t memory_oom_group_write(st
+ 	return nbytes;
+ }
+ 
+-enum {
+-	MEMORY_RECLAIM_SWAPPINESS = 0,
+-	MEMORY_RECLAIM_SWAPPINESS_MAX,
+-	MEMORY_RECLAIM_NULL,
+-};
+-
+-static const match_table_t tokens = {
+-	{ MEMORY_RECLAIM_SWAPPINESS, "swappiness=%d"},
+-	{ MEMORY_RECLAIM_SWAPPINESS_MAX, "swappiness=max"},
+-	{ MEMORY_RECLAIM_NULL, NULL },
+-};
+-
+ static ssize_t memory_reclaim(struct kernfs_open_file *of, char *buf,
+ 			      size_t nbytes, loff_t off)
+ {
+ 	struct mem_cgroup *memcg = mem_cgroup_from_css(of_css(of));
+-	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
+-	unsigned long nr_to_reclaim, nr_reclaimed = 0;
+-	int swappiness = -1;
+-	unsigned int reclaim_options;
+-	char *old_buf, *start;
+-	substring_t args[MAX_OPT_ARGS];
+-
+-	buf = strstrip(buf);
+-
+-	old_buf = buf;
+-	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;
+-	if (buf == old_buf)
+-		return -EINVAL;
+-
+-	buf = strstrip(buf);
+-
+-	while ((start = strsep(&buf, " ")) != NULL) {
+-		if (!strlen(start))
+-			continue;
+-		switch (match_token(start, tokens, args)) {
+-		case MEMORY_RECLAIM_SWAPPINESS:
+-			if (match_int(&args[0], &swappiness))
+-				return -EINVAL;
+-			if (swappiness < MIN_SWAPPINESS || swappiness > MAX_SWAPPINESS)
+-				return -EINVAL;
+-			break;
+-		case MEMORY_RECLAIM_SWAPPINESS_MAX:
+-			swappiness = SWAPPINESS_ANON_ONLY;
+-			break;
+-		default:
+-			return -EINVAL;
+-		}
+-	}
+-
+-	reclaim_options	= MEMCG_RECLAIM_MAY_SWAP | MEMCG_RECLAIM_PROACTIVE;
+-	while (nr_reclaimed < nr_to_reclaim) {
+-		/* Will converge on zero, but reclaim enforces a minimum */
+-		unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;
+-		unsigned long reclaimed;
+-
+-		if (signal_pending(current))
+-			return -EINTR;
+-
+-		/*
+-		 * This is the final attempt, drain percpu lru caches in the
+-		 * hope of introducing more evictable pages for
+-		 * try_to_free_mem_cgroup_pages().
+-		 */
+-		if (!nr_retries)
+-			lru_add_drain_all();
+-
+-		reclaimed = try_to_free_mem_cgroup_pages(memcg,
+-					batch_size, GFP_KERNEL,
+-					reclaim_options,
+-					swappiness == -1 ? NULL : &swappiness);
+-
+-		if (!reclaimed && !nr_retries--)
+-			return -EAGAIN;
++	int ret;
+ 
+-		nr_reclaimed += reclaimed;
+-	}
++	ret = user_proactive_reclaim(buf, memcg, NULL);
++	if (ret)
++		return ret;
+ 
+ 	return nbytes;
+ }
+--- a/mm/vmscan.c~mm-memcg-make-memoryreclaim-interface-generic
++++ a/mm/vmscan.c
+@@ -57,6 +57,7 @@
+ #include <linux/rculist_nulls.h>
+ #include <linux/random.h>
+ #include <linux/mmu_notifier.h>
++#include <linux/parser.h>
+ 
+ #include <asm/tlbflush.h>
+ #include <asm/div64.h>
+@@ -6712,6 +6713,15 @@ unsigned long try_to_free_mem_cgroup_pag
+ 
+ 	return nr_reclaimed;
+ }
++#else
++unsigned long try_to_free_mem_cgroup_pages(struct mem_cgroup *memcg,
++					   unsigned long nr_pages,
++					   gfp_t gfp_mask,
++					   unsigned int reclaim_options,
++					   int *swappiness)
++{
++	return 0;
++}
+ #endif
+ 
+ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
+@@ -7706,6 +7716,94 @@ int node_reclaim(struct pglist_data *pgd
+ 
+ 	return ret;
+ }
++
++enum {
++	MEMORY_RECLAIM_SWAPPINESS = 0,
++	MEMORY_RECLAIM_SWAPPINESS_MAX,
++	MEMORY_RECLAIM_NULL,
++};
++static const match_table_t tokens = {
++	{ MEMORY_RECLAIM_SWAPPINESS, "swappiness=%d"},
++	{ MEMORY_RECLAIM_SWAPPINESS_MAX, "swappiness=max"},
++	{ MEMORY_RECLAIM_NULL, NULL },
++};
++
++int user_proactive_reclaim(char *buf, struct mem_cgroup *memcg, pg_data_t *pgdat)
++{
++	unsigned int nr_retries = MAX_RECLAIM_RETRIES;
++	unsigned long nr_to_reclaim, nr_reclaimed = 0;
++	int swappiness = -1;
++	char *old_buf, *start;
++	substring_t args[MAX_OPT_ARGS];
++
++	if (!buf || (!memcg && !pgdat))
++		return -EINVAL;
++
++	buf = strstrip(buf);
++
++	old_buf = buf;
++	nr_to_reclaim = memparse(buf, &buf) / PAGE_SIZE;
++	if (buf == old_buf)
++		return -EINVAL;
++
++	buf = strstrip(buf);
++
++	while ((start = strsep(&buf, " ")) != NULL) {
++		if (!strlen(start))
++			continue;
++		switch (match_token(start, tokens, args)) {
++		case MEMORY_RECLAIM_SWAPPINESS:
++			if (match_int(&args[0], &swappiness))
++				return -EINVAL;
++			if (swappiness < MIN_SWAPPINESS ||
++			    swappiness > MAX_SWAPPINESS)
++				return -EINVAL;
++			break;
++		case MEMORY_RECLAIM_SWAPPINESS_MAX:
++			swappiness = SWAPPINESS_ANON_ONLY;
++			break;
++		default:
++			return -EINVAL;
++		}
++	}
++
++	while (nr_reclaimed < nr_to_reclaim) {
++		/* Will converge on zero, but reclaim enforces a minimum */
++		unsigned long batch_size = (nr_to_reclaim - nr_reclaimed) / 4;
++		unsigned long reclaimed;
++
++		if (signal_pending(current))
++			return -EINTR;
++
++		/*
++		 * This is the final attempt, drain percpu lru caches in the
++		 * hope of introducing more evictable pages.
++		 */
++		if (!nr_retries)
++			lru_add_drain_all();
++
++		if (memcg) {
++			unsigned int reclaim_options;
++
++			reclaim_options = MEMCG_RECLAIM_MAY_SWAP |
++					  MEMCG_RECLAIM_PROACTIVE;
++			reclaimed = try_to_free_mem_cgroup_pages(memcg,
++						 batch_size, GFP_KERNEL,
++						 reclaim_options,
++						 swappiness == -1 ? NULL : &swappiness);
++		} else {
++			return -EINVAL;
++		}
++
++		if (!reclaimed && !nr_retries--)
++			return -EAGAIN;
++
++		nr_reclaimed += reclaimed;
++	}
++
++	return 0;
++}
++
+ #endif
+ 
+ /**
+_
