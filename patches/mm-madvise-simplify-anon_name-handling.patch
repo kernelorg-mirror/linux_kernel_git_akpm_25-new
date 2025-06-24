@@ -1,0 +1,155 @@
+From: Vlastimil Babka <vbabka@suse.cz>
+Subject: mm, madvise: simplify anon_name handling
+Date: Tue, 24 Jun 2025 15:03:45 +0200
+
+Patch series "madvise anon_name cleanups", v2.
+
+While reviewing Lorenzo's madvise cleanups I've noticed that we can handle
+anon_name in madvise code much better, so sending that as patch 1. 
+Initially I wanted to do first move the existing logic from
+madvise_vma_behavior() to madvise_update_vma() as a separate patch before
+the actual simplification but that would require adding
+anon_vma_name_put() in error handling paths only to be removed again, so
+it's a single patch to avoid churn.
+
+It's also an opportunity to move some mm code from prctl under mm, hence
+patch 2.  After code moving preparation in patch 3, also unify madvise
+lock handling for madvise_set_anon_name() in patch 4.
+
+
+This patch (of 4):
+
+Since the introduction in 9a10064f5625 ("mm: add a field to store names
+for private anonymous memory") the code to set anon_name on a vma has been
+using madvise_update_vma() to call replace_anon_vma_name().  Since the
+former is called also by a number of other madvise behaviours that do not
+set a new anon_name, they have been passing the existing anon_name of the
+vma to make replace_anon_vma_name() a no-op.
+
+This is rather wasteful as it needs anon_vma_name_eq() to determine the
+no-op situations, and checks for when replace_anon_vma_name() is allowed
+(the vma is anon/shmem) duplicate the checks already done earlier in
+madvise_vma_behavior().  It has also lead to commit 942341dcc574 ("mm: fix
+use-after-free when anon vma name is used after vma is freed") adding
+anon_name refcount get/put operations exactly to the cases that actually
+do not change anon_name - just so the replace_anon_vma_name() can keep
+safely determining it has nothing to do.
+
+The recent madvise cleanups made this suboptimal handling very obvious,
+but happily also allow for an easy fix.  madvise_update_vma() now has the
+complete information whether it's been called to set a new anon_name, so
+stop passing it the existing vma's name and doing the refcount get/put in
+its only caller madvise_vma_behavior().
+
+In madvise_update_vma() itself, limit calling of replace_anon_vma_name()
+only to cases where we are setting a new name, otherwise we know it's a
+no-op.  We can rely solely on the __MADV_SET_ANON_VMA_NAME behaviour and
+can remove the duplicate checks for vma being anon/shmem that were done
+already in madvise_vma_behavior().
+
+Additionally, by using vma_modify_flags() when not modifying the
+anon_name, avoid explicitly passing the existing vma's anon_name and
+storing a pointer to it in struct madv_behavior or a local variable.  This
+prevents the danger of accessing a freed anon_name after vma merging,
+previously fixed by commit 942341dcc574.
+
+Link: https://lkml.kernel.org/r/20250624-anon_name_cleanup-v2-0-600075462a11@suse.cz
+Link: https://lkml.kernel.org/r/20250624-anon_name_cleanup-v2-1-600075462a11@suse.cz
+Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Tested-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Colin Cross <ccross@google.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: SeongJae Park <sj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/madvise.c |   37 +++++++++++++------------------------
+ 1 file changed, 13 insertions(+), 24 deletions(-)
+
+--- a/mm/madvise.c~mm-madvise-simplify-anon_name-handling
++++ a/mm/madvise.c
+@@ -176,25 +176,29 @@ static int replace_anon_vma_name(struct
+ }
+ #endif /* CONFIG_ANON_VMA_NAME */
+ /*
+- * Update the vm_flags on region of a vma, splitting it or merging it as
+- * necessary.  Must be called with mmap_lock held for writing;
+- * Caller should ensure anon_name stability by raising its refcount even when
+- * anon_name belongs to a valid vma because this function might free that vma.
++ * Update the vm_flags and/or anon_name on region of a vma, splitting it or
++ * merging it as necessary. Must be called with mmap_lock held for writing.
+  */
+ static int madvise_update_vma(vm_flags_t new_flags,
+ 		struct madvise_behavior *madv_behavior)
+ {
+-	int error;
+ 	struct vm_area_struct *vma = madv_behavior->vma;
+ 	struct madvise_behavior_range *range = &madv_behavior->range;
+ 	struct anon_vma_name *anon_name = madv_behavior->anon_name;
++	bool set_new_anon_name = madv_behavior->behavior == __MADV_SET_ANON_VMA_NAME;
+ 	VMA_ITERATOR(vmi, madv_behavior->mm, range->start);
+ 
+-	if (new_flags == vma->vm_flags && anon_vma_name_eq(anon_vma_name(vma), anon_name))
++	if (new_flags == vma->vm_flags && (!set_new_anon_name ||
++			anon_vma_name_eq(anon_vma_name(vma), anon_name)))
+ 		return 0;
+ 
+-	vma = vma_modify_flags_name(&vmi, madv_behavior->prev, vma,
++	if (set_new_anon_name)
++		vma = vma_modify_flags_name(&vmi, madv_behavior->prev, vma,
+ 			range->start, range->end, new_flags, anon_name);
++	else
++		vma = vma_modify_flags(&vmi, madv_behavior->prev, vma,
++			range->start, range->end, new_flags);
++
+ 	if (IS_ERR(vma))
+ 		return PTR_ERR(vma);
+ 
+@@ -203,11 +207,8 @@ static int madvise_update_vma(vm_flags_t
+ 	/* vm_flags is protected by the mmap_lock held in write mode. */
+ 	vma_start_write(vma);
+ 	vm_flags_reset(vma, new_flags);
+-	if (!vma->vm_file || vma_is_anon_shmem(vma)) {
+-		error = replace_anon_vma_name(vma, anon_name);
+-		if (error)
+-			return error;
+-	}
++	if (set_new_anon_name)
++		return replace_anon_vma_name(vma, anon_name);
+ 
+ 	return 0;
+ }
+@@ -1313,7 +1314,6 @@ static int madvise_vma_behavior(struct m
+ 	int behavior = madv_behavior->behavior;
+ 	struct vm_area_struct *vma = madv_behavior->vma;
+ 	vm_flags_t new_flags = vma->vm_flags;
+-	bool set_new_anon_name = behavior == __MADV_SET_ANON_VMA_NAME;
+ 	struct madvise_behavior_range *range = &madv_behavior->range;
+ 	int error;
+ 
+@@ -1403,18 +1403,7 @@ static int madvise_vma_behavior(struct m
+ 	/* This is a write operation.*/
+ 	VM_WARN_ON_ONCE(madv_behavior->lock_mode != MADVISE_MMAP_WRITE_LOCK);
+ 
+-	/*
+-	 * madvise_update_vma() might cause a VMA merge which could put an
+-	 * anon_vma_name, so we must hold an additional reference on the
+-	 * anon_vma_name so it doesn't disappear from under us.
+-	 */
+-	if (!set_new_anon_name) {
+-		madv_behavior->anon_name = anon_vma_name(vma);
+-		anon_vma_name_get(madv_behavior->anon_name);
+-	}
+ 	error = madvise_update_vma(new_flags, madv_behavior);
+-	if (!set_new_anon_name)
+-		anon_vma_name_put(madv_behavior->anon_name);
+ out:
+ 	/*
+ 	 * madvise() returns EAGAIN if kernel resources, such as
+_
