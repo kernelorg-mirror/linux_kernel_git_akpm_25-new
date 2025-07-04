@@ -1,0 +1,219 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: convert "movable" flag in page->mapping to a page flag
+Date: Fri, 4 Jul 2025 12:25:14 +0200
+
+Instead, let's use a page flag.  As the page flag can result in
+false-positives, glue it to the page types for which we support/implement
+movable_ops page migration.
+
+We are reusing PG_uptodate, that is for example used to track file system
+state and does not apply to movable_ops pages.  So warning in case it is
+set in page_has_movable_ops() on other page types could result in
+false-positive warnings.
+
+Likely we could set the bit using a non-atomic update: in contrast to
+page->mapping, we could have others trying to update the flags
+concurrently when trying to lock the folio.  In
+isolate_movable_ops_page(), we already take care of that by checking if
+the page has movable_ops before locking it.  Let's start with the atomic
+variant, we could later switch to the non-atomic variant once we are sure
+other cases are similarly fine.  Once we perform the switch, we'll have to
+introduce __SETPAGEFLAG_NOOP().
+
+Link: https://lkml.kernel.org/r/20250704102524.326966-21-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Eugenio Pé rez <eperezma@redhat.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Harry Yoo <harry.yoo@oracle.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Jason Wang <jasowang@redhat.com>
+Cc: Jerrin Shaji George <jerrin.shaji-george@broadcom.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+Cc: Mathew Brost <matthew.brost@intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: "Michael S. Tsirkin" <mst@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Xuan Zhuo <xuanzhuo@linux.alibaba.com>
+Cc: xu xin <xu.xin16@zte.com.cn>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/balloon_compaction.h |    2 -
+ include/linux/migrate.h            |    8 ----
+ include/linux/page-flags.h         |   54 ++++++++++++++++++++++-----
+ mm/compaction.c                    |    6 ---
+ mm/zpdesc.h                        |    2 -
+ 5 files changed, 46 insertions(+), 26 deletions(-)
+
+--- a/include/linux/balloon_compaction.h~mm-convert-movable-flag-in-page-mapping-to-a-page-flag
++++ a/include/linux/balloon_compaction.h
+@@ -92,7 +92,7 @@ static inline void balloon_page_insert(s
+ 				       struct page *page)
+ {
+ 	__SetPageOffline(page);
+-	__SetPageMovable(page);
++	SetPageMovableOps(page);
+ 	set_page_private(page, (unsigned long)balloon);
+ 	list_add(&page->lru, &balloon->pages);
+ }
+--- a/include/linux/migrate.h~mm-convert-movable-flag-in-page-mapping-to-a-page-flag
++++ a/include/linux/migrate.h
+@@ -103,14 +103,6 @@ static inline int migrate_huge_page_move
+ 
+ #endif /* CONFIG_MIGRATION */
+ 
+-#ifdef CONFIG_COMPACTION
+-void __SetPageMovable(struct page *page);
+-#else
+-static inline void __SetPageMovable(struct page *page)
+-{
+-}
+-#endif
+-
+ #ifdef CONFIG_NUMA_BALANCING
+ int migrate_misplaced_folio_prepare(struct folio *folio,
+ 		struct vm_area_struct *vma, int node);
+--- a/include/linux/page-flags.h~mm-convert-movable-flag-in-page-mapping-to-a-page-flag
++++ a/include/linux/page-flags.h
+@@ -170,6 +170,11 @@ enum pageflags {
+ 	/* non-lru isolated movable page */
+ 	PG_isolated = PG_reclaim,
+ 
++#ifdef CONFIG_MIGRATION
++	/* this is a movable_ops page (for selected typed pages only) */
++	PG_movable_ops = PG_uptodate,
++#endif
++
+ 	/* Only valid for buddy pages. Used to track pages that are reported */
+ 	PG_reported = PG_uptodate,
+ 
+@@ -698,9 +703,6 @@ PAGEFLAG_FALSE(VmemmapSelfHosted, vmemma
+  * bit; and then folio->mapping points, not to an anon_vma, but to a private
+  * structure which KSM associates with that merged page.  See ksm.h.
+  *
+- * PAGE_MAPPING_KSM without PAGE_MAPPING_ANON is used for non-lru movable
+- * page and then folio->mapping points to a struct movable_operations.
+- *
+  * Please note that, confusingly, "folio_mapping" refers to the inode
+  * address_space which maps the folio from disk; whereas "folio_mapped"
+  * refers to user virtual address space into which the folio is mapped.
+@@ -743,13 +745,6 @@ static __always_inline bool PageAnon(con
+ {
+ 	return folio_test_anon(page_folio(page));
+ }
+-
+-static __always_inline bool page_has_movable_ops(const struct page *page)
+-{
+-	return ((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) ==
+-				PAGE_MAPPING_MOVABLE;
+-}
+-
+ #ifdef CONFIG_KSM
+ /*
+  * A KSM page is one of those write-protected "shared pages" or "merged pages"
+@@ -1133,6 +1128,45 @@ bool is_free_buddy_page(const struct pag
+ 
+ PAGEFLAG(Isolated, isolated, PF_ANY);
+ 
++#ifdef CONFIG_MIGRATION
++/*
++ * This page is migratable through movable_ops (for selected typed pages
++ * only).
++ *
++ * Page migration of such pages might fail, for example, if the page is
++ * already isolated by somebody else, or if the page is about to get freed.
++ *
++ * While a subsystem might set selected typed pages that support page migration
++ * as being movable through movable_ops, it must never clear this flag.
++ *
++ * This flag is only cleared when the page is freed back to the buddy.
++ *
++ * Only selected page types support this flag (see page_movable_ops()) and
++ * the flag might be used in other context for other pages. Always use
++ * page_has_movable_ops() instead.
++ */
++TESTPAGEFLAG(MovableOps, movable_ops, PF_NO_TAIL);
++SETPAGEFLAG(MovableOps, movable_ops, PF_NO_TAIL);
++#else /* !CONFIG_MIGRATION */
++TESTPAGEFLAG_FALSE(MovableOps, movable_ops);
++SETPAGEFLAG_NOOP(MovableOps, movable_ops);
++#endif /* CONFIG_MIGRATION */
++
++/**
++ * page_has_movable_ops - test for a movable_ops page
++ * @page The page to test.
++ *
++ * Test whether this is a movable_ops page. Such pages will stay that
++ * way until freed.
++ *
++ * Returns true if this is a movable_ops page, otherwise false.
++ */
++static inline bool page_has_movable_ops(const struct page *page)
++{
++	return PageMovableOps(page) &&
++	       (PageOffline(page) || PageZsmalloc(page));
++}
++
+ static __always_inline int PageAnonExclusive(const struct page *page)
+ {
+ 	VM_BUG_ON_PGFLAGS(!PageAnon(page), page);
+--- a/mm/compaction.c~mm-convert-movable-flag-in-page-mapping-to-a-page-flag
++++ a/mm/compaction.c
+@@ -114,12 +114,6 @@ static unsigned long release_free_list(s
+ }
+ 
+ #ifdef CONFIG_COMPACTION
+-void __SetPageMovable(struct page *page)
+-{
+-	VM_BUG_ON_PAGE(!PageLocked(page), page);
+-	page->mapping = (void *)(PAGE_MAPPING_MOVABLE);
+-}
+-EXPORT_SYMBOL(__SetPageMovable);
+ 
+ /* Do not skip compaction more than 64 times */
+ #define COMPACT_MAX_DEFER_SHIFT 6
+--- a/mm/zpdesc.h~mm-convert-movable-flag-in-page-mapping-to-a-page-flag
++++ a/mm/zpdesc.h
+@@ -154,7 +154,7 @@ static inline struct zpdesc *pfn_zpdesc(
+ 
+ static inline void __zpdesc_set_movable(struct zpdesc *zpdesc)
+ {
+-	__SetPageMovable(zpdesc_page(zpdesc));
++	SetPageMovableOps(zpdesc_page(zpdesc));
+ }
+ 
+ static inline void __zpdesc_set_zsmalloc(struct zpdesc *zpdesc)
+_

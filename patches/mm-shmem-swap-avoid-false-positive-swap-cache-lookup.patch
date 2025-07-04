@@ -1,0 +1,103 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/shmem, swap: avoid false positive swap cache lookup
+Date: Sat, 5 Jul 2025 02:17:44 +0800
+
+If a shmem read request's index points to the middle of a large swap
+entry, shmem swap in will try the swap cache lookup using the large swap
+entry's starting value (which is the first sub swap entry of this large
+entry).  This will lead to false positive lookup results, if only the
+first few swap entries are cached but the actual requested swap entry
+pointed by index is uncached.  This is not a rare event as swap readahead
+always try to cache order 0 folios when possible.
+
+Currently, shmem will do a large entry split when it occurs, aborts due to
+a mismatching folio swap value, then retry the swapin from the beginning,
+which is a waste of CPU and adds wrong info to the readahead statistics.
+
+This can be optimized easily by doing the lookup using the right swap
+entry value.
+
+Link: https://lkml.kernel.org/r/20250704181748.63181-6-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/shmem.c |   31 +++++++++++++++----------------
+ 1 file changed, 15 insertions(+), 16 deletions(-)
+
+--- a/mm/shmem.c~mm-shmem-swap-avoid-false-positive-swap-cache-lookup
++++ a/mm/shmem.c
+@@ -2274,14 +2274,15 @@ static int shmem_swapin_folio(struct ino
+ 	pgoff_t offset;
+ 
+ 	VM_BUG_ON(!*foliop || !xa_is_value(*foliop));
+-	swap = index_entry = radix_to_swp_entry(*foliop);
++	index_entry = radix_to_swp_entry(*foliop);
++	swap = index_entry;
+ 	*foliop = NULL;
+ 
+-	if (is_poisoned_swp_entry(swap))
++	if (is_poisoned_swp_entry(index_entry))
+ 		return -EIO;
+ 
+-	si = get_swap_device(swap);
+-	order = shmem_confirm_swap(mapping, index, swap);
++	si = get_swap_device(index_entry);
++	order = shmem_confirm_swap(mapping, index, index_entry);
+ 	if (unlikely(!si)) {
+ 		if (order < 0)
+ 			return -EEXIST;
+@@ -2293,6 +2294,12 @@ static int shmem_swapin_folio(struct ino
+ 		return -EEXIST;
+ 	}
+ 
++	/* index may point to the middle of a large entry, get the sub entry */
++	if (order) {
++		offset = index - round_down(index, 1 << order);
++		swap = swp_entry(swp_type(swap), swp_offset(swap) + offset);
++	}
++
+ 	/* Look it up and read it in.. */
+ 	folio = swap_cache_get_folio(swap, NULL, 0);
+ 	if (!folio) {
+@@ -2305,8 +2312,10 @@ static int shmem_swapin_folio(struct ino
+ 
+ 		/* Skip swapcache for synchronous device. */
+ 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO)) {
+-			folio = shmem_swap_alloc_folio(inode, vma, index, swap, order, gfp);
++			folio = shmem_swap_alloc_folio(inode, vma, index,
++						       index_entry, order, gfp);
+ 			if (!IS_ERR(folio)) {
++				swap = index_entry;
+ 				skip_swapcache = true;
+ 				goto alloced;
+ 			}
+@@ -2320,17 +2329,7 @@ static int shmem_swapin_folio(struct ino
+ 			if (error == -EEXIST)
+ 				goto failed;
+ 		}
+-
+-		/*
+-		 * Now swap device can only swap in order 0 folio, it is
+-		 * necessary to recalculate the new swap entry based on
+-		 * the offset, as the swapin index might be unalgined.
+-		 */
+-		if (order) {
+-			offset = index - round_down(index, 1 << order);
+-			swap = swp_entry(swp_type(swap), swp_offset(swap) + offset);
+-		}
+-
++		/* Cached swapin with readahead, only supports order 0 */
+ 		folio = shmem_swapin_cluster(swap, gfp, info, index);
+ 		if (!folio) {
+ 			error = -ENOMEM;
+_
