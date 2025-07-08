@@ -1,20 +1,23 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm/shmem, swap: avoid false positive swap cache lookup
-Date: Fri, 27 Jun 2025 14:20:20 +0800
+Date: Sat, 5 Jul 2025 02:17:44 +0800
 
-If the shmem read request's index points to the middle of a large swap
-entry, shmem swap in does the swap cache lookup use the large swap entry's
-starting value (the first sub swap entry of this large entry).  This will
-lead to false positive lookup result if only the first few swap entries
-are cached, but the requested swap entry pointed by index is uncached.
+If a shmem read request's index points to the middle of a large swap
+entry, shmem swap in will try the swap cache lookup using the large swap
+entry's starting value (which is the first sub swap entry of this large
+entry).  This will lead to false positive lookup results, if only the
+first few swap entries are cached but the actual requested swap entry
+pointed by index is uncached.  This is not a rare event as swap readahead
+always try to cache order 0 folios when possible.
 
-Currently shmem will do a large entry split then retry the swapin from
-beginning, which is a waste of CPU and fragile.  Handle this correctly.
+Currently, shmem will do a large entry split when it occurs, aborts due to
+a mismatching folio swap value, then retry the swapin from the beginning,
+which is a waste of CPU and adds wrong info to the readahead statistics.
 
-Also add some sanity checks to help understand the code and ensure things
-won't go wrong.
+This can be optimized easily by doing the lookup using the right swap
+entry value.
 
-Link: https://lkml.kernel.org/r/20250627062020.534-8-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250704181748.63181-6-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Baoquan He <bhe@redhat.com>
@@ -28,71 +31,18 @@ Cc: Nhat Pham <nphamcs@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/shmem.c |   60 +++++++++++++++++++++++++++------------------------
- 1 file changed, 32 insertions(+), 28 deletions(-)
+ mm/shmem.c |   31 +++++++++++++++----------------
+ 1 file changed, 15 insertions(+), 16 deletions(-)
 
 --- a/mm/shmem.c~mm-shmem-swap-avoid-false-positive-swap-cache-lookup
 +++ a/mm/shmem.c
-@@ -1977,14 +1977,19 @@ unlock:
- 
- static struct folio *shmem_swapin_direct(struct inode *inode,
- 		struct vm_area_struct *vma, pgoff_t index,
--		swp_entry_t entry, int order, gfp_t gfp)
-+		swp_entry_t index_entry, swp_entry_t swap,
-+		int order, gfp_t gfp)
- {
- 	struct shmem_inode_info *info = SHMEM_I(inode);
--	int nr_pages = 1 << order;
- 	struct folio *new;
--	pgoff_t offset;
-+	swp_entry_t entry;
- 	gfp_t swap_gfp;
- 	void *shadow;
-+	int nr_pages;
-+
-+	/* Prefer aligned THP swapin */
-+	entry.val = index_entry.val;
-+	nr_pages = 1 << order;
- 
- 	/*
- 	 * We have arrived here because our zones are constrained, so don't
-@@ -2011,6 +2016,7 @@ static struct folio *shmem_swapin_direct
- 			swap_gfp = limit_gfp_mask(vma_thp_gfp_mask(vma), gfp);
- 		}
- 	}
-+
- retry:
- 	new = shmem_alloc_folio(swap_gfp, order, info, index);
- 	if (!new) {
-@@ -2056,11 +2062,10 @@ fallback:
- 	if (!order)
- 		return new;
- 	/* High order swapin failed, fallback to order 0 and retry */
--	order = 0;
--	nr_pages = 1;
-+	entry.val = swap.val;
- 	swap_gfp = gfp;
--	offset = index - round_down(index, nr_pages);
--	entry = swp_entry(swp_type(entry), swp_offset(entry) + offset);
-+	nr_pages = 1;
-+	order = 0;
- 	goto retry;
- }
- 
-@@ -2288,20 +2293,21 @@ static int shmem_swapin_folio(struct ino
- 	struct mm_struct *fault_mm = vma ? vma->vm_mm : NULL;
- 	struct shmem_inode_info *info = SHMEM_I(inode);
- 	int error, nr_pages, order, swap_order;
-+	swp_entry_t swap, index_entry;
- 	struct swap_info_struct *si;
- 	struct folio *folio = NULL;
- 	bool skip_swapcache = false;
--	swp_entry_t swap;
-+	pgoff_t offset;
+@@ -2274,14 +2274,15 @@ static int shmem_swapin_folio(struct ino
+ 	pgoff_t offset;
  
  	VM_BUG_ON(!*foliop || !xa_is_value(*foliop));
--	swap = radix_to_swp_entry(*foliop);
+-	swap = index_entry = radix_to_swp_entry(*foliop);
 +	index_entry = radix_to_swp_entry(*foliop);
++	swap = index_entry;
  	*foliop = NULL;
  
 -	if (is_poisoned_swp_entry(swap))
@@ -106,69 +56,48 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (unlikely(!si)) {
  		if (order < 0)
  			return -EEXIST;
-@@ -2313,13 +2319,15 @@ static int shmem_swapin_folio(struct ino
+@@ -2293,6 +2294,12 @@ static int shmem_swapin_folio(struct ino
  		return -EEXIST;
  	}
  
--	/* Look it up and read it in.. */
-+	/* @index may points to the middle of a large entry, get the real swap value first */
-+	offset = index - round_down(index, 1 << order);
-+	swap.val = index_entry.val + offset;
++	/* index may point to the middle of a large entry, get the sub entry */
++	if (order) {
++		offset = index - round_down(index, 1 << order);
++		swap = swp_entry(swp_type(swap), swp_offset(swap) + offset);
++	}
++
+ 	/* Look it up and read it in.. */
  	folio = swap_cache_get_folio(swap, NULL, 0);
  	if (!folio) {
+@@ -2305,8 +2312,10 @@ static int shmem_swapin_folio(struct ino
+ 
+ 		/* Skip swapcache for synchronous device. */
  		if (data_race(si->flags & SWP_SYNCHRONOUS_IO)) {
- 			/* Direct mTHP swapin without swap cache or readahead */
- 			folio = shmem_swapin_direct(inode, vma, index,
--						    swap, order, gfp);
-+						    index_entry, swap, order, gfp);
- 			if (IS_ERR(folio)) {
- 				error = PTR_ERR(folio);
- 				folio = NULL;
-@@ -2341,28 +2349,25 @@ static int shmem_swapin_folio(struct ino
- 			count_memcg_event_mm(fault_mm, PGMAJFAULT);
+-			folio = shmem_swap_alloc_folio(inode, vma, index, swap, order, gfp);
++			folio = shmem_swap_alloc_folio(inode, vma, index,
++						       index_entry, order, gfp);
+ 			if (!IS_ERR(folio)) {
++				swap = index_entry;
+ 				skip_swapcache = true;
+ 				goto alloced;
+ 			}
+@@ -2320,17 +2329,7 @@ static int shmem_swapin_folio(struct ino
+ 			if (error == -EEXIST)
+ 				goto failed;
  		}
- 	}
-+
-+	swap_order = folio_order(folio);
-+	nr_pages = folio_nr_pages(folio);
-+	/* The swap-in should cover both @swap and @index */
-+	swap.val = round_down(swap.val, nr_pages);
-+	VM_WARN_ON_ONCE(swap.val > index_entry.val + offset);
-+	VM_WARN_ON_ONCE(swap.val + nr_pages <= index_entry.val + offset);
-+
- 	/*
- 	 * We need to split an existing large entry if swapin brought in a
- 	 * smaller folio due to various of reasons.
--	 *
--	 * And worth noting there is a special case: if there is a smaller
--	 * cached folio that covers @swap, but not @index (it only covers
--	 * first few sub entries of the large entry, but @index points to
--	 * later parts), the swap cache lookup will still see this folio,
--	 * And we need to split the large entry here. Later checks will fail,
--	 * as it can't satisfy the swap requirement, and we will retry
--	 * the swapin from beginning.
- 	 */
--	swap_order = folio_order(folio);
-+	index = round_down(index, nr_pages);
- 	if (order > swap_order) {
--		error = shmem_split_swap_entry(inode, index, swap, gfp);
-+		error = shmem_split_swap_entry(inode, index, index_entry, gfp);
- 		if (error)
- 			goto failed_nolock;
- 	}
- 
--	index = round_down(index, 1 << swap_order);
--	swap.val = round_down(swap.val, 1 << swap_order);
 -
- 	/* We have to do this with folio locked to prevent races */
- 	folio_lock(folio);
- 	if ((!skip_swapcache && !folio_test_swapcache(folio)) ||
-@@ -2375,7 +2380,6 @@ static int shmem_swapin_folio(struct ino
- 		goto failed;
- 	}
- 	folio_wait_writeback(folio);
--	nr_pages = folio_nr_pages(folio);
- 
- 	/*
- 	 * Some architectures may have to restore extra metadata to the
+-		/*
+-		 * Now swap device can only swap in order 0 folio, it is
+-		 * necessary to recalculate the new swap entry based on
+-		 * the offset, as the swapin index might be unalgined.
+-		 */
+-		if (order) {
+-			offset = index - round_down(index, 1 << order);
+-			swap = swp_entry(swp_type(swap), swp_offset(swap) + offset);
+-		}
+-
++		/* Cached swapin with readahead, only supports order 0 */
+ 		folio = shmem_swapin_cluster(swap, gfp, info, index);
+ 		if (!folio) {
+ 			error = -ENOMEM;
 _
