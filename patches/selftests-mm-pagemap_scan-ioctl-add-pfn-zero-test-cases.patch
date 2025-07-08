@@ -1,0 +1,212 @@
+From: Muhammad Usama Anjum <usama.anjum@collabora.com>
+Subject: selftests/mm: pagemap_scan ioctl: add PFN ZERO test cases
+Date: Mon, 7 Jul 2025 12:33:20 +0500
+
+Add test cases to test the correctness of PFN ZERO flag of pagemap_scan
+ioctl.  Test with normal pages backed memory and huge pages backed memory.
+
+Link: https://lkml.kernel.org/r/20250707073321.106431-1-usama.anjum@collabora.com
+Signed-off-by: Muhammad Usama Anjum <usama.anjum@collabora.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Muhammad Usama Anjum <usama.anjum@collabora.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ tools/testing/selftests/mm/cow.c           |   27 -------
+ tools/testing/selftests/mm/pagemap_ioctl.c |   72 ++++++++++++++++++-
+ tools/testing/selftests/mm/vm_util.c       |   23 ++++++
+ tools/testing/selftests/mm/vm_util.h       |    2 
+ 4 files changed, 95 insertions(+), 29 deletions(-)
+
+--- a/tools/testing/selftests/mm/cow.c~selftests-mm-pagemap_scan-ioctl-add-pfn-zero-test-cases
++++ a/tools/testing/selftests/mm/cow.c
+@@ -72,31 +72,6 @@ static int detect_thp_sizes(size_t sizes
+ 	return count;
+ }
+ 
+-static void detect_huge_zeropage(void)
+-{
+-	int fd = open("/sys/kernel/mm/transparent_hugepage/use_zero_page",
+-		      O_RDONLY);
+-	size_t enabled = 0;
+-	char buf[15];
+-	int ret;
+-
+-	if (fd < 0)
+-		return;
+-
+-	ret = pread(fd, buf, sizeof(buf), 0);
+-	if (ret > 0 && ret < sizeof(buf)) {
+-		buf[ret] = 0;
+-
+-		enabled = strtoul(buf, NULL, 10);
+-		if (enabled == 1) {
+-			has_huge_zeropage = true;
+-			ksft_print_msg("[INFO] huge zeropage is enabled\n");
+-		}
+-	}
+-
+-	close(fd);
+-}
+-
+ static bool range_is_swapped(void *addr, size_t size)
+ {
+ 	for (; size; addr += pagesize, size -= pagesize)
+@@ -1903,7 +1878,7 @@ int main(int argc, char **argv)
+ 	}
+ 	nr_hugetlbsizes = detect_hugetlb_page_sizes(hugetlbsizes,
+ 						    ARRAY_SIZE(hugetlbsizes));
+-	detect_huge_zeropage();
++	has_huge_zeropage = detect_huge_zeropage();
+ 
+ 	ksft_set_plan(ARRAY_SIZE(anon_test_cases) * tests_per_anon_test_case() +
+ 		      ARRAY_SIZE(anon_thp_test_cases) * tests_per_anon_thp_test_case() +
+--- a/tools/testing/selftests/mm/pagemap_ioctl.c~selftests-mm-pagemap_scan-ioctl-add-pfn-zero-test-cases
++++ a/tools/testing/selftests/mm/pagemap_ioctl.c
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
++
+ #define _GNU_SOURCE
+ #include <stdio.h>
+ #include <fcntl.h>
+@@ -34,8 +35,8 @@
+ #define PAGEMAP "/proc/self/pagemap"
+ int pagemap_fd;
+ int uffd;
+-unsigned long page_size;
+-unsigned int hpage_size;
++size_t page_size;
++size_t hpage_size;
+ const char *progname;
+ 
+ #define LEN(region)	((region.end - region.start)/page_size)
+@@ -1480,6 +1481,68 @@ static void transact_test(int page_size)
+ 			      extra_thread_faults);
+ }
+ 
++void zeropfn_tests(void)
++{
++	unsigned long long mem_size;
++	struct page_region vec;
++	int i, ret;
++	char *mmap_mem, *mem;
++
++	/* Test with normal memory */
++	mem_size = 10 * page_size;
++	mem = mmap(NULL, mem_size, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
++	if (mem == MAP_FAILED)
++		ksft_exit_fail_msg("error nomem\n");
++
++	/* Touch each page to ensure it's mapped */
++	for (i = 0; i < mem_size; i += page_size)
++		(void)((volatile char *)mem)[i];
++
++	ret = pagemap_ioctl(mem, mem_size, &vec, 1, 0,
++			    (mem_size / page_size), PAGE_IS_PFNZERO, 0, 0, PAGE_IS_PFNZERO);
++	if (ret < 0)
++		ksft_exit_fail_msg("error %d %d %s\n", ret, errno, strerror(errno));
++
++	ksft_test_result(ret == 1 && LEN(vec) == (mem_size / page_size),
++			 "%s all pages must have PFNZERO set\n", __func__);
++
++	munmap(mem, mem_size);
++
++	/* Test with huge page if user_zero_page is set to 1 */
++	if (!detect_huge_zeropage()) {
++		ksft_test_result_skip("%s use_zero_page not supported or set to 1\n", __func__);
++		return;
++	}
++
++	mem_size = 2 * hpage_size;
++	mmap_mem = mmap(NULL, mem_size, PROT_READ | PROT_WRITE,
++			MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++	if (mmap_mem == MAP_FAILED)
++		ksft_exit_fail_msg("error nomem\n");
++
++	/* We need a THP-aligned memory area. */
++	mem = (char *)(((uintptr_t)mmap_mem + hpage_size) & ~(hpage_size - 1));
++
++	ret = madvise(mem, hpage_size, MADV_HUGEPAGE);
++	if (!ret) {
++		char tmp = *mem;
++
++		asm volatile("" : "+r" (tmp));
++
++		ret = pagemap_ioctl(mem, hpage_size, &vec, 1, 0,
++				    0, PAGE_IS_PFNZERO, 0, 0, PAGE_IS_PFNZERO);
++		if (ret < 0)
++			ksft_exit_fail_msg("error %d %d %s\n", ret, errno, strerror(errno));
++
++		ksft_test_result(ret == 1 && LEN(vec) == (hpage_size / page_size),
++				 "%s all huge pages must have PFNZERO set\n", __func__);
++	} else {
++		ksft_test_result_skip("%s huge page not supported\n", __func__);
++	}
++
++	munmap(mmap_mem, mem_size);
++}
++
+ int main(int __attribute__((unused)) argc, char *argv[])
+ {
+ 	int shmid, buf_size, fd, i, ret;
+@@ -1494,7 +1557,7 @@ int main(int __attribute__((unused)) arg
+ 	if (init_uffd())
+ 		ksft_exit_pass();
+ 
+-	ksft_set_plan(115);
++	ksft_set_plan(117);
+ 
+ 	page_size = getpagesize();
+ 	hpage_size = read_pmd_pagesize();
+@@ -1669,6 +1732,9 @@ int main(int __attribute__((unused)) arg
+ 	/* 16. Userfaultfd tests */
+ 	userfaultfd_tests();
+ 
++	/* 17. ZEROPFN tests */
++	zeropfn_tests();
++
+ 	close(pagemap_fd);
+ 	ksft_exit_pass();
+ }
+--- a/tools/testing/selftests/mm/vm_util.c~selftests-mm-pagemap_scan-ioctl-add-pfn-zero-test-cases
++++ a/tools/testing/selftests/mm/vm_util.c
+@@ -567,3 +567,26 @@ void *sys_mremap(void *old_address, unsi
+ 			       old_size, new_size, flags,
+ 			       (unsigned long)new_address);
+ }
++
++bool detect_huge_zeropage(void)
++{
++	int fd = open("/sys/kernel/mm/transparent_hugepage/use_zero_page",
++		      O_RDONLY);
++	bool enabled = 0;
++	char buf[15];
++	int ret;
++
++	if (fd < 0)
++		return 0;
++
++	ret = pread(fd, buf, sizeof(buf), 0);
++	if (ret > 0 && ret < sizeof(buf)) {
++		buf[ret] = 0;
++
++		if (strtoul(buf, NULL, 10) == 1)
++			enabled = 1;
++	}
++
++	close(fd);
++	return enabled;
++}
+--- a/tools/testing/selftests/mm/vm_util.h~selftests-mm-pagemap_scan-ioctl-add-pfn-zero-test-cases
++++ a/tools/testing/selftests/mm/vm_util.h
+@@ -74,6 +74,8 @@ static inline void skip_test_dodgy_fs(co
+ extern volatile sig_atomic_t signal_jump_set;
+ extern sigjmp_buf signal_jmp_buf;
+ 
++bool detect_huge_zeropage(void);
++
+ /*
+  * Ignore the checkpatch warning, we must read from x but don't want to do
+  * anything with it in order to trigger a read page fault. We therefore must use
+_
