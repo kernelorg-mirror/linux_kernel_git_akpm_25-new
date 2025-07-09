@@ -1,11 +1,11 @@
 From: wang lian <lianux.mm@gmail.com>
 Subject: selftests/mm: add process_madvise() tests
-Date: Mon, 30 Jun 2025 22:09:57 +0800
+Date: Thu, 3 Jul 2025 12:43:26 +0800
 
 Add tests for process_madvise(), focusing on verifying behavior under
 various conditions including valid usage and error cases.
 
-Link: https://lkml.kernel.org/r/20250630140957.4000-1-lianux.mm@gmail.com
+Link: https://lkml.kernel.org/r/20250703044326.65061-1-lianux.mm@gmail.com
 Signed-off-by: wang lian <lianux.mm@gmail.com>
 Suggested-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Suggested-by: David Hildenbrand <david@redhat.com>
@@ -19,22 +19,106 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/mm/.gitignore     |    1 
- tools/testing/selftests/mm/Makefile       |    1 
- tools/testing/selftests/mm/process_madv.c |  414 ++++++++++++++++++++
- tools/testing/selftests/mm/run_vmtests.sh |    5 
- 4 files changed, 421 insertions(+)
+ tools/testing/selftests/mm/.gitignore      |    1 
+ tools/testing/selftests/mm/Makefile        |    1 
+ tools/testing/selftests/mm/guard-regions.c |   51 --
+ tools/testing/selftests/mm/process_madv.c  |  358 +++++++++++++++++++
+ tools/testing/selftests/mm/run_vmtests.sh  |    5 
+ tools/testing/selftests/mm/vm_util.c       |   35 +
+ tools/testing/selftests/mm/vm_util.h       |   22 +
+ 7 files changed, 422 insertions(+), 51 deletions(-)
 
 --- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-process_madvise-tests
 +++ a/tools/testing/selftests/mm/.gitignore
-@@ -26,6 +26,7 @@ protection_keys
+@@ -25,6 +25,7 @@ pfnmap
+ protection_keys
  protection_keys_32
  protection_keys_64
- madv_populate
 +process_madv
+ madv_populate
  uffd-stress
  uffd-unit-tests
- uffd-wp-mremap
+--- a/tools/testing/selftests/mm/guard-regions.c~selftests-mm-add-process_madvise-tests
++++ a/tools/testing/selftests/mm/guard-regions.c
+@@ -9,8 +9,6 @@
+ #include <linux/limits.h>
+ #include <linux/userfaultfd.h>
+ #include <linux/fs.h>
+-#include <setjmp.h>
+-#include <signal.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -25,24 +23,6 @@
+ #include "../pidfd/pidfd.h"
+ 
+ /*
+- * Ignore the checkpatch warning, as per the C99 standard, section 7.14.1.1:
+- *
+- * "If the signal occurs other than as the result of calling the abort or raise
+- *  function, the behavior is undefined if the signal handler refers to any
+- *  object with static storage duration other than by assigning a value to an
+- *  object declared as volatile sig_atomic_t"
+- */
+-static volatile sig_atomic_t signal_jump_set;
+-static sigjmp_buf signal_jmp_buf;
+-
+-/*
+- * Ignore the checkpatch warning, we must read from x but don't want to do
+- * anything with it in order to trigger a read page fault. We therefore must use
+- * volatile to stop the compiler from optimising this away.
+- */
+-#define FORCE_READ(x) (*(volatile typeof(x) *)x)
+-
+-/*
+  * How is the test backing the mapping being tested?
+  */
+ enum backing_type {
+@@ -120,14 +100,6 @@ static int userfaultfd(int flags)
+ 	return syscall(SYS_userfaultfd, flags);
+ }
+ 
+-static void handle_fatal(int c)
+-{
+-	if (!signal_jump_set)
+-		return;
+-
+-	siglongjmp(signal_jmp_buf, c);
+-}
+-
+ static ssize_t sys_process_madvise(int pidfd, const struct iovec *iovec,
+ 				   size_t n, int advice, unsigned int flags)
+ {
+@@ -180,29 +152,6 @@ static bool try_read_write_buf(char *ptr
+ 	return try_read_buf(ptr) && try_write_buf(ptr);
+ }
+ 
+-static void setup_sighandler(void)
+-{
+-	struct sigaction act = {
+-		.sa_handler = &handle_fatal,
+-		.sa_flags = SA_NODEFER,
+-	};
+-
+-	sigemptyset(&act.sa_mask);
+-	if (sigaction(SIGSEGV, &act, NULL))
+-		ksft_exit_fail_perror("sigaction");
+-}
+-
+-static void teardown_sighandler(void)
+-{
+-	struct sigaction act = {
+-		.sa_handler = SIG_DFL,
+-		.sa_flags = SA_NODEFER,
+-	};
+-
+-	sigemptyset(&act.sa_mask);
+-	sigaction(SIGSEGV, &act, NULL);
+-}
+-
+ static int open_file(const char *prefix, char *path)
+ {
+ 	int fd;
 --- a/tools/testing/selftests/mm/Makefile~selftests-mm-add-process_madvise-tests
 +++ a/tools/testing/selftests/mm/Makefile
 @@ -85,6 +85,7 @@ TEST_GEN_FILES += mseal_test
@@ -49,7 +133,7 @@ diff --git a/tools/testing/selftests/mm/process_madv.c a/tools/testing/selftests
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/process_madv.c
-@@ -0,0 +1,414 @@
+@@ -0,0 +1,358 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +#define _GNU_SOURCE
@@ -70,60 +154,11 @@ new file mode 100644
 +
 +#include "../pidfd/pidfd.h"
 +
-+/*
-+ * Ignore the checkpatch warning, as per the C99 standard, section 7.14.1.1:
-+ *
-+ * "If the signal occurs other than as the result of calling the abort or raise
-+ *  function, the behavior is undefined if the signal handler refers to any
-+ *  object with static storage duration other than by assigning a value to an
-+ *  object declared as volatile sig_atomic_t"
-+ */
-+static volatile sig_atomic_t signal_jump_set;
-+static sigjmp_buf signal_jmp_buf;
-+
-+/*
-+ * Ignore the checkpatch warning, we must read from x but don't want to do
-+ * anything with it in order to trigger a read page fault. We therefore must use
-+ * volatile to stop the compiler from optimising this away.
-+ */
-+#define FORCE_READ(x) (*(volatile typeof(x) *)x)
-+
-+static void handle_fatal(int c)
-+{
-+	if (!signal_jump_set)
-+		return;
-+
-+	siglongjmp(signal_jmp_buf, c);
-+}
-+
 +FIXTURE(process_madvise)
 +{
 +	int pidfd;
 +	int flag;
 +};
-+
-+static void setup_sighandler(void)
-+{
-+	struct sigaction act = {
-+		.sa_handler = &handle_fatal,
-+		.sa_flags = SA_NODEFER,
-+	};
-+
-+	sigemptyset(&act.sa_mask);
-+	if (sigaction(SIGSEGV, &act, NULL))
-+		ksft_exit_fail_perror("sigaction");
-+}
-+
-+static void teardown_sighandler(void)
-+{
-+	struct sigaction act = {
-+		.sa_handler = SIG_DFL,
-+		.sa_flags = SA_NODEFER,
-+	};
-+
-+	sigemptyset(&act.sa_mask);
-+	sigaction(SIGSEGV, &act, NULL);
-+}
 +
 +FIXTURE_SETUP(process_madvise)
 +{
@@ -132,7 +167,7 @@ new file mode 100644
 +	setup_sighandler();
 +};
 +
-+FIXTURE_TEARDOWN_PARENT(process_madvise)
++FIXTURE_TEARDOWN(process_madvise)
 +{
 +	teardown_sighandler();
 +}
@@ -144,11 +179,11 @@ new file mode 100644
 +}
 +
 +/*
-+ * Enable our signal catcher and try to read/write the specified buffer. The
-+ * return value indicates whether the read/write succeeds without a fatal
++ * Enable our signal catcher and try to read the specified buffer. The
++ * return value indicates whether the read succeeds without a fatal
 + * signal.
 + */
-+static bool try_access_buf(char *ptr, bool write)
++static bool try_read_buf(char *ptr)
 +{
 +	bool failed;
 +
@@ -157,21 +192,11 @@ new file mode 100644
 +	/* If a fatal signal arose, we will jump back here and failed is set. */
 +	failed = sigsetjmp(signal_jmp_buf, 0) != 0;
 +
-+	if (!failed) {
-+		if (write)
-+			*ptr = 'x';
-+		else
-+			FORCE_READ(ptr);
-+	}
++	if (!failed)
++		FORCE_READ(ptr);
 +
 +	signal_jump_set = false;
 +	return !failed;
-+}
-+
-+/* Try and read from a buffer, return true if no fatal signal. */
-+static bool try_read_buf(char *ptr)
-+{
-+	return try_access_buf(ptr, false);
 +}
 +
 +TEST_F(process_madvise, basic)
@@ -188,7 +213,8 @@ new file mode 100644
 +	 */
 +	map = mmap(NULL, pagesize * 10, PROT_READ | PROT_WRITE,
 +		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-+	ASSERT_NE(map, MAP_FAILED);
++	if (map == MAP_FAILED)
++		ksft_exit_skip("mmap failed, not enough memory.\n");
 +
 +	/* Fill the entire region with a known pattern. */
 +	memset(map, 'A', pagesize * 10);
@@ -232,7 +258,8 @@ new file mode 100644
 +	char *unadvised_page = &map[1 * pagesize];
 +
 +	ASSERT_TRUE(try_read_buf(unadvised_page));
-+	ASSERT_EQ(*unadvised_page, 'A');
++	for (int i = 0; i < pagesize; i++)
++		ASSERT_EQ(unadvised_page[i], 'A');
 +
 +	/* Cleanup. */
 +	ASSERT_EQ(munmap(map, pagesize * 10), 0);
@@ -249,7 +276,7 @@ new file mode 100644
 +	bool in_vma;
 +
 +	in_vma = false;
-+	sprintf(smaps_path, "/proc/%d/smaps", pid);
++	snprintf(smaps_path, sizeof(smaps_path), "/proc/%d/smaps", pid);
 +	f = fopen(smaps_path, "r");
 +	if (!f)
 +		return -1;
@@ -447,7 +474,8 @@ new file mode 100644
 +
 +	map = mmap(NULL, pagesize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
 +		   0);
-+	ASSERT_NE(map, MAP_FAILED);
++	if (map == MAP_FAILED)
++		ksft_exit_skip("mmap failed, not enough memory.\n");
 +
 +	vec.iov_base = map;
 +	vec.iov_len = pagesize;
@@ -464,18 +492,17 @@ new file mode 100644
 +}
 +
 +TEST_HARNESS_MAIN
-\ No newline at end of file
 --- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-add-process_madvise-tests
 +++ a/tools/testing/selftests/mm/run_vmtests.sh
-@@ -59,6 +59,8 @@ separated by spaces:
- 	ksm tests that require >=2 NUMA nodes
- - pkey
- 	memory protection key tests
-+- process_madvise
+@@ -65,6 +65,8 @@ separated by spaces:
+ 	test pagemap_scan IOCTL
+ - pfnmap
+ 	tests for VM_PFNMAP handling
++- process_madv
 +	test process_madvise
- - soft_dirty
- 	test soft dirty page bit semantics
- - pagemap
+ - cow
+ 	test copy-on-write semantics
+ - thp
 @@ -422,6 +424,9 @@ CATEGORY="hmm" run_test bash ./test_hmm.
  # MADV_GUARD_INSTALL and MADV_GUARD_REMOVE tests
  CATEGORY="madv_guard" run_test ./guard-regions
@@ -486,4 +513,97 @@ new file mode 100644
  # MADV_POPULATE_READ and MADV_POPULATE_WRITE tests
  CATEGORY="madv_populate" run_test ./madv_populate
  
+--- a/tools/testing/selftests/mm/vm_util.c~selftests-mm-add-process_madvise-tests
++++ a/tools/testing/selftests/mm/vm_util.c
+@@ -20,6 +20,9 @@
+ unsigned int __page_size;
+ unsigned int __page_shift;
+ 
++volatile sig_atomic_t signal_jump_set;
++sigjmp_buf signal_jmp_buf;
++
+ uint64_t pagemap_get_entry(int fd, char *start)
+ {
+ 	const unsigned long pfn = (unsigned long)start / getpagesize();
+@@ -524,3 +527,35 @@ int read_sysfs(const char *file_path, un
+ 
+ 	return 0;
+ }
++
++static void handle_fatal(int c)
++{
++	if (!signal_jump_set)
++		return;
++
++	siglongjmp(signal_jmp_buf, c);
++}
++
++void setup_sighandler(void)
++{
++	struct sigaction act = {
++		.sa_handler = &handle_fatal,
++		.sa_flags = SA_NODEFER,
++	};
++
++	sigemptyset(&act.sa_mask);
++	if (sigaction(SIGSEGV, &act, NULL))
++		ksft_exit_fail_perror("sigaction in setup");
++}
++
++void teardown_sighandler(void)
++{
++	struct sigaction act = {
++		.sa_handler = SIG_DFL,
++		.sa_flags = SA_NODEFER,
++	};
++
++	sigemptyset(&act.sa_mask);
++	if (sigaction(SIGSEGV, &act, NULL))
++		ksft_exit_fail_perror("sigaction in teardown");
++}
+--- a/tools/testing/selftests/mm/vm_util.h~selftests-mm-add-process_madvise-tests
++++ a/tools/testing/selftests/mm/vm_util.h
+@@ -8,6 +8,8 @@
+ #include <unistd.h> /* _SC_PAGESIZE */
+ #include "../kselftest.h"
+ #include <linux/fs.h>
++#include <setjmp.h>
++#include <signal.h>
+ 
+ #define BIT_ULL(nr)                   (1ULL << (nr))
+ #define PM_SOFT_DIRTY                 BIT_ULL(55)
+@@ -61,6 +63,24 @@ static inline void skip_test_dodgy_fs(co
+ 	ksft_test_result_skip("%s failed with ENOENT. Filesystem might be buggy (9pfs?)\n", op_name);
+ }
+ 
++/*
++ * Ignore the checkpatch warning, as per the C99 standard, section 7.14.1.1:
++ *
++ * "If the signal occurs other than as the result of calling the abort or raise
++ *  function, the behavior is undefined if the signal handler refers to any
++ *  object with static storage duration other than by assigning a value to an
++ *  object declared as volatile sig_atomic_t"
++ */
++extern volatile sig_atomic_t signal_jump_set;
++extern sigjmp_buf signal_jmp_buf;
++
++/*
++ * Ignore the checkpatch warning, we must read from x but don't want to do
++ * anything with it in order to trigger a read page fault. We therefore must use
++ * volatile to stop the compiler from optimising this away.
++ */
++#define FORCE_READ(x) (*(volatile typeof(x) *)x)
++
+ uint64_t pagemap_get_entry(int fd, char *start);
+ bool pagemap_is_softdirty(int fd, char *start);
+ bool pagemap_is_swapped(int fd, char *start);
+@@ -90,6 +110,8 @@ bool find_vma_procmap(struct procmap_fd
+ int close_procmap(struct procmap_fd *procmap);
+ int write_sysfs(const char *file_path, unsigned long val);
+ int read_sysfs(const char *file_path, unsigned long *val);
++void setup_sighandler(void);
++void teardown_sighandler(void);
+ 
+ static inline int open_self_procmap(struct procmap_fd *procmap_out)
+ {
 _
