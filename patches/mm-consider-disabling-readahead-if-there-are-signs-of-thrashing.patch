@@ -1,0 +1,55 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: consider disabling readahead if there are signs of thrashing
+Date: Thu, 10 Jul 2025 12:52:32 -0700
+
+We've noticed in production that under a very heavy memory pressure the
+readahead behavior becomes unstable causing spikes in memory pressure and
+CPU contention on zone locks.
+
+The current mmap_miss heuristics considers minor pagefaults as a good
+reason to decrease mmap_miss and conditionally start async readahead. 
+This creates a vicious cycle: asynchronous readahead loads more pages,
+which in turn causes more minor pagefaults.  This problem is especially
+pronounced when multiple threads of an application fault on consecutive
+pages of an evicted executable, aggressively lowering the mmap_miss
+counter and preventing readahead from being disabled.
+
+To improve the logic let's check for !uptodate and workingset folios in
+do_async_mmap_readahead().  The presence of such pages is a strong
+indicator of thrashing, which is also used by the delay accounting code,
+e.g.  in folio_wait_bit_common().  So instead of decreasing mmap_miss and
+lower chances to disable readahead, let's do the opposite and bump it by
+MMAP_LOTSAMISS / 2.
+
+Link: https://lkml.kernel.org/r/20250710195232.124790-1-roman.gushchin@linux.dev
+Signed-off-by: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Liu Shixin <liushixin2@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+--- a/mm/filemap.c~mm-consider-disabling-readahead-if-there-are-signs-of-thrashing
++++ a/mm/filemap.c
+@@ -3324,6 +3324,17 @@ static struct file *do_async_mmap_readah
+ 		return fpin;
+ 
+ 	mmap_miss = READ_ONCE(ra->mmap_miss);
++	if (unlikely(!folio_test_uptodate(folio) &&
++		     folio_test_workingset(folio))) {
++		/*
++		 * If there are signs of thrashing, take a big step
++		 * towards disabling readahead.
++		 */
++		mmap_miss += MMAP_LOTSAMISS / 2;
++		mmap_miss = min(mmap_miss, MMAP_LOTSAMISS * 10);
++		WRITE_ONCE(ra->mmap_miss, mmap_miss);
++		return fpin;
++	}
+ 	if (mmap_miss)
+ 		WRITE_ONCE(ra->mmap_miss, --mmap_miss);
+ 
+_
