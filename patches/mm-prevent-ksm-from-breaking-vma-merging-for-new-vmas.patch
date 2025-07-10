@@ -42,6 +42,8 @@ these, disallowing all other cases.
 Also add stubs for newly introduced function invocations to VMA userland
 testing.
 
+[lorenzo.stoakes@oracle.com: correctly invoke late KSM check after mmap hook]
+  Link: https://lkml.kernel.org/r/5861f8f6-cf5a-4d82-a062-139fb3f9cddb@lucifer.local
 Link: https://lkml.kernel.org/r/3ba660af716d87a18ca5b4e635f2101edeb56340.1748537921.git.lorenzo.stoakes@oracle.com
 Fixes: d7597f59d1d3 ("mm: add new api to enable ksm per process") # please no backport!
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
@@ -58,11 +60,11 @@ Cc: Stefan Roesch <shr@devkernel.io>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/ksm.h              |    8 +++--
- mm/ksm.c                         |   18 +++++++----
- mm/vma.c                         |   44 +++++++++++++++++++++++++++--
- tools/testing/vma/vma_internal.h |   11 +++++++
- 4 files changed, 70 insertions(+), 11 deletions(-)
+ include/linux/ksm.h              |    8 ++--
+ mm/ksm.c                         |   18 ++++++----
+ mm/vma.c                         |   51 +++++++++++++++++++++++++++--
+ tools/testing/vma/vma_internal.h |   11 ++++++
+ 4 files changed, 77 insertions(+), 11 deletions(-)
 
 --- a/include/linux/ksm.h~mm-prevent-ksm-from-breaking-vma-merging-for-new-vmas
 +++ a/include/linux/ksm.h
@@ -122,16 +124,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void ksm_add_vmas(struct mm_struct *mm)
 --- a/mm/vma.c~mm-prevent-ksm-from-breaking-vma-merging-for-new-vmas
 +++ a/mm/vma.c
-@@ -2490,7 +2490,6 @@ static int __mmap_new_vma(struct mmap_st
- 	 */
- 	if (!vma_is_anonymous(vma))
- 		khugepaged_enter_vma(vma, map->flags);
--	ksm_add_vma(vma);
- 	*vmap = vma;
- 	return 0;
+@@ -32,6 +32,9 @@ struct mmap_state {
+ 	struct vma_munmap_struct vms;
+ 	struct ma_state mas_detach;
+ 	struct maple_tree mt_detach;
++
++	/* Determine if we can check KSM flags early in mmap() logic. */
++	bool check_ksm_early;
+ };
  
-@@ -2593,6 +2592,40 @@ static void set_vma_user_defined_fields(
- 	vma->vm_private_data = map->vm_private_data;
+ #define MMAP_STATE(name, mm_, vmi_, addr_, len_, pgoff_, flags_, file_) \
+@@ -2320,6 +2323,11 @@ static void vms_abort_munmap_vmas(struct
+ 	vms_complete_munmap_vmas(vms, mas_detach);
  }
  
 +static void update_ksm_flags(struct mmap_state *map)
@@ -139,6 +143,41 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	map->flags = ksm_vma_flags(map->mm, map->file, map->flags);
 +}
 +
+ /*
+  * __mmap_prepare() - Prepare to gather any overlapping VMAs that need to be
+  * unmapped once the map operation is completed, check limits, account mapping
+@@ -2424,6 +2432,7 @@ static int __mmap_new_file_vma(struct mm
+ 			!(map->flags & VM_MAYWRITE) &&
+ 			(vma->vm_flags & VM_MAYWRITE));
+ 
++	map->file = vma->vm_file;
+ 	map->flags = vma->vm_flags;
+ 
+ 	return 0;
+@@ -2473,6 +2482,11 @@ static int __mmap_new_vma(struct mmap_st
+ 	if (error)
+ 		goto free_iter_vma;
+ 
++	if (!map->check_ksm_early) {
++		update_ksm_flags(map);
++		vm_flags_init(vma, map->flags);
++	}
++
+ #ifdef CONFIG_SPARC64
+ 	/* TODO: Fix SPARC ADI! */
+ 	WARN_ON_ONCE(!arch_validate_flags(map->flags));
+@@ -2490,7 +2504,6 @@ static int __mmap_new_vma(struct mmap_st
+ 	 */
+ 	if (!vma_is_anonymous(vma))
+ 		khugepaged_enter_vma(vma, map->flags);
+-	ksm_add_vma(vma);
+ 	*vmap = vma;
+ 	return 0;
+ 
+@@ -2593,6 +2606,35 @@ static void set_vma_user_defined_fields(
+ 	vma->vm_private_data = map->vm_private_data;
+ }
+ 
 +/*
 + * Are we guaranteed no driver can change state such as to preclude KSM merging?
 + * If so, let's set the KSM mergeable flag early so we don't break VMA merging.
@@ -171,35 +210,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static unsigned long __mmap_region(struct file *file, unsigned long addr,
  		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
  		struct list_head *uf)
-@@ -2603,6 +2636,7 @@ static unsigned long __mmap_region(struc
- 	bool have_mmap_prepare = file && file->f_op->mmap_prepare;
+@@ -2604,12 +2646,17 @@ static unsigned long __mmap_region(struc
  	VMA_ITERATOR(vmi, mm, addr);
  	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file);
-+	bool check_ksm_early = can_set_ksm_flags_early(&map);
  
++	map.check_ksm_early = can_set_ksm_flags_early(&map);
++
  	error = __mmap_prepare(&map, uf);
  	if (!error && have_mmap_prepare)
-@@ -2610,6 +2644,9 @@ static unsigned long __mmap_region(struc
+ 		error = call_mmap_prepare(&map);
  	if (error)
  		goto abort_munmap;
  
-+	if (check_ksm_early)
++	if (map.check_ksm_early)
 +		update_ksm_flags(&map);
 +
  	/* Attempt to merge with adjacent VMAs... */
  	if (map.prev || map.next) {
  		VMG_MMAP_STATE(vmg, &map, /* vma = */ NULL);
-@@ -2619,6 +2656,9 @@ static unsigned long __mmap_region(struc
- 
- 	/* ...but if we can't, allocate a new VMA. */
- 	if (!vma) {
-+		if (!check_ksm_early)
-+			update_ksm_flags(&map);
-+
- 		error = __mmap_new_vma(&map, &vma);
- 		if (error)
- 			goto unacct_error;
-@@ -2721,6 +2761,7 @@ int do_brk_flags(struct vma_iterator *vm
+@@ -2721,6 +2768,7 @@ int do_brk_flags(struct vma_iterator *vm
  	 * Note: This happens *after* clearing old mappings in some code paths.
  	 */
  	flags |= VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
@@ -207,7 +236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!may_expand_vm(mm, flags, len >> PAGE_SHIFT))
  		return -ENOMEM;
  
-@@ -2764,7 +2805,6 @@ int do_brk_flags(struct vma_iterator *vm
+@@ -2764,7 +2812,6 @@ int do_brk_flags(struct vma_iterator *vm
  
  	mm->map_count++;
  	validate_mm(mm);
