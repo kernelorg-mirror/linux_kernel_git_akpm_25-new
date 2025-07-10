@@ -1,61 +1,52 @@
 From: Koichiro Den <koichiro.den@canonical.com>
 Subject: mm: vmscan: apply proportional reclaim pressure for memcg when MGLRU is enabled
-Date: Fri, 4 Apr 2025 23:11:18 +0900
+Date: Sat, 31 May 2025 01:23:53 +0900
 
 The scan implementation for MGLRU was missing proportional reclaim
 pressure for memcg, which contradicts the description in
 Documentation/admin-guide/cgroup-v2.rst (memory.{low,min} section).
 
-This issue was revealed by the LTP memcontrol03 [1] test case.  The
-following example output from a local test env with no NUMA shows that
-prior to this patch, proportional protection was not working:
+This issue can be observed in kselftest cgroup:test_memcontrol
+(specifically test_memcg_min and test_memcg_low).  The following table
+shows the actual values observed in my local test env (on xfs) and the
+error "e", which is the symmetric absolute percentage error from the ideal
+values of 29M for c[0] and 21M for c[1].
 
-* Without this patch (MGLRU enabled):
-  $ sudo LTP_SINGLE_FS_TYPE=xfs ./memcontrol03
-    ...
-    memcontrol03.c:214: TPASS: Expect: (A/B/C memory.current=25964544) ~= 34603008
-    memcontrol03.c:216: TPASS: Expect: (A/B/D memory.current=26038272) ~= 17825792
-    ...
+  test_memcg_min
 
-* With this patch (MGLRU enabled):
-  $ sudo LTP_SINGLE_FS_TYPE=xfs ./memcontrol03
-    ...
-    memcontrol03.c:214: TPASS: Expect: (A/B/C memory.current=29327360) ~= 34603008
-    memcontrol03.c:216: TPASS: Expect: (A/B/D memory.current=23748608) ~= 17825792
-    ...
+         | MGLRU enabled   | MGLRU enabled   | MGLRU disabled
+         | Without patch   | With patch      |
+    -----|-----------------|-----------------|---------------
+    c[0] | 25964544 (e=8%) | 28770304 (e=3%) | 27820032 (e=4%)
+    c[1] | 26214400 (e=9%) | 23998464 (e=4%) | 24776704 (e=6%)
 
-* When MGLRU is disabled:
-  $ sudo LTP_SINGLE_FS_TYPE=xfs ./memcontrol03
-    ...
-    memcontrol03.c:214: TPASS: Expect: (A/B/C memory.current=28819456) ~= 34603008
-    memcontrol03.c:216: TPASS: Expect: (A/B/D memory.current=24018944) ~= 17825792
-    ...
+  test_memcg_low
 
-Note that the test shows TPASS for all cases here due to its lenient
-criteria. And even with this patch, or when MGLRU is disabled, the
-results above show slight deviation from the expected values, but this
-is due to relatively small mem usage compared to the >> DEF_PRIORITY
-adjustment.
+         | MGLRU enabled   | MGLRU enabled   | MGLRU disabled
+         | Without patch   | With patch      |
+    -----|-----------------|-----------------|---------------
+    c[0] | 26214400 (e=7%) | 27930624 (e=4%) | 27688960 (e=5%)
+    c[1] | 26214400 (e=9%) | 24764416 (e=6%) | 24920064 (e=6%)
 
-Factor out the proportioning logic to a new function and have MGLRU
-reuse it.
+Factor out the proportioning logic to a new function and have MGLRU reuse
+it.  While at it, update the eviction behavior via debugfs 'lru_gen'
+interface ('-' command with an explicit 'nr_to_reclaim' parameter) to
+ensure eviction is limited to the specified number.
 
-Link: https://github.com/linux-test-project/ltp/blob/master/testcases/kernel/controllers/memcg/memcontrol03.c [1]
-Link: https://lkml.kernel.org/r/20250404141118.3895592-1-koichiro.den@canonical.com
+Link: https://lkml.kernel.org/r/20250530162353.541882-1-den@valinux.co.jp
 Signed-off-by: Koichiro Den <koichiro.den@canonical.com>
 Reviewed-by: Yuanchu Xie <yuanchu@google.com>
-Cc: Axel Rasmussen <axelrasmussen@google.com>
-Cc: Greg Thelen <gthelen@google.com>
 Cc: Yu Zhao <yuzhao@google.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vmscan.c |  148 ++++++++++++++++++++++++++------------------------
- 1 file changed, 78 insertions(+), 70 deletions(-)
+ mm/vmscan.c |  149 ++++++++++++++++++++++++++------------------------
+ 1 file changed, 79 insertions(+), 70 deletions(-)
 
 --- a/mm/vmscan.c~mm-vmscan-apply-proportional-reclaim-pressure-for-memcg-when-mglru-is-enabled
 +++ a/mm/vmscan.c
-@@ -2473,6 +2473,69 @@ static inline void calculate_pressure_ba
+@@ -2482,6 +2482,69 @@ static inline void calculate_pressure_ba
  	*denominator = ap + fp;
  }
  
@@ -125,7 +116,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Determine how aggressively the anon and file LRU lists should be
   * scanned.
-@@ -2551,70 +2614,10 @@ out:
+@@ -2560,70 +2623,10 @@ out:
  	for_each_evictable_lru(lru) {
  		bool file = is_file_lru(lru);
  		unsigned long lruvec_size;
@@ -197,7 +188,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		scan >>= sc->priority;
  
  		/*
-@@ -4545,8 +4548,9 @@ static bool isolate_folio(struct lruvec
+@@ -4554,8 +4557,9 @@ static bool isolate_folio(struct lruvec
  	return true;
  }
  
@@ -209,7 +200,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int i;
  	int gen;
-@@ -4555,7 +4559,7 @@ static int scan_folios(struct lruvec *lr
+@@ -4564,7 +4568,7 @@ static int scan_folios(struct lruvec *lr
  	int scanned = 0;
  	int isolated = 0;
  	int skipped = 0;
@@ -218,7 +209,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	struct lru_gen_folio *lrugen = &lruvec->lrugen;
  	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
  
-@@ -4666,7 +4670,8 @@ static int get_type_to_scan(struct lruve
+@@ -4675,7 +4679,8 @@ static int get_type_to_scan(struct lruve
  	return positive_ctrl_err(&sp, &pv);
  }
  
@@ -228,7 +219,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			  int *type_scanned, struct list_head *list)
  {
  	int i;
-@@ -4678,7 +4683,7 @@ static int isolate_folios(struct lruvec
+@@ -4687,7 +4692,7 @@ static int isolate_folios(struct lruvec
  
  		*type_scanned = type;
  
@@ -237,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (scanned)
  			return scanned;
  
-@@ -4688,7 +4693,8 @@ static int isolate_folios(struct lruvec
+@@ -4697,7 +4702,8 @@ static int isolate_folios(struct lruvec
  	return 0;
  }
  
@@ -247,7 +238,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int type;
  	int scanned;
-@@ -4707,7 +4713,7 @@ static int evict_folios(struct lruvec *l
+@@ -4716,7 +4722,7 @@ static int evict_folios(struct lruvec *l
  
  	spin_lock_irq(&lruvec->lru_lock);
  
@@ -256,7 +247,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	scanned += try_to_inc_min_seq(lruvec, swappiness);
  
-@@ -4828,6 +4834,8 @@ static long get_nr_to_scan(struct lruvec
+@@ -4837,6 +4843,8 @@ static long get_nr_to_scan(struct lruvec
  	if (nr_to_scan && !mem_cgroup_online(memcg))
  		return nr_to_scan;
  
@@ -265,7 +256,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* try to get away with not aging at the default priority */
  	if (!success || sc->priority == DEF_PRIORITY)
  		return nr_to_scan >> sc->priority;
-@@ -4880,7 +4888,7 @@ static bool try_to_shrink_lruvec(struct
+@@ -4889,7 +4897,7 @@ static bool try_to_shrink_lruvec(struct
  		if (nr_to_scan <= 0)
  			break;
  
@@ -274,12 +265,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!delta)
  			break;
  
-@@ -5501,7 +5509,7 @@ static int run_eviction(struct lruvec *l
+@@ -5510,7 +5518,8 @@ static int run_eviction(struct lruvec *l
  		if (sc->nr_reclaimed >= nr_to_reclaim)
  			return 0;
  
 -		if (!evict_folios(lruvec, sc, swappiness))
-+		if (!evict_folios(MAX_LRU_BATCH, lruvec, sc, swappiness))
++		if (!evict_folios(nr_to_reclaim - sc->nr_reclaimed, lruvec, sc,
++				  swappiness))
  			return 0;
  
  		cond_resched();
