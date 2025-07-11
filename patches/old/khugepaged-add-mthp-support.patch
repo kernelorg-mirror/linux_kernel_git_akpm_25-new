@@ -1,6 +1,6 @@
 From: Nico Pache <npache@redhat.com>
 Subject: khugepaged: add mTHP support
-Date: Mon, 28 Apr 2025 12:12:13 -0600
+Date: Tue, 1 Jul 2025 23:57:34 -0600
 
 Introduce the ability for khugepaged to collapse to different mTHP sizes. 
 While scanning PMD ranges for potential collapse candidates, keep track of
@@ -17,7 +17,12 @@ how full a THP must be to be eligible.
 If a mTHP collapse is attempted, but contains swapped out, or shared
 pages, we dont perform the collapse.
 
-Link: https://lkml.kernel.org/r/20250428181218.85925-8-npache@redhat.com
+For non-PMD collapse we must leave the anon VMA write locked until after
+we collapse the mTHP-- in the PMD case all the pages are isolated, but in
+the non-PMD case this is not true, and we must keep the lock to prevent
+changes to the VMA from occurring.
+
+Link: https://lkml.kernel.org/r/20250702055742.102808-8-npache@redhat.com
 Signed-off-by: Nico Pache <npache@redhat.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
@@ -46,30 +51,28 @@ Cc: Rafael Aquini <raquini@redhat.com>
 Cc: Randy Dunlap <rdunlap@infradead.org>
 Cc: Reported-by:Takashi Iwai <tiwai@suse.de>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
-Cc: Shuah Khan <shuah@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Thomas Hellstrom <thomas.hellstrom@linux.intel.com>
 Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Cc: Will Deacon <will@kernel.org>
-Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |  121 ++++++++++++++++++++++++++++++++--------------
- 1 file changed, 86 insertions(+), 35 deletions(-)
+ mm/khugepaged.c |  135 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 94 insertions(+), 41 deletions(-)
 
 --- a/mm/khugepaged.c~khugepaged-add-mthp-support
 +++ a/mm/khugepaged.c
-@@ -1136,13 +1136,14 @@ static int collapse_huge_page(struct mm_
+@@ -1132,13 +1132,14 @@ static int collapse_huge_page(struct mm_
  {
  	LIST_HEAD(compound_pagelist);
  	pmd_t *pmd, _pmd;
 -	pte_t *pte;
-+	pte_t *pte, mthp_pte;
++	pte_t *pte = NULL, mthp_pte;
  	pgtable_t pgtable;
  	struct folio *folio;
  	spinlock_t *pmd_ptl, *pte_ptl;
@@ -80,7 +83,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
  
-@@ -1158,12 +1159,13 @@ static int collapse_huge_page(struct mm_
+@@ -1154,13 +1155,13 @@ static int collapse_huge_page(struct mm_
  		*mmap_locked = false;
  	}
  
@@ -90,13 +93,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto out_nolock;
  
  	mmap_read_lock(mm);
--	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, HPAGE_PMD_ORDER);
+-	result = hugepage_vma_revalidate(mm, address, true, &vma, cc,
+-					 BIT(HPAGE_PMD_ORDER));
 +	*mmap_locked = true;
-+	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, order);
++	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, BIT(order));
  	if (result != SCAN_SUCCEED) {
  		mmap_read_unlock(mm);
  		goto out_nolock;
-@@ -1181,13 +1183,14 @@ static int collapse_huge_page(struct mm_
+@@ -1178,13 +1179,14 @@ static int collapse_huge_page(struct mm_
  		 * released when it fails. So we jump out_nolock directly in
  		 * that case.  Continuing to collapse causes inconsistency.
  		 */
@@ -113,16 +117,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Prevent all access to pagetables with the exception of
  	 * gup_fast later handled by the ptep_clear_flush and the VM
-@@ -1197,7 +1200,7 @@ static int collapse_huge_page(struct mm_
+@@ -1194,8 +1196,7 @@ static int collapse_huge_page(struct mm_
  	 * mmap_lock.
  	 */
  	mmap_write_lock(mm);
--	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, HPAGE_PMD_ORDER);
-+	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, order);
+-	result = hugepage_vma_revalidate(mm, address, true, &vma, cc,
+-					 BIT(HPAGE_PMD_ORDER));
++	result = hugepage_vma_revalidate(mm, address, true, &vma, cc, BIT(order));
  	if (result != SCAN_SUCCEED)
  		goto out_up_write;
  	/* check if the pmd is still valid */
-@@ -1208,11 +1211,12 @@ static int collapse_huge_page(struct mm_
+@@ -1206,11 +1207,12 @@ static int collapse_huge_page(struct mm_
  	vma_start_write(vma);
  	anon_vma_lock_write(vma->anon_vma);
  
@@ -137,7 +142,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * This removes any huge TLB entry from the CPU so we won't allow
  	 * huge and small TLB entries for the same virtual address to
-@@ -1226,18 +1230,16 @@ static int collapse_huge_page(struct mm_
+@@ -1224,18 +1226,16 @@ static int collapse_huge_page(struct mm_
  	mmu_notifier_invalidate_range_end(&range);
  	tlb_remove_table_sync_one();
  
@@ -159,8 +164,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		spin_lock(pmd_ptl);
  		BUG_ON(!pmd_none(*pmd));
  		/*
-@@ -1258,9 +1260,8 @@ static int collapse_huge_page(struct mm_
- 	anon_vma_unlock_write(vma->anon_vma);
+@@ -1250,17 +1250,17 @@ static int collapse_huge_page(struct mm_
+ 	}
+ 
+ 	/*
+-	 * All pages are isolated and locked so anon_vma rmap
+-	 * can't run anymore.
++	 * For PMD collapse all pages are isolated and locked so anon_vma
++	 * rmap can't run anymore
+ 	 */
+-	anon_vma_unlock_write(vma->anon_vma);
++	if (order == HPAGE_PMD_ORDER)
++		anon_vma_unlock_write(vma->anon_vma);
  
  	result = __collapse_huge_page_copy(pte, folio, pmd, _pmd,
 -					   vma, address, pte_ptl,
@@ -169,9 +184,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +					   vma, _address, pte_ptl,
 +					   &compound_pagelist, order);
  	if (unlikely(result != SCAN_SUCCEED))
- 		goto out_up_write;
+-		goto out_up_write;
++		goto out_unlock_anon_vma;
  
-@@ -1270,25 +1271,42 @@ static int collapse_huge_page(struct mm_
+ 	/*
+ 	 * The smp_wmb() inside __folio_mark_uptodate() ensures the
+@@ -1268,25 +1268,46 @@ static int collapse_huge_page(struct mm_
  	 * write.
  	 */
  	__folio_mark_uptodate(folio);
@@ -180,9 +198,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		pgtable = pmd_pgtable(_pmd);
 +		_pmd = folio_mk_pmd(folio, vma->vm_page_prot);
 +		_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
- 
--	_pmd = folio_mk_pmd(folio, vma->vm_page_prot);
--	_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
++
 +		spin_lock(pmd_ptl);
 +		BUG_ON(!pmd_none(*pmd));
 +		folio_add_new_anon_rmap(folio, vma, _address, RMAP_EXCLUSIVE);
@@ -196,6 +212,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		mthp_pte = mk_pte(&folio->page, vma->vm_page_prot);
 +		mthp_pte = maybe_mkwrite(pte_mkdirty(mthp_pte), vma);
  
+-	_pmd = folio_mk_pmd(folio, vma->vm_page_prot);
+-	_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
++		spin_lock(pmd_ptl);
++		BUG_ON(!pmd_none(*pmd));
++		folio_ref_add(folio, (1 << order) - 1);
++		folio_add_new_anon_rmap(folio, vma, _address, RMAP_EXCLUSIVE);
++		folio_add_lru_vma(folio, vma);
++		set_ptes(vma->vm_mm, _address, pte, mthp_pte, (1 << order));
++		update_mmu_cache_range(NULL, vma, _address, pte, (1 << order));
+ 
 -	spin_lock(pmd_ptl);
 -	BUG_ON(!pmd_none(*pmd));
 -	folio_add_new_anon_rmap(folio, vma, address, RMAP_EXCLUSIVE);
@@ -205,13 +231,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	update_mmu_cache_pmd(vma, address, pmd);
 -	deferred_split_folio(folio, false);
 -	spin_unlock(pmd_ptl);
-+		spin_lock(pmd_ptl);
-+		folio_ref_add(folio, (1 << order) - 1);
-+		folio_add_new_anon_rmap(folio, vma, _address, RMAP_EXCLUSIVE);
-+		folio_add_lru_vma(folio, vma);
-+		set_ptes(vma->vm_mm, _address, pte, mthp_pte, (1 << order));
-+		update_mmu_cache_range(NULL, vma, _address, pte, (1 << order));
-+
 +		smp_wmb(); /* make pte visible before pmd */
 +		pmd_populate(mm, pmd, pmd_pgtable(_pmd));
 +		spin_unlock(pmd_ptl);
@@ -220,13 +239,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	folio = NULL;
  
  	result = SCAN_SUCCEED;
++out_unlock_anon_vma:
++	if (order != HPAGE_PMD_ORDER)
++		anon_vma_unlock_write(vma->anon_vma);
  out_up_write:
 +	if (pte)
 +		pte_unmap(pte);
  	mmap_write_unlock(mm);
  out_nolock:
  	*mmap_locked = false;
-@@ -1364,31 +1382,58 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1362,31 +1383,57 @@ static int khugepaged_scan_pmd(struct mm
  {
  	pmd_t *pmd;
  	pte_t *pte, *_pte;
@@ -279,7 +301,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (chunk_none_count <= scaled_none)
 +				bitmap_set(cc->mthp_bitmap,
 +					   i / KHUGEPAGED_MIN_MTHP_NR, 1);
-+
 +			chunk_none_count = 0;
 +		}
 +
@@ -288,7 +309,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pte_t pteval = ptep_get(_pte);
  		if (is_swap_pte(pteval)) {
  			++unmapped;
-@@ -1411,10 +1456,11 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1409,10 +1456,11 @@ static int khugepaged_scan_pmd(struct mm
  			}
  		}
  		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
@@ -302,7 +323,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				continue;
  			} else {
  				result = SCAN_EXCEED_NONE_PTE;
-@@ -1510,6 +1556,7 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1508,6 +1556,7 @@ static int khugepaged_scan_pmd(struct mm
  								     address)))
  			referenced++;
  	}
@@ -310,7 +331,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!writable) {
  		result = SCAN_PAGE_RO;
  	} else if (cc->is_khugepaged &&
-@@ -1522,8 +1569,12 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1520,8 +1569,12 @@ static int khugepaged_scan_pmd(struct mm
  out_unmap:
  	pte_unmap_unlock(pte, ptl);
  	if (result == SCAN_SUCCEED) {
