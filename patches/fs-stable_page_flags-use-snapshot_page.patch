@@ -1,0 +1,120 @@
+From: Luiz Capitulino <luizcap@redhat.com>
+Subject: fs: stable_page_flags(): use snapshot_page()
+Date: Mon, 14 Jul 2025 09:16:54 -0400
+
+A race condition is possible in stable_page_flags() where user-space is
+reading /proc/kpageflags concurrently to a folio split.  This may lead to
+oopses or BUG_ON()s being triggered.
+
+To fix this, this commit uses snapshot_page() in stable_page_flags() so
+that stable_page_flags() works with a stable page and folio snapshots
+instead.
+
+Note that stable_page_flags() makes use of some functions that require the
+original page or folio pointer to work properly (eg.  is_free_budy_page()
+and folio_test_idle()).  Since those functions can't be used on the page
+snapshot, we replace their usage with flags that were set by
+snapshot_page() for this purpose.
+
+Link: https://lkml.kernel.org/r/52c16c0f00995a812a55980c2f26848a999a34ab.1752499009.git.luizcap@redhat.com
+Signed-off-by: Luiz Capitulino <luizcap@redhat.com>
+Reviewed-by: Shivank Garg <shivankg@amd.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: SeongJae Park <sj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/proc/page.c |   29 +++++++++++++----------------
+ 1 file changed, 13 insertions(+), 16 deletions(-)
+
+--- a/fs/proc/page.c~fs-stable_page_flags-use-snapshot_page
++++ a/fs/proc/page.c
+@@ -147,6 +147,7 @@ static inline u64 kpf_copy_bit(u64 kflag
+ u64 stable_page_flags(const struct page *page)
+ {
+ 	const struct folio *folio;
++	struct page_snapshot ps;
+ 	unsigned long k;
+ 	unsigned long mapping;
+ 	bool is_anon;
+@@ -158,7 +159,9 @@ u64 stable_page_flags(const struct page
+ 	 */
+ 	if (!page)
+ 		return 1 << KPF_NOPAGE;
+-	folio = page_folio(page);
++
++	snapshot_page(&ps, page);
++	folio = &ps.folio_snapshot;
+ 
+ 	k = folio->flags;
+ 
+@@ -169,7 +172,7 @@ u64 stable_page_flags(const struct page
+ 		mapping = (unsigned long)folio->mapping;
+ 		is_anon = mapping & FOLIO_MAPPING_ANON;
+ 
+-		if (page_mapped(page))
++		if (folio_mapped(folio))
+ 			u |= 1 << KPF_MMAP;
+ 		if (is_anon) {
+ 			u |= 1 << KPF_ANON;
+@@ -182,7 +185,7 @@ u64 stable_page_flags(const struct page
+ 	 * compound pages: export both head/tail info
+ 	 * they together define a compound page's start/end pos and order
+ 	 */
+-	if (page == &folio->page)
++	if (ps.idx == 0)
+ 		u |= kpf_copy_bit(k, KPF_COMPOUND_HEAD, PG_head);
+ 	else
+ 		u |= 1 << KPF_COMPOUND_TAIL;
+@@ -192,25 +195,19 @@ u64 stable_page_flags(const struct page
+ 	         folio_test_large_rmappable(folio)) {
+ 		/* Note: we indicate any THPs here, not just PMD-sized ones */
+ 		u |= 1 << KPF_THP;
+-	} else if (is_huge_zero_folio(folio)) {
++	} else if (is_huge_zero_pfn(ps.pfn)) {
+ 		u |= 1 << KPF_ZERO_PAGE;
+ 		u |= 1 << KPF_THP;
+-	} else if (is_zero_folio(folio)) {
++	} else if (is_zero_pfn(ps.pfn)) {
+ 		u |= 1 << KPF_ZERO_PAGE;
+ 	}
+ 
+-	/*
+-	 * Caveats on high order pages: PG_buddy and PG_slab will only be set
+-	 * on the head page.
+-	 */
+-	if (PageBuddy(page))
+-		u |= 1 << KPF_BUDDY;
+-	else if (page_count(page) == 0 && is_free_buddy_page(page))
++	if (ps.flags & PAGE_SNAPSHOT_PG_BUDDY)
+ 		u |= 1 << KPF_BUDDY;
+ 
+-	if (PageOffline(page))
++	if (folio_test_offline(folio))
+ 		u |= 1 << KPF_OFFLINE;
+-	if (PageTable(page))
++	if (folio_test_pgtable(folio))
+ 		u |= 1 << KPF_PGTABLE;
+ 	if (folio_test_slab(folio))
+ 		u |= 1 << KPF_SLAB;
+@@ -218,7 +215,7 @@ u64 stable_page_flags(const struct page
+ #if defined(CONFIG_PAGE_IDLE_FLAG) && defined(CONFIG_64BIT)
+ 	u |= kpf_copy_bit(k, KPF_IDLE,          PG_idle);
+ #else
+-	if (folio_test_idle(folio))
++	if (ps.flags & PAGE_SNAPSHOT_PG_IDLE)
+ 		u |= 1 << KPF_IDLE;
+ #endif
+ 
+@@ -244,7 +241,7 @@ u64 stable_page_flags(const struct page
+ 	if (u & (1 << KPF_HUGE))
+ 		u |= kpf_copy_bit(k, KPF_HWPOISON,	PG_hwpoison);
+ 	else
+-		u |= kpf_copy_bit(page->flags, KPF_HWPOISON,	PG_hwpoison);
++		u |= kpf_copy_bit(ps.page_snapshot.flags, KPF_HWPOISON, PG_hwpoison);
+ #endif
+ 
+ 	u |= kpf_copy_bit(k, KPF_RESERVED,	PG_reserved);
+_
