@@ -1,0 +1,85 @@
+From: Hugh Dickins <hughd@google.com>
+Subject: mm/shmem: writeout free swap if swap_writeout() reactivates
+Date: Wed, 16 Jul 2025 01:08:39 -0700 (PDT)
+
+If swap_writeout() returns AOP_WRITEPAGE_ACTIVATE (for example, because
+zswap cannot compress and memcg disables writeback), there is no virtue in
+keeping that folio in swap cache and holding the swap allocation:
+shmem_writeout() switch it back to shmem page cache before returning.
+
+Folio lock is held, and folio->memcg_data remains set throughout, so there
+is no need to get into any memcg or memsw charge complications:
+swap_free_nr() and delete_from_swap_cache() do as much as is needed (but
+beware the race with shmem_free_swap() when inode truncated or evicted).
+
+Doing the same for an anonymous folio is harder, since it will usually
+have been unmapped, with references to the swap left in the page tables. 
+Adding a function to remap the folio would be fun, but not worthwhile
+unless it has other uses, or an urgent bug with anon is demonstrated.
+
+Link: https://lkml.kernel.org/r/5c911f7a-af7a-5029-1dd4-2e00b66d565c@google.com
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Kairui Song <ryncsn@gmail.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/shmem.c |   33 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 32 insertions(+), 1 deletion(-)
+
+--- a/mm/shmem.c~mm-shmem-writeout-free-swap-if-swap_writeout-reactivates
++++ a/mm/shmem.c
+@@ -1655,6 +1655,7 @@ try_split:
+ 
+ 	if (!folio_alloc_swap(folio, __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN)) {
+ 		bool first_swapped = shmem_recalc_inode(inode, 0, nr_pages);
++		int error;
+ 
+ 		/*
+ 		 * Add inode to shmem_unuse()'s list of swapped-out inodes,
+@@ -1675,7 +1676,37 @@ try_split:
+ 		shmem_delete_from_page_cache(folio, swp_to_radix_entry(folio->swap));
+ 
+ 		BUG_ON(folio_mapped(folio));
+-		return swap_writeout(folio, plug);
++		error = swap_writeout(folio, plug);
++		if (error != AOP_WRITEPAGE_ACTIVATE) {
++			/* folio has been unlocked */
++			return error;
++		}
++
++		/*
++		 * The intention here is to avoid holding on to the swap when
++		 * zswap was unable to compress and unable to writeback; but
++		 * it will be appropriate if other reactivate cases are added.
++		 */
++		error = shmem_add_to_page_cache(folio, mapping, index,
++				swp_to_radix_entry(folio->swap),
++				__GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN);
++		/* Swap entry might be erased by racing shmem_free_swap() */
++		if (!error) {
++			spin_lock(&info->lock);
++			info->swapped -= nr_pages;
++			spin_unlock(&info->lock);
++			swap_free_nr(folio->swap, nr_pages);
++		}
++
++		/*
++		 * The delete_from_swap_cache() below could be left for
++		 * shrink_folio_list()'s folio_free_swap() to dispose of;
++		 * but I'm a little nervous about letting this folio out of
++		 * shmem_writeout() in a hybrid half-tmpfs-half-swap state
++		 * e.g. folio_mapping(folio) might give an unexpected answer.
++		 */
++		delete_from_swap_cache(folio);
++		goto redirty;
+ 	}
+ 	if (nr_pages > 1)
+ 		goto try_split;
+_

@@ -1,0 +1,56 @@
+From: Yadan Fan <ydfan@suse.com>
+Subject: mm: mempool: fix wake-up edge case bug for zero-minimum pools
+Date: Wed, 16 Jul 2025 23:37:30 +0800
+
+The mempool wake-up mechanism has a edge case bug that affects pools
+created with min_nr=0. When a thread blocks waiting for memory from an
+empty pool (curr_nr == 0), subsequent mempool_free() calls fail to wake
+the waiting thread because the condition "curr_nr < min_nr" evaluates
+to "0 < 0" which is false, this causes threads to sleep indefinitely.
+
+There is at least 2 places where the mempool created with min_nr=0:
+
+1. lib/btree.c:191: mempool_create(0, btree_alloc, btree_free, NULL)
+2. drivers/md/dm-verity-fec.c:791:
+    mempool_init_slab_pool(&f->extra_pool, 0, f->cache)
+
+Add an explicit check in mempool_free() to handle the min_nr=0 case:
+when the pool has zero minimum reserves, is currently empty, and has
+active waiters, wake them up. The wq_has_sleeper() avoids unnecessary
+wake-ups when no threads are waiting.
+
+Link: https://lkml.kernel.org/r/8c0cdb71-8d21-497e-b793-c43ce3a16345@suse.com
+Signed-off-by: Yadan Fan <ydfan@suse.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mempool.c |   17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+--- a/mm/mempool.c~mm-mempool-fix-wake-up-edge-case-bug-for-zero-minimum-pools
++++ a/mm/mempool.c
+@@ -545,6 +545,23 @@ void mempool_free(void *element, mempool
+ 		}
+ 		spin_unlock_irqrestore(&pool->lock, flags);
+ 	}
++
++	/*
++	 * Handle the min_nr = 0 edge case:
++	 * For zero-minimum pools, curr_nr < min_nr (0 < 0) never succeeds,
++	 * so waiters sleeping on pool->wait would never be woken by the
++	 * normal wake-up path. This explicit check ensures that when
++	 * pool->min_nr == 0 and pool->curr_nr == 0, any active waiters
++	 * are properly awakened.
++	 * The wq_has_sleeper() avoids unnecessary wake-ups when no
++	 * threads are waiting.
++	 */
++	if (unlikely(pool->min_nr == 0 &&
++		     READ_ONCE(pool->curr_nr) == 0 &&
++		     wq_has_sleeper(&pool->wait))) {
++		wake_up(&pool->wait);
++	}
++
+ 	pool->free(element, pool->pool_data);
+ }
+ EXPORT_SYMBOL(mempool_free);
+_
