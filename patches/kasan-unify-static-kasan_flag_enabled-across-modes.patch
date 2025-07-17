@@ -1,0 +1,203 @@
+From: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+Subject: kasan: unify static kasan_flag_enabled across modes
+Date: Thu, 17 Jul 2025 19:27:22 +0500
+
+Historically, the runtime static key kasan_flag_enabled existed only for
+CONFIG_KASAN_HW_TAGS mode.  Generic and SW_TAGS modes either relied on
+architecture-specific kasan_arch_is_ready() implementations or evaluated
+KASAN checks unconditionally, leading to code duplication.
+
+This patch implements two-level approach:
+
+1. kasan_enabled() - controls if KASAN is enabled at all (compile-time)
+2. kasan_shadow_initialized() - tracks shadow memory
+   initialization (runtime)
+
+For architectures that select ARCH_DEFER_KASAN: kasan_shadow_initialized()
+uses a static key that gets enabled when shadow memory is ready.
+
+For architectures that don't: kasan_shadow_initialized() returns
+IS_ENABLED(CONFIG_KASAN) since shadow is ready from the start.
+
+This provides:
+- Consistent interface across all KASAN modes
+- Runtime control only where actually needed
+- Compile-time constants for optimal performance where possible
+- Clear separation between "KASAN configured" vs "shadow ready"
+
+Also adds kasan_init_generic() function that enables the shadow flag and
+handles initialization for Generic mode, and updates SW_TAGS and HW_TAGS
+to use the unified kasan_shadow_enable() function.
+
+Link: https://lkml.kernel.org/r/20250717142732.292822-3-snovitoll@gmail.com
+Signed-off-by: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=217049
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kasan-enabled.h |   34 ++++++++++++++++++++++++--------
+ include/linux/kasan.h         |    6 +++++
+ mm/kasan/common.c             |    9 ++++++++
+ mm/kasan/generic.c            |   11 ++++++++++
+ mm/kasan/hw_tags.c            |    9 --------
+ mm/kasan/sw_tags.c            |    2 +
+ 6 files changed, 55 insertions(+), 16 deletions(-)
+
+--- a/include/linux/kasan-enabled.h~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/include/linux/kasan-enabled.h
+@@ -4,32 +4,50 @@
+ 
+ #include <linux/static_key.h>
+ 
+-#ifdef CONFIG_KASAN_HW_TAGS
++/* Controls whether KASAN is enabled at all (compile-time check). */
++static __always_inline bool kasan_enabled(void)
++{
++	return IS_ENABLED(CONFIG_KASAN);
++}
+ 
++#ifdef CONFIG_ARCH_DEFER_KASAN
++/*
++ * Global runtime flag for architectures that need deferred KASAN.
++ * Switched to 'true' by the appropriate kasan_init_*()
++ * once KASAN is fully initialized.
++ */
+ DECLARE_STATIC_KEY_FALSE(kasan_flag_enabled);
+ 
+-static __always_inline bool kasan_enabled(void)
++static __always_inline bool kasan_shadow_initialized(void)
+ {
+ 	return static_branch_likely(&kasan_flag_enabled);
+ }
+ 
+-static inline bool kasan_hw_tags_enabled(void)
++static inline void kasan_enable(void)
++{
++	static_branch_enable(&kasan_flag_enabled);
++}
++#else
++/* For architectures that can enable KASAN early, use compile-time check. */
++static __always_inline bool kasan_shadow_initialized(void)
+ {
+ 	return kasan_enabled();
+ }
+ 
+-#else /* CONFIG_KASAN_HW_TAGS */
++/* No-op for architectures that don't need deferred KASAN. */
++static inline void kasan_enable(void) {}
++#endif /* CONFIG_ARCH_DEFER_KASAN */
+ 
+-static inline bool kasan_enabled(void)
++#ifdef CONFIG_KASAN_HW_TAGS
++static inline bool kasan_hw_tags_enabled(void)
+ {
+-	return IS_ENABLED(CONFIG_KASAN);
++	return kasan_enabled();
+ }
+-
++#else
+ static inline bool kasan_hw_tags_enabled(void)
+ {
+ 	return false;
+ }
+-
+ #endif /* CONFIG_KASAN_HW_TAGS */
+ 
+ #endif /* LINUX_KASAN_ENABLED_H */
+--- a/include/linux/kasan.h~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/include/linux/kasan.h
+@@ -543,6 +543,12 @@ void kasan_report_async(void);
+ 
+ #endif /* CONFIG_KASAN_HW_TAGS */
+ 
++#ifdef CONFIG_KASAN_GENERIC
++void __init kasan_init_generic(void);
++#else
++static inline void kasan_init_generic(void) { }
++#endif
++
+ #ifdef CONFIG_KASAN_SW_TAGS
+ void __init kasan_init_sw_tags(void);
+ #else
+--- a/mm/kasan/common.c~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/mm/kasan/common.c
+@@ -32,6 +32,15 @@
+ #include "kasan.h"
+ #include "../slab.h"
+ 
++#ifdef CONFIG_ARCH_DEFER_KASAN
++/*
++ * Definition of the unified static key declared in kasan-enabled.h.
++ * This provides consistent runtime enable/disable across KASAN modes.
++ */
++DEFINE_STATIC_KEY_FALSE(kasan_flag_enabled);
++EXPORT_SYMBOL(kasan_flag_enabled);
++#endif
++
+ struct slab *kasan_addr_to_slab(const void *addr)
+ {
+ 	if (virt_addr_valid(addr))
+--- a/mm/kasan/generic.c~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/mm/kasan/generic.c
+@@ -37,6 +37,17 @@
+ #include "../slab.h"
+ 
+ /*
++ * Initialize Generic KASAN and enable runtime checks.
++ * This should be called from arch kasan_init() once shadow memory is ready.
++ */
++void __init kasan_init_generic(void)
++{
++	kasan_enable();
++
++	pr_info("KernelAddressSanitizer initialized (generic)\n");
++}
++
++/*
+  * All functions below always inlined so compiler could
+  * perform better optimizations in each of __asan_loadX/__assn_storeX
+  * depending on memory access size X.
+--- a/mm/kasan/hw_tags.c~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/mm/kasan/hw_tags.c
+@@ -46,13 +46,6 @@ static enum kasan_arg_mode kasan_arg_mod
+ static enum kasan_arg_vmalloc kasan_arg_vmalloc __initdata;
+ 
+ /*
+- * Whether KASAN is enabled at all.
+- * The value remains false until KASAN is initialized by kasan_init_hw_tags().
+- */
+-DEFINE_STATIC_KEY_FALSE(kasan_flag_enabled);
+-EXPORT_SYMBOL(kasan_flag_enabled);
+-
+-/*
+  * Whether the selected mode is synchronous, asynchronous, or asymmetric.
+  * Defaults to KASAN_MODE_SYNC.
+  */
+@@ -260,7 +253,7 @@ void __init kasan_init_hw_tags(void)
+ 	kasan_init_tags();
+ 
+ 	/* KASAN is now initialized, enable it. */
+-	static_branch_enable(&kasan_flag_enabled);
++	kasan_enable();
+ 
+ 	pr_info("KernelAddressSanitizer initialized (hw-tags, mode=%s, vmalloc=%s, stacktrace=%s)\n",
+ 		kasan_mode_info(),
+--- a/mm/kasan/sw_tags.c~kasan-unify-static-kasan_flag_enabled-across-modes
++++ a/mm/kasan/sw_tags.c
+@@ -45,6 +45,8 @@ void __init kasan_init_sw_tags(void)
+ 
+ 	kasan_init_tags();
+ 
++	kasan_enable();
++
+ 	pr_info("KernelAddressSanitizer initialized (sw-tags, stacktrace=%s)\n",
+ 		str_on_off(kasan_stack_collection_enabled()));
+ }
+_

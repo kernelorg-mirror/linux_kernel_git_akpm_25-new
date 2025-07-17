@@ -1,0 +1,415 @@
+From: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+Subject: kasan: add shadow checks to wrappers and rename kasan_arch_is_ready
+Date: Thu, 17 Jul 2025 19:27:32 +0500
+
+This patch completes:
+1. Adding kasan_shadow_initialized() checks to existing wrapper functions
+2. Replacing kasan_arch_is_ready() calls with kasan_shadow_initialized()
+3. Creating wrapper functions for internal functions that need shadow
+   readiness checks
+4. Removing the kasan_arch_is_ready() fallback definition
+
+The two-level approach is now fully implemented:
+- kasan_enabled() - controls whether KASAN is enabled at all.
+  (compile-time for most archs)
+- kasan_shadow_initialized() - tracks shadow memory initialization
+  (static key for ARCH_DEFER_KASAN archs, compile-time for others)
+
+This provides complete elimination of kasan_arch_is_ready() calls from
+KASAN implementation while moving all shadow readiness logic to
+wrapper functions.
+
+Link: https://lkml.kernel.org/r/20250717142732.292822-13-snovitoll@gmail.com
+Signed-off-by: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+Closes: https://bugzilla.kernel.org/show_bug.cgi?id=217049
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kasan.h |   36 +++++++++++++++++++++++++++---------
+ mm/kasan/common.c     |    9 +++------
+ mm/kasan/generic.c    |   12 +++---------
+ mm/kasan/kasan.h      |   36 ++++++++++++++++++++++++++----------
+ mm/kasan/shadow.c     |   32 +++++++-------------------------
+ 5 files changed, 66 insertions(+), 59 deletions(-)
+
+--- a/include/linux/kasan.h~kasan-add-shadow-checks-to-wrappers-and-rename-kasan_arch_is_ready
++++ a/include/linux/kasan.h
+@@ -194,7 +194,7 @@ bool __kasan_slab_pre_free(struct kmem_c
+ static __always_inline bool kasan_slab_pre_free(struct kmem_cache *s,
+ 						void *object)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		return __kasan_slab_pre_free(s, object, _RET_IP_);
+ 	return false;
+ }
+@@ -229,7 +229,7 @@ static __always_inline bool kasan_slab_f
+ 						void *object, bool init,
+ 						bool still_accessible)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		return __kasan_slab_free(s, object, init, still_accessible);
+ 	return false;
+ }
+@@ -237,7 +237,7 @@ static __always_inline bool kasan_slab_f
+ void __kasan_kfree_large(void *ptr, unsigned long ip);
+ static __always_inline void kasan_kfree_large(void *ptr)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		__kasan_kfree_large(ptr, _RET_IP_);
+ }
+ 
+@@ -302,7 +302,7 @@ bool __kasan_mempool_poison_pages(struct
+ static __always_inline bool kasan_mempool_poison_pages(struct page *page,
+ 						       unsigned int order)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		return __kasan_mempool_poison_pages(page, order, _RET_IP_);
+ 	return true;
+ }
+@@ -356,7 +356,7 @@ bool __kasan_mempool_poison_object(void
+  */
+ static __always_inline bool kasan_mempool_poison_object(void *ptr)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		return __kasan_mempool_poison_object(ptr, _RET_IP_);
+ 	return true;
+ }
+@@ -568,11 +568,29 @@ static inline void kasan_init_hw_tags(vo
+ #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+ 
+ void kasan_populate_early_vm_area_shadow(void *start, unsigned long size);
+-int kasan_populate_vmalloc(unsigned long addr, unsigned long size);
+-void kasan_release_vmalloc(unsigned long start, unsigned long end,
++
++int __kasan_populate_vmalloc(unsigned long addr, unsigned long size);
++static inline int kasan_populate_vmalloc(unsigned long addr, unsigned long size)
++{
++	if (!kasan_shadow_initialized())
++		return 0;
++	return __kasan_populate_vmalloc(addr, size);
++}
++
++void __kasan_release_vmalloc(unsigned long start, unsigned long end,
+ 			   unsigned long free_region_start,
+ 			   unsigned long free_region_end,
+ 			   unsigned long flags);
++static inline void kasan_release_vmalloc(unsigned long start,
++			   unsigned long end,
++			   unsigned long free_region_start,
++			   unsigned long free_region_end,
++			   unsigned long flags)
++{
++	if (kasan_shadow_initialized())
++		__kasan_release_vmalloc(start, end, free_region_start,
++			   free_region_end, flags);
++}
+ 
+ #else /* CONFIG_KASAN_GENERIC || CONFIG_KASAN_SW_TAGS */
+ 
+@@ -598,7 +616,7 @@ static __always_inline void *kasan_unpoi
+ 						unsigned long size,
+ 						kasan_vmalloc_flags_t flags)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		return __kasan_unpoison_vmalloc(start, size, flags);
+ 	return (void *)start;
+ }
+@@ -607,7 +625,7 @@ void __kasan_poison_vmalloc(const void *
+ static __always_inline void kasan_poison_vmalloc(const void *start,
+ 						 unsigned long size)
+ {
+-	if (kasan_enabled())
++	if (kasan_enabled() && kasan_shadow_initialized())
+ 		__kasan_poison_vmalloc(start, size);
+ }
+ 
+--- a/mm/kasan/common.c~kasan-add-shadow-checks-to-wrappers-and-rename-kasan_arch_is_ready
++++ a/mm/kasan/common.c
+@@ -259,7 +259,7 @@ static inline void poison_slab_object(st
+ bool __kasan_slab_pre_free(struct kmem_cache *cache, void *object,
+ 				unsigned long ip)
+ {
+-	if (!kasan_arch_is_ready() || is_kfence_address(object))
++	if (is_kfence_address(object))
+ 		return false;
+ 	return check_slab_allocation(cache, object, ip);
+ }
+@@ -267,7 +267,7 @@ bool __kasan_slab_pre_free(struct kmem_c
+ bool __kasan_slab_free(struct kmem_cache *cache, void *object, bool init,
+ 		       bool still_accessible)
+ {
+-	if (!kasan_arch_is_ready() || is_kfence_address(object))
++	if (is_kfence_address(object))
+ 		return false;
+ 
+ 	poison_slab_object(cache, object, init, still_accessible);
+@@ -291,9 +291,6 @@ bool __kasan_slab_free(struct kmem_cache
+ 
+ static inline bool check_page_allocation(void *ptr, unsigned long ip)
+ {
+-	if (!kasan_arch_is_ready())
+-		return false;
+-
+ 	if (ptr != page_address(virt_to_head_page(ptr))) {
+ 		kasan_report_invalid_free(ptr, ip, KASAN_REPORT_INVALID_FREE);
+ 		return true;
+@@ -520,7 +517,7 @@ bool __kasan_mempool_poison_object(void
+ 		return true;
+ 	}
+ 
+-	if (is_kfence_address(ptr) || !kasan_arch_is_ready())
++	if (is_kfence_address(ptr))
+ 		return true;
+ 
+ 	slab = folio_slab(folio);
+--- a/mm/kasan/generic.c~kasan-add-shadow-checks-to-wrappers-and-rename-kasan_arch_is_ready
++++ a/mm/kasan/generic.c
+@@ -176,7 +176,7 @@ static __always_inline bool check_region
+ 						size_t size, bool write,
+ 						unsigned long ret_ip)
+ {
+-	if (!kasan_arch_is_ready())
++	if (!kasan_shadow_initialized())
+ 		return true;
+ 
+ 	if (unlikely(size == 0))
+@@ -200,13 +200,10 @@ bool kasan_check_range(const void *addr,
+ 	return check_region_inline(addr, size, write, ret_ip);
+ }
+ 
+-bool kasan_byte_accessible(const void *addr)
++bool __kasan_byte_accessible(const void *addr)
+ {
+ 	s8 shadow_byte;
+ 
+-	if (!kasan_arch_is_ready())
+-		return true;
+-
+ 	shadow_byte = READ_ONCE(*(s8 *)kasan_mem_to_shadow(addr));
+ 
+ 	return shadow_byte >= 0 && shadow_byte < KASAN_GRANULE_SIZE;
+@@ -506,9 +503,6 @@ static void release_alloc_meta(struct ka
+ 
+ static void release_free_meta(const void *object, struct kasan_free_meta *meta)
+ {
+-	if (!kasan_arch_is_ready())
+-		return;
+-
+ 	/* Check if free meta is valid. */
+ 	if (*(u8 *)kasan_mem_to_shadow(object) != KASAN_SLAB_FREE_META)
+ 		return;
+@@ -573,7 +567,7 @@ void kasan_save_alloc_info(struct kmem_c
+ 	kasan_save_track(&alloc_meta->alloc_track, flags);
+ }
+ 
+-void kasan_save_free_info(struct kmem_cache *cache, void *object)
++void __kasan_save_free_info(struct kmem_cache *cache, void *object)
+ {
+ 	struct kasan_free_meta *free_meta;
+ 
+--- a/mm/kasan/kasan.h~kasan-add-shadow-checks-to-wrappers-and-rename-kasan_arch_is_ready
++++ a/mm/kasan/kasan.h
+@@ -398,7 +398,13 @@ depot_stack_handle_t kasan_save_stack(gf
+ void kasan_set_track(struct kasan_track *track, depot_stack_handle_t stack);
+ void kasan_save_track(struct kasan_track *track, gfp_t flags);
+ void kasan_save_alloc_info(struct kmem_cache *cache, void *object, gfp_t flags);
+-void kasan_save_free_info(struct kmem_cache *cache, void *object);
++
++void __kasan_save_free_info(struct kmem_cache *cache, void *object);
++static inline void kasan_save_free_info(struct kmem_cache *cache, void *object)
++{
++	if (kasan_enabled() && kasan_shadow_initialized())
++		__kasan_save_free_info(cache, object);
++}
+ 
+ #ifdef CONFIG_KASAN_GENERIC
+ bool kasan_quarantine_put(struct kmem_cache *cache, void *object);
+@@ -499,6 +505,7 @@ static inline bool kasan_byte_accessible
+ 
+ #else /* CONFIG_KASAN_HW_TAGS */
+ 
++void __kasan_poison(const void *addr, size_t size, u8 value, bool init);
+ /**
+  * kasan_poison - mark the memory range as inaccessible
+  * @addr: range start address, must be aligned to KASAN_GRANULE_SIZE
+@@ -506,7 +513,11 @@ static inline bool kasan_byte_accessible
+  * @value: value that's written to metadata for the range
+  * @init: whether to initialize the memory range (only for hardware tag-based)
+  */
+-void kasan_poison(const void *addr, size_t size, u8 value, bool init);
++static inline void kasan_poison(const void *addr, size_t size, u8 value, bool init)
++{
++	if (kasan_shadow_initialized())
++		__kasan_poison(addr, size, value, init);
++}
+ 
+ /**
+  * kasan_unpoison - mark the memory range as accessible
+@@ -521,12 +532,19 @@ void kasan_poison(const void *addr, size
+  */
+ void kasan_unpoison(const void *addr, size_t size, bool init);
+ 
+-bool kasan_byte_accessible(const void *addr);
++bool __kasan_byte_accessible(const void *addr);
++static inline bool kasan_byte_accessible(const void *addr)
++{
++	if (!kasan_shadow_initialized())
++		return true;
++	return __kasan_byte_accessible(addr);
++}
+ 
+ #endif /* CONFIG_KASAN_HW_TAGS */
+ 
+ #ifdef CONFIG_KASAN_GENERIC
+ 
++void __kasan_poison_last_granule(const void *address, size_t size);
+ /**
+  * kasan_poison_last_granule - mark the last granule of the memory range as
+  * inaccessible
+@@ -536,7 +554,11 @@ bool kasan_byte_accessible(const void *a
+  * This function is only available for the generic mode, as it's the only mode
+  * that has partially poisoned memory granules.
+  */
+-void kasan_poison_last_granule(const void *address, size_t size);
++static inline void kasan_poison_last_granule(const void *address, size_t size)
++{
++	if (kasan_shadow_initialized())
++		__kasan_poison_last_granule(address, size);
++}
+ 
+ #else /* CONFIG_KASAN_GENERIC */
+ 
+@@ -544,12 +566,6 @@ static inline void kasan_poison_last_gra
+ 
+ #endif /* CONFIG_KASAN_GENERIC */
+ 
+-#ifndef kasan_arch_is_ready
+-static inline bool kasan_arch_is_ready(void)	{ return true; }
+-#elif !defined(CONFIG_KASAN_GENERIC) || !defined(CONFIG_KASAN_OUTLINE)
+-#error kasan_arch_is_ready only works in KASAN generic outline mode!
+-#endif
+-
+ #if IS_ENABLED(CONFIG_KASAN_KUNIT_TEST)
+ 
+ void kasan_kunit_test_suite_start(void);
+--- a/mm/kasan/shadow.c~kasan-add-shadow-checks-to-wrappers-and-rename-kasan_arch_is_ready
++++ a/mm/kasan/shadow.c
+@@ -121,13 +121,10 @@ void *__hwasan_memcpy(void *dest, const
+ EXPORT_SYMBOL(__hwasan_memcpy);
+ #endif
+ 
+-void kasan_poison(const void *addr, size_t size, u8 value, bool init)
++void __kasan_poison(const void *addr, size_t size, u8 value, bool init)
+ {
+ 	void *shadow_start, *shadow_end;
+ 
+-	if (!kasan_arch_is_ready())
+-		return;
+-
+ 	/*
+ 	 * Perform shadow offset calculation based on untagged address, as
+ 	 * some of the callers (e.g. kasan_poison_new_object) pass tagged
+@@ -145,14 +142,11 @@ void kasan_poison(const void *addr, size
+ 
+ 	__memset(shadow_start, value, shadow_end - shadow_start);
+ }
+-EXPORT_SYMBOL_GPL(kasan_poison);
++EXPORT_SYMBOL_GPL(__kasan_poison);
+ 
+ #ifdef CONFIG_KASAN_GENERIC
+-void kasan_poison_last_granule(const void *addr, size_t size)
++void __kasan_poison_last_granule(const void *addr, size_t size)
+ {
+-	if (!kasan_arch_is_ready())
+-		return;
+-
+ 	if (size & KASAN_GRANULE_MASK) {
+ 		u8 *shadow = (u8 *)kasan_mem_to_shadow(addr + size);
+ 		*shadow = size & KASAN_GRANULE_MASK;
+@@ -353,7 +347,7 @@ static int ___alloc_pages_bulk(struct pa
+ 	return 0;
+ }
+ 
+-static int __kasan_populate_vmalloc(unsigned long start, unsigned long end)
++static int __kasan_populate_vmalloc_do(unsigned long start, unsigned long end)
+ {
+ 	unsigned long nr_pages, nr_total = PFN_UP(end - start);
+ 	struct vmalloc_populate_data data;
+@@ -385,14 +379,11 @@ static int __kasan_populate_vmalloc(unsi
+ 	return ret;
+ }
+ 
+-int kasan_populate_vmalloc(unsigned long addr, unsigned long size)
++int __kasan_populate_vmalloc(unsigned long addr, unsigned long size)
+ {
+ 	unsigned long shadow_start, shadow_end;
+ 	int ret;
+ 
+-	if (!kasan_arch_is_ready())
+-		return 0;
+-
+ 	if (!is_vmalloc_or_module_addr((void *)addr))
+ 		return 0;
+ 
+@@ -414,7 +405,7 @@ int kasan_populate_vmalloc(unsigned long
+ 	shadow_start = PAGE_ALIGN_DOWN(shadow_start);
+ 	shadow_end = PAGE_ALIGN(shadow_end);
+ 
+-	ret = __kasan_populate_vmalloc(shadow_start, shadow_end);
++	ret = __kasan_populate_vmalloc_do(shadow_start, shadow_end);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -551,7 +542,7 @@ static int kasan_depopulate_vmalloc_pte(
+  * pages entirely covered by the free region, we will not run in to any
+  * trouble - any simultaneous allocations will be for disjoint regions.
+  */
+-void kasan_release_vmalloc(unsigned long start, unsigned long end,
++void __kasan_release_vmalloc(unsigned long start, unsigned long end,
+ 			   unsigned long free_region_start,
+ 			   unsigned long free_region_end,
+ 			   unsigned long flags)
+@@ -560,9 +551,6 @@ void kasan_release_vmalloc(unsigned long
+ 	unsigned long region_start, region_end;
+ 	unsigned long size;
+ 
+-	if (!kasan_arch_is_ready())
+-		return;
+-
+ 	region_start = ALIGN(start, KASAN_MEMORY_PER_SHADOW_PAGE);
+ 	region_end = ALIGN_DOWN(end, KASAN_MEMORY_PER_SHADOW_PAGE);
+ 
+@@ -611,9 +599,6 @@ void *__kasan_unpoison_vmalloc(const voi
+ 	 * with setting memory tags, so the KASAN_VMALLOC_INIT flag is ignored.
+ 	 */
+ 
+-	if (!kasan_arch_is_ready())
+-		return (void *)start;
+-
+ 	if (!is_vmalloc_or_module_addr(start))
+ 		return (void *)start;
+ 
+@@ -636,9 +621,6 @@ void *__kasan_unpoison_vmalloc(const voi
+  */
+ void __kasan_poison_vmalloc(const void *start, unsigned long size)
+ {
+-	if (!kasan_arch_is_ready())
+-		return;
+-
+ 	if (!is_vmalloc_or_module_addr(start))
+ 		return;
+ 
+_
