@@ -1,6 +1,6 @@
 From: Nico Pache <npache@redhat.com>
 Subject: khugepaged: add mTHP support
-Date: Tue, 1 Jul 2025 23:57:34 -0600
+Date: Sun, 13 Jul 2025 18:32:00 -0600
 
 Introduce the ability for khugepaged to collapse to different mTHP sizes. 
 While scanning PMD ranges for potential collapse candidates, keep track of
@@ -22,7 +22,10 @@ we collapse the mTHP-- in the PMD case all the pages are isolated, but in
 the non-PMD case this is not true, and we must keep the lock to prevent
 changes to the VMA from occurring.
 
-Link: https://lkml.kernel.org/r/20250702055742.102808-8-npache@redhat.com
+Currently madv_collapse is not supported and will only attempt PMD
+collapse.
+
+Link: https://lkml.kernel.org/r/20250714003207.113275-8-npache@redhat.com
 Signed-off-by: Nico Pache <npache@redhat.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
@@ -34,6 +37,7 @@ Cc: Christoph Lameter (Ampere) <cl@gentwo.org>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: David Rientjes <rientjes@google.com>
 Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Jonathan Corbet <corbet@lwn.net>
@@ -57,17 +61,18 @@ Cc: Thomas Hellstrom <thomas.hellstrom@linux.intel.com>
 Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |  135 ++++++++++++++++++++++++++++++++--------------
- 1 file changed, 94 insertions(+), 41 deletions(-)
+ mm/khugepaged.c |  138 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 97 insertions(+), 41 deletions(-)
 
 --- a/mm/khugepaged.c~khugepaged-add-mthp-support
 +++ a/mm/khugepaged.c
-@@ -1132,13 +1132,14 @@ static int collapse_huge_page(struct mm_
+@@ -1133,13 +1133,14 @@ static int collapse_huge_page(struct mm_
  {
  	LIST_HEAD(compound_pagelist);
  	pmd_t *pmd, _pmd;
@@ -83,7 +88,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
  
-@@ -1154,13 +1155,13 @@ static int collapse_huge_page(struct mm_
+@@ -1155,13 +1156,13 @@ static int collapse_huge_page(struct mm_
  		*mmap_locked = false;
  	}
  
@@ -100,7 +105,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (result != SCAN_SUCCEED) {
  		mmap_read_unlock(mm);
  		goto out_nolock;
-@@ -1178,13 +1179,14 @@ static int collapse_huge_page(struct mm_
+@@ -1179,13 +1180,14 @@ static int collapse_huge_page(struct mm_
  		 * released when it fails. So we jump out_nolock directly in
  		 * that case.  Continuing to collapse causes inconsistency.
  		 */
@@ -117,7 +122,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Prevent all access to pagetables with the exception of
  	 * gup_fast later handled by the ptep_clear_flush and the VM
-@@ -1194,8 +1196,7 @@ static int collapse_huge_page(struct mm_
+@@ -1195,8 +1197,7 @@ static int collapse_huge_page(struct mm_
  	 * mmap_lock.
  	 */
  	mmap_write_lock(mm);
@@ -127,7 +132,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (result != SCAN_SUCCEED)
  		goto out_up_write;
  	/* check if the pmd is still valid */
-@@ -1206,11 +1207,12 @@ static int collapse_huge_page(struct mm_
+@@ -1207,11 +1208,12 @@ static int collapse_huge_page(struct mm_
  	vma_start_write(vma);
  	anon_vma_lock_write(vma->anon_vma);
  
@@ -142,7 +147,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * This removes any huge TLB entry from the CPU so we won't allow
  	 * huge and small TLB entries for the same virtual address to
-@@ -1224,18 +1226,16 @@ static int collapse_huge_page(struct mm_
+@@ -1225,18 +1227,16 @@ static int collapse_huge_page(struct mm_
  	mmu_notifier_invalidate_range_end(&range);
  	tlb_remove_table_sync_one();
  
@@ -164,7 +169,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		spin_lock(pmd_ptl);
  		BUG_ON(!pmd_none(*pmd));
  		/*
-@@ -1250,17 +1250,17 @@ static int collapse_huge_page(struct mm_
+@@ -1251,17 +1251,17 @@ static int collapse_huge_page(struct mm_
  	}
  
  	/*
@@ -189,7 +194,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * The smp_wmb() inside __folio_mark_uptodate() ensures the
-@@ -1268,25 +1268,46 @@ static int collapse_huge_page(struct mm_
+@@ -1269,25 +1269,46 @@ static int collapse_huge_page(struct mm_
  	 * write.
  	 */
  	__folio_mark_uptodate(folio);
@@ -248,7 +253,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mmap_write_unlock(mm);
  out_nolock:
  	*mmap_locked = false;
-@@ -1362,31 +1383,57 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1363,31 +1384,60 @@ static int collapse_scan_pmd(struct mm_s
  {
  	pmd_t *pmd;
  	pte_t *pte, *_pte;
@@ -278,8 +283,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	memset(cc->node_load, 0, sizeof(cc->node_load));
  	nodes_clear(cc->alloc_nmask);
 +
-+	enabled_orders = thp_vma_allowable_orders(vma, vma->vm_flags,
-+		tva_flags, THP_ORDERS_ALL_ANON);
++	if (cc->is_khugepaged)
++		enabled_orders = thp_vma_allowable_orders(vma, vma->vm_flags,
++			tva_flags, THP_ORDERS_ALL_ANON);
++	else
++		enabled_orders = BIT(HPAGE_PMD_ORDER);
 +
 +	is_pmd_only = (enabled_orders == (1 << HPAGE_PMD_ORDER));
 +
@@ -309,7 +317,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pte_t pteval = ptep_get(_pte);
  		if (is_swap_pte(pteval)) {
  			++unmapped;
-@@ -1409,10 +1456,11 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1410,10 +1460,11 @@ static int collapse_scan_pmd(struct mm_s
  			}
  		}
  		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
@@ -323,7 +331,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				continue;
  			} else {
  				result = SCAN_EXCEED_NONE_PTE;
-@@ -1508,6 +1556,7 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1509,6 +1560,7 @@ static int collapse_scan_pmd(struct mm_s
  								     address)))
  			referenced++;
  	}
@@ -331,13 +339,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!writable) {
  		result = SCAN_PAGE_RO;
  	} else if (cc->is_khugepaged &&
-@@ -1520,8 +1569,12 @@ static int khugepaged_scan_pmd(struct mm
+@@ -1521,8 +1573,12 @@ static int collapse_scan_pmd(struct mm_s
  out_unmap:
  	pte_unmap_unlock(pte, ptl);
  	if (result == SCAN_SUCCEED) {
 -		result = collapse_huge_page(mm, address, referenced,
 -					    unmapped, cc, mmap_locked, HPAGE_PMD_ORDER, 0);
-+		result = khugepaged_scan_bitmap(mm, address, referenced, unmapped, cc,
++		result = collapse_scan_bitmap(mm, address, referenced, unmapped, cc,
 +			       mmap_locked, enabled_orders);
 +		if (result > 0)
 +			result = SCAN_SUCCEED;
