@@ -1,0 +1,148 @@
+From: Zi Yan <ziy@nvidia.com>
+Subject: mm/huge_memory: deduplicate code in __folio_split()
+Date: Fri, 18 Jul 2025 14:37:17 -0400
+
+xas unlock, remap_page(), local_irq_enable() are moved out of if branches
+to deduplicate the code.  While at it, add remap_flags to clean up
+remap_page() call site.  nr_dropped is renamed to nr_shmem_dropped, as it
+becomes a variable at __folio_split() scope.
+
+Link: https://lkml.kernel.org/r/20250718183720.4054515-4-ziy@nvidia.com
+Signed-off-by: Zi Yan <ziy@nvidia.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Antonio Quartulli <antonio@mandelbit.com>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dan Carpenter <dan.carpenter@linaro.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kirill A. Shutemov <k.shutemov@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Mathew Brost <matthew.brost@intel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   73 +++++++++++++++++++++------------------------
+ 1 file changed, 35 insertions(+), 38 deletions(-)
+
+--- a/mm/huge_memory.c~mm-huge_memory-deduplicate-code-in-__folio_split
++++ a/mm/huge_memory.c
+@@ -3595,6 +3595,8 @@ static int __folio_split(struct folio *f
+ 	struct anon_vma *anon_vma = NULL;
+ 	int order = folio_order(folio);
+ 	struct folio *new_folio, *next;
++	int nr_shmem_dropped = 0;
++	int remap_flags = 0;
+ 	int extra_pins, ret;
+ 	pgoff_t end;
+ 	bool is_hzp;
+@@ -3718,15 +3720,16 @@ static int __folio_split(struct folio *f
+ 		 */
+ 		xas_lock(&xas);
+ 		xas_reset(&xas);
+-		if (xas_load(&xas) != folio)
++		if (xas_load(&xas) != folio) {
++			ret = -EAGAIN;
+ 			goto fail;
++		}
+ 	}
+ 
+ 	/* Prevent deferred_split_scan() touching ->_refcount */
+ 	spin_lock(&ds_queue->split_queue_lock);
+ 	if (folio_ref_freeze(folio, 1 + extra_pins)) {
+ 		struct address_space *swap_cache = NULL;
+-		int nr_dropped = 0;
+ 		struct lruvec *lruvec;
+ 
+ 		if (folio_order(folio) > 1 &&
+@@ -3798,7 +3801,7 @@ static int __folio_split(struct folio *f
+ 			/* Some pages can be beyond EOF: drop them from cache */
+ 			if (new_folio->index >= end) {
+ 				if (shmem_mapping(mapping))
+-					nr_dropped += folio_nr_pages(new_folio);
++					nr_shmem_dropped += folio_nr_pages(new_folio);
+ 				else if (folio_test_clear_dirty(new_folio))
+ 					folio_account_cleaned(
+ 						new_folio,
+@@ -3828,47 +3831,41 @@ static int __folio_split(struct folio *f
+ 
+ 		if (swap_cache)
+ 			xa_unlock(&swap_cache->i_pages);
+-		if (mapping)
+-			xas_unlock(&xas);
++	} else {
++		spin_unlock(&ds_queue->split_queue_lock);
++		ret = -EAGAIN;
++	}
++fail:
++	if (mapping)
++		xas_unlock(&xas);
+ 
+-		local_irq_enable();
++	local_irq_enable();
+ 
+-		if (nr_dropped)
+-			shmem_uncharge(mapping->host, nr_dropped);
++	if (nr_shmem_dropped)
++		shmem_uncharge(mapping->host, nr_shmem_dropped);
+ 
+-		remap_page(folio, 1 << order,
+-			   !ret && folio_test_anon(folio) ?
+-				   RMP_USE_SHARED_ZEROPAGE :
+-				   0);
++	if (!ret && is_anon)
++		remap_flags = RMP_USE_SHARED_ZEROPAGE;
++	remap_page(folio, 1 << order, remap_flags);
+ 
++	/*
++	 * Unlock all after-split folios except the one containing
++	 * @lock_at page. If @folio is not split, it will be kept locked.
++	 */
++	for (new_folio = folio; new_folio != end_folio; new_folio = next) {
++		next = folio_next(new_folio);
++		if (new_folio == page_folio(lock_at))
++			continue;
++
++		folio_unlock(new_folio);
+ 		/*
+-		 * Unlock all after-split folios except the one containing
+-		 * @lock_at page. If @folio is not split, it will be kept locked.
++		 * Subpages may be freed if there wasn't any mapping
++		 * like if add_to_swap() is running on a lru page that
++		 * had its mapping zapped. And freeing these pages
++		 * requires taking the lru_lock so we do the put_page
++		 * of the tail pages after the split is complete.
+ 		 */
+-		for (new_folio = folio; new_folio != end_folio;
+-		     new_folio = next) {
+-			next = folio_next(new_folio);
+-			if (new_folio == page_folio(lock_at))
+-				continue;
+-
+-			folio_unlock(new_folio);
+-			/*
+-			 * Subpages may be freed if there wasn't any mapping
+-			 * like if add_to_swap() is running on a lru page that
+-			 * had its mapping zapped. And freeing these pages
+-			 * requires taking the lru_lock so we do the put_page
+-			 * of the tail pages after the split is complete.
+-			 */
+-			free_folio_and_swap_cache(new_folio);
+-		}
+-	} else {
+-		spin_unlock(&ds_queue->split_queue_lock);
+-fail:
+-		if (mapping)
+-			xas_unlock(&xas);
+-		local_irq_enable();
+-		remap_page(folio, folio_nr_pages(folio), 0);
+-		ret = -EAGAIN;
++		free_folio_and_swap_cache(new_folio);
+ 	}
+ 
+ out_unlock:
+_
