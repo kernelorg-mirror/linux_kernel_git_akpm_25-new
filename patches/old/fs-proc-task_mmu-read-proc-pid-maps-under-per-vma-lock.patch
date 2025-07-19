@@ -1,29 +1,31 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: fs/proc/task_mmu: read proc/pid/maps under per-vma lock
-Date: Thu, 3 Jul 2025 23:07:25 -0700
+Date: Tue, 15 Jul 2025 20:05:56 -0700
 
-With maple_tree supporting vma tree traversal under RCU and per-vma
-locks, /proc/pid/maps can be read while holding individual vma locks
-instead of locking the entire address space.
+With maple_tree supporting vma tree traversal under RCU and per-vma locks,
+/proc/pid/maps can be read while holding individual vma locks instead of
+locking the entire address space.  A completely lockless approach (walking
+vma tree under RCU) would be quite complex with the main issue being
+get_vma_name() using callbacks which might not work correctly with a
+stable vma copy, requiring original (unstable) vma - see
+special_mapping_name() for example.
 
-Completely lockless approach (walking vma tree under RCU) would be quite
-complex with the main issue being get_vma_name() using callbacks which
-might not work correctly with a stable vma copy, requiring original
-(unstable) vma - see special_mapping_name() for an example.  When per-vma
-lock acquisition fails, we take the mmap_lock for reading, lock the vma,
-release the mmap_lock and continue.  This fallback to mmap read lock
-guarantees the reader to make forward progress even during lock
+When per-vma lock acquisition fails, we take the mmap_lock for reading,
+lock the vma, release the mmap_lock and continue.  This fallback to mmap
+read lock guarantees the reader to make forward progress even during lock
 contention.  This will interfere with the writer but for a very short time
 while we are acquiring the per-vma lock and only when there was contention
-on the vma reader is interested in.  We shouldn't see a repeated fallback
-to mmap read locks in practice, as this require a very unlikely series of
-lock contentions (for instance due to repeated vma split operations). 
-However even if this did somehow happen, we would still progress.
+on the vma reader is interested in.
 
-One case requiring special handling is when vma changes between the time
-it was found and the time it got locked.  A problematic case would be if
-vma got shrunk so that it's start moved higher in the address space and a
-new vma was installed at the beginning:
+We shouldn't see a repeated fallback to mmap read locks in practice, as
+this require a very unlikely series of lock contentions (for instance due
+to repeated vma split operations).  However even if this did somehow
+happen, we would still progress.
+
+One case requiring special handling is when a vma changes between the time
+it was found and the time it got locked.  A problematic case would be if a
+vma got shrunk so that its vm_start moved higher in the address space and
+a new vma was installed at the beginning:
 
 reader found:               |--------VMA A--------|
 VMA is modified:            |-VMA B-|----VMA A----|
@@ -31,23 +33,22 @@ reader locks modified VMA A
 reader reports VMA A:       |  gap  |----VMA A----|
 
 This would result in reporting a gap in the address space that does not
-exist. To prevent this we retry the lookup after locking the vma, however
+exist.  To prevent this we retry the lookup after locking the vma, however
 we do that only when we identify a gap and detect that the address space
 was changed after we found the vma.
 
 This change is designed to reduce mmap_lock contention and prevent a
 process reading /proc/pid/maps files (often a low priority task, such as
-monitoring/data collection services) from blocking address space updates.
-
+monitoring/data collection services) from blocking address space updates. 
 Note that this change has a userspace visible disadvantage: it allows for
 sub-page data tearing as opposed to the previous mechanism where data
 tearing could happen only between pages of generated output data.  Since
 current userspace considers data tearing between pages to be acceptable,
 we assume is will be able to handle sub-page data tearing as well.
 
-Link: https://lkml.kernel.org/r/20250704060727.724817-8-surenb@google.com
+Link: https://lkml.kernel.org/r/20250716030557.1547501-8-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
-Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Alexey Dobriyan <adobriyan@gmail.com>
 Cc: Andrii Nakryiko <andrii@kernel.org>
 Cc: Christian Brauner <brauner@kernel.org>
@@ -59,6 +60,7 @@ Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Josef Bacik <josef@toxicpanda.com>
 Cc: Kalesh Singh <kaleshsingh@google.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Oscar Salvador <osalvador@suse.de>
@@ -68,17 +70,16 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Shuah Khan <shuah@kernel.org>
 Cc: Thomas Weißschuh <linux@weissschuh.net>
 Cc: T.J. Mercier <tjmercier@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Ye Bin <yebin10@huawei.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/proc/internal.h        |    5 +
- fs/proc/task_mmu.c        |  118 ++++++++++++++++++++++++++++++++----
- include/linux/mmap_lock.h |   11 +++
+ fs/proc/task_mmu.c        |  145 +++++++++++++++++++++++++++++++++---
+ include/linux/mmap_lock.h |   11 ++
  mm/madvise.c              |    3 
- mm/mmap_lock.c            |   88 ++++++++++++++++++++++++++
- 5 files changed, 214 insertions(+), 11 deletions(-)
+ mm/mmap_lock.c            |   93 +++++++++++++++++++++++
+ 5 files changed, 246 insertions(+), 11 deletions(-)
 
 --- a/fs/proc/internal.h~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/fs/proc/internal.h
@@ -96,7 +97,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
 --- a/fs/proc/task_mmu.c~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/fs/proc/task_mmu.c
-@@ -127,15 +127,107 @@ static void release_task_mempolicy(struc
+@@ -127,15 +127,134 @@ static void release_task_mempolicy(struc
  }
  #endif
  
@@ -119,7 +120,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	/*
 +	 * smaps and numa_maps perform page table walk, therefore require
-+	 * mmap_lock but maps can be read with locking just the vma.
++	 * mmap_lock but maps can be read with locking just the vma and
++	 * walking the vma tree under rcu read protection.
 +	 */
 +	if (m->op != &proc_pid_maps_op) {
 +		if (mmap_read_lock_killable(priv->mm))
@@ -161,6 +163,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return vma;
 +}
 +
++static inline bool fallback_to_mmap_lock(struct proc_maps_private *priv,
++					 loff_t pos)
++{
++	if (priv->mmap_locked)
++		return false;
++
++	rcu_read_unlock();
++	mmap_read_lock(priv->mm);
++	/* Reinitialize the iterator after taking mmap_lock */
++	vma_iter_set(&priv->iter, pos);
++	priv->mmap_locked = true;
++
++	return true;
++}
++
 +#else /* CONFIG_PER_VMA_LOCK */
 +
 +static inline bool lock_vma_range(struct seq_file *m,
@@ -170,8 +187,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +static inline void unlock_vma_range(struct proc_maps_private *priv)
- {
--	struct vm_area_struct *vma = vma_next(&priv->iter);
++{
 +	mmap_read_unlock(priv->mm);
 +}
 +
@@ -181,17 +197,29 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return vma_next(&priv->iter);
 +}
 +
++static inline bool fallback_to_mmap_lock(struct proc_maps_private *priv,
++					 loff_t pos)
++{
++	return false;
++}
++
 +#endif /* CONFIG_PER_VMA_LOCK */
 +
 +static struct vm_area_struct *proc_get_vma(struct seq_file *m, loff_t *ppos)
-+{
+ {
+-	struct vm_area_struct *vma = vma_next(&priv->iter);
 +	struct proc_maps_private *priv = m->private;
 +	struct vm_area_struct *vma;
 +
++retry:
 +	vma = get_next_vma(priv, *ppos);
-+	/* EINTR is possible */
-+	if (IS_ERR(vma))
++	/* EINTR of EAGAIN is possible */
++	if (IS_ERR(vma)) {
++		if (PTR_ERR(vma) == -EAGAIN && fallback_to_mmap_lock(priv, *ppos))
++			goto retry;
++
 +		return vma;
++	}
  
 +	/* Store previous position to be able to restart if needed */
 +	priv->last_pos = *ppos;
@@ -209,7 +237,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		vma = get_gate_vma(priv->mm);
  	}
  
-@@ -163,28 +255,34 @@ static void *m_start(struct seq_file *m,
+@@ -163,28 +282,34 @@ static void *m_start(struct seq_file *m,
  		return NULL;
  	}
  
@@ -248,7 +276,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void m_stop(struct seq_file *m, void *v)
-@@ -196,7 +294,7 @@ static void m_stop(struct seq_file *m, v
+@@ -196,7 +321,7 @@ static void m_stop(struct seq_file *m, v
  		return;
  
  	release_task_mempolicy(priv);
@@ -279,7 +307,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline void mm_lock_seqcount_init(struct mm_struct *mm) {}
 --- a/mm/madvise.c~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/mm/madvise.c
-@@ -108,7 +108,8 @@ void anon_vma_name_free(struct kref *kre
+@@ -109,7 +109,8 @@ void anon_vma_name_free(struct kref *kre
  
  struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma)
  {
@@ -291,14 +319,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/mm/mmap_lock.c~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/mm/mmap_lock.c
-@@ -178,6 +178,94 @@ inval:
+@@ -178,6 +178,99 @@ inval:
  	count_vm_vma_lock_event(VMA_LOCK_ABORT);
  	return NULL;
  }
 +
-+static struct vm_area_struct *lock_vma_under_mmap_lock(struct mm_struct *mm,
-+						       struct vma_iterator *iter,
-+						       unsigned long address)
++static struct vm_area_struct *lock_next_vma_under_mmap_lock(struct mm_struct *mm,
++							    struct vma_iterator *vmi,
++							    unsigned long from_addr)
 +{
 +	struct vm_area_struct *vma;
 +	int ret;
@@ -308,10 +336,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return ERR_PTR(ret);
 +
 +	/* Lookup the vma at the last position again under mmap_read_lock */
-+	vma_iter_init(iter, mm, address);
-+	vma = vma_next(iter);
-+	if (vma)
-+		vma_start_read_locked(vma);
++	vma_iter_set(vmi, from_addr);
++	vma = vma_next(vmi);
++	if (vma) {
++		/* Very unlikely vma->vm_refcnt overflow case */
++		if (unlikely(!vma_start_read_locked(vma)))
++			vma = ERR_PTR(-EAGAIN);
++	}
 +
 +	mmap_read_unlock(mm);
 +
@@ -319,8 +350,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +struct vm_area_struct *lock_next_vma(struct mm_struct *mm,
-+				     struct vma_iterator *iter,
-+				     unsigned long address)
++				     struct vma_iterator *vmi,
++				     unsigned long from_addr)
 +{
 +	struct vm_area_struct *vma;
 +	unsigned int mm_wr_seq;
@@ -330,12 +361,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +retry:
 +	/* Start mmap_lock speculation in case we need to verify the vma later */
 +	mmap_unlocked = mmap_lock_speculate_try_begin(mm, &mm_wr_seq);
-+	vma = vma_next(iter);
++	vma = vma_next(vmi);
 +	if (!vma)
 +		return NULL;
 +
 +	vma = vma_start_read(mm, vma);
-+
 +	if (IS_ERR_OR_NULL(vma)) {
 +		/*
 +		 * Retry immediately if the vma gets detached from under us.
@@ -343,19 +373,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * have to be constantly knocked out from under us.
 +		 */
 +		if (PTR_ERR(vma) == -EAGAIN) {
-+			vma_iter_init(iter, mm, address);
++			/* reset to search from the last address */
++			vma_iter_set(vmi, from_addr);
 +			goto retry;
 +		}
 +
-+		goto out;
++		goto fallback;
 +	}
 +
 +	/*
 +	 * Verify the vma we locked belongs to the same address space and it's
 +	 * not behind of the last search position.
 +	 */
-+	if (unlikely(vma->vm_mm != mm || address >= vma->vm_end))
-+		goto out_unlock;
++	if (unlikely(vma->vm_mm != mm || from_addr >= vma->vm_end))
++		goto fallback_unlock;
 +
 +	/*
 +	 * vma can be ahead of the last search position but we need to verify
@@ -363,23 +394,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * installed ahead of it. Otherwise we might observe a gap that should
 +	 * not be there.
 +	 */
-+	if (address < vma->vm_start) {
++	if (from_addr < vma->vm_start) {
 +		/* Verify only if the address space might have changed since vma lookup. */
 +		if (!mmap_unlocked || mmap_lock_speculate_retry(mm, mm_wr_seq)) {
-+			vma_iter_init(iter, mm, address);
-+			if (vma != vma_next(iter))
-+				goto out_unlock;
++			vma_iter_set(vmi, from_addr);
++			if (vma != vma_next(vmi))
++				goto fallback_unlock;
 +		}
 +	}
 +
 +	return vma;
 +
-+out_unlock:
++fallback_unlock:
 +	vma_end_read(vma);
-+out:
++fallback:
 +	rcu_read_unlock();
-+	vma = lock_vma_under_mmap_lock(mm, iter, address);
++	vma = lock_next_vma_under_mmap_lock(mm, vmi, from_addr);
 +	rcu_read_lock();
++	/* Reinitialize the iterator after re-entering rcu read section */
++	vma_iter_set(vmi, IS_ERR_OR_NULL(vma) ? from_addr : vma->vm_end);
 +
 +	return vma;
 +}

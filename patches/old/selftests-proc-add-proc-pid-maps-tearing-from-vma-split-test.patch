@@ -1,9 +1,8 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: selftests/proc: add /proc/pid/maps tearing from vma split test
-Date: Thu, 3 Jul 2025 23:07:19 -0700
+Date: Tue, 15 Jul 2025 20:05:50 -0700
 
-Patch series "use per-vma locks for /proc/pid/maps reads and
-PROCMAP_QUERY", v6.
+Patch series "use per-vma locks for /proc/pid/maps reads", v7.
 
 Reading /proc/pid/maps requires read-locking mmap_lock which prevents any
 other task from concurrently modifying the address space.  This guarantees
@@ -25,16 +24,14 @@ either in its original form or after it was modified.
 This patchset switches from holding mmap_lock while reading /proc/pid/maps
 to taking per-vma locks as we walk the vma tree.  This reduces the
 contention with tasks modifying the address space because they would have
-to contend for the same vma as opposed to the entire address space.  Same
-is done for PROCMAP_QUERY ioctl which locks only the vma that fell into
-the requested range instead of the entire address space.  Previous version
-of this patchset [1] tried to perform /proc/pid/maps reading under RCU,
-however its implementation is quite complex and the results are worse than
-the new version because it still relied on mmap_lock speculation which
-retries if any part of the address space gets modified.  New implementaion
-is both simpler and results in less contention.  Note that similar
-approach would not work for /proc/pid/smaps reading as it also walks the
-page table and that's not RCU-safe.
+to contend for the same vma as opposed to the entire address space. 
+Previous version of this patchset [1] tried to perform /proc/pid/maps
+reading under RCU, however its implementation is quite complex and the
+results are worse than the new version because it still relied on
+mmap_lock speculation which retries if any part of the address space gets
+modified.  New implementaion is both simpler and results in less
+contention.  Note that similar approach would not work for /proc/pid/smaps
+reading as it also walks the page table and that's not RCU-safe.
 
 Paul McKenney's designed a test [2] to measure mmap/munmap latencies while
 concurrently reading /proc/pid/maps.  The test has a pair of processes
@@ -45,32 +42,42 @@ and for each run the maximum and mean latency is printed.  The map/unmap
 process is started first, its PID is passed to the scanners, and then the
 map/unmap process waits until both scanners are running before starting
 its timed test.  The scanners keep scanning until the specified
-/proc/PID/maps file disappears.  This test registered close to 10x
-improvement in update latencies:
+/proc/PID/maps file disappears.
+
+The latest results from Paul:
+Stock mm-unstable, all of the runs had maximum latencies in excess of 0.5
+milliseconds, and with 80% of the runs' latencies exceeding a full
+millisecond, and ranging up beyond 4 full milliseconds.  In contrast, 99%
+of the runs with this patch series applied had maximum latencies of less
+than 0.5 milliseconds, with the single outlier at only 0.608 milliseconds.
+
+From a median-performance (as opposed to maximum-latency) viewpoint, this
+patch series also looks good, with stock mm weighing in at 11 microseconds
+and patch series at 6 microseconds, better than a 2x improvement.
 
 Before the change:
 ./run-proc-vs-map.sh --nsamples 100 --rawdata -- --busyduration 2
-    0.011     0.008     0.455
-    0.011     0.008     0.472
-    0.011     0.008     0.535
-    0.011     0.009     0.545
+    0.011     0.008     0.521
+    0.011     0.008     0.552
+    0.011     0.008     0.590
+    0.011     0.008     0.660
     ...
-    0.011     0.014     2.875
-    0.011     0.014     2.913
-    0.011     0.014     3.007
-    0.011     0.015     3.018
+    0.011     0.015     2.987
+    0.011     0.015     3.038
+    0.011     0.016     3.431
+    0.011     0.016     4.707
 
 After the change:
 ./run-proc-vs-map.sh --nsamples 100 --rawdata -- --busyduration 2
-    0.006     0.005     0.036
-    0.006     0.005     0.039
-    0.006     0.005     0.039
-    0.006     0.005     0.039
+    0.006     0.005     0.026
+    0.006     0.005     0.029
+    0.006     0.005     0.034
+    0.006     0.005     0.035
     ...
-    0.006     0.006     0.403
-    0.006     0.006     0.474
-    0.006     0.006     0.479
-    0.006     0.006     0.498
+    0.006     0.006     0.421
+    0.006     0.006     0.423
+    0.006     0.006     0.439
+    0.006     0.006     0.608
 
 The patchset also adds a number of tests to check for /proc/pid/maps data
 coherency.  They are designed to detect any unexpected data tearing while
@@ -136,7 +143,7 @@ In all these cases the retry mechanism prevents us from reporting possible
 temporary gaps.
 
 
-This patch (of 8):
+This patch (of 7):
 
 The /proc/pid/maps file is generated page by page, with the mmap_lock
 released between pages.  This can lead to inconsistent reads if the
@@ -148,21 +155,24 @@ observing a "hole" where a vma should be (e.g., due to a vma being
 replaced and the space temporarily being empty) is unacceptable.
 
 Implement a test that:
-1. Forks a child process which continuously modifies its address space,
-specifically targeting a vma at the boundary between two pages.
+1. Forks a child process which continuously modifies its address
+   space, specifically targeting a vma at the boundary between two pages.
 2. The parent process repeatedly reads the child's /proc/pid/maps.
-3. The parent process checks the last vma of the first page and
-the first vma of the second page for consistency, looking for the
-effects of vma splits or merges.
+3. The parent process checks the last vma of the first page and the
+   first vma of the second page for consistency, looking for the effects
+   of vma splits or merges.
 
 The test duration is configurable via the -d command-line parameter in
 seconds to increase the likelihood of catching the race condition.  The
 default test duration is 5 seconds.
 
-Example command: proc-maps-race -d 10
+Example Command: proc-maps-race -d 10
 
-Link: https://lkml.kernel.org/r/20250704060727.724817-1-surenb@google.com
-Link: https://lkml.kernel.org/r/20250704060727.724817-2-surenb@google.com
+Link: https://lkml.kernel.org/r/20250716030557.1547501-1-surenb@google.com
+Link: https://lkml.kernel.org/r/20250716030557.1547501-2-surenb@google.com
+Link: https://lore.kernel.org/all/20250418174959.1431962-1-surenb@google.com/ [1]
+Link: https://github.com/paulmckrcu/proc-mmap_sem-test [2]
+Link: https://lore.kernel.org/all/e1863f40-39ab-4e5b-984a-c48765ffde1c@lucifer.local/ [3]
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Cc: Alexey Dobriyan <adobriyan@gmail.com>
 Cc: Andrii Nakryiko <andrii@kernel.org>
