@@ -1,6 +1,6 @@
 From: Alexander Graf <graf@amazon.com>
 Subject: kexec: enable CMA based contiguous allocation
-Date: Tue, 13 May 2025 18:02:29 +0000
+Date: Tue, 10 Jun 2025 08:53:27 +0000
 
 When booting a new kernel with kexec_file, the kernel picks a target
 location that the kernel should live at, then allocates random pages,
@@ -50,32 +50,33 @@ Using CMA allocations has two advantages:
      in a memory region that is considered allocated in the old kernel and
      has a chance to reinitialize that component.
 
-Link: https://lkml.kernel.org/r/20250513180229.7494-1-graf@amazon.com
+Link: https://lkml.kernel.org/r/20250610085327.51817-1-graf@amazon.com
 Signed-off-by: Alexander Graf <graf@amazon.com>
-Cc: Baoquan He <bhe@redhat.com>
-Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Acked-by: Baoquan He <bhe@redhat.com>
+Reviewed-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Zhongkun He <hezhongkun.hzk@bytedance.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- arch/riscv/kernel/elf_kexec.c |    1 
+ arch/riscv/kernel/kexec_elf.c |    1 
  include/linux/kexec.h         |   10 +++
  include/uapi/linux/kexec.h    |    1 
  kernel/kexec.c                |    2 
  kernel/kexec_core.c           |  100 +++++++++++++++++++++++++++++---
- kernel/kexec_file.c           |   47 ++++++++++++++-
+ kernel/kexec_file.c           |   51 ++++++++++++++++
  kernel/kexec_internal.h       |    2 
- 7 files changed, 152 insertions(+), 11 deletions(-)
+ 7 files changed, 156 insertions(+), 11 deletions(-)
 
---- a/arch/riscv/kernel/elf_kexec.c~kexec-enable-cma-based-contiguous-allocation
-+++ a/arch/riscv/kernel/elf_kexec.c
-@@ -109,6 +109,7 @@ static int elf_find_pbase(struct kimage
+--- a/arch/riscv/kernel/kexec_elf.c~kexec-enable-cma-based-contiguous-allocation
++++ a/arch/riscv/kernel/kexec_elf.c
+@@ -95,6 +95,7 @@ static int elf_find_pbase(struct kimage
+ 	kbuf.buf_align = PMD_SIZE;
  	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
  	kbuf.memsz = ALIGN(kernel_len, PAGE_SIZE);
- 	kbuf.top_down = false;
 +	kbuf.cma = NULL;
+ 	kbuf.top_down = false;
  	ret = arch_kexec_locate_mem_hole(&kbuf);
  	if (!ret) {
- 		*old_pbase = lowest_paddr;
 --- a/include/linux/kexec.h~kexec-enable-cma-based-contiguous-allocation
 +++ a/include/linux/kexec.h
 @@ -79,6 +79,12 @@ extern note_buf_t __percpu *crash_notes;
@@ -91,22 +92,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct kexec_segment {
  	/*
  	 * This pointer can point to user memory if kexec_load() system
-@@ -174,6 +180,7 @@ int kexec_image_post_load_cleanup_defaul
+@@ -172,6 +178,7 @@ int kexec_image_post_load_cleanup_defaul
+  * @buf_align:	Minimum alignment needed.
+  * @buf_min:	The buffer can't be placed below this address.
   * @buf_max:	The buffer can't be placed above this address.
++ * @cma:	CMA page if the buffer is backed by CMA.
   * @top_down:	Allocate from top of memory.
   * @random:	Place the buffer at a random position.
-+ * @cma:	CMA page if the buffer is backed by CMA.
   */
- struct kexec_buf {
- 	struct kimage *image;
-@@ -188,6 +195,7 @@ struct kexec_buf {
+@@ -184,6 +191,7 @@ struct kexec_buf {
+ 	unsigned long buf_align;
+ 	unsigned long buf_min;
+ 	unsigned long buf_max;
++	struct page *cma;
+ 	bool top_down;
  #ifdef CONFIG_CRASH_DUMP
  	bool random;
- #endif
-+	struct page *cma;
- };
- 
- 
 @@ -340,6 +348,7 @@ struct kimage {
  
  	unsigned long nr_segments;
@@ -319,7 +320,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include "kexec_internal.h"
  
  #ifdef CONFIG_KEXEC_SIG
-@@ -229,6 +230,8 @@ kimage_file_prepare_segments(struct kima
+@@ -253,6 +254,8 @@ kimage_file_prepare_segments(struct kima
  		ret = 0;
  	}
  
@@ -328,7 +329,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (cmdline_len) {
  		image->cmdline_buf = memdup_user(cmdline_ptr, cmdline_len);
  		if (IS_ERR(image->cmdline_buf)) {
-@@ -410,7 +413,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, ke
+@@ -434,7 +437,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, ke
  			      i, ksegment->buf, ksegment->bufsz, ksegment->mem,
  			      ksegment->memsz);
  
@@ -337,7 +338,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (ret)
  			goto out;
  	}
-@@ -639,6 +642,39 @@ static int kexec_walk_resources(struct k
+@@ -663,6 +666,43 @@ static int kexec_walk_resources(struct k
  		return walk_system_ram_res(0, ULONG_MAX, kbuf, func);
  }
  
@@ -349,6 +350,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	/* User space disabled CMA allocations, bail out. */
 +	if (kbuf->image->no_cma)
++		return -EPERM;
++
++	/* Skip CMA logic for crash kernel */
++	if (kbuf->image->type == KEXEC_TYPE_CRASH)
 +		return -EPERM;
 +
 +	p = dma_alloc_from_contiguous(NULL, nr_pages, get_order(kbuf->buf_align), true);
@@ -377,7 +382,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * kexec_locate_mem_hole - find free memory for the purgatory or the next kernel
   * @kbuf:	Parameters for the memory search.
-@@ -663,6 +699,13 @@ int kexec_locate_mem_hole(struct kexec_b
+@@ -687,6 +727,13 @@ int kexec_locate_mem_hole(struct kexec_b
  	if (ret <= 0)
  		return ret;
  
@@ -391,7 +396,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
  		ret = kexec_walk_resources(kbuf, locate_mem_hole_callback);
  	else
-@@ -708,6 +751,7 @@ int kexec_add_buffer(struct kexec_buf *k
+@@ -732,6 +779,7 @@ int kexec_add_buffer(struct kexec_buf *k
  	/* Ensure minimum alignment needed for segments. */
  	kbuf->memsz = ALIGN(kbuf->memsz, PAGE_SIZE);
  	kbuf->buf_align = max(kbuf->buf_align, PAGE_SIZE);
@@ -399,7 +404,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Walk the RAM ranges and allocate a suitable range for the buffer */
  	ret = arch_kexec_locate_mem_hole(kbuf);
-@@ -720,6 +764,7 @@ int kexec_add_buffer(struct kexec_buf *k
+@@ -744,6 +792,7 @@ int kexec_add_buffer(struct kexec_buf *k
  	ksegment->bufsz = kbuf->bufsz;
  	ksegment->mem = kbuf->mem;
  	ksegment->memsz = kbuf->memsz;
