@@ -1,14 +1,15 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: fs/proc/task_mmu: read proc/pid/maps under per-vma lock
-Date: Tue, 15 Jul 2025 20:05:56 -0700
+Date: Sat, 19 Jul 2025 11:28:54 -0700
 
 With maple_tree supporting vma tree traversal under RCU and per-vma locks,
 /proc/pid/maps can be read while holding individual vma locks instead of
-locking the entire address space.  A completely lockless approach (walking
-vma tree under RCU) would be quite complex with the main issue being
-get_vma_name() using callbacks which might not work correctly with a
-stable vma copy, requiring original (unstable) vma - see
-special_mapping_name() for example.
+locking the entire address space.
+
+A completely lockless approach (walking vma tree under RCU) would be quite
+complex with the main issue being get_vma_name() using callbacks which
+might not work correctly with a stable vma copy, requiring original
+(unstable) vma - see special_mapping_name() for example.
 
 When per-vma lock acquisition fails, we take the mmap_lock for reading,
 lock the vma, release the mmap_lock and continue.  This fallback to mmap
@@ -46,7 +47,7 @@ tearing could happen only between pages of generated output data.  Since
 current userspace considers data tearing between pages to be acceptable,
 we assume is will be able to handle sub-page data tearing as well.
 
-Link: https://lkml.kernel.org/r/20250716030557.1547501-8-surenb@google.com
+Link: https://lkml.kernel.org/r/20250719182854.3166724-7-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Alexey Dobriyan <adobriyan@gmail.com>
@@ -75,11 +76,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/proc/internal.h        |    5 +
- fs/proc/task_mmu.c        |  145 +++++++++++++++++++++++++++++++++---
+ fs/proc/task_mmu.c        |  141 +++++++++++++++++++++++++++++++++---
  include/linux/mmap_lock.h |   11 ++
  mm/madvise.c              |    3 
  mm/mmap_lock.c            |   93 +++++++++++++++++++++++
- 5 files changed, 246 insertions(+), 11 deletions(-)
+ 5 files changed, 244 insertions(+), 9 deletions(-)
 
 --- a/fs/proc/internal.h~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/fs/proc/internal.h
@@ -97,7 +98,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
 --- a/fs/proc/task_mmu.c~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/fs/proc/task_mmu.c
-@@ -127,15 +127,134 @@ static void release_task_mempolicy(struc
+@@ -130,13 +130,132 @@ static void release_task_mempolicy(struc
  }
  #endif
  
@@ -232,12 +233,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 */
 +		*ppos = vma->vm_end;
  	} else {
--		*ppos = -2;
-+		*ppos = -2; /* -2 indicates gate vma */
+ 		*ppos = SENTINEL_VMA_GATE;
  		vma = get_gate_vma(priv->mm);
- 	}
- 
-@@ -163,28 +282,34 @@ static void *m_start(struct seq_file *m,
+@@ -166,19 +285,25 @@ static void *m_start(struct seq_file *m,
  		return NULL;
  	}
  
@@ -257,7 +255,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		*ppos = last_addr = priv->last_pos;
  	vma_iter_init(&priv->iter, mm, (unsigned long)last_addr);
  	hold_task_mempolicy(priv);
- 	if (last_addr == -2)
+ 	if (last_addr == SENTINEL_VMA_GATE)
  		return get_gate_vma(mm);
  
 -	return proc_get_vma(priv, ppos);
@@ -265,10 +263,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void *m_next(struct seq_file *m, void *v, loff_t *ppos)
- {
- 	if (*ppos == -2) {
--		*ppos = -1;
-+		*ppos = -1; /* -1 indicates no more vmas */
+@@ -187,7 +312,7 @@ static void *m_next(struct seq_file *m,
+ 		*ppos = SENTINEL_VMA_END;
  		return NULL;
  	}
 -	return proc_get_vma(m->private, ppos);
@@ -276,7 +272,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void m_stop(struct seq_file *m, void *v)
-@@ -196,7 +321,7 @@ static void m_stop(struct seq_file *m, v
+@@ -199,7 +324,7 @@ static void m_stop(struct seq_file *m, v
  		return;
  
  	release_task_mempolicy(priv);
@@ -307,7 +303,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline void mm_lock_seqcount_init(struct mm_struct *mm) {}
 --- a/mm/madvise.c~fs-proc-task_mmu-read-proc-pid-maps-under-per-vma-lock
 +++ a/mm/madvise.c
-@@ -109,7 +109,8 @@ void anon_vma_name_free(struct kref *kre
+@@ -108,7 +108,8 @@ void anon_vma_name_free(struct kref *kre
  
  struct anon_vma_name *anon_vma_name(struct vm_area_struct *vma)
  {

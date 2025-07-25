@@ -1,15 +1,18 @@
 From: Dev Jain <dev.jain@arm.com>
 Subject: mm: add batched versions of ptep_modify_prot_start/commit
-Date: Sat, 28 Jun 2025 17:04:33 +0530
+Date: Fri, 18 Jul 2025 14:32:40 +0530
 
 Batch ptep_modify_prot_start/commit in preparation for optimizing
-mprotect.  Architecture can override these helpers; in case not, they are
-implemented as a simple loop over the corresponding single pte helpers.
+mprotect, implementing them as a simple loop over the corresponding single
+pte helpers.  Architecture may override these helpers.
 
-Link: https://lkml.kernel.org/r/20250628113435.46678-3-dev.jain@arm.com
+Link: https://lkml.kernel.org/r/20250718090244.21092-4-dev.jain@arm.com
 Signed-off-by: Dev Jain <dev.jain@arm.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
-Cc: Barry Song <baohua@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
 Cc: David Hildenbrand <david@redhat.com>
@@ -19,36 +22,34 @@ Cc: Joey Gouly <joey.gouly@arm.com>
 Cc: Kevin Brodsky <kevin.brodsky@arm.com>
 Cc: Lance Yang <ioworker0@gmail.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Peter Xu <peterx@redhat.com>
-Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
 Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Yicong Yang <yangyicong@hisilicon.com>
 Cc: Zhenhua Huang <quic_zhenhuah@quicinc.com>
-Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/pgtable.h |   83 +++++++++++++++++++++++++++++++++++++-
+ include/linux/pgtable.h |   84 +++++++++++++++++++++++++++++++++++++-
  mm/mprotect.c           |    4 -
- 2 files changed, 84 insertions(+), 3 deletions(-)
+ 2 files changed, 85 insertions(+), 3 deletions(-)
 
 --- a/include/linux/pgtable.h~mm-add-batched-versions-of-ptep_modify_prot_start-commit
 +++ a/include/linux/pgtable.h
-@@ -1331,7 +1331,8 @@ static inline pte_t ptep_modify_prot_sta
+@@ -1331,7 +1331,9 @@ static inline pte_t ptep_modify_prot_sta
  
  /*
   * Commit an update to a pte, leaving any hardware-controlled bits in
 - * the PTE unmodified.
-+ * the PTE unmodified. The pte may have been "upgraded" w.r.t a/d bits compared
-+ * to the old_pte, as in, it may have a/d bits on which were off in old_pte.
++ * the PTE unmodified. The pte returned from ptep_modify_prot_start() may
++ * additionally have young and/or dirty bits set where previously they were not,
++ * so the updated pte may have these additional changes.
   */
  static inline void ptep_modify_prot_commit(struct vm_area_struct *vma,
  					   unsigned long addr,
-@@ -1340,6 +1341,86 @@ static inline void ptep_modify_prot_comm
+@@ -1340,6 +1342,86 @@ static inline void ptep_modify_prot_comm
  	__ptep_modify_prot_commit(vma, addr, ptep, pte);
  }
  #endif /* __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION */
@@ -72,10 +73,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * Note that PTE bits in the PTE batch besides the PFN can differ.
 + *
 + * Context: The caller holds the page table lock.  The PTEs map consecutive
-+ * pages that belong to the same folio.  The PTEs are all in the same PMD.
-+ * Since the batch is determined from folio_pte_batch, the PTEs must differ
-+ * only in a/d bits (and the soft dirty bit; see fpb_t flags in
-+ * mprotect_folio_pte_batch()).
++ * pages that belong to the same folio. All other PTE bits must be identical for
++ * all PTEs in the batch except for young and dirty bits.  The PTEs are all in
++ * the same PMD.
 + */
 +#ifndef modify_prot_start_ptes
 +static inline pte_t modify_prot_start_ptes(struct vm_area_struct *vma,
@@ -112,9 +112,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * loop over ptep_modify_prot_commit().
 + *
 + * Context: The caller holds the page table lock. The PTEs are all in the same
-+ * PMD. On exit, the set ptes in the batch map the same folio. The pte may have
-+ * been "upgraded" w.r.t a/d bits compared to the old_pte, as in, it may have
-+ * a/d bits on which were off in old_pte.
++ * PMD. On exit, the set ptes in the batch map the same folio. The ptes set by
++ * ptep_modify_prot_start() may additionally have young and/or dirty bits set
++ * where previously they were not, so the updated ptes may have these
++ * additional changes.
 + */
 +#ifndef modify_prot_commit_ptes
 +static inline void modify_prot_commit_ptes(struct vm_area_struct *vma, unsigned long addr,
@@ -122,10 +123,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	int i;
 +
-+	for (i = 0; i < nr; ++i) {
++	for (i = 0; i < nr; ++i, ++ptep, addr += PAGE_SIZE) {
 +		ptep_modify_prot_commit(vma, addr, ptep, old_pte, pte);
-+		ptep++;
-+		addr += PAGE_SIZE;
++
++		/* Advance PFN only, set same prot */
 +		old_pte = pte_next_pfn(old_pte);
 +		pte = pte_next_pfn(pte);
 +	}
@@ -137,8 +138,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
 --- a/mm/mprotect.c~mm-add-batched-versions-of-ptep_modify_prot_start-commit
 +++ a/mm/mprotect.c
-@@ -206,7 +206,7 @@ static long change_pte_range(struct mmu_
- 					continue;
+@@ -204,7 +204,7 @@ static long change_pte_range(struct mmu_
+ 				}
  			}
  
 -			oldpte = ptep_modify_prot_start(vma, addr, pte);
@@ -146,7 +147,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			ptent = pte_modify(oldpte, newprot);
  
  			if (uffd_wp)
-@@ -232,7 +232,7 @@ static long change_pte_range(struct mmu_
+@@ -230,7 +230,7 @@ static long change_pte_range(struct mmu_
  			    can_change_pte_writable(vma, addr, ptent))
  				ptent = pte_mkwrite(ptent, vma);
  

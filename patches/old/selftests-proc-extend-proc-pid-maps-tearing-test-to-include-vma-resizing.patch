@@ -1,6 +1,6 @@
 From: Suren Baghdasaryan <surenb@google.com>
 Subject: selftests/proc: extend /proc/pid/maps tearing test to include vma resizing
-Date: Tue, 15 Jul 2025 20:05:51 -0700
+Date: Sat, 19 Jul 2025 11:28:50 -0700
 
 Test that /proc/pid/maps does not report unexpected holes in the address
 space when a vma at the edge of the page is being concurrently remapped. 
@@ -8,7 +8,7 @@ This remapping results in the vma shrinking and expanding from under the
 reader.  We should always see either shrunk or expanded (original) version
 of the vma.
 
-Link: https://lkml.kernel.org/r/20250716030557.1547501-3-surenb@google.com
+Link: https://lkml.kernel.org/r/20250719182854.3166724-3-surenb@google.com
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
 Cc: Alexey Dobriyan <adobriyan@gmail.com>
 Cc: Andrii Nakryiko <andrii@kernel.org>
@@ -36,42 +36,53 @@ Cc: Ye Bin <yebin10@huawei.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/proc/proc-maps-race.c |   83 ++++++++++++++++
- 1 file changed, 83 insertions(+)
+ tools/testing/selftests/proc/proc-maps-race.c |   79 ++++++++++++++++
+ 1 file changed, 79 insertions(+)
 
 --- a/tools/testing/selftests/proc/proc-maps-race.c~selftests-proc-extend-proc-pid-maps-tearing-test-to-include-vma-resizing
 +++ a/tools/testing/selftests/proc/proc-maps-race.c
-@@ -336,6 +336,86 @@ static void test_maps_tearing_from_split
- 	signal_state(mod_info, TEST_DONE);
+@@ -242,6 +242,28 @@ static inline bool check_split_result(st
+ 	       strcmp(mod_first_line->text, restored_first_line->text) != 0;
  }
  
-+static inline void shrink_vma(const struct vma_modifier_info *mod_info)
++static inline bool shrink_vma(FIXTURE_DATA(proc_maps_race) *self)
 +{
-+	assert(mremap(mod_info->addr, page_size * 3, page_size, 0) != MAP_FAILED);
++	return mremap(self->mod_info->addr, self->page_size * 3,
++		      self->page_size, 0) != MAP_FAILED;
 +}
 +
-+static inline void expand_vma(const struct vma_modifier_info *mod_info)
++static inline bool expand_vma(FIXTURE_DATA(proc_maps_race) *self)
 +{
-+	assert(mremap(mod_info->addr, page_size, page_size * 3, 0) != MAP_FAILED);
++	return mremap(self->mod_info->addr, self->page_size,
++		      self->page_size * 3, 0) != MAP_FAILED;
 +}
 +
-+static inline void check_shrink_result(struct line_content *mod_last_line,
++static inline bool check_shrink_result(struct line_content *mod_last_line,
 +				       struct line_content *mod_first_line,
 +				       struct line_content *restored_last_line,
 +				       struct line_content *restored_first_line)
 +{
 +	/* Make sure only the last vma of the first page is changing */
-+	assert(strcmp(mod_last_line->text, restored_last_line->text) != 0);
-+	assert(strcmp(mod_first_line->text, restored_first_line->text) == 0);
++	return strcmp(mod_last_line->text, restored_last_line->text) != 0 &&
++	       strcmp(mod_first_line->text, restored_first_line->text) == 0;
 +}
 +
-+static void test_maps_tearing_from_resize(int maps_fd,
-+					  struct vma_modifier_info *mod_info,
-+					  struct page_content *page1,
-+					  struct page_content *page2,
-+					  struct line_content *last_line,
-+					  struct line_content *first_line)
+ FIXTURE_SETUP(proc_maps_race)
+ {
+ 	const char *duration = getenv("DURATION");
+@@ -439,6 +461,63 @@ TEST_F(proc_maps_race, test_maps_tearing
+ 
+ 		clock_gettime(CLOCK_MONOTONIC_COARSE, &end_ts);
+ 	} while (end_ts.tv_sec - start_ts.tv_sec < self->duration_sec);
++
++	/* Signal the modifyer thread to stop and wait until it exits */
++	signal_state(mod_info, TEST_DONE);
++}
++
++TEST_F(proc_maps_race, test_maps_tearing_from_resize)
 +{
++	struct vma_modifier_info *mod_info = self->mod_info;
++
 +	struct line_content shrunk_last_line;
 +	struct line_content shrunk_first_line;
 +	struct line_content restored_last_line;
@@ -80,17 +91,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	wait_for_state(mod_info, SETUP_READY);
 +
 +	/* re-read the file to avoid using stale data from previous test */
-+	read_boundary_lines(maps_fd, page1, page2, last_line, first_line);
++	ASSERT_TRUE(read_boundary_lines(self, &self->last_line, &self->first_line));
 +
 +	mod_info->vma_modify = shrink_vma;
 +	mod_info->vma_restore = expand_vma;
 +	mod_info->vma_mod_check = check_shrink_result;
 +
-+	capture_mod_pattern(maps_fd, mod_info, page1, page2, last_line, first_line,
-+			    &shrunk_last_line, &shrunk_first_line,
-+			    &restored_last_line, &restored_first_line);
++	ASSERT_TRUE(capture_mod_pattern(self, &shrunk_last_line, &shrunk_first_line,
++					&restored_last_line, &restored_first_line));
 +
-+	/* Now start concurrent modifications for test_duration_sec */
++	/* Now start concurrent modifications for self->duration_sec */
 +	signal_state(mod_info, TEST_READY);
 +
 +	struct line_content new_last_line;
@@ -99,7 +109,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +	clock_gettime(CLOCK_MONOTONIC_COARSE, &start_ts);
 +	do {
-+		read_boundary_lines(maps_fd, page1, page2, &new_last_line, &new_first_line);
++		ASSERT_TRUE(read_boundary_lines(self, &new_last_line, &new_first_line));
 +
 +		/* Check if we read vmas after shrinking it */
 +		if (!strcmp(new_last_line.text, shrunk_last_line.text)) {
@@ -111,31 +121,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			 * again. In that case new first line will be the same
 +			 * as the last restored line.
 +			 */
-+			assert(!strcmp(new_first_line.text, shrunk_first_line.text) ||
-+			       !strcmp(new_first_line.text, restored_last_line.text));
++			ASSERT_FALSE(strcmp(new_first_line.text, shrunk_first_line.text) &&
++				     strcmp(new_first_line.text, restored_last_line.text));
 +		} else {
 +			/* The vmas should be consistent with the original/resored state */
-+			assert(!strcmp(new_last_line.text, restored_last_line.text) &&
-+			       !strcmp(new_first_line.text, restored_first_line.text));
++			ASSERT_FALSE(strcmp(new_last_line.text, restored_last_line.text));
++			ASSERT_FALSE(strcmp(new_first_line.text, restored_first_line.text));
 +		}
++
 +		clock_gettime(CLOCK_MONOTONIC_COARSE, &end_ts);
-+	} while (end_ts.tv_sec - start_ts.tv_sec < test_duration_sec);
-+
-+	/* Signal the modifyer thread to stop and wait until it exits */
-+	signal_state(mod_info, TEST_DONE);
-+}
-+
- int usage(void)
- {
- 	fprintf(stderr, "Userland /proc/pid/{s}maps race test cases\n");
-@@ -444,6 +524,9 @@ int main(int argc, char **argv)
- 	test_maps_tearing_from_split(maps_fd, mod_info, &page1, &page2,
- 				     &last_line, &first_line);
++	} while (end_ts.tv_sec - start_ts.tv_sec < self->duration_sec);
  
-+	test_maps_tearing_from_resize(maps_fd, mod_info, &page1, &page2,
-+				      &last_line, &first_line);
-+
- 	stop_vma_modifier(mod_info);
- 
- 	free(page2.data);
+ 	/* Signal the modifyer thread to stop and wait until it exits */
+ 	signal_state(mod_info, TEST_DONE);
 _
