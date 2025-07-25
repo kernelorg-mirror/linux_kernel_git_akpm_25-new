@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/mseal: rework mseal apply logic
-Date: Tue, 15 Jul 2025 14:37:42 +0100
+Date: Wed, 16 Jul 2025 18:38:06 +0100
 
 The logic can be simplified - firstly by renaming the inconsistently named
 apply_mm_seal() to mseal_apply().
@@ -9,37 +9,33 @@ We then wrap mseal_fixup() into the main loop as the logic is simple
 enough to not require it, equally it isn't a hugely pleasant pattern in
 mprotect() etc.  so it's not something we want to perpetuate.
 
-We remove some redundant comments, and then avoid the entirely unnecessary
-and slightly bizarre invocation of vma_iter_end() on each loop - really
-what we want, given we have asserted there are no gaps in the range - is
-to handle start, end being offset into a VMAs.  This is easily handled
-with MIN()/MAX().
+We eliminate the need for invoking vma_iter_end() on each loop by directly
+determining if the VMA was merged - the only thing we need concern
+ourselves with is whether the start/end of the (gapless) range are offset
+into VMAs.
 
-There's no need to have an 'out' label block since on vma_modify_flags()
-error we abort anyway.
-
-And by refactoring like this we avoid the rather horrid 'pass pointer to
-prev around' pattern used in mprotect() et al.
+This refactoring also avoids the rather horrid 'pass pointer to prev
+around' pattern used in mprotect() et al.
 
 No functional change intended.
 
-Link: https://lkml.kernel.org/r/1d6abf27d8eac0001f8ad47b13f0084ceaa6657b.1752586090.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/9ae70e1c509d790cf174f16e491975efd9be50b6.1752687069.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Reviewed-by: Pedro Falcato <pfalcato@suse.de>
 Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
-Cc: David Hildenbrand <david@redhat.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Jeff Xu <jeffxu@chromium.org>
 Cc: Jann Horn <jannh@google.com>
-Cc: Jeff Xu <jeffxu@chromium.org>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mseal.c |   69 ++++++++++++++++-----------------------------------
- 1 file changed, 22 insertions(+), 47 deletions(-)
+ mm/mseal.c |   67 +++++++++++++++------------------------------------
+ 1 file changed, 20 insertions(+), 47 deletions(-)
 
 --- a/mm/mseal.c~mm-mseal-rework-mseal-apply-logic
 +++ a/mm/mseal.c
-@@ -15,60 +15,35 @@
+@@ -15,28 +15,6 @@
  #include <linux/sched.h>
  #include "internal.h"
  
@@ -65,6 +61,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	return ret;
 -}
 -
+ /* Does the [start, end) range contain any unmapped memory? */
+ static bool range_contains_unmapped(struct mm_struct *mm,
+ 		unsigned long start, unsigned long end)
+@@ -55,38 +33,33 @@ static bool range_contains_unmapped(stru
+ 	return prev_end < end;
+ }
+ 
 -/*
 - * Apply sealing.
 - */
@@ -75,6 +78,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	unsigned long nstart;
  	struct vm_area_struct *vma, *prev;
 -	VMA_ITERATOR(vmi, current->mm, start);
++	unsigned long curr_start = start;
 +	VMA_ITERATOR(vmi, mm, start);
  
 +	/* We know there are no gaps so this will be non-NULL. */
@@ -101,26 +105,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (error)
 -			return error;
 -		nstart = vma_iter_end(&vmi);
-+		unsigned long curr_start, curr_end;
++		unsigned long curr_end = MIN(vma->vm_end, end);
 +
-+		if (vma->vm_flags & VM_SEALED) {
-+			prev = vma;
-+			continue;
++		if (!(vma->vm_flags & VM_SEALED)) {
++			vma = vma_modify_flags(&vmi, prev, vma,
++					curr_start, curr_end,
++					vma->vm_flags | VM_SEALED);
++			if (IS_ERR(vma))
++				return PTR_ERR(vma);
++			vm_flags_set(vma, VM_SEALED);
 +		}
-+		curr_start = MAX(start, vma->vm_start);
-+		curr_end = MIN(vma->vm_end, end);
-+
-+		vma = vma_modify_flags(&vmi, prev, vma, curr_start, curr_end,
-+				vma->vm_flags | VM_SEALED);
-+		if (IS_ERR(vma))
-+			return PTR_ERR(vma);
-+		vm_flags_set(vma, VM_SEALED);
 +
 +		prev = vma;
++		curr_start = curr_end;
  	}
  
  	return 0;
-@@ -185,10 +160,10 @@ int do_mseal(unsigned long start, size_t
+@@ -185,10 +158,10 @@ int do_mseal(unsigned long start, size_t
  	 * reaching the max supported VMAs, however, those cases shall
  	 * be rare.
  	 */

@@ -1,0 +1,67 @@
+From: Jann Horn <jannh@google.com>
+Subject: mm/rmap: add anon_vma lifetime debug check
+Date: Fri, 25 Jul 2025 14:16:24 +0200
+
+If an anon folio is mapped into userspace, its anon_vma must be alive,
+otherwise rmap walks can hit UAF.
+
+There have been syzkaller reports a few months ago[1][2] of UAF in rmap
+walks that seems to indicate that there can be pages with elevated
+mapcount whose anon_vma has already been freed, but I think we never
+figured out what the cause is; and syzkaller only hit these UAFs when
+memory pressure randomly caused reclaim to rmap-walk the affected pages,
+so it of course didn't manage to create a reproducer.
+
+Add a VM_WARN_ON_FOLIO() when we add/remove mappings of anonymous folios
+to hopefully catch such issues more reliably.
+
+[1] https://lore.kernel.org/r/67abaeaf.050a0220.110943.0041.GAE@google.com
+[2] https://lore.kernel.org/r/67a76f33.050a0220.3d72c.0028.GAE@google.com
+
+Link: https://lkml.kernel.org/r/20250725-anonvma-uaf-debug-v2-1-bc3c7e5ba5b1@google.com
+Signed-off-by: Jann Horn <jannh@google.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Rik van Riel <riel@surriel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/rmap.h |   22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+--- a/include/linux/rmap.h~mm-rmap-add-anon_vma-lifetime-debug-check
++++ a/include/linux/rmap.h
+@@ -449,6 +449,28 @@ static inline void __folio_rmap_sanity_c
+ 	default:
+ 		VM_WARN_ON_ONCE(true);
+ 	}
++
++	/*
++	 * Anon folios must have an associated live anon_vma as long as they're
++	 * mapped into userspace.
++	 * Note that the atomic_read() mainly does two things:
++	 *
++	 * 1. In KASAN builds with CONFIG_SLUB_RCU_DEBUG, it causes KASAN to
++	 *    check that the associated anon_vma has not yet been freed (subject
++	 *    to KASAN's usual limitations). This check will pass if the
++	 *    anon_vma's refcount has already dropped to 0 but an RCU grace
++	 *    period hasn't passed since then.
++	 * 2. If the anon_vma has not yet been freed, it checks that the
++	 *    anon_vma still has a nonzero refcount (as opposed to being in the
++	 *    middle of an RCU delay for getting freed).
++	 */
++	if (folio_test_anon(folio) && !folio_test_ksm(folio)) {
++		unsigned long mapping = (unsigned long)folio->mapping;
++		struct anon_vma *anon_vma;
++
++		anon_vma = (void *)(mapping - FOLIO_MAPPING_ANON);
++		VM_WARN_ON_FOLIO(atomic_read(&anon_vma->refcount) == 0, folio);
++	}
+ }
+ 
+ /*
+_
