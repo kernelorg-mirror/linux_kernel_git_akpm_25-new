@@ -1,0 +1,199 @@
+From: Harry Yoo <harry.yoo@oracle.com>
+Subject: x86/mm/64: convert p*d_populate{,_init} to _kernel variants
+Date: Fri, 25 Jul 2025 10:21:05 +0900
+
+Introduce p*d_populate_kernel_safe() and convert p*d_populate{,_init}() to
+p*d_populate_kernel{,_init}() to ensure synchronization of kernel mappings
+when populating PGD entries.
+
+By converting them, we eliminate the risk of forgetting to synchronize
+top-level page tables after populating PGD entries.
+
+Link: https://lkml.kernel.org/r/20250725012106.5316-5-harry.yoo@oracle.com
+Signed-off-by: Harry Yoo <harry.yoo@oracle.com>
+Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: bibo mao <maobibo@loongson.cn>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Christoph Lameter (Ampere) <cl@gentwo.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Gwan-gyeong Mun <gwan-gyeong.mun@intel.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Joao Martins <joao.m.martins@oracle.com>
+Cc: Joerg Roedel <joro@8bytes.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: Thomas Huth <thuth@redhat.com>
+Cc: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/include/asm/pgalloc.h |   20 ++++++++++++++++++++
+ arch/x86/mm/init_64.c          |   25 +++++++++++++++++++------
+ arch/x86/mm/kasan_init_64.c    |    8 ++++----
+ 3 files changed, 43 insertions(+), 10 deletions(-)
+
+--- a/arch/x86/include/asm/pgalloc.h~x86-mm-64-convert-pd_populate_init-to-_kernel-variants
++++ a/arch/x86/include/asm/pgalloc.h
+@@ -120,6 +120,15 @@ static inline void p4d_populate_safe(str
+ 	set_p4d_safe(p4d, __p4d(_PAGE_TABLE | __pa(pud)));
+ }
+ 
++static inline void p4d_populate_kernel_safe(unsigned long addr,
++					    p4d_t *p4d, pud_t *pud)
++{
++	paravirt_alloc_pud(&init_mm, __pa(pud) >> PAGE_SHIFT);
++	set_p4d_safe(p4d, __p4d(_PAGE_TABLE | __pa(pud)));
++	if (ARCH_PAGE_TABLE_SYNC_MASK & PGTBL_P4D_MODIFIED)
++		arch_sync_kernel_mappings(addr, addr);
++}
++
+ extern void ___pud_free_tlb(struct mmu_gather *tlb, pud_t *pud);
+ 
+ static inline void __pud_free_tlb(struct mmu_gather *tlb, pud_t *pud,
+@@ -145,6 +154,17 @@ static inline void pgd_populate_safe(str
+ 	set_pgd_safe(pgd, __pgd(_PAGE_TABLE | __pa(p4d)));
+ }
+ 
++static inline void pgd_populate_kernel_safe(unsigned long addr,
++				       pgd_t *pgd, p4d_t *p4d)
++{
++	if (!pgtable_l5_enabled())
++		return;
++	paravirt_alloc_p4d(&init_mm, __pa(p4d) >> PAGE_SHIFT);
++	set_pgd_safe(pgd, __pgd(_PAGE_TABLE | __pa(p4d)));
++	if (ARCH_PAGE_TABLE_SYNC_MASK & PGTBL_PGD_MODIFIED)
++		arch_sync_kernel_mappings(addr, addr);
++}
++
+ extern void ___p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d);
+ 
+ static inline void __p4d_free_tlb(struct mmu_gather *tlb, p4d_t *p4d,
+--- a/arch/x86/mm/init_64.c~x86-mm-64-convert-pd_populate_init-to-_kernel-variants
++++ a/arch/x86/mm/init_64.c
+@@ -75,6 +75,19 @@ DEFINE_POPULATE(pgd_populate, pgd, p4d,
+ DEFINE_POPULATE(pud_populate, pud, pmd, init)
+ DEFINE_POPULATE(pmd_populate_kernel, pmd, pte, init)
+ 
++#define DEFINE_POPULATE_KERNEL(fname, type1, type2, init)	\
++static inline void fname##_init(unsigned long addr,		\
++		type1##_t *arg1, type2##_t *arg2, bool init)	\
++{								\
++	if (init)						\
++		fname##_safe(addr, arg1, arg2);			\
++	else							\
++		fname(addr, arg1, arg2);			\
++}
++
++DEFINE_POPULATE_KERNEL(pgd_populate_kernel, pgd, p4d, init)
++DEFINE_POPULATE_KERNEL(p4d_populate_kernel, p4d, pud, init)
++
+ #define DEFINE_ENTRY(type1, type2, init)			\
+ static inline void set_##type1##_init(type1##_t *arg1,		\
+ 			type2##_t arg2, bool init)		\
+@@ -255,7 +268,7 @@ static p4d_t *fill_p4d(pgd_t *pgd, unsig
+ {
+ 	if (pgd_none(*pgd)) {
+ 		p4d_t *p4d = (p4d_t *)spp_getpage();
+-		pgd_populate(&init_mm, pgd, p4d);
++		pgd_populate_kernel(vaddr, pgd, p4d);
+ 		if (p4d != p4d_offset(pgd, 0))
+ 			printk(KERN_ERR "PAGETABLE BUG #00! %p <-> %p\n",
+ 			       p4d, p4d_offset(pgd, 0));
+@@ -267,7 +280,7 @@ static pud_t *fill_pud(p4d_t *p4d, unsig
+ {
+ 	if (p4d_none(*p4d)) {
+ 		pud_t *pud = (pud_t *)spp_getpage();
+-		p4d_populate(&init_mm, p4d, pud);
++		p4d_populate_kernel(vaddr, p4d, pud);
+ 		if (pud != pud_offset(p4d, 0))
+ 			printk(KERN_ERR "PAGETABLE BUG #01! %p <-> %p\n",
+ 			       pud, pud_offset(p4d, 0));
+@@ -720,7 +733,7 @@ phys_p4d_init(p4d_t *p4d_page, unsigned
+ 					   page_size_mask, prot, init);
+ 
+ 		spin_lock(&init_mm.page_table_lock);
+-		p4d_populate_init(&init_mm, p4d, pud, init);
++		p4d_populate_kernel_init(vaddr, p4d, pud, init);
+ 		spin_unlock(&init_mm.page_table_lock);
+ 	}
+ 
+@@ -762,10 +775,10 @@ __kernel_physical_mapping_init(unsigned
+ 
+ 		spin_lock(&init_mm.page_table_lock);
+ 		if (pgtable_l5_enabled())
+-			pgd_populate_init(&init_mm, pgd, p4d, init);
++			pgd_populate_kernel_init(vaddr, pgd, p4d, init);
+ 		else
+-			p4d_populate_init(&init_mm, p4d_offset(pgd, vaddr),
+-					  (pud_t *) p4d, init);
++			p4d_populate_kernel_init(vaddr, p4d_offset(pgd, vaddr),
++						 (pud_t *) p4d, init);
+ 
+ 		spin_unlock(&init_mm.page_table_lock);
+ 		pgd_changed = true;
+--- a/arch/x86/mm/kasan_init_64.c~x86-mm-64-convert-pd_populate_init-to-_kernel-variants
++++ a/arch/x86/mm/kasan_init_64.c
+@@ -108,7 +108,7 @@ static void __init kasan_populate_p4d(p4
+ 	if (p4d_none(*p4d)) {
+ 		void *p = early_alloc(PAGE_SIZE, nid, true);
+ 
+-		p4d_populate(&init_mm, p4d, p);
++		p4d_populate_kernel(addr, p4d, p);
+ 	}
+ 
+ 	pud = pud_offset(p4d, addr);
+@@ -128,7 +128,7 @@ static void __init kasan_populate_pgd(pg
+ 
+ 	if (pgd_none(*pgd)) {
+ 		p = early_alloc(PAGE_SIZE, nid, true);
+-		pgd_populate(&init_mm, pgd, p);
++		pgd_populate_kernel(addr, pgd, p);
+ 	}
+ 
+ 	p4d = p4d_offset(pgd, addr);
+@@ -255,7 +255,7 @@ static void __init kasan_shallow_populat
+ 
+ 		if (p4d_none(*p4d)) {
+ 			p = early_alloc(PAGE_SIZE, NUMA_NO_NODE, true);
+-			p4d_populate(&init_mm, p4d, p);
++			p4d_populate_kernel(addr, p4d, p);
+ 		}
+ 	} while (p4d++, addr = next, addr != end);
+ }
+@@ -273,7 +273,7 @@ static void __init kasan_shallow_populat
+ 
+ 		if (pgd_none(*pgd)) {
+ 			p = early_alloc(PAGE_SIZE, NUMA_NO_NODE, true);
+-			pgd_populate(&init_mm, pgd, p);
++			pgd_populate_kernel(addr, pgd, p);
+ 		}
+ 
+ 		/*
+_
