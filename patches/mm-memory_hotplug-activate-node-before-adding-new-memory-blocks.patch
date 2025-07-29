@@ -1,0 +1,123 @@
+From: Hannes Reinecke <hare@kernel.org>
+Subject: mm/memory_hotplug: activate node before adding new memory blocks
+Date: Tue, 29 Jul 2025 08:46:35 +0200
+
+The sysfs attributes for memory blocks require the node ID to be set and
+initialized, so move the node activation before adding new memory blocks. 
+This also has the nice side effect that the BUG_ON() can be converted into
+a WARN_ON() as we now can handle registration errors.
+
+Link: https://lkml.kernel.org/r/20250729064637.51662-3-hare@kernel.org
+Fixes: b9ff036082cd ("mm/memory_hotplug.c: make add_memory_resource use __try_online_node")
+Signed-off-by: Hannes Reinecke <hare@kernel.org>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Donet Tom <donettom@linux.ibm.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/base/memory.c  |    4 ++--
+ include/linux/memory.h |    2 +-
+ mm/memory_hotplug.c    |   32 +++++++++++++++++---------------
+ 3 files changed, 20 insertions(+), 18 deletions(-)
+
+--- a/drivers/base/memory.c~mm-memory_hotplug-activate-node-before-adding-new-memory-blocks
++++ a/drivers/base/memory.c
+@@ -879,7 +879,7 @@ static void remove_memory_block(struct m
+  * Called under device_hotplug_lock.
+  */
+ int create_memory_block_devices(unsigned long start, unsigned long size,
+-				struct vmem_altmap *altmap,
++				int nid, struct vmem_altmap *altmap,
+ 				struct memory_group *group)
+ {
+ 	const unsigned long start_block_id = pfn_to_block_id(PFN_DOWN(start));
+@@ -893,7 +893,7 @@ int create_memory_block_devices(unsigned
+ 		return -EINVAL;
+ 
+ 	for (block_id = start_block_id; block_id != end_block_id; block_id++) {
+-		ret = add_memory_block(block_id, NUMA_NO_NODE, MEM_OFFLINE, altmap, group);
++		ret = add_memory_block(block_id, nid, MEM_OFFLINE, altmap, group);
+ 		if (ret)
+ 			break;
+ 	}
+--- a/include/linux/memory.h~mm-memory_hotplug-activate-node-before-adding-new-memory-blocks
++++ a/include/linux/memory.h
+@@ -159,7 +159,7 @@ static inline unsigned long memory_block
+ extern int register_memory_notifier(struct notifier_block *nb);
+ extern void unregister_memory_notifier(struct notifier_block *nb);
+ int create_memory_block_devices(unsigned long start, unsigned long size,
+-				struct vmem_altmap *altmap,
++				int nid, struct vmem_altmap *altmap,
+ 				struct memory_group *group);
+ void remove_memory_block_devices(unsigned long start, unsigned long size);
+ extern void memory_dev_init(void);
+--- a/mm/memory_hotplug.c~mm-memory_hotplug-activate-node-before-adding-new-memory-blocks
++++ a/mm/memory_hotplug.c
+@@ -1477,7 +1477,7 @@ static int create_altmaps_and_memory_blo
+ 		}
+ 
+ 		/* create memory block devices after memory was added */
+-		ret = create_memory_block_devices(cur_start, memblock_size,
++		ret = create_memory_block_devices(cur_start, memblock_size, nid,
+ 						  params.altmap, group);
+ 		if (ret) {
+ 			arch_remove_memory(cur_start, memblock_size, NULL);
+@@ -1539,8 +1539,16 @@ int add_memory_resource(int nid, struct
+ 
+ 	ret = __try_online_node(nid, false);
+ 	if (ret < 0)
+-		goto error;
+-	new_node = ret;
++		goto error_memblock_remove;
++	if (ret) {
++		node_set_online(nid);
++		ret = register_one_node(nid);
++		if (WARN_ON(ret)) {
++			node_set_offline(nid);
++			goto error_memblock_remove;
++		}
++		new_node = true;
++	}
+ 
+ 	/*
+ 	 * Self hosted memmap array
+@@ -1556,24 +1564,13 @@ int add_memory_resource(int nid, struct
+ 			goto error;
+ 
+ 		/* create memory block devices after memory was added */
+-		ret = create_memory_block_devices(start, size, NULL, group);
++		ret = create_memory_block_devices(start, size, nid, NULL, group);
+ 		if (ret) {
+ 			arch_remove_memory(start, size, params.altmap);
+ 			goto error;
+ 		}
+ 	}
+ 
+-	if (new_node) {
+-		/* If sysfs file of new node can't be created, cpu on the node
+-		 * can't be hot-added. There is no rollback way now.
+-		 * So, check by BUG_ON() to catch it reluctantly..
+-		 * We online node here. We can't roll back from here.
+-		 */
+-		node_set_online(nid);
+-		ret = register_one_node(nid);
+-		BUG_ON(ret);
+-	}
+-
+ 	register_memory_blocks_under_node_hotplug(nid, PFN_DOWN(start),
+ 					  PFN_UP(start + size - 1));
+ 
+@@ -1597,6 +1594,11 @@ int add_memory_resource(int nid, struct
+ 
+ 	return ret;
+ error:
++	if (new_node) {
++		node_set_offline(nid);
++		unregister_one_node(nid);
++	}
++error_memblock_remove:
+ 	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
+ 		memblock_remove(start, size);
+ error_mem_hotplug_end:
+_
