@@ -1,0 +1,60 @@
+From: Breno Leitao <leitao@debian.org>
+Subject: mm/kmemleak: avoid deadlock by moving pr_warn() outside kmemleak_lock
+Date: Thu, 31 Jul 2025 02:57:18 -0700
+
+When netpoll is enabled, calling pr_warn_once() while holding
+kmemleak_lock in mem_pool_alloc() can cause a deadlock due to lock
+inversion with the netconsole subsystem.  This occurs because
+pr_warn_once() may trigger netpoll, which eventually leads to
+__alloc_skb() and back into kmemleak code, attempting to reacquire
+kmemleak_lock.
+
+This is the path for the deadlock.
+
+mem_pool_alloc()
+  -> raw_spin_lock_irqsave(&kmemleak_lock, flags);
+      -> pr_warn_once()
+          -> netconsole subsystem
+	     -> netpoll
+	         -> __alloc_skb
+		   -> __create_object
+		     -> raw_spin_lock_irqsave(&kmemleak_lock, flags);
+
+Fix this by setting a flag and issuing the pr_warn_once() after
+kmemleak_lock is released.
+
+Link: https://lkml.kernel.org/r/20250731-kmemleak_lock-v1-1-728fd470198f@debian.org
+Fixes: c5665868183fec ("mm: kmemleak: use the memory pool for early allocations")
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Reported-by: Jakub Kicinski <kuba@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/kmemleak.c |    5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+--- a/mm/kmemleak.c~mm-kmemleak-avoid-deadlock-by-moving-pr_warn-outside-kmemleak_lock
++++ a/mm/kmemleak.c
+@@ -470,6 +470,7 @@ static struct kmemleak_object *mem_pool_
+ {
+ 	unsigned long flags;
+ 	struct kmemleak_object *object;
++	bool warn = false;
+ 
+ 	/* try the slab allocator first */
+ 	if (object_cache) {
+@@ -488,8 +489,10 @@ static struct kmemleak_object *mem_pool_
+ 	else if (mem_pool_free_count)
+ 		object = &mem_pool[--mem_pool_free_count];
+ 	else
+-		pr_warn_once("Memory pool empty, consider increasing CONFIG_DEBUG_KMEMLEAK_MEM_POOL_SIZE\n");
++		warn = true;
+ 	raw_spin_unlock_irqrestore(&kmemleak_lock, flags);
++	if (warn)
++		pr_warn_once("Memory pool empty, consider increasing CONFIG_DEBUG_KMEMLEAK_MEM_POOL_SIZE\n");
+ 
+ 	return object;
+ }
+_
