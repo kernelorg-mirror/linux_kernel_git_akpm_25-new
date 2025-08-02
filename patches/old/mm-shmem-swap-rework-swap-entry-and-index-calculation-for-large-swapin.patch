@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm/shmem, swap: rework swap entry and index calculation for large swapin
-Date: Thu, 10 Jul 2025 11:37:05 +0800
+Date: Mon, 28 Jul 2025 15:53:05 +0800
 
 Instead of calculating the swap entry differently in different swapin
 paths, calculate it early before the swap cache lookup and use that for
@@ -30,25 +30,25 @@ The final object size and stack usage are also reduced due to simplified
 code:
 
 ./scripts/bloat-o-meter mm/shmem.o.old mm/shmem.o
-add/remove: 0/0 grow/shrink: 0/1 up/down: 0/-233 (-233)
+add/remove: 0/0 grow/shrink: 0/1 up/down: 0/-145 (-145)
 Function                                     old     new   delta
-shmem_swapin_folio                          4040    3807    -233
-Total: Before=33152, After=32919, chg -0.70%
+shmem_swapin_folio                          4056    3911    -145
+Total: Before=33242, After=33097, chg -0.44%
 
 Stack usage (Before vs After):
-mm/shmem.c:2277:12:shmem_swapin_folio   264     static
-mm/shmem.c:2277:12:shmem_swapin_folio   256     static
+mm/shmem.c:2314:12:shmem_swapin_folio   264     static
+mm/shmem.c:2314:12:shmem_swapin_folio   256     static
 
-And while at it, round down the index too if swap entry is round down.
-The index is used either for folio reallocation or confirming the
-mapping content. In either case, it should be aligned with the swap
-folio.
+And while at it, round down the index too if swap entry is round down. 
+The index is used either for folio reallocation or confirming the mapping
+content.  In either case, it should be aligned with the swap folio.
 
-Link: https://lkml.kernel.org/r/20250710033706.71042-8-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250728075306.12704-8-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Tested-by: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
 Cc: Chris Li <chrisl@kernel.org>
 Cc: Dev Jain <dev.jain@arm.com>
 Cc: Hugh Dickins <hughd@google.com>
@@ -58,12 +58,12 @@ Cc: Nhat Pham <nphamcs@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/shmem.c |   63 ++++++++++++++++++++++++---------------------------
- 1 file changed, 30 insertions(+), 33 deletions(-)
+ mm/shmem.c |   67 +++++++++++++++++++++++++--------------------------
+ 1 file changed, 33 insertions(+), 34 deletions(-)
 
 --- a/mm/shmem.c~mm-shmem-swap-rework-swap-entry-and-index-calculation-for-large-swapin
 +++ a/mm/shmem.c
-@@ -2301,7 +2301,7 @@ unlock:
+@@ -2302,7 +2302,7 @@ unlock:
  	if (xas_error(&xas))
  		return xas_error(&xas);
  
@@ -72,7 +72,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -2322,7 +2322,7 @@ static int shmem_swapin_folio(struct ino
+@@ -2323,7 +2323,7 @@ static int shmem_swapin_folio(struct ino
  	struct swap_info_struct *si;
  	struct folio *folio = NULL;
  	bool skip_swapcache = false;
@@ -81,7 +81,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgoff_t offset;
  
  	VM_BUG_ON(!*foliop || !xa_is_value(*foliop));
-@@ -2330,11 +2330,11 @@ static int shmem_swapin_folio(struct ino
+@@ -2331,11 +2331,11 @@ static int shmem_swapin_folio(struct ino
  	swap = index_entry;
  	*foliop = NULL;
  
@@ -96,7 +96,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (unlikely(!si)) {
  		if (order < 0)
  			return -EEXIST;
-@@ -2346,6 +2346,12 @@ static int shmem_swapin_folio(struct ino
+@@ -2347,6 +2347,12 @@ static int shmem_swapin_folio(struct ino
  		return -EEXIST;
  	}
  
@@ -109,7 +109,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Look it up and read it in.. */
  	folio = swap_cache_get_folio(swap, NULL, 0);
  	if (!folio) {
-@@ -2366,16 +2372,7 @@ static int shmem_swapin_folio(struct ino
+@@ -2359,7 +2365,8 @@ static int shmem_swapin_folio(struct ino
+ 
+ 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO)) {
+ 			/* Direct swapin skipping swap cache & readahead */
+-			folio = shmem_swap_alloc_folio(inode, vma, index, swap, order, gfp);
++			folio = shmem_swap_alloc_folio(inode, vma, index,
++						       index_entry, order, gfp);
+ 			if (IS_ERR(folio)) {
+ 				error = PTR_ERR(folio);
+ 				folio = NULL;
+@@ -2367,16 +2374,7 @@ static int shmem_swapin_folio(struct ino
  			}
  			skip_swapcache = true;
  		} else {
@@ -127,7 +137,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			folio = shmem_swapin_cluster(swap, gfp, info, index);
  			if (!folio) {
  				error = -ENOMEM;
-@@ -2392,23 +2389,25 @@ static int shmem_swapin_folio(struct ino
+@@ -2384,6 +2382,7 @@ static int shmem_swapin_folio(struct ino
+ 			}
+ 		}
+ 	}
++
+ 	if (order > folio_order(folio)) {
+ 		/*
+ 		 * Swapin may get smaller folios due to various reasons:
+@@ -2393,24 +2392,25 @@ static int shmem_swapin_folio(struct ino
  		 * large swap entries. In such cases, we should split the
  		 * large swap entry to prevent possible data corruption.
  		 */
@@ -151,6 +169,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		}
 -	} else if (order < folio_order(folio)) {
 -		swap.val = round_down(swap.val, 1 << folio_order(folio));
+-		index = round_down(index, 1 << folio_order(folio));
 +	/*
 +	 * If the folio is large, round down swap and index by folio size.
 +	 * No matter what race occurs, the swap layer ensures we either get
@@ -167,16 +186,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		index = round_down(index, nr_pages);
  	}
  
- 	/* We have to do this with folio locked to prevent races */
-@@ -2423,7 +2422,6 @@ static int shmem_swapin_folio(struct ino
- 		goto failed;
- 	}
- 	folio_wait_writeback(folio);
--	nr_pages = folio_nr_pages(folio);
- 
  	/*
- 	 * Some architectures may have to restore extra metadata to the
-@@ -2437,8 +2435,7 @@ static int shmem_swapin_folio(struct ino
+@@ -2446,8 +2446,7 @@ static int shmem_swapin_folio(struct ino
  			goto failed;
  	}
  
