@@ -48,6 +48,8 @@ UAF in T1.
 To avoid this we move vma->vm_mm verification into vma_start_read() and
 grab vma->vm_mm to stabilize it before vma_refcount_put() operation.
 
+[surenb@google.com: v3]
+  Link: https://lkml.kernel.org/r/20250729145709.2731370-1-surenb@google.com
 Link: https://lkml.kernel.org/r/20250728175355.2282375-1-surenb@google.com
 Fixes: 3104138517fc ("mm: make vma cache SLAB_TYPESAFE_BY_RCU")
 Signed-off-by: Suren Baghdasaryan <surenb@google.com>
@@ -61,9 +63,9 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mmap_lock.h |   23 +++++++++++++++++++++++
+ include/linux/mmap_lock.h |   30 ++++++++++++++++++++++++++++++
  mm/mmap_lock.c            |   10 +++-------
- 2 files changed, 26 insertions(+), 7 deletions(-)
+ 2 files changed, 33 insertions(+), 7 deletions(-)
 
 --- a/include/linux/mmap_lock.h~mm-fix-a-uaf-when-vma-mm-is-freed-after-vma-vm_refcnt-got-dropped
 +++ a/include/linux/mmap_lock.h
@@ -75,7 +77,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #define MMAP_LOCK_INITIALIZER(name) \
  	.mmap_lock = __RWSEM_INITIALIZER((name).mmap_lock),
-@@ -183,6 +184,28 @@ static inline struct vm_area_struct *vma
+@@ -154,6 +155,10 @@ static inline void vma_refcount_put(stru
+  * reused and attached to a different mm before we lock it.
+  * Returns the vma on success, NULL on failure to lock and EAGAIN if vma got
+  * detached.
++ *
++ * WARNING! The vma passed to this function cannot be used if the function
++ * fails to lock it because in certain cases RCU lock is dropped and then
++ * reacquired. Once RCU lock is dropped the vma can be concurently freed.
+  */
+ static inline struct vm_area_struct *vma_start_read(struct mm_struct *mm,
+ 						    struct vm_area_struct *vma)
+@@ -183,6 +188,31 @@ static inline struct vm_area_struct *vma
  	}
  
  	rwsem_acquire_read(&vma->vmlock_dep_map, 0, 1, _RET_IP_);
@@ -89,9 +102,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (unlikely(vma->vm_mm != mm)) {
 +		/* Use a copy of vm_mm in case vma is freed after we drop vm_refcnt */
 +		struct mm_struct *other_mm = vma->vm_mm;
++
 +		/*
 +		 * __mmdrop() is a heavy operation and we don't need RCU
 +		 * protection here. Release RCU lock during these operations.
++		 * We reinstate the RCU read lock as the caller expects it to
++		 * be held when this function returns even on error.
 +		 */
 +		rcu_read_unlock();
 +		mmgrab(other_mm);
@@ -125,7 +141,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	 * not behind of the last search position.
 -	 */
 -	if (unlikely(vma->vm_mm != mm || from_addr >= vma->vm_end))
-+	/* Verify the vma is not behind of the last search position. */
++	/* Verify the vma is not behind the last search position. */
 +	if (unlikely(from_addr >= vma->vm_end))
  		goto fallback_unlock;
  

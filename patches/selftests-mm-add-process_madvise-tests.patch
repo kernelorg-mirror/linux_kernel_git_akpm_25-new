@@ -5,6 +5,8 @@ Date: Mon, 21 Jul 2025 19:46:14 +0800
 Add tests for process_madvise(), focusing on verifying behavior under
 various conditions including valid usage and error cases.
 
+[lianux.mm@gmail.com: v7]
+  Link: https://lkml.kernel.org/r/20250729113109.12272-1-lianux.mm@gmail.com
 Link: https://lkml.kernel.org/r/20250729113109.12272-1-lianux.mm@gmail.com
 Link: https://lkml.kernel.org/r/20250721114614.40996-1-lianux.mm@gmail.com
 Signed-off-by: wang lian <lianux.mm@gmail.com>
@@ -26,9 +28,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 
  tools/testing/selftests/mm/.gitignore     |    1 
  tools/testing/selftests/mm/Makefile       |    1 
- tools/testing/selftests/mm/process_madv.c |  302 ++++++++++++++++++++
+ tools/testing/selftests/mm/process_madv.c |  344 ++++++++++++++++++++
  tools/testing/selftests/mm/run_vmtests.sh |    5 
- 4 files changed, 309 insertions(+)
+ 4 files changed, 351 insertions(+)
 
 --- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-process_madvise-tests
 +++ a/tools/testing/selftests/mm/.gitignore
@@ -54,7 +56,7 @@ diff --git a/tools/testing/selftests/mm/process_madv.c a/tools/testing/selftests
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/process_madv.c
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,344 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +
 +#define _GNU_SOURCE
@@ -198,7 +200,7 @@ new file mode 100644
 +		void *map_addr;
 +	} info;
 +
-+	huge_page_size = default_huge_page_size();
++	huge_page_size = read_pmd_pagesize();
 +	if (huge_page_size <= 0)
 +		SKIP(return, "Could not determine a valid huge page size.\n");
 +
@@ -250,7 +252,8 @@ new file mode 100644
 +	vec.iov_base = info.map_addr;
 +	vec.iov_len = huge_page_size;
 +
-+	ret = sys_process_madvise(self->remote_pidfd, &vec, 1, MADV_COLLAPSE, 0);
++	ret = sys_process_madvise(self->remote_pidfd, &vec, 1, MADV_COLLAPSE,
++				  0);
 +	if (ret == -1) {
 +		if (errno == EINVAL)
 +			SKIP(return, "PROCESS_MADV_ADVISE is not supported.\n");
@@ -269,12 +272,18 @@ new file mode 100644
 + */
 +TEST_F(process_madvise, exited_process_pidfd)
 +{
++	const unsigned long pagesize = self->page_size;
 +	struct iovec vec;
++	char *map;
 +	ssize_t ret;
-+	int pidfd;
 +
-+	vec.iov_base = (void *)0x1234;
-+	vec.iov_len = 4096;
++	map = mmap(NULL, pagesize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
++		   0);
++	if (map == MAP_FAILED)
++		SKIP(return, "mmap failed, not enough memory.\n");
++
++	vec.iov_base = map;
++	vec.iov_len = pagesize;
 +
 +	/*
 +	 * Using a pidfd for a process that has already exited should fail
@@ -286,16 +295,16 @@ new file mode 100644
 +	if (self->child_pid == 0)
 +		exit(0);
 +
-+	pidfd = syscall(__NR_pidfd_open, self->child_pid, 0);
-+	ASSERT_GE(pidfd, 0);
++	self->remote_pidfd = syscall(__NR_pidfd_open, self->child_pid, 0);
++	ASSERT_GE(self->remote_pidfd, 0);
 +
 +	/* Wait for the child to ensure it has terminated. */
 +	waitpid(self->child_pid, NULL, 0);
 +
-+	ret = sys_process_madvise(pidfd, &vec, 1, MADV_DONTNEED, 0);
++	ret = sys_process_madvise(self->remote_pidfd, &vec, 1, MADV_DONTNEED,
++				  0);
 +	ASSERT_EQ(ret, -1);
 +	ASSERT_EQ(errno, ESRCH);
-+	close(pidfd);
 +}
 +
 +/*
@@ -304,11 +313,18 @@ new file mode 100644
 + */
 +TEST_F(process_madvise, bad_pidfd)
 +{
++	const unsigned long pagesize = self->page_size;
 +	struct iovec vec;
++	char *map;
 +	ssize_t ret;
 +
-+	vec.iov_base = (void *)0x1234;
-+	vec.iov_len = 4096;
++	map = mmap(NULL, pagesize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
++		   0);
++	if (map == MAP_FAILED)
++		SKIP(return, "mmap failed, not enough memory.\n");
++
++	vec.iov_base = map;
++	vec.iov_len = pagesize;
 +
 +	/* Using an invalid fd number (-1) should fail with EBADF. */
 +	ret = sys_process_madvise(-1, &vec, 1, MADV_DONTNEED, 0);
@@ -322,6 +338,34 @@ new file mode 100644
 +	ret = sys_process_madvise(STDIN_FILENO, &vec, 1, MADV_DONTNEED, 0);
 +	ASSERT_EQ(ret, -1);
 +	ASSERT_EQ(errno, EBADF);
++}
++
++/*
++ * Test that process_madvise() rejects vlen > UIO_MAXIOV.
++ * The kernel should return -EINVAL when the number of iovecs exceeds 1024.
++ */
++TEST_F(process_madvise, invalid_vlen)
++{
++	const unsigned long pagesize = self->page_size;
++	int pidfd = self->pidfd;
++	struct iovec vec;
++	char *map;
++	ssize_t ret;
++
++	map = mmap(NULL, pagesize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1,
++		   0);
++	if (map == MAP_FAILED)
++		SKIP(return, "mmap failed, not enough memory.\n");
++
++	vec.iov_base = map;
++	vec.iov_len = pagesize;
++
++	ret = sys_process_madvise(pidfd, &vec, 1025, MADV_DONTNEED, 0);
++	ASSERT_EQ(ret, -1);
++	ASSERT_EQ(errno, EINVAL);
++
++	/* Cleanup. */
++	ASSERT_EQ(munmap(map, pagesize), 0);
 +}
 +
 +/*
