@@ -1,0 +1,185 @@
+From: Brian Mak <makb@juniper.net>
+Subject: x86/kexec: carry forward the boot DTB on kexec
+Date: Tue, 5 Aug 2025 14:15:27 -0700
+
+Currently, the kexec_file_load syscall on x86 does not support passing a
+device tree blob to the new kernel.  Some embedded x86 systems use device
+trees.  On these systems, failing to pass a device tree to the new kernel
+causes a boot failure.
+
+To add support for this, we copy the behavior of ARM64 and PowerPC and
+copy the current boot's device tree blob for use in the new kernel.  We do
+this on x86 by passing the device tree blob as a setup_data entry in
+accordance with the x86 boot protocol.
+
+This behavior is gated behind the KEXEC_FILE_FORCE_DTB flag.
+
+Link: https://lkml.kernel.org/r/20250805211527.122367-3-makb@juniper.net
+Signed-off-by: Brian Mak <makb@juniper.net>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Rob Herring <robh@kernel.org>
+Cc: Saravana Kannan <saravanak@google.com>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/x86/kernel/kexec-bzimage64.c |   47 ++++++++++++++++++++++++++--
+ include/linux/kexec.h             |    5 ++
+ include/uapi/linux/kexec.h        |    4 ++
+ kernel/kexec_file.c               |    1 
+ 4 files changed, 53 insertions(+), 4 deletions(-)
+
+--- a/arch/x86/kernel/kexec-bzimage64.c~x86-kexec-carry-forward-the-boot-dtb-on-kexec
++++ a/arch/x86/kernel/kexec-bzimage64.c
+@@ -16,6 +16,8 @@
+ #include <linux/kexec.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
++#include <linux/libfdt.h>
++#include <linux/of_fdt.h>
+ #include <linux/efi.h>
+ #include <linux/random.h>
+ 
+@@ -212,6 +214,28 @@ setup_efi_state(struct boot_params *para
+ }
+ #endif /* CONFIG_EFI */
+ 
++#ifdef CONFIG_OF_FLATTREE
++static void setup_dtb(struct boot_params *params,
++		      unsigned long params_load_addr,
++		      unsigned int dtb_setup_data_offset)
++{
++	struct setup_data *sd = (void *)params + dtb_setup_data_offset;
++	unsigned long setup_data_phys, dtb_len;
++
++	dtb_len = fdt_totalsize(initial_boot_params);
++	sd->type = SETUP_DTB;
++	sd->len = dtb_len;
++
++	/* Carry over current boot DTB with setup_data */
++	memcpy(sd->data, initial_boot_params, dtb_len);
++
++	/* Add setup data */
++	setup_data_phys = params_load_addr + dtb_setup_data_offset;
++	sd->next = params->hdr.setup_data;
++	params->hdr.setup_data = setup_data_phys;
++}
++#endif /* CONFIG_OF_FLATTREE */
++
+ static void
+ setup_ima_state(const struct kimage *image, struct boot_params *params,
+ 		unsigned long params_load_addr,
+@@ -336,6 +360,17 @@ setup_boot_parameters(struct kimage *ima
+ 			sizeof(struct efi_setup_data);
+ #endif
+ 
++#ifdef CONFIG_OF_FLATTREE
++	if (image->force_dtb && initial_boot_params) {
++		setup_dtb(params, params_load_addr, setup_data_offset);
++		setup_data_offset += sizeof(struct setup_data) +
++				     fdt_totalsize(initial_boot_params);
++	} else {
++		pr_debug("Not carrying over DTB, force_dtb = %d\n",
++			 image->force_dtb);
++	}
++#endif
++
+ 	if (IS_ENABLED(CONFIG_IMA_KEXEC)) {
+ 		/* Setup IMA log buffer state */
+ 		setup_ima_state(image, params, params_load_addr,
+@@ -529,6 +564,12 @@ static void *bzImage64_load(struct kimag
+ 				sizeof(struct setup_data) +
+ 				RNG_SEED_LENGTH;
+ 
++#ifdef CONFIG_OF_FLATTREE
++	if (image->force_dtb && initial_boot_params)
++		kbuf.bufsz += sizeof(struct setup_data) +
++			      fdt_totalsize(initial_boot_params);
++#endif
++
+ 	if (IS_ENABLED(CONFIG_IMA_KEXEC))
+ 		kbuf.bufsz += sizeof(struct setup_data) +
+ 			      sizeof(struct ima_setup_data);
+@@ -537,7 +578,7 @@ static void *bzImage64_load(struct kimag
+ 		kbuf.bufsz += sizeof(struct setup_data) +
+ 			      sizeof(struct kho_data);
+ 
+-	params = kzalloc(kbuf.bufsz, GFP_KERNEL);
++	params = kvzalloc(kbuf.bufsz, GFP_KERNEL);
+ 	if (!params)
+ 		return ERR_PTR(-ENOMEM);
+ 	efi_map_offset = params_cmdline_sz;
+@@ -647,7 +688,7 @@ static void *bzImage64_load(struct kimag
+ 	return ldata;
+ 
+ out_free_params:
+-	kfree(params);
++	kvfree(params);
+ 	return ERR_PTR(ret);
+ }
+ 
+@@ -659,7 +700,7 @@ static int bzImage64_cleanup(void *loade
+ 	if (!ldata)
+ 		return 0;
+ 
+-	kfree(ldata->bootparams_buf);
++	kvfree(ldata->bootparams_buf);
+ 	ldata->bootparams_buf = NULL;
+ 
+ 	return 0;
+--- a/include/linux/kexec.h~x86-kexec-carry-forward-the-boot-dtb-on-kexec
++++ a/include/linux/kexec.h
+@@ -395,6 +395,9 @@ struct kimage {
+ 
+ 	/* Information for loading purgatory */
+ 	struct purgatory_info purgatory_info;
++
++	/* Force carrying over the DTB from the current boot */
++	bool force_dtb;
+ #endif
+ 
+ #ifdef CONFIG_CRASH_HOTPLUG
+@@ -461,7 +464,7 @@ bool kexec_load_permitted(int kexec_imag
+ /* List of defined/legal kexec file flags */
+ #define KEXEC_FILE_FLAGS	(KEXEC_FILE_UNLOAD | KEXEC_FILE_ON_CRASH | \
+ 				 KEXEC_FILE_NO_INITRAMFS | KEXEC_FILE_DEBUG | \
+-				 KEXEC_FILE_NO_CMA)
++				 KEXEC_FILE_NO_CMA | KEXEC_FILE_FORCE_DTB)
+ 
+ /* flag to track if kexec reboot is in progress */
+ extern bool kexec_in_progress;
+--- a/include/uapi/linux/kexec.h~x86-kexec-carry-forward-the-boot-dtb-on-kexec
++++ a/include/uapi/linux/kexec.h
+@@ -22,12 +22,16 @@
+  * KEXEC_FILE_ON_CRASH : Load/unload operation belongs to kdump image.
+  * KEXEC_FILE_NO_INITRAMFS : No initramfs is being loaded. Ignore the initrd
+  *                           fd field.
++ * KEXEC_FILE_FORCE_DTB : Force carrying over the current boot's DTB to the new
++ *                        kernel on x86. This is already the default behavior on
++ *                        some other architectures, like ARM64 and PowerPC.
+  */
+ #define KEXEC_FILE_UNLOAD	0x00000001
+ #define KEXEC_FILE_ON_CRASH	0x00000002
+ #define KEXEC_FILE_NO_INITRAMFS	0x00000004
+ #define KEXEC_FILE_DEBUG	0x00000008
+ #define KEXEC_FILE_NO_CMA	0x00000010
++#define KEXEC_FILE_FORCE_DTB	0x00000020
+ 
+ /* These values match the ELF architecture values.
+  * Unless there is a good reason that should continue to be the case.
+--- a/kernel/kexec_file.c~x86-kexec-carry-forward-the-boot-dtb-on-kexec
++++ a/kernel/kexec_file.c
+@@ -255,6 +255,7 @@ kimage_file_prepare_segments(struct kima
+ 	}
+ 
+ 	image->no_cma = !!(flags & KEXEC_FILE_NO_CMA);
++	image->force_dtb = flags & KEXEC_FILE_FORCE_DTB;
+ 
+ 	if (cmdline_len) {
+ 		image->cmdline_buf = memdup_user(cmdline_ptr, cmdline_len);
+_
