@@ -1,0 +1,142 @@
+From: Vitaly Wool <vitaly.wool@konsulko.se>
+Subject: rust: support large alignments in allocations
+Date: Wed, 6 Aug 2025 14:55:52 +0200
+
+Add support for large (> PAGE_SIZE) alignments in Rust allocators.  All
+the preparations on the C side are already done, we just need to add
+bindings for <alloc>_node_align() functions and start using those.
+
+Link: https://lkml.kernel.org/r/20250806125552.1727073-1-vitaly.wool@konsulko.se
+Signed-off-by: Vitaly Wool <vitaly.wool@konsulko.se>
+Acked-by: Danilo Krummrich <dakr@kernel.org>
+Acked-by: Alice Ryhl <aliceryhl@google.com>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kent Overstreet <kent.overstreet@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ rust/helpers/slab.c            |   10 ++++++----
+ rust/helpers/vmalloc.c         |    5 +++--
+ rust/kernel/alloc/allocator.rs |   30 +++++++++---------------------
+ 3 files changed, 18 insertions(+), 27 deletions(-)
+
+--- a/rust/helpers/slab.c~rust-support-large-alignments-in-allocations
++++ a/rust/helpers/slab.c
+@@ -3,13 +3,15 @@
+ #include <linux/slab.h>
+ 
+ void * __must_check __realloc_size(2)
+-rust_helper_krealloc_node(const void *objp, size_t new_size, gfp_t flags, int node)
++rust_helper_krealloc_node_align(const void *objp, size_t new_size, unsigned long align,
++				gfp_t flags, int node)
+ {
+-	return krealloc_node(objp, new_size, flags, node);
++	return krealloc_node_align(objp, new_size, align, flags, node);
+ }
+ 
+ void * __must_check __realloc_size(2)
+-rust_helper_kvrealloc_node(const void *p, size_t size, gfp_t flags, int node)
++rust_helper_kvrealloc_node_align(const void *p, size_t size, unsigned long align,
++				 gfp_t flags, int node)
+ {
+-	return kvrealloc_node(p, size, flags, node);
++	return kvrealloc_node_align(p, size, align, flags, node);
+ }
+--- a/rust/helpers/vmalloc.c~rust-support-large-alignments-in-allocations
++++ a/rust/helpers/vmalloc.c
+@@ -3,7 +3,8 @@
+ #include <linux/vmalloc.h>
+ 
+ void * __must_check __realloc_size(2)
+-rust_helper_vrealloc_node(const void *p, size_t size, gfp_t flags, int node)
++rust_helper_vrealloc_node_align(const void *p, size_t size, unsigned long align,
++				gfp_t flags, int node)
+ {
+-	return vrealloc_node(p, size, flags, node);
++	return vrealloc_node_align(p, size, align, flags, node);
+ }
+--- a/rust/kernel/alloc/allocator.rs~rust-support-large-alignments-in-allocations
++++ a/rust/kernel/alloc/allocator.rs
+@@ -15,7 +15,6 @@ use core::ptr::NonNull;
+ 
+ use crate::alloc::{AllocError, Allocator, NumaNode};
+ use crate::bindings;
+-use crate::pr_warn;
+ 
+ /// The contiguous kernel allocator.
+ ///
+@@ -56,25 +55,26 @@ fn aligned_size(new_layout: Layout) -> u
+ 
+ /// # Invariants
+ ///
+-/// One of the following: `krealloc_node`, `vrealloc_node`, `kvrealloc_node`.
++/// One of the following: `krealloc_node_align`, `vrealloc_node_align`, `kvrealloc_node_align`.
+ struct ReallocFunc(
+     unsafe extern "C" fn(
+         *const crate::ffi::c_void,
+         usize,
++        crate::ffi::c_ulong,
+         u32,
+         crate::ffi::c_int,
+     ) -> *mut crate::ffi::c_void,
+ );
+ 
+ impl ReallocFunc {
+-    // INVARIANT: `krealloc_node` satisfies the type invariants.
+-    const KREALLOC: Self = Self(bindings::krealloc_node);
++    // INVARIANT: `krealloc_node_align` satisfies the type invariants.
++    const KREALLOC: Self = Self(bindings::krealloc_node_align);
+ 
+-    // INVARIANT: `vrealloc_node` satisfies the type invariants.
+-    const VREALLOC: Self = Self(bindings::vrealloc_node);
++    // INVARIANT: `vrealloc_node_align` satisfies the type invariants.
++    const VREALLOC: Self = Self(bindings::vrealloc_node_align);
+ 
+-    // INVARIANT: `kvrealloc_node` satisfies the type invariants.
+-    const KVREALLOC: Self = Self(bindings::kvrealloc_node);
++    // INVARIANT: `kvrealloc_node_align` satisfies the type invariants.
++    const KVREALLOC: Self = Self(bindings::kvrealloc_node_align);
+ 
+     /// # Safety
+     ///
+@@ -116,7 +116,7 @@ impl ReallocFunc {
+         // - Those functions provide the guarantees of this function.
+         let raw_ptr = unsafe {
+             // If `size == 0` and `ptr != NULL` the memory behind the pointer is freed.
+-            self.0(ptr.cast(), size, flags.0, nid.0).cast()
++            self.0(ptr.cast(), size, layout.align(), flags.0, nid.0).cast()
+         };
+ 
+         let ptr = if size == 0 {
+@@ -160,12 +160,6 @@ unsafe impl Allocator for Vmalloc {
+         flags: Flags,
+         nid: NumaNode,
+     ) -> Result<NonNull<[u8]>, AllocError> {
+-        // TODO: Support alignments larger than PAGE_SIZE.
+-        if layout.align() > bindings::PAGE_SIZE {
+-            pr_warn!("Vmalloc does not support alignments larger than PAGE_SIZE yet.\n");
+-            return Err(AllocError);
+-        }
+-
+         // SAFETY: If not `None`, `ptr` is guaranteed to point to valid memory, which was previously
+         // allocated with this `Allocator`.
+         unsafe { ReallocFunc::VREALLOC.call(ptr, layout, old_layout, flags, nid) }
+@@ -185,12 +179,6 @@ unsafe impl Allocator for KVmalloc {
+         flags: Flags,
+         nid: NumaNode,
+     ) -> Result<NonNull<[u8]>, AllocError> {
+-        // TODO: Support alignments larger than PAGE_SIZE.
+-        if layout.align() > bindings::PAGE_SIZE {
+-            pr_warn!("KVmalloc does not support alignments larger than PAGE_SIZE yet.\n");
+-            return Err(AllocError);
+-        }
+-
+         // SAFETY: If not `None`, `ptr` is guaranteed to point to valid memory, which was previously
+         // allocated with this `Allocator`.
+         unsafe { ReallocFunc::KVREALLOC.call(ptr, layout, old_layout, flags, nid) }
+_

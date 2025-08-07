@@ -1,0 +1,118 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm, swap: prefer nonfull over free clusters
+Date: Thu, 7 Aug 2025 00:17:48 +0800
+
+We prefer a free cluster over a nonfull cluster whenever a CPU local
+cluster is drained to respect the SSD discard behavior [1].  It's not a
+best practice for non-discarding devices.  And this is causing a higher
+fragmentation rate.
+
+So for a non-discarding device, prefer nonfull over free clusters.  This
+reduces the fragmentation issue by a lot.
+
+Testing with make -j96, defconfig, using 64k mTHP, 8G ZRAM:
+
+Before: sys time: 6176.34s  64kB/swpout: 1659757  64kB/swpout_fallback: 139503
+After:  sys time: 6194.11s  64kB/swpout: 1689470  64kB/swpout_fallback: 56147
+
+Testing with make -j96, defconfig, using 64k mTHP, 10G ZRAM:
+
+After:  sys time: 5531.49s  64kB/swpout: 1791142  64kB/swpout_fallback: 17676
+After:  sys time: 5587.53s  64kB/swpout: 1811598  64kB/swpout_fallback: 0
+
+Performance is basically unchanged, and the large allocation failure rate
+is lower. Enabling all mTHP sizes showed a more significant result.
+
+Using the same test setup with 10G ZRAM and enabling all mTHP sizes:
+
+128kB swap failure rate:
+Before: swpout:451599 swpout_fallback:54525
+After:  swpout:502710 swpout_fallback:870
+
+256kB swap failure rate:
+Before: swpout:63652  swpout_fallback:2708
+After:  swpout:65913  swpout_fallback:20
+
+512kB swap failure rate:
+Before: swpout:11663  swpout_fallback:1767
+After:  swpout:14480  swpout_fallback:6
+
+2M swap failure rate:
+Before: swpout:24     swpout_fallback:1442
+After:  swpout:1329   swpout_fallback:7
+
+The success rate of large allocations is much higher.
+
+Link: https://lore.kernel.org/linux-mm/87v8242vng.fsf@yhuang6-desk2.ccr.corp.intel.com/ [1]
+Link: https://lkml.kernel.org/r/20250806161748.76651-4-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Acked-by: Chris Li <chrisl@kernel.org>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/swapfile.c |   38 ++++++++++++++++++++++++++++----------
+ 1 file changed, 28 insertions(+), 10 deletions(-)
+
+--- a/mm/swapfile.c~mm-swap-prefer-nonfull-over-free-clusters
++++ a/mm/swapfile.c
+@@ -908,18 +908,20 @@ static unsigned long cluster_alloc_swap_
+ 	}
+ 
+ new_cluster:
+-	ci = isolate_lock_cluster(si, &si->free_clusters);
+-	if (ci) {
+-		found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
+-						order, usage);
+-		if (found)
+-			goto done;
++	/*
++	 * If the device need discard, prefer new cluster over nonfull
++	 * to spread out the writes.
++	 */
++	if (si->flags & SWP_PAGE_DISCARD) {
++		ci = isolate_lock_cluster(si, &si->free_clusters);
++		if (ci) {
++			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
++							order, usage);
++			if (found)
++				goto done;
++		}
+ 	}
+ 
+-	/* Try reclaim from full clusters if free clusters list is drained */
+-	if (vm_swap_full())
+-		swap_reclaim_full_clusters(si, false);
+-
+ 	if (order < PMD_ORDER) {
+ 		while ((ci = isolate_lock_cluster(si, &si->nonfull_clusters[order]))) {
+ 			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
+@@ -927,7 +929,23 @@ new_cluster:
+ 			if (found)
+ 				goto done;
+ 		}
++	}
++
++	if (!(si->flags & SWP_PAGE_DISCARD)) {
++		ci = isolate_lock_cluster(si, &si->free_clusters);
++		if (ci) {
++			found = alloc_swap_scan_cluster(si, ci, cluster_offset(si, ci),
++							order, usage);
++			if (found)
++				goto done;
++		}
++	}
+ 
++	/* Try reclaim full clusters if free and nonfull lists are drained */
++	if (vm_swap_full())
++		swap_reclaim_full_clusters(si, false);
++
++	if (order < PMD_ORDER) {
+ 		/*
+ 		 * Scan only one fragment cluster is good enough. Order 0
+ 		 * allocation will surely success, and large allocation
+_

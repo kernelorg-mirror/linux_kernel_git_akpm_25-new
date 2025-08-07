@@ -1,0 +1,105 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm, swap: only scan one cluster in fragment list
+Date: Thu, 7 Aug 2025 00:17:46 +0800
+
+Patch series "mm, swap: improve cluster scan strategy", v2.
+
+This series improves the large allocation performance and reduces the
+failure rate.  Some design of the cluster alloactor was later found to be
+improvable after thorough testing.
+
+The allocator spent too much effort scanning the fragment list, which is
+not helpful in most setups, but causes serious contention of the list lock
+(si->lock).  Besides, the allocator prefers free clusters when searching
+for a new cluster due to historical reasons, which causes fragmentation
+issues.
+
+So make the allocator only scan one cluster for high order allocation, and
+prefer nonfull cluster.  This both improves the performance and reduces
+fragmentation.
+
+For example, build kernel test with make -j96 and 10G ZRAM with 64kB mTHP
+enabled shows better performance and a lower failure rate:
+
+Before: sys time: 11609.69s  64kB/swpout: 1787051  64kB/swpout_fallback: 20917
+After:  sys time: 5587.53s   64kB/swpout: 1811598  64kB/swpout_fallback: 0
+
+System time is cut in half, and the failure rate drops to zero. Larger
+allocations in a hybrid workload also showed a major improvement:
+
+512kB swap failure rate:
+Before: swpout:11663  swpout_fallback:1767
+After:  swpout:14480  swpout_fallback:6
+
+2M swap failure rate:
+Before: swpout:24     swpout_fallback:1442
+After:  swpout:1329   swpout_fallback:7
+
+
+This patch (of 3):
+
+Fragment clusters were mostly failing high order allocation already.  The
+reason we scan it through now is that a swap slot may get freed without
+releasing the swap cache, so a swap map entry will end up in HAS_CACHE
+only status, and the cluster won't be moved back to non-full or free
+cluster list.  This may cause a higher allocation failure rate.
+
+Usually only !SWP_SYNCHRONOUS_IO devices may have a large number of slots
+stuck in HAS_CACHE only status.  Because when a !SWP_SYNCHRONOUS_IO
+device's usage is low (!vm_swap_full()), it will try to lazy free the swap
+cache.
+
+But this fragment list scan out is a bit overkill.  Fragmentation is only
+an issue for the allocator when the device is getting full, and by that
+time, swap will be releasing the swap cache aggressively already.  Only
+scan one fragment cluster at a time is good enough to reclaim already
+pinned slots, and move the cluster back to nonfull.
+
+And besides, only high order allocation requires iterating over the list,
+order 0 allocation will succeed on the first attempt.  And high order
+allocation failure isn't a serious problem.
+
+So the iteration of fragment clusters is trivial, but it will slow down
+large allocation by a lot when the fragment cluster list is long.  So it's
+better to drop this fragment cluster iteration design.
+
+Test on a 48c96t system, build linux kernel using 10G ZRAM, make -j48,
+defconfig with 768M cgroup memory limit, on top of tmpfs, 4K folio only:
+
+Before: sys time: 4432.56s
+After:  sys time: 4430.18s
+
+Change to make -j96, 2G memory limit, 64kB mTHP enabled, and 10G ZRAM:
+
+Before: sys time: 11609.69s  64kB/swpout: 1787051  64kB/swpout_fallback: 20917
+After:  sys time: 5572.85s   64kB/swpout: 1797612  64kB/swpout_fallback: 19254
+
+Change to 8G ZRAM:
+
+Before: sys time: 21524.35s  64kB/swpout: 1687142  64kB/swpout_fallback: 128496
+After:  sys time: 6278.45s   64kB/swpout: 1679127  64kB/swpout_fallback: 130942
+
+Change to use 10G brd device with SWP_SYNCHRONOUS_IO flag removed:
+
+Before: sys time: 7393.50s  64kB/swpout:1788246  swpout_fallback: 0
+After:  sys time: 7399.88s  64kB/swpout:1784257  swpout_fallback: 0
+
+Change to use 8G brd device with SWP_SYNCHRONOUS_IO flag removed:
+
+Before: sys time: 26292.26s 64kB/swpout:1645236  swpout_fallback: 138945
+After:  sys time: 9463.16s  64kB/swpout:1581376  swpout_fallback: 259979
+
+The performance is a lot better for large folios, and the large order
+allocation failure rate is only very slightly higher or unchanged even
+for !SWP_SYNCHRONOUS_IO devices high pressure.
+
+Link: https://lkml.kernel.org/r/20250806161748.76651-1-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250806161748.76651-2-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
