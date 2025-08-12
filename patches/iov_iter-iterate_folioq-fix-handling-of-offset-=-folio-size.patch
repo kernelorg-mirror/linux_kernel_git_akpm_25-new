@@ -1,0 +1,76 @@
+From: Dominique Martinet <asmadeus@codewreck.org>
+Subject: iov_iter: iterate_folioq: fix handling of offset >= folio size
+Date: Mon, 11 Aug 2025 16:39:05 +0900
+
+So we've had this regression in 9p for..  almost a year, which is way too
+long, but there was no "easy" reproducer until yesterday (thank you
+again!!)
+
+It turned out to be a bug with iov_iter on folios,
+iov_iter_get_pages_alloc2() would advance the iov_iter correctly up to the
+end edge of a folio and the later copy_to_iter() fails on the
+iterate_folioq() bug.
+
+Happy to consider alternative ways of fixing this, now there's a
+reproducer it's all much clearer; for the bug to be visible we basically
+need to make and IO with non-contiguous folios in the iov_iter which is
+not obvious to test with synthetic VMs, with size that triggers a
+zero-copy read followed by a non-zero-copy read.
+
+It's apparently possible to get an iov forwarded all the way up to the end
+of the current page we're looking at, e.g.
+
+(gdb) p *iter
+$24 = {iter_type = 4 '\004', nofault = false, data_source = false, iov_offset = 4096, {__ubuf_iovec = {
+      iov_base = 0xffff88800f5bc000, iov_len = 655}, {{__iov = 0xffff88800f5bc000, kvec = 0xffff88800f5bc000,
+        bvec = 0xffff88800f5bc000, folioq = 0xffff88800f5bc000, xarray = 0xffff88800f5bc000,
+        ubuf = 0xffff88800f5bc000}, count = 655}}, {nr_segs = 2, folioq_slot = 2 '\002', xarray_start = 2}}
+
+Where iov_offset is 4k with 4k-sized folios
+
+This should have been because we're only in the 2nd slot and there's
+another one after this, but iterate_folioq should not try to map a folio
+that skips the whole size, and more importantly part here does not end up
+zero (because 'PAGE_SIZE - skip % PAGE_SIZE' ends up PAGE_SIZE and not
+zero..), so skip forward to the "advance to next folio" code.
+
+Link: https://lkml.kernel.org/r/20250811-iot_iter_folio-v1-0-d9c223adf93c@codewreck.org
+Link: https://lkml.kernel.org/r/20250811-iot_iter_folio-v1-1-d9c223adf93c@codewreck.org
+Link: https://lkml.kernel.org/r/D4LHHUNLG79Y.12PI0X6BEHRHW@mbosch.me/
+Fixes: db0aa2e9566f ("mm: Define struct folio_queue and ITER_FOLIOQ to handle a sequence of folios")
+Signed-off-by: Dominique Martinet <asmadeus@codewreck.org>
+Reported-by: Maximilian Bosch <maximilian@mbosch.me>
+Reported-by: Ryan Lahfa <ryan@lahfa.xyz>
+Reported-by: Christian Theune <ct@flyingcircus.io>
+Reported-by: Arnout Engelen <arnout@bzzt.net>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Howells <dhowells@redhat.com>
+Cc: Ryan Lahfa <ryan@lahfa.xyz>
+Cc: <stable@vger.kernel.org>	[v6.12+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/iov_iter.h |    3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/include/linux/iov_iter.h~iov_iter-iterate_folioq-fix-handling-of-offset-=-folio-size
++++ a/include/linux/iov_iter.h
+@@ -168,6 +168,8 @@ size_t iterate_folioq(struct iov_iter *i
+ 			break;
+ 
+ 		fsize = folioq_folio_size(folioq, slot);
++		if (skip >= fsize)
++			goto next;
+ 		base = kmap_local_folio(folio, skip);
+ 		part = umin(len, PAGE_SIZE - skip % PAGE_SIZE);
+ 		remain = step(base, progress, part, priv, priv2);
+@@ -177,6 +179,7 @@ size_t iterate_folioq(struct iov_iter *i
+ 		progress += consumed;
+ 		skip += consumed;
+ 		if (skip >= fsize) {
++next:
+ 			skip = 0;
+ 			slot++;
+ 			if (slot == folioq_nr_slots(folioq) && folioq->next) {
+_
