@@ -1,0 +1,152 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/mremap: allow multi-VMA move when filesystem uses thp_get_unmapped_area
+Date: Sun, 3 Aug 2025 12:11:21 +0100
+
+The multi-VMA move functionality introduced in commit d23cb648e365
+("mm/mremap: permit mremap() move of multiple VMA") doesn't allow moves of
+file-backed mappings which specify a custom f_op->get_unmapped_area
+handler excepting hugetlb and shmem.
+
+We expand this to include thp_get_unmapped_area to support file-backed
+mappings for filesystems which use large folios.
+
+Additionally, when the first VMA in a range is not compatible with a
+multi-VMA move, instead of moving the first VMA and returning an error,
+this series results in us not moving anything and returning an error
+immediately.
+
+Examining this second change in detail:
+
+The semantics of multi-VMA moves in mremap() very clearly indicate that a
+failure can result in a partial move of VMAs.
+
+This is in line with other aggregate operations within the kernel, which
+share these semantics.
+
+There are two classes of failures we're concerned with - eligiblity for
+mutli-VMA move, and transient failures that would occur even if the user
+individually moved each VMA.
+
+The latter is due to out-of-memory conditions (which, given the
+allocations involved are small, would likely be fatal in any case), or
+hitting the mapping limit.
+
+Regardless of the cause, transient issues would be fatal anyway, so it
+isn't really material which VMAs succeeded at being moved or not.
+
+However with when it comes to multi-VMA move eligiblity, we face another
+issue - we must allow a single VMA to succeed regardless of this
+eligiblity (as, of course, it is not a multi-VMA move) - but we must then
+fail multi-VMA operations.
+
+The two means by which VMAs may fail the eligbility test are - the VMAs
+being UFFD-armed, or the VMA being file-backed and providing its own
+f_op->get_unmapped_area() helper (because this may result in MREMAP_FIXED
+being disregarded), excepting those known to correctly handle
+MREMAP_FIXED.
+
+It is therefore conceivable that a user could erroneously try to use this
+functionality in these instances, and would prefer to not perform any move
+at all should that occur.
+
+This series therefore avoids any move of subsequent VMAs should the first
+be multi-VMA move ineligble and the input span exceeds that of the first
+VMA.
+
+We also add detailed test logic to assert that multi VMA move with
+ineligible VMAs functions as expected.
+
+
+This patch (of 3):
+
+We currently restrict multi-VMA move to avoid filesystems or drivers which
+provide a custom f_op->get_unmapped_area handler unless it is known to
+correctly handle MREMAP_FIXED.
+
+We do this so we do not get unexpected result when moving from one area to
+another (for instance, if the handler would align things resulting in the
+moved VMAs having different gaps than the original mapping).
+
+More and more filesystems are moving to using large folios, and typically
+do so (in part) by setting f_op->get_unmapped_area to
+thp_get_unmapped_area.
+
+When mremap() invokes the file system's get_unmapped MREMAP_FIXED, it does
+so via get_unmapped_area(), called in vrm_set_new_addr().  In order to do
+so, it converts the MREMAP_FIXED flag to a MAP_FIXED flag and passes this
+to the unmapped area handler.
+
+The __get_unmapped_area() function (called by get_unmapped_area()) in turn
+invokes the filesystem or driver's f_op->get_unmapped_area() handler.
+
+Therefore this is a point at which thp_get_unmapped_area() may be called
+(also, this is the case for anonymous mappings where the size is huge page
+aligned).
+
+thp_get_unmapped_area() calls thp_get_unmapped_area_vmflags() and
+__thp_get_unmapped_area() in turn (falling back to
+mm_get_unmapped_area_vm_flags() which is known to handle MAP_FIXED
+correctly).
+
+The __thp_get_unmapped_area() function in turn does nothing to change the
+address hint, nor the MAP_FIXED flag, only adjusting alignment parameters.
+It hten calls mm_get_unmapped_area_vmflags(), and in turn arch-specific
+unmapped area functions, all of which honour MAP_FIXED correctly.
+
+Therefore, we can safely add thp_get_unmapped_area to the known-good
+handlers.
+
+Link: https://lkml.kernel.org/r/cover.1754218667.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/4f2542340c29c84d3d470b0c605e916b192f6c81.1754218667.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/mremap.c |   20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+--- a/mm/mremap.c~mm-mremap-allow-multi-vma-move-when-filesystem-uses-thp_get_unmapped_area
++++ a/mm/mremap.c
+@@ -1620,7 +1620,7 @@ static void notify_uffd(struct vma_remap
+ 
+ static bool vma_multi_allowed(struct vm_area_struct *vma)
+ {
+-	struct file *file;
++	struct file *file = vma->vm_file;
+ 
+ 	/*
+ 	 * We can't support moving multiple uffd VMAs as notify requires
+@@ -1633,15 +1633,17 @@ static bool vma_multi_allowed(struct vm_
+ 	 * Custom get unmapped area might result in MREMAP_FIXED not
+ 	 * being obeyed.
+ 	 */
+-	file = vma->vm_file;
+-	if (file && !vma_is_shmem(vma) && !is_vm_hugetlb_page(vma)) {
+-		const struct file_operations *fop = file->f_op;
++	if (!file || !file->f_op->get_unmapped_area)
++		return true;
++	/* Known good. */
++	if (vma_is_shmem(vma))
++		return true;
++	if (is_vm_hugetlb_page(vma))
++		return true;
++	if (file->f_op->get_unmapped_area == thp_get_unmapped_area)
++		return true;
+ 
+-		if (fop->get_unmapped_area)
+-			return false;
+-	}
+-
+-	return true;
++	return false;
+ }
+ 
+ static int check_prep_vma(struct vma_remap_struct *vrm)
+_
