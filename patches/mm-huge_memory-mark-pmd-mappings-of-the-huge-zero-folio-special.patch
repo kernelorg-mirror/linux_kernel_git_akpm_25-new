@@ -1,0 +1,142 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/huge_memory: mark PMD mappings of the huge zero folio special
+Date: Mon, 11 Aug 2025 13:26:25 +0200
+
+The huge zero folio is refcounted (+mapcounted -- is that a word?)
+differently than "normal" folios, similarly (but different) to the
+ordinary shared zeropage.
+
+For this reason, we special-case these pages in
+vm_normal_page*/vm_normal_folio*, and only allow selected callers to still
+use them (e.g., GUP can still take a reference on them).
+
+vm_normal_page_pmd() already filters out the huge zero folio, to indicate
+it a special (return NULL).  However, so far we are not making use of
+pmd_special() on architectures that support it
+(CONFIG_ARCH_HAS_PTE_SPECIAL), like we would with the ordinary shared
+zeropage.
+
+Let's mark PMD mappings of the huge zero folio similarly as special, so we
+can avoid the manual check for the huge zero folio with
+CONFIG_ARCH_HAS_PTE_SPECIAL next, and only perform the check on
+!CONFIG_ARCH_HAS_PTE_SPECIAL.
+
+In copy_huge_pmd(), where we have a manual pmd_special() check to handle
+PFNMAP, we have to manually rule out the huge zero folio.  That code needs
+a serious cleanup, but that's something for another day.
+
+While at it, update the doc regarding the shared zero folios.
+
+No functional change intended: vm_normal_page_pmd() still returns NULL
+when it encounters the huge zero folio.
+
+Link: https://lkml.kernel.org/r/20250811112631.759341-6-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Vrabel <david.vrabel@citrix.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Juegren Gross <jgross@suse.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Stefano Stabellini <sstabellini@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |    8 ++++++--
+ mm/memory.c      |   15 ++++++++++-----
+ 2 files changed, 16 insertions(+), 7 deletions(-)
+
+--- a/mm/huge_memory.c~mm-huge_memory-mark-pmd-mappings-of-the-huge-zero-folio-special
++++ a/mm/huge_memory.c
+@@ -1309,6 +1309,7 @@ static void set_huge_zero_folio(pgtable_
+ {
+ 	pmd_t entry;
+ 	entry = folio_mk_pmd(zero_folio, vma->vm_page_prot);
++	entry = pmd_mkspecial(entry);
+ 	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+ 	set_pmd_at(mm, haddr, pmd, entry);
+ 	mm_inc_nr_ptes(mm);
+@@ -1418,7 +1419,9 @@ static vm_fault_t insert_pmd(struct vm_a
+ 	if (fop.is_folio) {
+ 		entry = folio_mk_pmd(fop.folio, vma->vm_page_prot);
+ 
+-		if (!is_huge_zero_folio(fop.folio)) {
++		if (is_huge_zero_folio(fop.folio)) {
++			entry = pmd_mkspecial(entry);
++		} else {
+ 			folio_get(fop.folio);
+ 			folio_add_file_rmap_pmd(fop.folio, &fop.folio->page, vma);
+ 			add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PMD_NR);
+@@ -1643,7 +1646,8 @@ int copy_huge_pmd(struct mm_struct *dst_
+ 	int ret = -ENOMEM;
+ 
+ 	pmd = pmdp_get_lockless(src_pmd);
+-	if (unlikely(pmd_present(pmd) && pmd_special(pmd))) {
++	if (unlikely(pmd_present(pmd) && pmd_special(pmd) &&
++		     !is_huge_zero_pmd(pmd))) {
+ 		dst_ptl = pmd_lock(dst_mm, dst_pmd);
+ 		src_ptl = pmd_lockptr(src_mm, src_pmd);
+ 		spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+--- a/mm/memory.c~mm-huge_memory-mark-pmd-mappings-of-the-huge-zero-folio-special
++++ a/mm/memory.c
+@@ -555,7 +555,14 @@ static void print_bad_pte(struct vm_area
+  *
+  * "Special" mappings do not wish to be associated with a "struct page" (either
+  * it doesn't exist, or it exists but they don't want to touch it). In this
+- * case, NULL is returned here. "Normal" mappings do have a struct page.
++ * case, NULL is returned here. "Normal" mappings do have a struct page and
++ * are ordinarily refcounted.
++ *
++ * Page mappings of the shared zero folios are always considered "special", as
++ * they are not ordinarily refcounted: neither the refcount nor the mapcount
++ * of these folios is adjusted when mapping them into user page tables.
++ * Selected page table walkers (such as GUP) can still identify mappings of the
++ * shared zero folios and work with the underlying "struct page".
+  *
+  * There are 2 broad cases. Firstly, an architecture may define a pte_special()
+  * pte bit, in which case this function is trivial. Secondly, an architecture
+@@ -585,9 +592,8 @@ static void print_bad_pte(struct vm_area
+  *
+  * VM_MIXEDMAP mappings can likewise contain memory with or without "struct
+  * page" backing, however the difference is that _all_ pages with a struct
+- * page (that is, those where pfn_valid is true) are refcounted and considered
+- * normal pages by the VM. The only exception are zeropages, which are
+- * *never* refcounted.
++ * page (that is, those where pfn_valid is true, except the shared zero
++ * folios) are refcounted and considered normal pages by the VM.
+  *
+  * The disadvantage is that pages are refcounted (which can be slower and
+  * simply not an option for some PFNMAP users). The advantage is that we
+@@ -667,7 +673,6 @@ struct page *vm_normal_page_pmd(struct v
+ {
+ 	unsigned long pfn = pmd_pfn(pmd);
+ 
+-	/* Currently it's only used for huge pfnmaps */
+ 	if (unlikely(pmd_special(pmd)))
+ 		return NULL;
+ 
+_

@@ -1,0 +1,195 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm: rename vm_ops->find_special_page() to vm_ops->find_normal_page()
+Date: Mon, 11 Aug 2025 13:26:31 +0200
+
+...  and hide it behind a kconfig option.  There is really no need for any
+!xen code to perform this check.
+
+The naming is a bit off: we want to find the "normal" page when a PTE was
+marked "special".  So it's really not "finding a special" page.
+
+Improve the documentation, and add a comment in the code where XEN ends up
+performing the pte_mkspecial() through a hypercall.  More details can be
+found in commit 923b2919e2c3 ("xen/gntdev: mark userspace PTEs as special
+on x86 PV guests").
+
+Link: https://lkml.kernel.org/r/20250811112631.759341-12-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Oscar Salvador <osalvador@suse.de>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
+Cc: David Vrabel <david.vrabel@citrix.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Juegren Gross <jgross@suse.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Stefano Stabellini <sstabellini@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/xen/Kconfig              |    1 +
+ drivers/xen/gntdev.c             |    5 +++--
+ include/linux/mm.h               |   18 +++++++++++++-----
+ mm/Kconfig                       |    2 ++
+ mm/memory.c                      |   12 ++++++++++--
+ tools/testing/vma/vma_internal.h |   18 +++++++++++++-----
+ 6 files changed, 42 insertions(+), 14 deletions(-)
+
+--- a/drivers/xen/gntdev.c~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/drivers/xen/gntdev.c
+@@ -321,6 +321,7 @@ static int find_grant_ptes(pte_t *pte, u
+ 	BUG_ON(pgnr >= map->count);
+ 	pte_maddr = arbitrary_virt_to_machine(pte).maddr;
+ 
++	/* Note: this will perform a pte_mkspecial() through the hypercall. */
+ 	gnttab_set_map_op(&map->map_ops[pgnr], pte_maddr, flags,
+ 			  map->grants[pgnr].ref,
+ 			  map->grants[pgnr].domid);
+@@ -528,7 +529,7 @@ static void gntdev_vma_close(struct vm_a
+ 	gntdev_put_map(priv, map);
+ }
+ 
+-static struct page *gntdev_vma_find_special_page(struct vm_area_struct *vma,
++static struct page *gntdev_vma_find_normal_page(struct vm_area_struct *vma,
+ 						 unsigned long addr)
+ {
+ 	struct gntdev_grant_map *map = vma->vm_private_data;
+@@ -539,7 +540,7 @@ static struct page *gntdev_vma_find_spec
+ static const struct vm_operations_struct gntdev_vmops = {
+ 	.open = gntdev_vma_open,
+ 	.close = gntdev_vma_close,
+-	.find_special_page = gntdev_vma_find_special_page,
++	.find_normal_page = gntdev_vma_find_normal_page,
+ };
+ 
+ /* ------------------------------------------------------------------ */
+--- a/drivers/xen/Kconfig~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/drivers/xen/Kconfig
+@@ -138,6 +138,7 @@ config XEN_GNTDEV
+ 	depends on XEN
+ 	default m
+ 	select MMU_NOTIFIER
++	select FIND_NORMAL_PAGE
+ 	help
+ 	  Allows userspace processes to use grants.
+ 
+--- a/include/linux/mm.h~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/include/linux/mm.h
+@@ -657,13 +657,21 @@ struct vm_operations_struct {
+ 	struct mempolicy *(*get_policy)(struct vm_area_struct *vma,
+ 					unsigned long addr, pgoff_t *ilx);
+ #endif
++#ifdef CONFIG_FIND_NORMAL_PAGE
+ 	/*
+-	 * Called by vm_normal_page() for special PTEs to find the
+-	 * page for @addr.  This is useful if the default behavior
+-	 * (using pte_page()) would not find the correct page.
++	 * Called by vm_normal_page() for special PTEs in @vma at @addr. This
++	 * allows for returning a "normal" page from vm_normal_page() even
++	 * though the PTE indicates that the "struct page" either does not exist
++	 * or should not be touched: "special".
++	 *
++	 * Do not add new users: this really only works when a "normal" page
++	 * was mapped, but then the PTE got changed to something weird (+
++	 * marked special) that would not make pte_pfn() identify the originally
++	 * inserted page.
+ 	 */
+-	struct page *(*find_special_page)(struct vm_area_struct *vma,
+-					  unsigned long addr);
++	struct page *(*find_normal_page)(struct vm_area_struct *vma,
++					 unsigned long addr);
++#endif /* CONFIG_FIND_NORMAL_PAGE */
+ };
+ 
+ #ifdef CONFIG_NUMA_BALANCING
+--- a/mm/Kconfig~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/mm/Kconfig
+@@ -1381,6 +1381,8 @@ config PT_RECLAIM
+ 
+ 	  Note: now only empty user PTE page table pages will be reclaimed.
+ 
++config FIND_NORMAL_PAGE
++	def_bool n
+ 
+ source "mm/damon/Kconfig"
+ 
+--- a/mm/memory.c~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/mm/memory.c
+@@ -639,6 +639,12 @@ static void print_bad_page_map(struct vm
+  * trivial. Secondly, an architecture may not have a spare page table
+  * entry bit, which requires a more complicated scheme, described below.
+  *
++ * With CONFIG_FIND_NORMAL_PAGE, we might have the "special" bit set on
++ * page table entries that actually map "normal" pages: however, that page
++ * cannot be looked up through the PFN stored in the page table entry, but
++ * instead will be looked up through vm_ops->find_normal_page(). So far, this
++ * only applies to PTEs.
++ *
+  * A raw VM_PFNMAP mapping (ie. one that is not COWed) is always considered a
+  * special mapping (even if there are underlying and valid "struct pages").
+  * COWed pages of a VM_PFNMAP are always normal.
+@@ -679,8 +685,10 @@ static inline struct page *__vm_normal_p
+ {
+ 	if (IS_ENABLED(CONFIG_ARCH_HAS_PTE_SPECIAL)) {
+ 		if (unlikely(special)) {
+-			if (vma->vm_ops && vma->vm_ops->find_special_page)
+-				return vma->vm_ops->find_special_page(vma, addr);
++#ifdef CONFIG_FIND_NORMAL_PAGE
++			if (vma->vm_ops && vma->vm_ops->find_normal_page)
++				return vma->vm_ops->find_normal_page(vma, addr);
++#endif /* CONFIG_FIND_NORMAL_PAGE */
+ 			if (vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))
+ 				return NULL;
+ 			if (is_zero_pfn(pfn) || is_huge_zero_pfn(pfn))
+--- a/tools/testing/vma/vma_internal.h~mm-rename-vm_ops-find_special_page-to-vm_ops-find_normal_page
++++ a/tools/testing/vma/vma_internal.h
+@@ -467,13 +467,21 @@ struct vm_operations_struct {
+ 	struct mempolicy *(*get_policy)(struct vm_area_struct *vma,
+ 					unsigned long addr, pgoff_t *ilx);
+ #endif
++#ifdef CONFIG_FIND_NORMAL_PAGE
+ 	/*
+-	 * Called by vm_normal_page() for special PTEs to find the
+-	 * page for @addr.  This is useful if the default behavior
+-	 * (using pte_page()) would not find the correct page.
++	 * Called by vm_normal_page() for special PTEs in @vma at @addr. This
++	 * allows for returning a "normal" page from vm_normal_page() even
++	 * though the PTE indicates that the "struct page" either does not exist
++	 * or should not be touched: "special".
++	 *
++	 * Do not add new users: this really only works when a "normal" page
++	 * was mapped, but then the PTE got changed to something weird (+
++	 * marked special) that would not make pte_pfn() identify the originally
++	 * inserted page.
+ 	 */
+-	struct page *(*find_special_page)(struct vm_area_struct *vma,
+-					  unsigned long addr);
++	struct page *(*find_normal_page)(struct vm_area_struct *vma,
++					 unsigned long addr);
++#endif /* CONFIG_FIND_NORMAL_PAGE */
+ };
+ 
+ struct vm_unmapped_area_info {
+_

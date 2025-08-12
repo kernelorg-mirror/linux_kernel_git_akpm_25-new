@@ -1,0 +1,135 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: fs/dax: use vmf_insert_folio_pmd() to insert the huge zero folio
+Date: Mon, 11 Aug 2025 13:26:24 +0200
+
+Let's convert to vmf_insert_folio_pmd().
+
+There is a theoretical change in behavior: in the unlikely case there is
+already something mapped, we'll now still call trace_dax_pmd_load_hole()
+and return VM_FAULT_NOPAGE.
+
+Previously, we would have returned VM_FAULT_FALLBACK, and the caller would
+have zapped the PMD to try a PTE fault.
+
+However, that behavior was different to other PTE+PMD faults, when there
+would already be something mapped, and it's not even clear if it could be
+triggered.
+
+Assuming the huge zero folio is already mapped, all good, no need to
+fallback to PTEs.
+
+Assuming there is already a leaf page table ...  the behavior would be
+just like when trying to insert a PMD mapping a folio through
+dax_fault_iter()->vmf_insert_folio_pmd().
+
+Assuming there is already something else mapped as PMD?  It sounds like a
+BUG, and the behavior would be just like when trying to insert a PMD
+mapping a folio through dax_fault_iter()->vmf_insert_folio_pmd().
+
+So, it sounds reasonable to not handle huge zero folios differently to
+inserting PMDs mapping folios when there already is something mapped.
+
+Link: https://lkml.kernel.org/r/20250811112631.759341-5-david@redhat.com
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Alistair Popple <apopple@nvidia.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: David Vrabel <david.vrabel@citrix.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Juegren Gross <jgross@suse.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Oleksandr Tyshchenko <oleksandr_tyshchenko@epam.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Stefano Stabellini <sstabellini@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/dax.c |   47 ++++++++++-------------------------------------
+ 1 file changed, 10 insertions(+), 37 deletions(-)
+
+--- a/fs/dax.c~fs-dax-use-vmf_insert_folio_pmd-to-insert-the-huge-zero-folio
++++ a/fs/dax.c
+@@ -1375,51 +1375,24 @@ static vm_fault_t dax_pmd_load_hole(stru
+ 		const struct iomap_iter *iter, void **entry)
+ {
+ 	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+-	unsigned long pmd_addr = vmf->address & PMD_MASK;
+-	struct vm_area_struct *vma = vmf->vma;
+ 	struct inode *inode = mapping->host;
+-	pgtable_t pgtable = NULL;
+ 	struct folio *zero_folio;
+-	spinlock_t *ptl;
+-	pmd_t pmd_entry;
+-	unsigned long pfn;
++	vm_fault_t ret;
+ 
+ 	zero_folio = mm_get_huge_zero_folio(vmf->vma->vm_mm);
+ 
+-	if (unlikely(!zero_folio))
+-		goto fallback;
+-
+-	pfn = page_to_pfn(&zero_folio->page);
+-	*entry = dax_insert_entry(xas, vmf, iter, *entry, pfn,
+-				  DAX_PMD | DAX_ZERO_PAGE);
+-
+-	if (arch_needs_pgtable_deposit()) {
+-		pgtable = pte_alloc_one(vma->vm_mm);
+-		if (!pgtable)
+-			return VM_FAULT_OOM;
++	if (unlikely(!zero_folio)) {
++		trace_dax_pmd_load_hole_fallback(inode, vmf, zero_folio, *entry);
++		return VM_FAULT_FALLBACK;
+ 	}
+ 
+-	ptl = pmd_lock(vmf->vma->vm_mm, vmf->pmd);
+-	if (!pmd_none(*(vmf->pmd))) {
+-		spin_unlock(ptl);
+-		goto fallback;
+-	}
+-
+-	if (pgtable) {
+-		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
+-		mm_inc_nr_ptes(vma->vm_mm);
+-	}
+-	pmd_entry = folio_mk_pmd(zero_folio, vmf->vma->vm_page_prot);
+-	set_pmd_at(vmf->vma->vm_mm, pmd_addr, vmf->pmd, pmd_entry);
+-	spin_unlock(ptl);
+-	trace_dax_pmd_load_hole(inode, vmf, zero_folio, *entry);
+-	return VM_FAULT_NOPAGE;
++	*entry = dax_insert_entry(xas, vmf, iter, *entry, folio_pfn(zero_folio),
++				  DAX_PMD | DAX_ZERO_PAGE);
+ 
+-fallback:
+-	if (pgtable)
+-		pte_free(vma->vm_mm, pgtable);
+-	trace_dax_pmd_load_hole_fallback(inode, vmf, zero_folio, *entry);
+-	return VM_FAULT_FALLBACK;
++	ret = vmf_insert_folio_pmd(vmf, zero_folio, false);
++	if (ret == VM_FAULT_NOPAGE)
++		trace_dax_pmd_load_hole(inode, vmf, zero_folio, *entry);
++	return ret;
+ }
+ #else
+ static vm_fault_t dax_pmd_load_hole(struct xa_state *xas, struct vm_fault *vmf,
+_
