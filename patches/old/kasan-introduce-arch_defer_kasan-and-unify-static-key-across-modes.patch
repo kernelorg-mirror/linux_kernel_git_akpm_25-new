@@ -1,9 +1,9 @@
 From: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
 Subject: kasan: introduce ARCH_DEFER_KASAN and unify static key across modes
-Date: Fri, 8 Aug 2025 00:40:11 +0500
+Date: Sun, 10 Aug 2025 17:57:45 +0500
 
 Patch series "kasan: unify kasan_enabled() and remove arch-specific
-implementations", v5.
+implementations", v6.
 
 This patch series addresses the fragmentation in KASAN initialization
 across architectures by introducing a unified approach that eliminates
@@ -26,24 +26,45 @@ unify the static key infrastructure across all KASAN modes.
 
 [1] PowerPC, UML, LoongArch selects ARCH_DEFER_KASAN.
 
-Link: https://lkml.kernel.org/r/20250807194012.631367-1-snovitoll@gmail.com
-Link: https://lkml.kernel.org/r/20250807194012.631367-2-snovitoll@gmail.com
-Signed-off-by: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+The core issue is that different architectures haveinconsistent approaches
+to KASAN readiness tracking:
+- PowerPC, LoongArch, and UML arch, each implement own
+  kasan_arch_is_ready()
+- Only HW_TAGS mode had a unified static key (kasan_flag_enabled)
+- Generic and SW_TAGS modes relied on arch-specific solutions or always-on
+    behavior
+
+This patch addresses the fragmentation in KASAN initialization across
+architectures by introducing a unified approach that eliminates duplicate
+static keys and arch-specific kasan_arch_is_ready() implementations.
+
+Let's replace kasan_arch_is_ready() with existing kasan_enabled() check,
+which examines the static key being enabled if arch selects
+ARCH_DEFER_KASAN or has HW_TAGS mode support.  For other arch,
+kasan_enabled() checks the enablement during compile time.
+
+Now KASAN users can use a single kasan_enabled() check everywhere.
+
+Link: https://lkml.kernel.org/r/20250810125746.1105476-1-snovitoll@gmail.com
+Link: https://lkml.kernel.org/r/20250810125746.1105476-2-snovitoll@gmail.com
 Closes: https://bugzilla.kernel.org/show_bug.cgi?id=217049
+Signed-off-by: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
+Reviewed-by: Christophe Leroy <christophe.leroy@csgroup.eu>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Alexander Potapenko <glider@google.com>
 Cc: Alexandre Ghiti <alex@ghiti.fr>
+Cc: Alexandre Ghiti <alexghiti@rivosinc.com>
 Cc: Andrey Konovalov <andreyknvl@gmail.com>
 Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
 Cc: Baoquan He <bhe@redhat.com>
-Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: David Gow <davidgow@google.com>
 Cc: Dmitriy Vyukov <dvyukov@google.com>
 Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Huacai Chen <chenhuacai@loongson.cn>
 Cc: Marco Elver <elver@google.com>
 Cc: Qing Zhang <zhangqing@loongson.cn>
+Cc: Sabyrzhan Tasbolatov <snovitoll@gmail.com>
 Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
-Cc: Alexandre Ghiti <alexghiti@rivosinc.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
@@ -57,10 +78,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  arch/powerpc/mm/kasan/init_book3s_64.c |    6 ----
  arch/um/Kconfig                        |    1 
  arch/um/include/asm/kasan.h            |    5 +--
- arch/um/kernel/mem.c                   |   10 +++++--
+ arch/um/kernel/mem.c                   |   13 +++++++--
  include/linux/kasan-enabled.h          |   32 ++++++++++++++++-------
  include/linux/kasan.h                  |    6 ++++
- lib/Kconfig.kasan                      |    8 +++++
+ lib/Kconfig.kasan                      |   12 ++++++++
  mm/kasan/common.c                      |   17 +++++++++---
  mm/kasan/generic.c                     |   19 ++++++++++---
  mm/kasan/hw_tags.c                     |    9 ------
@@ -68,7 +89,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  mm/kasan/shadow.c                      |   12 ++++----
  mm/kasan/sw_tags.c                     |    1 
  mm/kasan/tags.c                        |    2 -
- 21 files changed, 100 insertions(+), 69 deletions(-)
+ 21 files changed, 106 insertions(+), 70 deletions(-)
 
 --- a/arch/loongarch/include/asm/kasan.h~kasan-introduce-arch_defer_kasan-and-unify-static-key-across-modes
 +++ a/arch/loongarch/include/asm/kasan.h
@@ -99,7 +120,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	select ACPI_PPTT if ACPI
  	select ACPI_SYSTEM_POWER_STATES_SUPPORT	if ACPI
  	select ARCH_BINFMT_ELF_STATE
-+	select ARCH_DEFER_KASAN if KASAN
++	select ARCH_NEEDS_DEFER_KASAN
  	select ARCH_DISABLE_KASAN_INLINE
  	select ARCH_ENABLE_MEMORY_HOTPLUG
  	select ARCH_ENABLE_MEMORY_HOTREMOVE
@@ -161,7 +182,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	# Please keep this list sorted alphabetically.
  	#
  	select ARCH_32BIT_OFF_T if PPC32
-+	select ARCH_DEFER_KASAN			if KASAN && PPC_RADIX_MMU
++	select ARCH_NEEDS_DEFER_KASAN		if PPC_RADIX_MMU
  	select ARCH_DISABLE_KASAN_INLINE	if PPC_RADIX_MMU
  	select ARCH_DMA_DEFAULT_COHERENT	if !NOT_COHERENT_CACHE
  	select ARCH_ENABLE_MEMORY_HOTPLUG
@@ -232,13 +253,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  config UML
  	bool
  	default y
-+	select ARCH_DEFER_KASAN if STATIC_LINK
++	select ARCH_NEEDS_DEFER_KASAN if STATIC_LINK
  	select ARCH_WANTS_DYNAMIC_TASK_STRUCT
  	select ARCH_HAS_CACHE_LINE_SIZE
  	select ARCH_HAS_CPU_FINALIZE_INIT
 --- a/arch/um/kernel/mem.c~kasan-introduce-arch_defer_kasan-and-unify-static-key-across-modes
 +++ a/arch/um/kernel/mem.c
-@@ -21,9 +21,9 @@
+@@ -21,10 +21,10 @@
  #include <os.h>
  #include <um_malloc.h>
  #include <linux/sched/task.h>
@@ -246,22 +267,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #ifdef CONFIG_KASAN
 -int kasan_um_is_ready;
- void kasan_init(void)
+-void kasan_init(void)
++void __init kasan_init(void)
  {
  	/*
-@@ -32,7 +32,10 @@ void kasan_init(void)
+ 	 * kasan_map_memory will map all of the required address space and
+@@ -32,7 +32,11 @@ void kasan_init(void)
  	 */
  	kasan_map_memory((void *)KASAN_SHADOW_START, KASAN_SHADOW_SIZE);
  	init_task.kasan_depth = 0;
 -	kasan_um_is_ready = true;
-+	/* Since kasan_init() is called before main(),
++	/*
++	 * Since kasan_init() is called before main(),
 +	 * KASAN is initialized but the enablement is deferred after
 +	 * jump_label_init(). See arch_mm_preinit().
 +	 */
  }
  
  static void (*kasan_init_ptr)(void)
-@@ -58,6 +61,9 @@ static unsigned long brk_end;
+@@ -58,6 +62,9 @@ static unsigned long brk_end;
  
  void __init arch_mm_preinit(void)
  {
@@ -346,12 +370,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #else
 --- a/lib/Kconfig.kasan~kasan-introduce-arch_defer_kasan-and-unify-static-key-across-modes
 +++ a/lib/Kconfig.kasan
-@@ -19,6 +19,14 @@ config ARCH_DISABLE_KASAN_INLINE
+@@ -19,6 +19,18 @@ config ARCH_DISABLE_KASAN_INLINE
  	  Disables both inline and stack instrumentation. Selected by
  	  architectures that do not support these instrumentation types.
  
-+config ARCH_DEFER_KASAN
++config ARCH_NEEDS_DEFER_KASAN
 +	bool
++
++config ARCH_DEFER_KASAN
++	def_bool y
++	depends on KASAN && ARCH_NEEDS_DEFER_KASAN
 +	help
 +	  Architectures should select this if they need to defer KASAN
 +	  initialization until shadow memory is properly set up. This
@@ -373,7 +401,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * This provides consistent runtime enable/disable across KASAN modes.
 + */
 +DEFINE_STATIC_KEY_FALSE(kasan_flag_enabled);
-+EXPORT_SYMBOL(kasan_flag_enabled);
++EXPORT_SYMBOL_GPL(kasan_flag_enabled);
 +#endif
 +
  struct slab *kasan_addr_to_slab(const void *addr)
