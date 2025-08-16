@@ -1,0 +1,133 @@
+From: David Hildenbrand <david@redhat.com>
+Subject: mm/huge_memory: respect MADV_COLLAPSE with PR_THP_DISABLE_EXCEPT_ADVISED
+Date: Fri, 15 Aug 2025 14:54:55 +0100
+
+Let's allow for making MADV_COLLAPSE succeed on areas that neither have
+VM_HUGEPAGE nor VM_NOHUGEPAGE when we have THP disabled unless explicitly
+advised (PR_THP_DISABLE_EXCEPT_ADVISED).
+
+MADV_COLLAPSE is a clear advice that we want to collapse.
+
+Note that we still respect the VM_NOHUGEPAGE flag, just like
+MADV_COLLAPSE always does. So consequently, MADV_COLLAPSE is now only
+refused on VM_NOHUGEPAGE with PR_THP_DISABLE_EXCEPT_ADVISED,
+including for shmem.
+
+Link: https://lkml.kernel.org/r/20250815135549.130506-4-usamaarif642@gmail.com
+Co-developed-by: Usama Arif <usamaarif642@gmail.com>
+Signed-off-by: Usama Arif <usamaarif642@gmail.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yafang <laoar.shao@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/huge_mm.h    |    8 +++++++-
+ include/uapi/linux/prctl.h |    2 +-
+ mm/huge_memory.c           |    5 +++--
+ mm/memory.c                |    6 ++++--
+ mm/shmem.c                 |    2 +-
+ 5 files changed, 16 insertions(+), 7 deletions(-)
+
+--- a/include/linux/huge_mm.h~mm-huge_memory-respect-madv_collapse-with-pr_thp_disable_except_advised
++++ a/include/linux/huge_mm.h
+@@ -329,7 +329,7 @@ struct thpsize {
+  * through madvise or prctl.
+  */
+ static inline bool vma_thp_disabled(struct vm_area_struct *vma,
+-		vm_flags_t vm_flags)
++		vm_flags_t vm_flags, bool forced_collapse)
+ {
+ 	/* Are THPs disabled for this VMA? */
+ 	if (vm_flags & VM_NOHUGEPAGE)
+@@ -343,6 +343,12 @@ static inline bool vma_thp_disabled(stru
+ 	 */
+ 	if (vm_flags & VM_HUGEPAGE)
+ 		return false;
++	/*
++	 * Forcing a collapse (e.g., madv_collapse), is a clear advice to
++	 * use THPs.
++	 */
++	if (forced_collapse)
++		return false;
+ 	return mm_flags_test(MMF_DISABLE_THP_EXCEPT_ADVISED, vma->vm_mm);
+ }
+ 
+--- a/include/uapi/linux/prctl.h~mm-huge_memory-respect-madv_collapse-with-pr_thp_disable_except_advised
++++ a/include/uapi/linux/prctl.h
+@@ -185,7 +185,7 @@ struct prctl_mm_map {
+ #define PR_SET_THP_DISABLE	41
+ /*
+  * Don't disable THPs when explicitly advised (e.g., MADV_HUGEPAGE /
+- * VM_HUGEPAGE).
++ * VM_HUGEPAGE, MADV_COLLAPSE).
+  */
+ # define PR_THP_DISABLE_EXCEPT_ADVISED	(1 << 1)
+ #define PR_GET_THP_DISABLE	42
+--- a/mm/huge_memory.c~mm-huge_memory-respect-madv_collapse-with-pr_thp_disable_except_advised
++++ a/mm/huge_memory.c
+@@ -104,7 +104,8 @@ unsigned long __thp_vma_allowable_orders
+ {
+ 	const bool smaps = type == TVA_SMAPS;
+ 	const bool in_pf = type == TVA_PAGEFAULT;
+-	const bool enforce_sysfs = type != TVA_FORCED_COLLAPSE;
++	const bool forced_collapse = type == TVA_FORCED_COLLAPSE;
++	const bool enforce_sysfs = !forced_collapse;
+ 	unsigned long supported_orders;
+ 
+ 	/* Check the intersection of requested and supported orders. */
+@@ -122,7 +123,7 @@ unsigned long __thp_vma_allowable_orders
+ 	if (!vma->vm_mm)		/* vdso */
+ 		return 0;
+ 
+-	if (thp_disabled_by_hw() || vma_thp_disabled(vma, vm_flags))
++	if (thp_disabled_by_hw() || vma_thp_disabled(vma, vm_flags, forced_collapse))
+ 		return 0;
+ 
+ 	/* khugepaged doesn't collapse DAX vma, but page fault is fine. */
+--- a/mm/memory.c~mm-huge_memory-respect-madv_collapse-with-pr_thp_disable_except_advised
++++ a/mm/memory.c
+@@ -5332,9 +5332,11 @@ vm_fault_t do_set_pmd(struct vm_fault *v
+ 	 * It is too late to allocate a small folio, we already have a large
+ 	 * folio in the pagecache: especially s390 KVM cannot tolerate any
+ 	 * PMD mappings, but PTE-mapped THP are fine. So let's simply refuse any
+-	 * PMD mappings if THPs are disabled.
++	 * PMD mappings if THPs are disabled. As we already have a THP,
++	 * behave as if we are forcing a collapse.
+ 	 */
+-	if (thp_disabled_by_hw() || vma_thp_disabled(vma, vma->vm_flags))
++	if (thp_disabled_by_hw() || vma_thp_disabled(vma, vma->vm_flags,
++						     /* forced_collapse=*/ true))
+ 		return ret;
+ 
+ 	if (!thp_vma_suitable_order(vma, haddr, PMD_ORDER))
+--- a/mm/shmem.c~mm-huge_memory-respect-madv_collapse-with-pr_thp_disable_except_advised
++++ a/mm/shmem.c
+@@ -1817,7 +1817,7 @@ unsigned long shmem_allowable_huge_order
+ 	vm_flags_t vm_flags = vma ? vma->vm_flags : 0;
+ 	unsigned int global_orders;
+ 
+-	if (thp_disabled_by_hw() || (vma && vma_thp_disabled(vma, vm_flags)))
++	if (thp_disabled_by_hw() || (vma && vma_thp_disabled(vma, vm_flags, shmem_huge_force)))
+ 		return 0;
+ 
+ 	global_orders = shmem_huge_global_enabled(inode, index, write_end,
+_

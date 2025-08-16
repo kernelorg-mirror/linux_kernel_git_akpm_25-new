@@ -1,0 +1,191 @@
+From: SeongJae Park <sj@kernel.org>
+Subject: mm/zswap: store <PAGE_SIZE compression failed page as-is
+Date: Fri, 15 Aug 2025 14:30:20 -0700
+
+When zswap writeback is enabled and it fails compressing a given page, the
+page is swapped out to the backing swap device.  This behavior breaks the
+zswap's writeback LRU order, and hence users can experience unexpected
+latency spikes.  If the page is compressed without failure, but results in
+a size of PAGE_SIZE, the LRU order is kept, but the decompression overhead
+for loading the page back on the later access is unnecessary.
+
+Keep the LRU order and optimize unnecessary decompression overheads in
+those cases, by storing the original content as-is in zpool.  The length
+field of zswap_entry will be set appropriately, as PAGE_SIZE, Hence
+whether it is saved as-is or not (whether decompression is unnecessary) is
+identified by 'zswap_entry->length == PAGE_SIZE'.
+
+Because the uncompressed data is saved in zpool, same to the compressed
+ones, this introduces no change in terms of memory management including
+movability and migratability of involved pages.
+
+This change is also not increasing per zswap entry metadata overhead.  But
+as the number of incompressible pages increases, total zswap metadata
+overhead is proportionally increased.  The overhead should not be
+problematic in usual cases, since the zswap metadata for single zswap
+entry is much smaller than PAGE_SIZE, and in common zswap use cases there
+should be a sufficient amount of compressible pages.  Also it can be
+mitigated by the zswap writeback.
+
+When the writeback is disabled, the additional overhead could be
+problematic.  For the case, keep the current behavior that just returns
+the failure and let swap_writeout() put the page back to the active LRU
+list in the case.
+
+Knowing how many compression failures happened will be useful for future
+investigations.  investigations.  Add a new debugfs file, compress_fail,
+for the purpose.
+
+Tests
+-----
+
+I tested this patch using a simple self-written microbenchmark that is
+available at GitHub[1].  You can reproduce the test I did by executing
+run_tests.sh of the repo on your system.  Note that the repo's
+documentation is not good as of this writing, so you may need to read and
+use the code.
+
+The basic test scenario is simple.  Run a test program making artificial
+accesses to memory having artificial content under memory.high-set memory
+limit and measure how many accesses were made in given time.
+
+The test program repeatedly and randomly access three anonymous memory
+regions.  The regions are all 500 MiB size, and accessed in the same
+probability.  Two of those are filled up with a simple content that can
+easily be compressed, while the remaining one is filled up with a content
+that read from /dev/urandom, which is easy to fail at compressing to
+<PAGE_SIZE size.  The program runs for two minutes and prints out the
+number of accesses made every five seconds.
+
+The test script runs the program under below four configurations.
+
+- 0: memory.high is set to 2 GiB, zswap is disabled.
+- 1-1: memory.high is set to 1350 MiB, zswap is disabled.
+- 1-2: On 1-1, zswap is enabled without this patch.
+- 1-3: On 1-2, this patch is applied.
+
+For all zswap enabled cases, zswap shrinker is enabled.
+
+Configuration '0' is for showing the original memory performance. 
+Configurations 1-1, 1-2 and 1-3 are for showing the performance of swap,
+zswap, and this patch under a level of memory pressure (~10% of working
+set).  Configurations 0 and 1-1 are not the main focus of this patch, but
+I'm adding those since their results transparently show how far this
+microbenchmark test is from the real world.
+
+Because the per-5 seconds performance is not very reliable, I measured the
+average of that for the last one minute period of the test program run.  I
+also measured a few vmstat counters including zswpin, zswpout, zswpwb,
+pswpin and pswpout during the test runs.
+
+The measurement results are as below.  To save space, I show performance
+numbers that are normalized to that of the configuration '0' (no memory
+pressure), only.  The averaged accesses per 5 seconds of configuration '0'
+was 36493417.75.
+
+    config            0       1-1     1-2      1-3
+    perf_normalized   1.0000  0.0057  0.0235   0.0367
+    perf_stdev_ratio  0.0582  0.0652  0.0167   0.0346
+    zswpin            0       0       3548424  1999335
+    zswpout           0       0       3588817  2361689
+    zswpwb            0       0       10214    340270
+    pswpin            0       485806  772038   340967
+    pswpout           0       649543  144773   340270
+
+'perf_normalized' is the performance metric, normalized to that of
+configuration '0' (no pressure).  'perf_stdev_ratio' is the standard
+deviation of the averaged data points, as a ratio to the averaged metric
+value.  For example, configuration '0' performance was showing 5.8% stdev.
+Configurations 1-1 and 1-3 were having about 6.5% and 6.1% stdev.  Also
+the results were highly variable between multiple runs.  So this result is
+not very stable but just showing ball park figures.  Please keep this in
+your mind when reading these results.
+
+Under about 10% of working set memory pressure, the performance was
+dropped to about 0.57% of no-pressure one, when the normal swap is used
+(1-1).  Note that ~10% working set pressure is already extreme, at least
+on this test setup.  No one would desire system setups that can degrade
+performance to 0.57% of the best case.
+
+By turning zswap on (1-2), the performance was improved about 4x,
+resulting in about 2.35% of no-pressure one.  Because of the
+incompressible pages in the third memory region, a significant amount of
+(non-zswap) swap I/O operations were made, though.
+
+By applying this patch (1-3), about 56% performance improvement was made,
+resulting in about 3.67% of no-pressure one.  Reduced pswpin of 1-3
+compared to 1-2 let us see where this improvement came from.
+
+Tests without Zswap Shrinker
+----------------------------
+
+Zswap shrinker is not enabled by default, so I ran the above test after
+disabling zswap shrinker.  The results are as below.
+
+    config            0       1-1     1-2      1-3
+    perf_normalized   1.0000  0.0056  0.0185   0.0260
+    perf_stdev_ratio  0.0467  0.0348  0.1832   0.3387
+    zswpin            0       0       2506765  6049078
+    zswpout           0       0       2534357  6115426
+    zswpwb            0       0       0        0
+    pswpin            0       463694  472978   0
+    pswpout           0       686227  612149   0
+
+The overall normalized performance of the different configs are very
+similar to those of zswap shrinker enabled case.  By adding the memory
+pressure, the performance was dropped to 0.56% of the original one.  By
+enabling zswap without zswap shrinker, the performance was increased to
+1.85% of the original one.  By applying this patch on it, the performance
+was further increased to 2.6% of the original one.
+
+Even though zswap shrinker is disabled, 1-2 shows high number of pswpin
+and pswpout because the incompressible pages are directly swapped out.  In
+case of 1-3, it shows zero pswpin and pswpout since it saves
+incompressible pages in the memory, and show higher performance.
+
+Note that the performance of 1-2 and 1-3 varies pretty a lot.  Standard
+deviation of the performance for 1-2 was about 18.32% of the performance,
+while that for 1-3 was about 33.87%.  Because zswap shrinker is disabled
+and the memory pressure is induced by memory.high, the workload got
+penalty_jiffies sleeps, and this resulted in the unstabilized performance.
+
+Related Works
+-------------
+
+This is not an entirely new attempt.  Nhat Pham and Takero Funaki tried
+very similar approaches in October 2023[2] and April 2024[3],
+respectively.  The two approaches didn't get merged mainly due to the
+metadata overhead concern.  I described why I think that shouldn't be a
+problem for this change, which is automatically disabled when writeback is
+disabled, at the beginning of this changelog.
+
+This patch is not particularly different from those, and actually built
+upon those.  I wrote this from scratch again, though.  Hence adding
+Suggested-by tags for them.  Actually Nhat first suggested this to me
+offlist.
+
+Historically, writeback disabling was introduced partially as a way to
+solve the LRU order issue.  Yosry pointed out[4] this is still suboptimal
+when the incompressible pages are cold, since the incompressible pages
+will continuously be tried to be zswapped out, and burn CPU cycles for
+compression attempts that will anyway fail.  One imaginable solution for
+the problem is reusing the swapped-out page and its struct page to store
+in the zswap pool.  But that's out of the scope of this patch.
+
+Link: https://lkml.kernel.org/r/20250815213020.89327-1-sj@kernel.org
+Link: https://github.com/sjp38/eval_zswap/blob/master/run.sh [1] 
+Link: https://lore.kernel.org/20231017003519.1426574-3-nphamcs@gmail.com [2] 
+Link: https://lore.kernel.org/20240706022523.1104080-6-flintglass@gmail.com [3] 
+Link: https://lore.kernel.org/CAJD7tkZXS-UJVAFfvxJ0nNgTzWBiqepPYA4hEozi01_qktkitg@mail.gmail.com [4] 
+Signed-off-by: SeongJae Park <sj@kernel.org>
+Suggested-by: Nhat Pham <nphamcs@gmail.com>
+Suggested-by: Takero Funaki <flintglass@gmail.com>
+Acked-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Kairui Song <kasong@tencent.com>

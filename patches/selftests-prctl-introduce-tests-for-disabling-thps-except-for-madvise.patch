@@ -1,0 +1,198 @@
+From: Usama Arif <usamaarif642@gmail.com>
+Subject: selftests: prctl: introduce tests for disabling THPs except for madvise
+Date: Fri, 15 Aug 2025 14:54:59 +0100
+
+The test will set the global system THP setting to never, madvise or
+always depending on the fixture variant and the 2M setting to inherit
+before it starts (and reset to original at teardown).  The fixture setup
+will also test if PR_SET_THP_DISABLE prctl call can be made with
+PR_THP_DISABLE_EXCEPT_ADVISED and skip if it fails.
+
+This tests if the process can:
+- successfully get the policy to disable THPs expect for madvise.
+- get hugepages only on MADV_HUGE and MADV_COLLAPSE if the global policy
+  is madvise/always and only with MADV_COLLAPSE if the global policy is
+  never.
+- successfully reset the policy of the process.
+- after reset, only get hugepages with:
+  - MADV_COLLAPSE when policy is set to never.
+  - MADV_HUGE and MADV_COLLAPSE when policy is set to madvise.
+  - always when policy is set to "always".
+- never get a THP with MADV_NOHUGEPAGE.
+- repeat the above tests in a forked process to make sure  the policy is
+  carried across forks.
+
+Test results:
+./prctl_thp_disable
+TAP version 13
+1..12
+ok 1 prctl_thp_disable_completely.never.nofork
+ok 2 prctl_thp_disable_completely.never.fork
+ok 3 prctl_thp_disable_completely.madvise.nofork
+ok 4 prctl_thp_disable_completely.madvise.fork
+ok 5 prctl_thp_disable_completely.always.nofork
+ok 6 prctl_thp_disable_completely.always.fork
+ok 7 prctl_thp_disable_except_madvise.never.nofork
+ok 8 prctl_thp_disable_except_madvise.never.fork
+ok 9 prctl_thp_disable_except_madvise.madvise.nofork
+ok 10 prctl_thp_disable_except_madvise.madvise.fork
+ok 11 prctl_thp_disable_except_madvise.always.nofork
+ok 12 prctl_thp_disable_except_madvise.always.fork
+
+Link: https://lkml.kernel.org/r/20250815135549.130506-8-usamaarif642@gmail.com
+Signed-off-by: Usama Arif <usamaarif642@gmail.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yafang <laoar.shao@gmail.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ tools/testing/selftests/mm/prctl_thp_disable.c |  111 +++++++++++++++
+ 1 file changed, 111 insertions(+)
+
+--- a/tools/testing/selftests/mm/prctl_thp_disable.c~selftests-prctl-introduce-tests-for-disabling-thps-except-for-madvise
++++ a/tools/testing/selftests/mm/prctl_thp_disable.c
+@@ -16,6 +16,10 @@
+ #include "thp_settings.h"
+ #include "vm_util.h"
+ 
++#ifndef PR_THP_DISABLE_EXCEPT_ADVISED
++#define PR_THP_DISABLE_EXCEPT_ADVISED (1 << 1)
++#endif
++
+ enum thp_collapse_type {
+ 	THP_COLLAPSE_NONE,
+ 	THP_COLLAPSE_MADV_NOHUGEPAGE,
+@@ -166,6 +170,113 @@ TEST_F(prctl_thp_disable_completely, for
+ 
+ 	wait(&ret);
+ 	if (WIFEXITED(ret))
++		ret = WEXITSTATUS(ret);
++	else
++		ret = -EINVAL;
++	ASSERT_EQ(ret, 0);
++}
++
++static void prctl_thp_disable_except_madvise_test(struct __test_metadata *const _metadata,
++						  size_t pmdsize,
++						  enum thp_enabled thp_policy)
++{
++	ASSERT_EQ(prctl(PR_GET_THP_DISABLE, NULL, NULL, NULL, NULL), 3);
++
++	/* tests after prctl overrides global policy */
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_NONE, pmdsize), 0);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_NOHUGEPAGE, pmdsize), 0);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_HUGEPAGE, pmdsize),
++		  thp_policy == THP_NEVER ? 0 : 1);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_COLLAPSE, pmdsize), 1);
++
++	/* Reset to global policy */
++	ASSERT_EQ(prctl(PR_SET_THP_DISABLE, 0, NULL, NULL, NULL), 0);
++
++	/* tests after prctl is cleared, and only global policy is effective */
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_NONE, pmdsize),
++		  thp_policy == THP_ALWAYS ? 1 : 0);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_NOHUGEPAGE, pmdsize), 0);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_HUGEPAGE, pmdsize),
++		  thp_policy == THP_NEVER ? 0 : 1);
++
++	ASSERT_EQ(test_mmap_thp(THP_COLLAPSE_MADV_COLLAPSE, pmdsize), 1);
++}
++
++FIXTURE(prctl_thp_disable_except_madvise)
++{
++	struct thp_settings settings;
++	size_t pmdsize;
++};
++
++FIXTURE_VARIANT(prctl_thp_disable_except_madvise)
++{
++	enum thp_enabled thp_policy;
++};
++
++FIXTURE_VARIANT_ADD(prctl_thp_disable_except_madvise, never)
++{
++	.thp_policy = THP_NEVER,
++};
++
++FIXTURE_VARIANT_ADD(prctl_thp_disable_except_madvise, madvise)
++{
++	.thp_policy = THP_MADVISE,
++};
++
++FIXTURE_VARIANT_ADD(prctl_thp_disable_except_madvise, always)
++{
++	.thp_policy = THP_ALWAYS,
++};
++
++FIXTURE_SETUP(prctl_thp_disable_except_madvise)
++{
++	if (!thp_available())
++		SKIP(return, "Transparent Hugepages not available\n");
++
++	self->pmdsize = read_pmd_pagesize();
++	if (!self->pmdsize)
++		SKIP(return, "Unable to read PMD size\n");
++
++	if (prctl(PR_SET_THP_DISABLE, 1, PR_THP_DISABLE_EXCEPT_ADVISED, NULL, NULL))
++		SKIP(return, "Unable to set PR_THP_DISABLE_EXCEPT_ADVISED\n");
++
++	thp_save_settings();
++	thp_read_settings(&self->settings);
++	self->settings.thp_enabled = variant->thp_policy;
++	self->settings.hugepages[sz2ord(self->pmdsize, getpagesize())].enabled = THP_INHERIT;
++	thp_write_settings(&self->settings);
++}
++
++FIXTURE_TEARDOWN(prctl_thp_disable_except_madvise)
++{
++	thp_restore_settings();
++}
++
++TEST_F(prctl_thp_disable_except_madvise, nofork)
++{
++	prctl_thp_disable_except_madvise_test(_metadata, self->pmdsize, variant->thp_policy);
++}
++
++TEST_F(prctl_thp_disable_except_madvise, fork)
++{
++	int ret = 0;
++	pid_t pid;
++
++	/* Make sure prctl changes are carried across fork */
++	pid = fork();
++	ASSERT_GE(pid, 0);
++
++	if (!pid)
++		prctl_thp_disable_except_madvise_test(_metadata, self->pmdsize,
++						      variant->thp_policy);
++
++	wait(&ret);
++	if (WIFEXITED(ret))
+ 		ret = WEXITSTATUS(ret);
+ 	else
+ 		ret = -EINVAL;
+_
