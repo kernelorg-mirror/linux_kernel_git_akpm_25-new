@@ -1,0 +1,101 @@
+From: Boris Burkov <boris@bur.io>
+Subject: mm: add vmstat for cgroup uncharged pages
+Date: Mon, 18 Aug 2025 17:36:54 -0700
+
+Uncharged pages are tricky to track by their essential "uncharged" nature.
+To maintain good accounting, introduce a vmstat counter tracking all
+uncharged pages.  Since this is only meaningful when cgroups are
+configured, only expose the counter when CONFIG_MEMCG is set.
+
+Confirmed that these work as expected at a high level by mounting a btrfs
+using AS_UNCHARGED for metadata pages, and seeing the counter rise with fs
+usage then go back to a minimal level after drop_caches and finally down
+to 0 after unmounting the fs.
+
+Link: https://lkml.kernel.org/r/04b3a5c9944d79072d752c85dac1294ca9bee183.1755562487.git.boris@bur.io
+Signed-off-by: Boris Burkov <boris@bur.io>
+Suggested-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Tested-by: syzbot@syzkaller.appspotmail.com
+Cc: Chris Mason <clm@fb.com>
+Cc: David Sterba <dsterba@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qu Wenruo <wqu@suse.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmzone.h |    3 +++
+ mm/filemap.c           |   17 +++++++++++++++++
+ mm/vmstat.c            |    3 +++
+ 3 files changed, 23 insertions(+)
+
+--- a/include/linux/mmzone.h~mm-add-vmstat-for-cgroup-uncharged-pages
++++ a/include/linux/mmzone.h
+@@ -259,6 +259,9 @@ enum node_stat_item {
+ 	NR_HUGETLB,
+ #endif
+ 	NR_BALLOON_PAGES,
++#ifdef CONFIG_MEMCG
++	NR_UNCHARGED_FILE_PAGES,
++#endif
+ 	NR_VM_NODE_STAT_ITEMS
+ };
+ 
+--- a/mm/filemap.c~mm-add-vmstat-for-cgroup-uncharged-pages
++++ a/mm/filemap.c
+@@ -146,6 +146,19 @@ static void page_cache_delete(struct add
+ 	mapping->nrpages -= nr;
+ }
+ 
++#ifdef CONFIG_MEMCG
++static void filemap_mod_uncharged_vmstat(struct folio *folio, int sign)
++{
++	long nr = folio_nr_pages(folio) * sign;
++
++	mod_node_page_state(folio_pgdat(folio), NR_UNCHARGED_FILE_PAGES, nr);
++}
++#else
++static void filemap_mod_uncharged_vmstat(struct folio *folio, int sign)
++{
++}
++#endif
++
+ static void filemap_unaccount_folio(struct address_space *mapping,
+ 		struct folio *folio)
+ {
+@@ -190,6 +203,8 @@ static void filemap_unaccount_folio(stru
+ 		__lruvec_stat_mod_folio(folio, NR_FILE_THPS, -nr);
+ 		filemap_nr_thps_dec(mapping);
+ 	}
++	if (test_bit(AS_UNCHARGED, &folio->mapping->flags))
++		filemap_mod_uncharged_vmstat(folio, -1);
+ 
+ 	/*
+ 	 * At this point folio must be either written or cleaned by
+@@ -987,6 +1002,8 @@ int filemap_add_folio(struct address_spa
+ 		if (!(gfp & __GFP_WRITE) && shadow)
+ 			workingset_refault(folio, shadow);
+ 		folio_add_lru(folio);
++		if (!charge_mem_cgroup)
++			filemap_mod_uncharged_vmstat(folio, 1);
+ 	}
+ 	return ret;
+ }
+--- a/mm/vmstat.c~mm-add-vmstat-for-cgroup-uncharged-pages
++++ a/mm/vmstat.c
+@@ -1290,6 +1290,9 @@ const char * const vmstat_text[] = {
+ 	[I(NR_HUGETLB)]				= "nr_hugetlb",
+ #endif
+ 	[I(NR_BALLOON_PAGES)]			= "nr_balloon_pages",
++#ifdef CONFIG_MEMCG
++	[I(NR_UNCHARGED_FILE_PAGES)]		= "nr_uncharged_file_pages",
++#endif
+ #undef I
+ 
+ 	/* system-wide enum vm_stat_item counters */
+_
