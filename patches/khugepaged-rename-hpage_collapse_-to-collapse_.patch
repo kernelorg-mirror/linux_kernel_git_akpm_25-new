@@ -1,0 +1,373 @@
+From: Nico Pache <npache@redhat.com>
+Subject: khugepaged: rename hpage_collapse_* to collapse_*
+Date: Tue, 19 Aug 2025 07:41:53 -0600
+
+Patch series "khugepaged: mTHP support", v10.
+
+The following series provides khugepaged with the capability to collapse
+anonymous memory regions to mTHPs.
+
+To achieve this we generalize the khugepaged functions to no longer depend
+on PMD_ORDER.  Then during the PMD scan, we use a bitmap to track chunks
+of pages (defined by KHUGEPAGED_MTHP_MIN_ORDER) that are utilized.  After
+the PMD scan is done, we do binary recursion on the bitmap to find the
+optimal mTHP sizes for the PMD range.  The restriction on max_ptes_none is
+removed during the scan, to make sure we account for the whole PMD range. 
+When no mTHP size is enabled, the legacy behavior of khugepaged is
+maintained.  max_ptes_none will be scaled by the attempted collapse order
+to determine how full a mTHP must be to be eligible for the collapse to
+occur.  If a mTHP collapse is attempted, but contains swapped out, or
+shared pages, we don't perform the collapse.  It is now also possible to
+collapse to mTHPs without requiring the PMD THP size to be enabled.
+
+With the default max_ptes_none=511, the code should keep its most of its
+original behavior.  When enabling multiple adjacent (m)THP sizes we need
+to set max_ptes_none<=255.  With max_ptes_none > HPAGE_PMD_NR/2 you will
+experience collapse "creep" and constantly promote mTHPs to the next
+available size.  This is due the fact that a collapse will introduce at
+least 2x the number of pages, and on a future scan will satisfy the
+promotion condition once again.
+
+Patch 1:     Refactor/rename hpage_collapse
+Patch 2:     Some refactoring to combine madvise_collapse and khugepaged
+Patch 3-5:   Generalize khugepaged functions for arbitrary orders
+Patch 6-8:   The mTHP patches
+Patch 9-10:  Allow khugepaged to operate without PMD enabled
+Patch 11-12: Tracing/stats
+Patch 13:    Documentation
+
+---------
+ Testing
+---------
+- Built for x86_64, aarch64, ppc64le, and s390x
+- selftests mm
+- I created a test script that I used to push khugepaged to its limits
+   while monitoring a number of stats and tracepoints. The code is
+   available here[1] (Run in legacy mode for these changes and set mthp
+   sizes to inherit)
+   The summary from my testings was that there was no significant
+   regression noticed through this test. In some cases my changes had
+   better collapse latencies, and was able to scan more pages in the same
+   amount of time/work, but for the most part the results were consistent.
+- redis testing. I tested these changes along with my defer changes
+  (see followup [4] post for more details). We've decided to get the mTHP
+  changes merged first before attempting the defer series.
+- some basic testing on 64k page size.
+- lots of general use.
+
+
+This patch (of 13):
+
+The hpage_collapse functions describe functions used by madvise_collapse
+and khugepaged.  remove the unnecessary hpage prefix to shorten the
+function name.
+
+Link: https://lkml.kernel.org/r/20250819134205.622806-1-npache@redhat.com
+Link: https://lkml.kernel.org/r/20250819134205.622806-2-npache@redhat.com
+Link: https://gitlab.com/npache/khugepaged_mthp_test [1]
+Signed-off-by: Nico Pache <npache@redhat.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christoph Lameter (Ampere) <cl@gentwo.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Kirill A. Shuemov <kirill.shutemov@linux.intel.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Nanyong Sun <sunnanyong@huawei.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rafael Aquini <raquini@redhat.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Reported-by:Takashi Iwai <tiwai@suse.de>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Hellstrom <thomas.hellstrom@linux.intel.com>
+Cc: Usama Arif <usamaarif642@gmail.com>
+Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <yang@os.amperecomputing.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |   73 ++++++++++++++++++++++------------------------
+ 1 file changed, 36 insertions(+), 37 deletions(-)
+
+--- a/mm/khugepaged.c~khugepaged-rename-hpage_collapse_-to-collapse_
++++ a/mm/khugepaged.c
+@@ -402,14 +402,14 @@ void __init khugepaged_destroy(void)
+ 	kmem_cache_destroy(mm_slot_cache);
+ }
+ 
+-static inline int hpage_collapse_test_exit(struct mm_struct *mm)
++static inline int collapse_test_exit(struct mm_struct *mm)
+ {
+ 	return atomic_read(&mm->mm_users) == 0;
+ }
+ 
+-static inline int hpage_collapse_test_exit_or_disable(struct mm_struct *mm)
++static inline int collapse_test_exit_or_disable(struct mm_struct *mm)
+ {
+-	return hpage_collapse_test_exit(mm) ||
++	return collapse_test_exit(mm) ||
+ 		mm_flags_test(MMF_DISABLE_THP_COMPLETELY, mm);
+ }
+ 
+@@ -444,7 +444,7 @@ void __khugepaged_enter(struct mm_struct
+ 	int wakeup;
+ 
+ 	/* __khugepaged_exit() must not run from under us */
+-	VM_BUG_ON_MM(hpage_collapse_test_exit(mm), mm);
++	VM_BUG_ON_MM(collapse_test_exit(mm), mm);
+ 	if (unlikely(mm_flags_test_and_set(MMF_VM_HUGEPAGE, mm)))
+ 		return;
+ 
+@@ -502,7 +502,7 @@ void __khugepaged_exit(struct mm_struct
+ 	} else if (mm_slot) {
+ 		/*
+ 		 * This is required to serialize against
+-		 * hpage_collapse_test_exit() (which is guaranteed to run
++		 * collapse_test_exit() (which is guaranteed to run
+ 		 * under mmap sem read mode). Stop here (after we return all
+ 		 * pagetables will be destroyed) until khugepaged has finished
+ 		 * working on the pagetables under the mmap_lock.
+@@ -592,7 +592,7 @@ static int __collapse_huge_page_isolate(
+ 		folio = page_folio(page);
+ 		VM_BUG_ON_FOLIO(!folio_test_anon(folio), folio);
+ 
+-		/* See hpage_collapse_scan_pmd(). */
++		/* See collapse_scan_pmd(). */
+ 		if (folio_maybe_mapped_shared(folio)) {
+ 			++shared;
+ 			if (cc->is_khugepaged &&
+@@ -848,7 +848,7 @@ struct collapse_control khugepaged_colla
+ 	.is_khugepaged = true,
+ };
+ 
+-static bool hpage_collapse_scan_abort(int nid, struct collapse_control *cc)
++static bool collapse_scan_abort(int nid, struct collapse_control *cc)
+ {
+ 	int i;
+ 
+@@ -883,7 +883,7 @@ static inline gfp_t alloc_hugepage_khuge
+ }
+ 
+ #ifdef CONFIG_NUMA
+-static int hpage_collapse_find_target_node(struct collapse_control *cc)
++static int collapse_find_target_node(struct collapse_control *cc)
+ {
+ 	int nid, target_node = 0, max_value = 0;
+ 
+@@ -902,7 +902,7 @@ static int hpage_collapse_find_target_no
+ 	return target_node;
+ }
+ #else
+-static int hpage_collapse_find_target_node(struct collapse_control *cc)
++static int collapse_find_target_node(struct collapse_control *cc)
+ {
+ 	return 0;
+ }
+@@ -923,7 +923,7 @@ static int hugepage_vma_revalidate(struc
+ 	enum tva_type type = cc->is_khugepaged ? TVA_KHUGEPAGED :
+ 				 TVA_FORCED_COLLAPSE;
+ 
+-	if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
++	if (unlikely(collapse_test_exit_or_disable(mm)))
+ 		return SCAN_ANY_PROCESS;
+ 
+ 	*vmap = vma = find_vma(mm, address);
+@@ -996,7 +996,7 @@ static int check_pmd_still_valid(struct
+ 
+ /*
+  * Bring missing pages in from swap, to complete THP collapse.
+- * Only done if hpage_collapse_scan_pmd believes it is worthwhile.
++ * Only done if khugepaged_scan_pmd believes it is worthwhile.
+  *
+  * Called and returns without pte mapped or spinlocks held.
+  * Returns result: if not SCAN_SUCCEED, mmap_lock has been released.
+@@ -1082,7 +1082,7 @@ static int alloc_charge_folio(struct fol
+ {
+ 	gfp_t gfp = (cc->is_khugepaged ? alloc_hugepage_khugepaged_gfpmask() :
+ 		     GFP_TRANSHUGE);
+-	int node = hpage_collapse_find_target_node(cc);
++	int node = collapse_find_target_node(cc);
+ 	struct folio *folio;
+ 
+ 	folio = __folio_alloc(gfp, HPAGE_PMD_ORDER, node, &cc->alloc_nmask);
+@@ -1268,10 +1268,10 @@ out_nolock:
+ 	return result;
+ }
+ 
+-static int hpage_collapse_scan_pmd(struct mm_struct *mm,
+-				   struct vm_area_struct *vma,
+-				   unsigned long address, bool *mmap_locked,
+-				   struct collapse_control *cc)
++static int collapse_scan_pmd(struct mm_struct *mm,
++			     struct vm_area_struct *vma,
++			     unsigned long address, bool *mmap_locked,
++			     struct collapse_control *cc)
+ {
+ 	pmd_t *pmd;
+ 	pte_t *pte, *_pte;
+@@ -1382,7 +1382,7 @@ static int hpage_collapse_scan_pmd(struc
+ 		 * hit record.
+ 		 */
+ 		node = folio_nid(folio);
+-		if (hpage_collapse_scan_abort(node, cc)) {
++		if (collapse_scan_abort(node, cc)) {
+ 			result = SCAN_SCAN_ABORT;
+ 			goto out_unmap;
+ 		}
+@@ -1451,7 +1451,7 @@ static void collect_mm_slot(struct khuge
+ 
+ 	lockdep_assert_held(&khugepaged_mm_lock);
+ 
+-	if (hpage_collapse_test_exit(mm)) {
++	if (collapse_test_exit(mm)) {
+ 		/* free mm_slot */
+ 		hash_del(&slot->hash);
+ 		list_del(&slot->mm_node);
+@@ -1753,7 +1753,7 @@ static void retract_page_tables(struct a
+ 		if (find_pmd_or_thp_or_none(mm, addr, &pmd) != SCAN_SUCCEED)
+ 			continue;
+ 
+-		if (hpage_collapse_test_exit(mm))
++		if (collapse_test_exit(mm))
+ 			continue;
+ 		/*
+ 		 * When a vma is registered with uffd-wp, we cannot recycle
+@@ -2275,9 +2275,9 @@ out:
+ 	return result;
+ }
+ 
+-static int hpage_collapse_scan_file(struct mm_struct *mm, unsigned long addr,
+-				    struct file *file, pgoff_t start,
+-				    struct collapse_control *cc)
++static int collapse_scan_file(struct mm_struct *mm, unsigned long addr,
++			      struct file *file, pgoff_t start,
++			      struct collapse_control *cc)
+ {
+ 	struct folio *folio = NULL;
+ 	struct address_space *mapping = file->f_mapping;
+@@ -2332,7 +2332,7 @@ static int hpage_collapse_scan_file(stru
+ 		}
+ 
+ 		node = folio_nid(folio);
+-		if (hpage_collapse_scan_abort(node, cc)) {
++		if (collapse_scan_abort(node, cc)) {
+ 			result = SCAN_SCAN_ABORT;
+ 			folio_put(folio);
+ 			break;
+@@ -2382,7 +2382,7 @@ static int hpage_collapse_scan_file(stru
+ 	return result;
+ }
+ 
+-static unsigned int khugepaged_scan_mm_slot(unsigned int pages, int *result,
++static unsigned int collapse_scan_mm_slot(unsigned int pages, int *result,
+ 					    struct collapse_control *cc)
+ 	__releases(&khugepaged_mm_lock)
+ 	__acquires(&khugepaged_mm_lock)
+@@ -2420,7 +2420,7 @@ static unsigned int khugepaged_scan_mm_s
+ 		goto breakouterloop_mmap_lock;
+ 
+ 	progress++;
+-	if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
++	if (unlikely(collapse_test_exit_or_disable(mm)))
+ 		goto breakouterloop;
+ 
+ 	vma_iter_init(&vmi, mm, khugepaged_scan.address);
+@@ -2428,7 +2428,7 @@ static unsigned int khugepaged_scan_mm_s
+ 		unsigned long hstart, hend;
+ 
+ 		cond_resched();
+-		if (unlikely(hpage_collapse_test_exit_or_disable(mm))) {
++		if (unlikely(collapse_test_exit_or_disable(mm))) {
+ 			progress++;
+ 			break;
+ 		}
+@@ -2449,7 +2449,7 @@ skip:
+ 			bool mmap_locked = true;
+ 
+ 			cond_resched();
+-			if (unlikely(hpage_collapse_test_exit_or_disable(mm)))
++			if (unlikely(collapse_test_exit_or_disable(mm)))
+ 				goto breakouterloop;
+ 
+ 			VM_BUG_ON(khugepaged_scan.address < hstart ||
+@@ -2462,12 +2462,12 @@ skip:
+ 
+ 				mmap_read_unlock(mm);
+ 				mmap_locked = false;
+-				*result = hpage_collapse_scan_file(mm,
++				*result = collapse_scan_file(mm,
+ 					khugepaged_scan.address, file, pgoff, cc);
+ 				fput(file);
+ 				if (*result == SCAN_PTE_MAPPED_HUGEPAGE) {
+ 					mmap_read_lock(mm);
+-					if (hpage_collapse_test_exit_or_disable(mm))
++					if (collapse_test_exit_or_disable(mm))
+ 						goto breakouterloop;
+ 					*result = collapse_pte_mapped_thp(mm,
+ 						khugepaged_scan.address, false);
+@@ -2476,7 +2476,7 @@ skip:
+ 					mmap_read_unlock(mm);
+ 				}
+ 			} else {
+-				*result = hpage_collapse_scan_pmd(mm, vma,
++				*result = collapse_scan_pmd(mm, vma,
+ 					khugepaged_scan.address, &mmap_locked, cc);
+ 			}
+ 
+@@ -2509,7 +2509,7 @@ breakouterloop_mmap_lock:
+ 	 * Release the current mm_slot if this mm is about to die, or
+ 	 * if we scanned all vmas of this mm.
+ 	 */
+-	if (hpage_collapse_test_exit(mm) || !vma) {
++	if (collapse_test_exit(mm) || !vma) {
+ 		/*
+ 		 * Make sure that if mm_users is reaching zero while
+ 		 * khugepaged runs here, khugepaged_exit will find
+@@ -2563,8 +2563,8 @@ static void khugepaged_do_scan(struct co
+ 			pass_through_head++;
+ 		if (khugepaged_has_work() &&
+ 		    pass_through_head < 2)
+-			progress += khugepaged_scan_mm_slot(pages - progress,
+-							    &result, cc);
++			progress += collapse_scan_mm_slot(pages - progress,
++							  &result, cc);
+ 		else
+ 			progress = pages;
+ 		spin_unlock(&khugepaged_mm_lock);
+@@ -2805,12 +2805,11 @@ int madvise_collapse(struct vm_area_stru
+ 
+ 			mmap_read_unlock(mm);
+ 			mmap_locked = false;
+-			result = hpage_collapse_scan_file(mm, addr, file, pgoff,
+-							  cc);
++			result = collapse_scan_file(mm, addr, file, pgoff, cc);
+ 			fput(file);
+ 		} else {
+-			result = hpage_collapse_scan_pmd(mm, vma, addr,
+-							 &mmap_locked, cc);
++			result = collapse_scan_pmd(mm, vma, addr,
++						   &mmap_locked, cc);
+ 		}
+ 		if (!mmap_locked)
+ 			*lock_dropped = true;
+_
