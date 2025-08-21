@@ -1,0 +1,126 @@
+From: "Vishal Moola (Oracle)" <vishal.moola@gmail.com>
+Subject: mm: tag kernel stack pages
+Date: Wed, 20 Aug 2025 13:20:29 -0700
+
+Currently, we have no way to distinguish a kernel stack page from an
+unidentified page.  Being able to track this information can be beneficial
+for optimizing kernel memory usage (i.e.  analyzing fragmentation,
+location etc.).  Knowing a page is being used for a kernel stack gives us
+more insight about pages that are certainly immovable and important to
+kernel functionality.
+
+Add a new pagetype, and tag pages alongside the kernel stack accounting. 
+Also, ensure the type is dumped to /proc/kpageflags and the page-types
+tool can find it.
+
+Link: https://lkml.kernel.org/r/20250820202029.1909925-1-vishal.moola@gmail.com
+Signed-off-by: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: David Hildenbrand <david@redhat.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ fs/proc/page.c                         |    3 ++-
+ include/linux/page-flags.h             |    5 +++++
+ include/uapi/linux/kernel-page-flags.h |    1 +
+ kernel/fork.c                          |   19 +++++++++++++++++--
+ tools/mm/page-types.c                  |    1 +
+ 5 files changed, 26 insertions(+), 3 deletions(-)
+
+--- a/fs/proc/page.c~mm-tag-kernel-stack-pages
++++ a/fs/proc/page.c
+@@ -201,7 +201,8 @@ u64 stable_page_flags(const struct page
+ 
+ 	if (ps.flags & PAGE_SNAPSHOT_PG_BUDDY)
+ 		u |= 1 << KPF_BUDDY;
+-
++	if (folio_test_stack(folio))
++		u |= 1 << KPF_KSTACK;
+ 	if (folio_test_offline(folio))
+ 		u |= 1 << KPF_OFFLINE;
+ 	if (folio_test_pgtable(folio))
+--- a/include/linux/page-flags.h~mm-tag-kernel-stack-pages
++++ a/include/linux/page-flags.h
+@@ -933,6 +933,7 @@ enum pagetype {
+ 	PGTY_zsmalloc		= 0xf6,
+ 	PGTY_unaccepted		= 0xf7,
+ 	PGTY_large_kmalloc	= 0xf8,
++	PGTY_kstack		= 0xf9,
+ 
+ 	PGTY_mapcount_underflow = 0xff
+ };
+@@ -995,6 +996,10 @@ static __always_inline void __ClearPage#
+ 	page->page_type = UINT_MAX;					\
+ }
+ 
++/* PageStack() indicates that a page is used by kernel stacks.
++ */
++PAGE_TYPE_OPS(Stack, kstack, stack)
++
+ /*
+  * PageBuddy() indicates that the page is free and in the buddy system
+  * (see mm/page_alloc.c).
+--- a/include/uapi/linux/kernel-page-flags.h~mm-tag-kernel-stack-pages
++++ a/include/uapi/linux/kernel-page-flags.h
+@@ -36,5 +36,6 @@
+ #define KPF_ZERO_PAGE		24
+ #define KPF_IDLE		25
+ #define KPF_PGTABLE		26
++#define KPF_KSTACK		27
+ 
+ #endif /* _UAPILINUX_KERNEL_PAGE_FLAGS_H */
+--- a/kernel/fork.c~mm-tag-kernel-stack-pages
++++ a/kernel/fork.c
+@@ -440,15 +440,22 @@ static void account_kernel_stack(struct
+ 		struct vm_struct *vm_area = task_stack_vm_area(tsk);
+ 		int i;
+ 
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
++		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+ 			mod_lruvec_page_state(vm_area->pages[i], NR_KERNEL_STACK_KB,
+ 					      account * (PAGE_SIZE / 1024));
++			__SetPageStack(vm_area->pages[i]);
++		}
+ 	} else {
+ 		void *stack = task_stack_page(tsk);
++		struct page *page = virt_to_head_page(stack);
++		int i;
+ 
+ 		/* All stack pages are in the same node. */
+ 		mod_lruvec_kmem_state(stack, NR_KERNEL_STACK_KB,
+ 				      account * (THREAD_SIZE / 1024));
++
++		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++, page++)
++			__SetPageStack(page);
+ 	}
+ }
+ 
+@@ -461,8 +468,16 @@ void exit_task_stack_account(struct task
+ 		int i;
+ 
+ 		vm_area = task_stack_vm_area(tsk);
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
++		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+ 			memcg_kmem_uncharge_page(vm_area->pages[i], 0);
++			__ClearPageStack(vm_area->pages[i]);
++		}
++	} else {
++		struct page *page = virt_to_head_page(task_stack_page(tsk));
++		int i;
++
++		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++, page++)
++			__ClearPageStack(page);
+ 	}
+ }
+ 
+--- a/tools/mm/page-types.c~mm-tag-kernel-stack-pages
++++ a/tools/mm/page-types.c
+@@ -127,6 +127,7 @@ static const char * const page_flag_name
+ 	[KPF_PGTABLE]		= "g:pgtable",
+ 	[KPF_ZERO_PAGE]		= "z:zero_page",
+ 	[KPF_IDLE]              = "i:idle_page",
++	[KPF_KSTACK]		= "k:kernel_stack",
+ 
+ 	[KPF_RESERVED]		= "r:reserved",
+ 	[KPF_MLOCKED]		= "m:mlocked",
+_
