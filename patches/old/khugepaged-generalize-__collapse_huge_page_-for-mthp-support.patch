@@ -1,20 +1,20 @@
 From: Nico Pache <npache@redhat.com>
 Subject: khugepaged: generalize __collapse_huge_page_* for mTHP support
-Date: Sun, 13 Jul 2025 18:31:58 -0600
+Date: Tue, 19 Aug 2025 07:41:57 -0600
 
-Generalize the order of the __collapse_huge_page_* functions to support
+generalize the order of the __collapse_huge_page_* functions to support
 future mTHP collapse.
 
 mTHP collapse can suffer from incosistant behavior, and memory waste
-"creep". disable swapin and shared support for mTHP collapse.
+"creep".  disable swapin and shared support for mTHP collapse.
 
 No functional changes in this patch.
 
-Link: https://lkml.kernel.org/r/20250714003207.113275-6-npache@redhat.com
+Link: https://lkml.kernel.org/r/20250819134205.622806-6-npache@redhat.com
+Co-developed-by: Dev Jain <dev.jain@arm.com>
 Signed-off-by: Dev Jain <dev.jain@arm.com>
 Signed-off-by: Nico Pache <npache@redhat.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
-Co-developed-by: Dev Jain <dev.jain@arm.com>
 Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
@@ -53,79 +53,88 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/khugepaged.c |   49 +++++++++++++++++++++++++++++-----------------
- 1 file changed, 31 insertions(+), 18 deletions(-)
+ mm/khugepaged.c |   62 +++++++++++++++++++++++++++++++---------------
+ 1 file changed, 43 insertions(+), 19 deletions(-)
 
 --- a/mm/khugepaged.c~khugepaged-generalize-__collapse_huge_page_-for-mthp-support
 +++ a/mm/khugepaged.c
-@@ -552,15 +552,17 @@ static int __collapse_huge_page_isolate(
+@@ -551,15 +551,17 @@ static int __collapse_huge_page_isolate(
  					unsigned long address,
  					pte_t *pte,
  					struct collapse_control *cc,
 -					struct list_head *compound_pagelist)
 +					struct list_head *compound_pagelist,
-+					u8 order)
++					unsigned int order)
  {
  	struct page *page = NULL;
  	struct folio *folio = NULL;
  	pte_t *_pte;
  	int none_or_zero = 0, shared = 0, result = SCAN_FAIL, referenced = 0;
  	bool writable = false;
-+	int scaled_none = khugepaged_max_ptes_none >> (HPAGE_PMD_ORDER - order);
++	int scaled_max_ptes_none = khugepaged_max_ptes_none >> (HPAGE_PMD_ORDER - order);
  
 -	for (_pte = pte; _pte < pte + HPAGE_PMD_NR;
 +	for (_pte = pte; _pte < pte + (1 << order);
  	     _pte++, address += PAGE_SIZE) {
  		pte_t pteval = ptep_get(_pte);
  		if (pte_none(pteval) || (pte_present(pteval) &&
-@@ -568,7 +570,7 @@ static int __collapse_huge_page_isolate(
+@@ -567,7 +569,7 @@ static int __collapse_huge_page_isolate(
  			++none_or_zero;
  			if (!userfaultfd_armed(vma) &&
  			    (!cc->is_khugepaged ||
 -			     none_or_zero <= khugepaged_max_ptes_none)) {
-+			     none_or_zero <= scaled_none)) {
++			     none_or_zero <= scaled_max_ptes_none)) {
  				continue;
  			} else {
  				result = SCAN_EXCEED_NONE_PTE;
-@@ -596,8 +598,8 @@ static int __collapse_huge_page_isolate(
- 		/* See hpage_collapse_scan_pmd(). */
+@@ -595,8 +597,14 @@ static int __collapse_huge_page_isolate(
+ 		/* See collapse_scan_pmd(). */
  		if (folio_maybe_mapped_shared(folio)) {
  			++shared;
 -			if (cc->is_khugepaged &&
 -			    shared > khugepaged_max_ptes_shared) {
++			/*
++			 * TODO: Support shared pages without leading to further
++			 * mTHP collapses. Currently bringing in new pages via
++			 * shared may cause a future higher order collapse on a
++			 * rescan of the same range.
++			 */
 +			if (order != HPAGE_PMD_ORDER || (cc->is_khugepaged &&
 +			    shared > khugepaged_max_ptes_shared)) {
  				result = SCAN_EXCEED_SHARED_PTE;
  				count_vm_event(THP_SCAN_EXCEED_SHARED_PTE);
  				goto out;
-@@ -698,13 +700,14 @@ static void __collapse_huge_page_copy_su
+@@ -697,15 +705,16 @@ static void __collapse_huge_page_copy_su
  						struct vm_area_struct *vma,
  						unsigned long address,
  						spinlock_t *ptl,
 -						struct list_head *compound_pagelist)
 +						struct list_head *compound_pagelist,
-+						u8 order)
++						unsigned int order)
  {
+-	unsigned long end = address + HPAGE_PMD_SIZE;
++	unsigned long end = address + (PAGE_SIZE << order);
  	struct folio *src, *tmp;
- 	pte_t *_pte;
  	pte_t pteval;
+ 	pte_t *_pte;
+ 	unsigned int nr_ptes;
  
--	for (_pte = pte; _pte < pte + HPAGE_PMD_NR;
-+	for (_pte = pte; _pte < pte + (1 << order);
- 	     _pte++, address += PAGE_SIZE) {
+-	for (_pte = pte; _pte < pte + HPAGE_PMD_NR; _pte += nr_ptes,
++	for (_pte = pte; _pte < pte + (1 << order); _pte += nr_ptes,
+ 	     address += nr_ptes * PAGE_SIZE) {
+ 		nr_ptes = 1;
  		pteval = ptep_get(_pte);
- 		if (pte_none(pteval) || is_zero_pfn(pte_pfn(pteval))) {
-@@ -751,7 +754,8 @@ static void __collapse_huge_page_copy_fa
+@@ -761,7 +770,8 @@ static void __collapse_huge_page_copy_fa
  					     pmd_t *pmd,
  					     pmd_t orig_pmd,
  					     struct vm_area_struct *vma,
 -					     struct list_head *compound_pagelist)
 +					     struct list_head *compound_pagelist,
-+					     u8 order)
++					     unsigned int order)
  {
  	spinlock_t *pmd_ptl;
  
-@@ -768,7 +772,7 @@ static void __collapse_huge_page_copy_fa
+@@ -778,7 +788,7 @@ static void __collapse_huge_page_copy_fa
  	 * Release both raw and compound pages isolated
  	 * in __collapse_huge_page_isolate.
  	 */
@@ -134,16 +143,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -789,7 +793,7 @@ static void __collapse_huge_page_copy_fa
+@@ -799,7 +809,7 @@ static void __collapse_huge_page_copy_fa
  static int __collapse_huge_page_copy(pte_t *pte, struct folio *folio,
  		pmd_t *pmd, pmd_t orig_pmd, struct vm_area_struct *vma,
  		unsigned long address, spinlock_t *ptl,
 -		struct list_head *compound_pagelist)
-+		struct list_head *compound_pagelist, u8 order)
++		struct list_head *compound_pagelist, unsigned int order)
  {
  	unsigned int i;
  	int result = SCAN_SUCCEED;
-@@ -797,7 +801,7 @@ static int __collapse_huge_page_copy(pte
+@@ -807,7 +817,7 @@ static int __collapse_huge_page_copy(pte
  	/*
  	 * Copying pages' contents is subject to memory poison at any iteration.
  	 */
@@ -152,7 +161,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pte_t pteval = ptep_get(pte + i);
  		struct page *page = folio_page(folio, i);
  		unsigned long src_addr = address + i * PAGE_SIZE;
-@@ -816,10 +820,10 @@ static int __collapse_huge_page_copy(pte
+@@ -826,10 +836,10 @@ static int __collapse_huge_page_copy(pte
  
  	if (likely(result == SCAN_SUCCEED))
  		__collapse_huge_page_copy_succeeded(pte, vma, address, ptl,
@@ -165,12 +174,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return result;
  }
-@@ -994,11 +998,11 @@ static int check_pmd_still_valid(struct
+@@ -1005,11 +1015,11 @@ static int check_pmd_still_valid(struct
  static int __collapse_huge_page_swapin(struct mm_struct *mm,
  				       struct vm_area_struct *vma,
  				       unsigned long haddr, pmd_t *pmd,
 -				       int referenced)
-+				       int referenced, u8 order)
++				       int referenced, unsigned int order)
  {
  	int swapped_in = 0;
  	vm_fault_t ret = 0;
@@ -179,13 +188,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int result;
  	pte_t *pte = NULL;
  	spinlock_t *ptl;
-@@ -1029,6 +1033,15 @@ static int __collapse_huge_page_swapin(s
+@@ -1040,6 +1050,19 @@ static int __collapse_huge_page_swapin(s
  		if (!is_swap_pte(vmf.orig_pte))
  			continue;
  
-+		/* Dont swapin for mTHP collapse */
++		/*
++		 * TODO: Support swapin without leading to further mTHP
++		 * collapses. Currently bringing in new pages via swapin may
++		 * cause a future higher order collapse on a rescan of the same
++		 * range.
++		 */
 +		if (order != HPAGE_PMD_ORDER) {
-+			count_mthp_stat(order, MTHP_STAT_COLLAPSE_EXCEED_SWAP);
 +			pte_unmap(pte);
 +			mmap_read_unlock(mm);
 +			result = SCAN_EXCEED_SWAP_PTE;
@@ -195,25 +208,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		vmf.pte = pte;
  		vmf.ptl = ptl;
  		ret = do_swap_page(&vmf);
-@@ -1149,7 +1162,7 @@ static int collapse_huge_page(struct mm_
+@@ -1160,7 +1183,7 @@ static int collapse_huge_page(struct mm_
  		 * that case.  Continuing to collapse causes inconsistency.
  		 */
  		result = __collapse_huge_page_swapin(mm, vma, address, pmd,
 -						     referenced);
-+				referenced, HPAGE_PMD_ORDER);
++						     referenced, HPAGE_PMD_ORDER);
  		if (result != SCAN_SUCCEED)
  			goto out_nolock;
  	}
-@@ -1197,7 +1210,7 @@ static int collapse_huge_page(struct mm_
+@@ -1208,7 +1231,8 @@ static int collapse_huge_page(struct mm_
  	pte = pte_offset_map_lock(mm, &_pmd, address, &pte_ptl);
  	if (pte) {
  		result = __collapse_huge_page_isolate(vma, address, pte, cc,
 -						      &compound_pagelist);
-+					&compound_pagelist, HPAGE_PMD_ORDER);
++						      &compound_pagelist,
++						      HPAGE_PMD_ORDER);
  		spin_unlock(pte_ptl);
  	} else {
  		result = SCAN_PMD_NULL;
-@@ -1227,7 +1240,7 @@ static int collapse_huge_page(struct mm_
+@@ -1238,7 +1262,7 @@ static int collapse_huge_page(struct mm_
  
  	result = __collapse_huge_page_copy(pte, folio, pmd, _pmd,
  					   vma, address, pte_ptl,
