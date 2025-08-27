@@ -1,0 +1,108 @@
+From: Dev Jain <dev.jain@arm.com>
+Subject: selftests/mm/uffd-stress: make test operate on less hugetlb memory
+Date: Tue, 26 Aug 2025 12:37:04 +0530
+
+Patch series "selftests/mm: uffd-stress fixes".
+
+This patchset ensures that the number of hugepages is correctly set in the
+system so that the uffd-stress test does not fail due to the racy nature
+of the test.  Patch 1 corrects the hugepage constraint in the
+run_vmtests.sh script, whereas patch 2 corrects the constraint in the test
+itself.
+
+
+This patch (of 2):
+
+We observed uffd-stress selftest failure on arm64 and intermittent
+failures on x86 too:
+
+running ./uffd-stress hugetlb-private 128 32
+
+bounces: 17, mode: rnd read, ERROR: UFFDIO_COPY error: -12 (errno=12, @uffd-common.c:617) [FAIL]
+not ok 18 uffd-stress hugetlb-private 128 32 # exit=1
+
+For this particular case, the number of free hugepages from run_vmtests.sh
+will be 128, and the test will allocate 64 hugepages in the source
+location.  The stress() function will start spawning threads which will
+operate on the destination location, triggering uffd-operations like
+UFFDIO_COPY from src to dst, which means that we will require 64 more
+hugepages for the dst location.
+
+Let us observe the locking_thread() function.  It will lock the mutex kept
+at dst, triggering uffd-copy.  Suppose that 127 (64 for src and 63 for
+dst) hugepages have been reserved.  In case of BOUNCE_RANDOM, it may
+happen that two threads trying to lock the mutex at dst, try to do so at
+the same hugepage number.  If one thread succeeds in reserving the last
+hugepage, then the other thread may fail in alloc_hugetlb_folio(),
+returning -ENOMEM.  I can confirm that this is indeed the case by this
+hacky patch:
+
+: --- a/mm/hugetlb.c
+: +++ b/mm/hugetlb.c
+: @@ -6929,6 +6929,11 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_pte,
+: 
+:  		folio = alloc_hugetlb_folio(dst_vma, dst_addr, false);
+:  		if (IS_ERR(folio)) {
+: +			pte_t *actual_pte = hugetlb_walk(dst_vma, dst_addr, PMD_SIZE);
+: +			if (actual_pte) {
+: +				ret = -EEXIST;
+: +				goto out;
+: +			}
+:  			ret = -ENOMEM;
+:  			goto out;
+:  		}
+
+This code path gets triggered indicating that the PMD at which one thread
+is trying to map a hugepage, gets filled by a racing thread.
+
+Therefore, instead of using freepgs to compute the amount of memory, use
+freepgs - 10, so that the test still has some extra hugepages to use. 
+Note that, in case this value underflows, there is a check for the number
+of free hugepages in the test itself, which will fail, so we are safe.
+
+Link: https://lkml.kernel.org/r/20250826070705.53841-1-dev.jain@arm.com
+Link: https://lkml.kernel.org/r/20250826070705.53841-2-dev.jain@arm.com
+Signed-off-by: Dev Jain <dev.jain@arm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/hugetlb.c                              |    5 +++++
+ tools/testing/selftests/mm/run_vmtests.sh |    2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+--- a/mm/hugetlb.c~selftests-mm-uffd-stress-make-test-operate-on-less-hugetlb-memory
++++ a/mm/hugetlb.c
+@@ -6935,6 +6935,11 @@ int hugetlb_mfill_atomic_pte(pte_t *dst_
+ 
+ 		folio = alloc_hugetlb_folio(dst_vma, dst_addr, false);
+ 		if (IS_ERR(folio)) {
++			pte_t *actual_pte = hugetlb_walk(dst_vma, dst_addr, PMD_SIZE);
++			if (actual_pte) {
++				ret = -EEXIST;
++				goto out;
++			}
+ 			ret = -ENOMEM;
+ 			goto out;
+ 		}
+--- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-uffd-stress-make-test-operate-on-less-hugetlb-memory
++++ a/tools/testing/selftests/mm/run_vmtests.sh
+@@ -328,7 +328,7 @@ CATEGORY="userfaultfd" run_test ${uffd_s
+ # the size of the free pages we have, which is used for *each*.
+ # uffd-stress expects a region expressed in MiB, so we adjust
+ # half_ufd_size_MB accordingly.
+-half_ufd_size_MB=$(((freepgs * hpgsize_KB) / 1024 / 2))
++half_ufd_size_MB=$((((freepgs - 10) * hpgsize_KB) / 1024 / 2))
+ CATEGORY="userfaultfd" run_test ${uffd_stress_bin} hugetlb "$half_ufd_size_MB" 32
+ CATEGORY="userfaultfd" run_test ${uffd_stress_bin} hugetlb-private "$half_ufd_size_MB" 32
+ CATEGORY="userfaultfd" run_test ${uffd_stress_bin} shmem 20 16
+_
