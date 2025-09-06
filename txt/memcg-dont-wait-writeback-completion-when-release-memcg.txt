@@ -1,0 +1,85 @@
+From: Julian Sun <sunjunchao@bytedance.com>
+Subject: memcg: don't wait writeback completion when release memcg.
+Date: Thu, 28 Aug 2025 04:45:57 +0800
+
+Recently, we encountered the following hung task:
+
+INFO: task kworker/4:1:1334558 blocked for more than 1720 seconds.
+[Wed Jul 30 17:47:45 2025] Workqueue: cgroup_destroy css_free_rwork_fn
+[Wed Jul 30 17:47:45 2025] Call Trace:
+[Wed Jul 30 17:47:45 2025]  __schedule+0x934/0xe10
+[Wed Jul 30 17:47:45 2025]  ? complete+0x3b/0x50
+[Wed Jul 30 17:47:45 2025]  ? _cond_resched+0x15/0x30
+[Wed Jul 30 17:47:45 2025]  schedule+0x40/0xb0
+[Wed Jul 30 17:47:45 2025]  wb_wait_for_completion+0x52/0x80
+[Wed Jul 30 17:47:45 2025]  ? finish_wait+0x80/0x80
+[Wed Jul 30 17:47:45 2025]  mem_cgroup_css_free+0x22/0x1b0
+[Wed Jul 30 17:47:45 2025]  css_free_rwork_fn+0x42/0x380
+[Wed Jul 30 17:47:45 2025]  process_one_work+0x1a2/0x360
+[Wed Jul 30 17:47:45 2025]  worker_thread+0x30/0x390
+[Wed Jul 30 17:47:45 2025]  ? create_worker+0x1a0/0x1a0
+[Wed Jul 30 17:47:45 2025]  kthread+0x110/0x130
+[Wed Jul 30 17:47:45 2025]  ? __kthread_cancel_work+0x40/0x40
+[Wed Jul 30 17:47:45 2025]  ret_from_fork+0x1f/0x30
+
+The direct cause is that memcg spends a long time waiting for dirty page
+writeback of foreign memcgs during release.
+
+The root causes are:
+    a. The wb may have multiple writeback tasks, containing millions
+       of dirty pages, as shown below:
+
+>>> for work in list_for_each_entry("struct wb_writeback_work", \
+				    wb.work_list.address_of_(), "list"):
+...     print(work.nr_pages, work.reason, hex(work))
+...
+900628  WB_REASON_FOREIGN_FLUSH 0xffff969e8d956b40
+1116521 WB_REASON_FOREIGN_FLUSH 0xffff9698332a9540
+1275228 WB_REASON_FOREIGN_FLUSH 0xffff969d9b444bc0
+1099673 WB_REASON_FOREIGN_FLUSH 0xffff969f0954d6c0
+1351522 WB_REASON_FOREIGN_FLUSH 0xffff969e76713340
+2567437 WB_REASON_FOREIGN_FLUSH 0xffff9694ae208400
+2954033 WB_REASON_FOREIGN_FLUSH 0xffff96a22d62cbc0
+3008860 WB_REASON_FOREIGN_FLUSH 0xffff969eee8ce3c0
+3337932 WB_REASON_FOREIGN_FLUSH 0xffff9695b45156c0
+3348916 WB_REASON_FOREIGN_FLUSH 0xffff96a22c7a4f40
+3345363 WB_REASON_FOREIGN_FLUSH 0xffff969e5d872800
+3333581 WB_REASON_FOREIGN_FLUSH 0xffff969efd0f4600
+3382225 WB_REASON_FOREIGN_FLUSH 0xffff969e770edcc0
+3418770 WB_REASON_FOREIGN_FLUSH 0xffff96a252ceea40
+3387648 WB_REASON_FOREIGN_FLUSH 0xffff96a3bda86340
+3385420 WB_REASON_FOREIGN_FLUSH 0xffff969efc6eb280
+3418730 WB_REASON_FOREIGN_FLUSH 0xffff96a348ab1040
+3426155 WB_REASON_FOREIGN_FLUSH 0xffff969d90beac00
+3397995 WB_REASON_FOREIGN_FLUSH 0xffff96a2d7288800
+3293095 WB_REASON_FOREIGN_FLUSH 0xffff969dab423240
+3293595 WB_REASON_FOREIGN_FLUSH 0xffff969c765ff400
+3199511 WB_REASON_FOREIGN_FLUSH 0xffff969a72d5e680
+3085016 WB_REASON_FOREIGN_FLUSH 0xffff969f0455e000
+3035712 WB_REASON_FOREIGN_FLUSH 0xffff969d9bbf4b00
+
+    b. The writeback might severely throttled by wbt, with a speed
+       possibly less than 100kb/s, leading to a very long writeback time.
+
+>>> wb.write_bandwidth
+(unsigned long)24
+>>> wb.write_bandwidth
+(unsigned long)13
+
+The wb_wait_for_completion() here is probably only used to prevent
+use-after-free.  Therefore, we manage 'done' separately and automatically
+free it.
+
+This allows us to remove wb_wait_for_completion() while preventing the
+use-after-free issue.
+
+Link: https://lkml.kernel.org/r/20250827204557.90112-1-sunjunchao@bytedance.com
+Fixes: 97b27821b485 ("writeback, memcg: Implement foreign dirty flushing")
+Signed-off-by: Julian Sun <sunjunchao@bytedance.com>
+Acked-by: Tejun Heo <tj@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Shakeel Butt <shakeelb@google.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
+Cc: <stable@vger.kernel.org>

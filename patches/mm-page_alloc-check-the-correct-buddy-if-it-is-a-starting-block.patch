@@ -1,0 +1,94 @@
+From: Wei Yang <richard.weiyang@gmail.com>
+Subject: mm/page_alloc: check the correct buddy if it is a starting block
+Date: Fri, 5 Sep 2025 14:03:58 +0000
+
+find_large_buddy() search buddy based on start_pfn, which maybe different
+from page's pfn, e.g.  when page is not pageblock aligned, because
+prep_move_freepages_block() always align start_pfn to pageblock.
+
+This means when we found a starting block at start_pfn, it may check on
+the wrong page theoretically.  And not split the free page as it is
+supposed to, causing a freelist migratetype mismatch.
+
+The good news is the page passed to __move_freepages_block_isolate() has
+only two possible cases:
+
+  * page is pageblock aligned
+  * page is __first_valid_page() of this block
+
+So it is safe for the first case, and it won't get a buddy larger than
+pageblock for the second case.
+
+To fix the issue, check the returned pfn of find_large_buddy() to decide
+whether to split the free page:
+
+  1. if it is not a PageBuddy pfn, no split;
+  2. if it is a PageBuddy pfn but order <= pageblock_order, no split;
+  3. if it is a PageBuddy pfn with order > pageblock_order, start_pfn is
+     either in the starting block or tail block, split the PageBuddy at
+     pageblock_order level.
+
+Link: https://lkml.kernel.org/r/20250905140358.28849-1-richard.weiyang@gmail.com
+Signed-off-by: Wei Yang <richard.weiyang@gmail.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page_alloc.c |   25 ++++++++-----------------
+ 1 file changed, 8 insertions(+), 17 deletions(-)
+
+--- a/mm/page_alloc.c~mm-page_alloc-check-the-correct-buddy-if-it-is-a-starting-block
++++ a/mm/page_alloc.c
+@@ -2090,9 +2090,10 @@ static inline void toggle_pageblock_isol
+ static bool __move_freepages_block_isolate(struct zone *zone,
+ 		struct page *page, bool isolate)
+ {
+-	unsigned long start_pfn, pfn;
++	unsigned long start_pfn, buddy_pfn;
+ 	int from_mt;
+ 	int to_mt;
++	struct page *buddy;
+ 
+ 	if (isolate == get_pageblock_isolate(page)) {
+ 		VM_WARN_ONCE(1, "%s a pageblock that is already in that state",
+@@ -2107,29 +2108,19 @@ static bool __move_freepages_block_isola
+ 	if (pageblock_order == MAX_PAGE_ORDER)
+ 		goto move;
+ 
+-	/* We're a tail block in a larger buddy */
+-	pfn = find_large_buddy(start_pfn);
+-	if (pfn != start_pfn) {
+-		struct page *buddy = pfn_to_page(pfn);
++	buddy_pfn = find_large_buddy(start_pfn);
++	buddy = pfn_to_page(buddy_pfn);
++	/* We're a part of a larger buddy */
++	if (PageBuddy(buddy) && buddy_order(buddy) > pageblock_order) {
+ 		int order = buddy_order(buddy);
+ 
+ 		del_page_from_free_list(buddy, zone, order,
+-					get_pfnblock_migratetype(buddy, pfn));
++					get_pfnblock_migratetype(buddy, buddy_pfn));
+ 		toggle_pageblock_isolate(page, isolate);
+-		split_large_buddy(zone, buddy, pfn, order, FPI_NONE);
++		split_large_buddy(zone, buddy, buddy_pfn, order, FPI_NONE);
+ 		return true;
+ 	}
+ 
+-	/* We're the starting block of a larger buddy */
+-	if (PageBuddy(page) && buddy_order(page) > pageblock_order) {
+-		int order = buddy_order(page);
+-
+-		del_page_from_free_list(page, zone, order,
+-					get_pfnblock_migratetype(page, pfn));
+-		toggle_pageblock_isolate(page, isolate);
+-		split_large_buddy(zone, page, pfn, order, FPI_NONE);
+-		return true;
+-	}
+ move:
+ 	/* Use MIGRATETYPE_MASK to get non-isolate migratetype */
+ 	if (isolate) {
+_
