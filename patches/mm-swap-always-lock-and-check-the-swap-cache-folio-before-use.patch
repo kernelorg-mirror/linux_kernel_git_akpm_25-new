@@ -1,0 +1,151 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm, swap: always lock and check the swap cache folio before use
+Date: Sat, 6 Sep 2025 03:13:47 +0800
+
+Swap cache lookup only increases the reference count of the returned
+folio.  That's not enough to ensure a folio is stable in the swap cache,
+so the folio could be removed from the swap cache at any time.  The caller
+should always lock and check the folio before using it.
+
+We have just documented this in kerneldoc, now introduce a helper for swap
+cache folio verification with proper sanity checks.
+
+Also, sanitize a few current users to use this convention and the new
+helper for easier debugging.  They were not having observable problems
+yet, only trivial issues like wasted CPU cycles on swapoff or reclaiming. 
+They would fail in some other way, but it is still better to always follow
+this convention to make things robust and make later commits easier to do.
+
+Link: https://lkml.kernel.org/r/20250905191357.78298-6-ryncsn@gmail.com
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: kernel test robot <oliver.sang@intel.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c     |    3 +--
+ mm/swap.h       |   24 ++++++++++++++++++++++++
+ mm/swap_state.c |    7 +++++--
+ mm/swapfile.c   |   10 +++++++---
+ 4 files changed, 37 insertions(+), 7 deletions(-)
+
+--- a/mm/memory.c~mm-swap-always-lock-and-check-the-swap-cache-folio-before-use
++++ a/mm/memory.c
+@@ -4748,8 +4748,7 @@ vm_fault_t do_swap_page(struct vm_fault
+ 		 * swapcache, we need to check that the page's swap has not
+ 		 * changed.
+ 		 */
+-		if (unlikely(!folio_test_swapcache(folio) ||
+-			     page_swap_entry(page).val != entry.val))
++		if (unlikely(!folio_matches_swap_entry(folio, entry)))
+ 			goto out_page;
+ 
+ 		if (unlikely(PageHWPoison(page))) {
+--- a/mm/swapfile.c~mm-swap-always-lock-and-check-the-swap-cache-folio-before-use
++++ a/mm/swapfile.c
+@@ -240,14 +240,12 @@ again:
+ 	 * Offset could point to the middle of a large folio, or folio
+ 	 * may no longer point to the expected offset before it's locked.
+ 	 */
+-	if (offset < swp_offset(folio->swap) ||
+-	    offset >= swp_offset(folio->swap) + nr_pages) {
++	if (!folio_matches_swap_entry(folio, entry)) {
+ 		folio_unlock(folio);
+ 		folio_put(folio);
+ 		goto again;
+ 	}
+ 	offset = swp_offset(folio->swap);
+-
+ 	need_reclaim = ((flags & TTRS_ANYWAY) ||
+ 			((flags & TTRS_UNMAPPED) && !folio_mapped(folio)) ||
+ 			((flags & TTRS_FULL) && mem_cgroup_swap_full(folio)));
+@@ -2150,6 +2148,12 @@ static int unuse_pte_range(struct vm_are
+ 		}
+ 
+ 		folio_lock(folio);
++		if (!folio_matches_swap_entry(folio, entry)) {
++			folio_unlock(folio);
++			folio_put(folio);
++			continue;
++		}
++
+ 		folio_wait_writeback(folio);
+ 		ret = unuse_pte(vma, pmd, addr, entry, folio);
+ 		if (ret < 0) {
+--- a/mm/swap.h~mm-swap-always-lock-and-check-the-swap-cache-folio-before-use
++++ a/mm/swap.h
+@@ -52,6 +52,25 @@ static inline pgoff_t swap_cache_index(s
+ 	return swp_offset(entry) & SWAP_ADDRESS_SPACE_MASK;
+ }
+ 
++/**
++ * folio_matches_swap_entry - Check if a folio matches a given swap entry.
++ * @folio: The folio.
++ * @entry: The swap entry to check against.
++ *
++ * Context: The caller should have the folio locked to ensure it's stable
++ * and nothing will move it in or out of the swap cache.
++ * Return: true or false.
++ */
++static inline bool folio_matches_swap_entry(const struct folio *folio,
++					    swp_entry_t entry)
++{
++	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
++	if (!folio_test_swapcache(folio))
++		return false;
++	VM_WARN_ON_ONCE_FOLIO(!IS_ALIGNED(folio->swap.val, folio_nr_pages(folio)), folio);
++	return folio->swap.val == round_down(entry.val, folio_nr_pages(folio));
++}
++
+ void show_swap_cache_info(void);
+ void *get_shadow_from_swap_cache(swp_entry_t entry);
+ int add_to_swap_cache(struct folio *folio, swp_entry_t entry,
+@@ -144,6 +163,11 @@ static inline pgoff_t swap_cache_index(s
+ 	return 0;
+ }
+ 
++static inline bool folio_matches_swap_entry(const struct folio *folio, swp_entry_t entry)
++{
++	return false;
++}
++
+ static inline void show_swap_cache_info(void)
+ {
+ }
+--- a/mm/swap_state.c~mm-swap-always-lock-and-check-the-swap-cache-folio-before-use
++++ a/mm/swap_state.c
+@@ -79,7 +79,7 @@ void show_swap_cache_info(void)
+  * with reference count or locks.
+  * Return: Returns the found folio on success, NULL otherwise. The caller
+  * must lock and check if the folio still matches the swap entry before
+- * use.
++ * use (e.g. with folio_matches_swap_entry).
+  */
+ struct folio *swap_cache_get_folio(swp_entry_t entry)
+ {
+@@ -346,7 +346,10 @@ struct folio *__read_swap_cache_async(sw
+ 	for (;;) {
+ 		int err;
+ 
+-		/* Check the swap cache in case the folio is already there */
++		/*
++		 * Check the swap cache first, if a cached folio is found,
++		 * return it unlocked. The caller will lock and check it.
++		 */
+ 		folio = swap_cache_get_folio(entry);
+ 		if (folio)
+ 			goto got_folio;
+_

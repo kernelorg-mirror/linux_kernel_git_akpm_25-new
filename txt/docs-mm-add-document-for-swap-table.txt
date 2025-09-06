@@ -1,0 +1,145 @@
+From: Chris Li <chrisl@kernel.org>
+Subject: docs/mm: add document for swap table
+Date: Sat, 6 Sep 2025 03:13:43 +0800
+
+Patch series "mm, swap: introduce swap table as swap cache (phase I)", v2.
+
+This is the first phase of the bigger series implementing basic
+infrastructures for the Swap Table idea proposed at the LSF/MM/BPF topic
+"Integrate swap cache, swap maps with swap allocator" [1].  To give credit
+where it is due, this is based on Chris Li's idea and a prototype of using
+cluster size atomic arrays to implement swap cache.
+
+This phase I contains 15 patches, introduces the swap table infrastructure
+and uses it as the swap cache backend.  By doing so, we have up to ~5-20%
+performance gain in throughput, RPS or build time for benchmark and
+workload tests.  The speed up is due to less contention on the swap cache
+access and shallower swap cache lookup path.  The cluster size is much
+finer-grained than the 64M address space split, which is removed in this
+phase I.  It also unifies and cleans up the swap code base.
+
+Each swap cluster will dynamically allocate the swap table, which is an
+atomic array to cover every swap slot in the cluster.  It replaces the
+swap cache backed by XArray.  In phase I, the static allocated swap_map
+still co-exists with the swap table.  The memory usage is about the same
+as the original on average.  A few exception test cases show about 1%
+higher in memory usage.  In the following phases of the series, swap_map
+will merge into the swap table without additional memory allocation.  It
+will result in net memory reduction compared to the original swap cache.
+
+Testing has shown that phase I has a significant performance improvement
+from 8c/1G ARM machine to 48c96t/128G x86_64 servers in many practical
+workloads.
+
+The full picture with a summary can be found at [2].  An older bigger
+series of 28 patches is posted at [3].
+
+vm-scability test:
+==================
+Test with:
+usemem --init-time -O -y -x -n 31 1G (4G memcg, PMEM as swap)
+                           Before:         After:
+System time:               219.12s         158.16s        (-27.82%)
+Sum Throughput:            4767.13 MB/s    6128.59 MB/s   (+28.55%)
+Single process Throughput: 150.21 MB/s     196.52 MB/s    (+30.83%)
+Free latency:              175047.58 us    131411.87 us   (-24.92%)
+
+usemem --init-time -O -y -x -n 32 1536M (16G memory, global pressure,
+PMEM as swap)
+                           Before:         After:
+System time:               356.16s         284.68s      (-20.06%)
+Sum Throughput:            4648.35 MB/s    5453.52 MB/s (+17.32%)
+Single process Throughput: 141.63 MB/s     168.35 MB/s  (+18.86%)
+Free latency:              499907.71 us    484977.03 us (-2.99%)
+
+This shows an improvement of more than 20% improvement in most readings.
+
+Build kernel test:
+==================
+The following result matrix is from building kernel with defconfig on
+tmpfs with ZSWAP / ZRAM, using different memory pressure and setups. 
+Measuring sys and real time in seconds, less is better (user time is
+almost identical as expected):
+
+ -j<NR> / Mem  | Sys before / after  | Real before / after
+Using 16G ZRAM with memcg limit:
+     6  / 192M | 9686 / 9472  -2.21% | 2130  / 2096   -1.59%
+     12 / 256M | 6610 / 6451  -2.41% |  827  /  812   -1.81%
+     24 / 384M | 5938 / 5701  -3.37% |  414  /  405   -2.17%
+     48 / 768M | 4696 / 4409  -6.11% |  188  /  182   -3.19%
+With 64k folio:
+     24 / 512M | 4222 / 4162  -1.42% |  326  /  321   -1.53%
+     48 / 1G   | 3688 / 3622  -1.79% |  151  /  149   -1.32%
+With ZSWAP with 3G memcg (using higher limit due to kmem account):
+     48 / 3G   |  603 /  581  -3.65% |  81   /   80   -1.23%
+
+Testing extremely high global memory and schedule pressure: Using ZSWAP
+with 32G NVMEs in a 48c VM that has 4G memory, no memcg limit, system
+components take up about 1.5G already, using make -j48 to build defconfig:
+
+Before:  sys time: 2069.53s            real time: 135.76s
+After:   sys time: 2021.13s (-2.34%)   real time: 134.23s (-1.12%)
+
+On another 48c 4G memory VM, using 16G ZRAM as swap, testing make
+-j48 with same config:
+
+Before:  sys time: 1756.96s            real time: 111.01s
+After:   sys time: 1715.90s (-2.34%)   real time: 109.51s (-1.35%)
+
+All cases are more or less faster, and no regression even under extremely
+heavy global memory pressure.
+
+Redis / Valkey bench:
+=====================
+The test machine is a ARM64 VM with 1536M memory 12 cores, Redis is set to
+use 2500M memory, and ZRAM swapfile size is set to 5G:
+
+Testing with:
+redis-benchmark -r 2000000 -n 2000000 -d 1024 -c 12 -P 32 -t get
+
+                no BGSAVE                with BGSAVE
+Before:         487576.06 RPS            280016.02 RPS
+After:          487541.76 RPS (-0.01%)   300155.32 RPS (+7.19%)
+
+Testing with:
+redis-benchmark -r 2500000 -n 2500000 -d 1024 -c 12 -P 32 -t get
+                no BGSAVE                with BGSAVE
+Before:         466789.59 RPS            281213.92 RPS
+After:          466402.89 RPS (-0.08%)   298411.84 RPS (+6.12%)
+
+With BGSAVE enabled, most Redis memory will have a swap count > 1 so swap
+cache is heavily in use.  We can see a about 6% performance gain.  No
+BGSAVE is very slightly slower (<0.1%) due to the higher memory pressure
+of the co-existence of swap_map and swap table.  This will be optimzed
+into a net gain and up to 20% gain in BGSAVE case in the following phases.
+
+HDD swap is also about 40% faster with usemem test because we removed an
+old contention workaround.
+
+
+This patch (of 15):
+
+Swap table is the new swap cache.
+
+Link: https://lkml.kernel.org/r/20250905191357.78298-1-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250905191357.78298-2-ryncsn@gmail.com
+Link: https://lore.kernel.org/CAMgjq7BvQ0ZXvyLGp2YP96+i+6COCBBJCYmjXHGBnfisCAb8VA@mail.gmail.com [1]
+Link: https://github.com/ryncsn/linux/tree/kasong/devel/swap-table [2]
+Link: https://lore.kernel.org/linux-mm/20250514201729.48420-1-ryncsn@gmail.com/ [3]
+Signed-off-by: Chris Li <chrisl@kernel.org>
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Suggested-by: Chris Li <chrisl@kernel.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: kernel test robot <oliver.sang@intel.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Yosry Ahmed <yosryahmed@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
