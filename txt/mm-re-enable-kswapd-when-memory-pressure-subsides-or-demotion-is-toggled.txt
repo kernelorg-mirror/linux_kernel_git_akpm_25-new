@@ -1,0 +1,69 @@
+From: Chanwon Park <flyinrm@gmail.com>
+Subject: mm: re-enable kswapd when memory pressure subsides or demotion is toggled
+Date: Mon, 8 Sep 2025 19:04:10 +0900
+
+If kswapd fails to reclaim pages from a node MAX_RECLAIM_RETRIES in a
+row, kswapd on that node gets disabled. That is, the system won't wakeup
+kswapd for that node until page reclamation is observed at least once.
+That reclamation is mostly done by direct reclaim, which in turn enables
+kswapd back.
+
+However, on systems with CXL memory nodes, workloads with high anon page
+usage can disable kswapd indefinitely, without triggering direct
+reclaim. This can be reproduced with following steps:
+
+   numa node 0   (32GB memory, 48 CPUs)
+   numa node 2~5 (512GB CXL memory, 128GB each)
+   (numa node 1 is disabled)
+   swap space 8GB
+
+   1) Set /sys/kernel/mm/demotion_enabled to 0.
+   2) Set /proc/sys/kernel/numa_balancing to 0.
+   3) Run a process that allocates and random accesses 500GB of anon
+      pages.
+   4) Let the process exit normally.
+
+During 3), free memory on node 0 gets lower than low watermark, and
+kswapd runs and depletes swap space. Then, kswapd fails consecutively
+and gets disabled. Allocation afterwards happens on CXL memory, so node
+0 never gains more memory pressure to trigger direct reclaim.
+
+After 4), kswapd on node 0 remains disabled, and tasks running on that
+node are unable to swap. If you turn on NUMA_BALANCING_MEMORY_TIERING
+and demotion now, it won't work properly since kswapd is disabled.
+
+To mitigate this problem, reset kswapd_failures to 0 on following
+conditions:
+
+   a) ZONE_BELOW_HIGH bit of a zone in hopeless node with a fallback
+      memory node gets cleared.
+   b) demotion_enabled is changed from false to true.
+
+Rationale for a):
+   ZONE_BELOW_HIGH bit being cleared might be a sign that the node may
+   be reclaimable afterwards. This won't help much if the memory-hungry
+   process keeps running without freeing anything, but at least the node
+   will go back to reclaimable state when the process exits.
+
+Rationale for b):
+   When demotion_enabled is false, kswapd can only reclaim anon pages by
+   swapping them out to swap space. If demotion_enabled is turned on,
+   kswapd can demote anon pages to another node for reclaiming. So, the
+   original failure count for determining reclaimability is no longer
+   valid.
+
+Since kswapd_failures resets may be missed by ++ operation, it is
+changed from int to atomic_t.
+
+Link: https://lkml.kernel.org/r/aL6qGi69jWXfPc4D@pcw-MS-7D22
+Signed-off-by: Chanwon Park <flyinrm@gmail.com>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>

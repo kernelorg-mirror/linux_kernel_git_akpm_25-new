@@ -1,0 +1,233 @@
+From: Chanwon Park <flyinrm@gmail.com>
+Subject: mm: re-enable kswapd when memory pressure subsides or demotion is toggled
+Date: Mon, 8 Sep 2025 19:04:10 +0900
+
+If kswapd fails to reclaim pages from a node MAX_RECLAIM_RETRIES in a
+row, kswapd on that node gets disabled. That is, the system won't wakeup
+kswapd for that node until page reclamation is observed at least once.
+That reclamation is mostly done by direct reclaim, which in turn enables
+kswapd back.
+
+However, on systems with CXL memory nodes, workloads with high anon page
+usage can disable kswapd indefinitely, without triggering direct
+reclaim. This can be reproduced with following steps:
+
+   numa node 0   (32GB memory, 48 CPUs)
+   numa node 2~5 (512GB CXL memory, 128GB each)
+   (numa node 1 is disabled)
+   swap space 8GB
+
+   1) Set /sys/kernel/mm/demotion_enabled to 0.
+   2) Set /proc/sys/kernel/numa_balancing to 0.
+   3) Run a process that allocates and random accesses 500GB of anon
+      pages.
+   4) Let the process exit normally.
+
+During 3), free memory on node 0 gets lower than low watermark, and
+kswapd runs and depletes swap space. Then, kswapd fails consecutively
+and gets disabled. Allocation afterwards happens on CXL memory, so node
+0 never gains more memory pressure to trigger direct reclaim.
+
+After 4), kswapd on node 0 remains disabled, and tasks running on that
+node are unable to swap. If you turn on NUMA_BALANCING_MEMORY_TIERING
+and demotion now, it won't work properly since kswapd is disabled.
+
+To mitigate this problem, reset kswapd_failures to 0 on following
+conditions:
+
+   a) ZONE_BELOW_HIGH bit of a zone in hopeless node with a fallback
+      memory node gets cleared.
+   b) demotion_enabled is changed from false to true.
+
+Rationale for a):
+   ZONE_BELOW_HIGH bit being cleared might be a sign that the node may
+   be reclaimable afterwards. This won't help much if the memory-hungry
+   process keeps running without freeing anything, but at least the node
+   will go back to reclaimable state when the process exits.
+
+Rationale for b):
+   When demotion_enabled is false, kswapd can only reclaim anon pages by
+   swapping them out to swap space. If demotion_enabled is turned on,
+   kswapd can demote anon pages to another node for reclaiming. So, the
+   original failure count for determining reclaimability is no longer
+   valid.
+
+Since kswapd_failures resets may be missed by ++ operation, it is
+changed from int to atomic_t.
+
+Link: https://lkml.kernel.org/r/aL6qGi69jWXfPc4D@pcw-MS-7D22
+Signed-off-by: Chanwon Park <flyinrm@gmail.com>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmzone.h |    2 +-
+ mm/memory-tiers.c      |   12 ++++++++++++
+ mm/page_alloc.c        |   17 ++++++++++++++++-
+ mm/show_mem.c          |    3 ++-
+ mm/vmscan.c            |   14 +++++++-------
+ mm/vmstat.c            |    2 +-
+ 6 files changed, 39 insertions(+), 11 deletions(-)
+
+--- a/include/linux/mmzone.h~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/include/linux/mmzone.h
+@@ -1440,7 +1440,7 @@ typedef struct pglist_data {
+ 	int kswapd_order;
+ 	enum zone_type kswapd_highest_zoneidx;
+ 
+-	int kswapd_failures;		/* Number of 'reclaimed == 0' runs */
++	atomic_t kswapd_failures;	/* Number of 'reclaimed == 0' runs */
+ 
+ #ifdef CONFIG_COMPACTION
+ 	int kcompactd_max_order;
+--- a/mm/memory-tiers.c~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/mm/memory-tiers.c
+@@ -942,11 +942,23 @@ static ssize_t demotion_enabled_store(st
+ 				      const char *buf, size_t count)
+ {
+ 	ssize_t ret;
++	bool before = numa_demotion_enabled;
+ 
+ 	ret = kstrtobool(buf, &numa_demotion_enabled);
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Reset kswapd_failures statistics. They may no longer be
++	 * valid since the policy for kswapd has changed.
++	 */
++	if (before == false && numa_demotion_enabled == true) {
++		struct pglist_data *pgdat;
++
++		for_each_online_pgdat(pgdat)
++			atomic_set(&pgdat->kswapd_failures, 0);
++	}
++
+ 	return count;
+ }
+ 
+--- a/mm/page_alloc.c~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/mm/page_alloc.c
+@@ -2866,8 +2866,23 @@ static void free_frozen_page_commit(stru
+ 				   pcp, pindex);
+ 		if (test_bit(ZONE_BELOW_HIGH, &zone->flags) &&
+ 		    zone_watermark_ok(zone, 0, high_wmark_pages(zone),
+-				      ZONE_MOVABLE, 0))
++				      ZONE_MOVABLE, 0)) {
++			struct pglist_data *pgdat = zone->zone_pgdat;
+ 			clear_bit(ZONE_BELOW_HIGH, &zone->flags);
++
++			/*
++			 * Assume that memory pressure on this node is gone
++			 * and may be in a reclaimable state. If a memory
++			 * fallback node exists, direct reclaim may not have
++			 * been triggered, leaving 'hopeless node' stay in
++			 * that state for a while. Let kswapd work again by
++			 * resetting kswapd_failures.
++			 */
++			if (atomic_read(&pgdat->kswapd_failures)
++			    >= MAX_RECLAIM_RETRIES &&
++			    next_memory_node(pgdat->node_id) < MAX_NUMNODES)
++				atomic_set(&pgdat->kswapd_failures, 0);
++		}
+ 	}
+ }
+ 
+--- a/mm/show_mem.c~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/mm/show_mem.c
+@@ -278,7 +278,8 @@ static void show_free_areas(unsigned int
+ #endif
+ 			K(node_page_state(pgdat, NR_PAGETABLE)),
+ 			K(node_page_state(pgdat, NR_SECONDARY_PAGETABLE)),
+-			str_yes_no(pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES),
++			str_yes_no(atomic_read(&pgdat->kswapd_failures)
++				   >= MAX_RECLAIM_RETRIES),
+ 			K(node_page_state(pgdat, NR_BALLOON_PAGES)));
+ 	}
+ 
+--- a/mm/vmscan.c~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/mm/vmscan.c
+@@ -518,7 +518,7 @@ static bool skip_throttle_noprogress(pg_
+ 	 * If kswapd is disabled, reschedule if necessary but do not
+ 	 * throttle as the system is likely near OOM.
+ 	 */
+-	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++	if (atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES)
+ 		return true;
+ 
+ 	/*
+@@ -5101,7 +5101,7 @@ static void lru_gen_shrink_node(struct p
+ 	blk_finish_plug(&plug);
+ done:
+ 	if (sc->nr_reclaimed > reclaimed)
+-		pgdat->kswapd_failures = 0;
++		atomic_set(&pgdat->kswapd_failures, 0);
+ }
+ 
+ /******************************************************************************
+@@ -6180,7 +6180,7 @@ again:
+ 	 * successful direct reclaim run will revive a dormant kswapd.
+ 	 */
+ 	if (reclaimable)
+-		pgdat->kswapd_failures = 0;
++		atomic_set(&pgdat->kswapd_failures, 0);
+ 	else if (sc->cache_trim_mode)
+ 		sc->cache_trim_mode_failed = 1;
+ }
+@@ -6492,7 +6492,7 @@ static bool allow_direct_reclaim(pg_data
+ 	int i;
+ 	bool wmark_ok;
+ 
+-	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++	if (atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES)
+ 		return true;
+ 
+ 	for_each_managed_zone_pgdat(zone, pgdat, i, ZONE_NORMAL) {
+@@ -6902,7 +6902,7 @@ static bool prepare_kswapd_sleep(pg_data
+ 		wake_up_all(&pgdat->pfmemalloc_wait);
+ 
+ 	/* Hopeless node, leave it to direct reclaim */
+-	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES)
++	if (atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES)
+ 		return true;
+ 
+ 	if (pgdat_balanced(pgdat, order, highest_zoneidx)) {
+@@ -7170,7 +7170,7 @@ restart:
+ 	}
+ 
+ 	if (!sc.nr_reclaimed)
+-		pgdat->kswapd_failures++;
++		atomic_inc(&pgdat->kswapd_failures);
+ 
+ out:
+ 	clear_reclaim_active(pgdat, highest_zoneidx);
+@@ -7429,7 +7429,7 @@ void wakeup_kswapd(struct zone *zone, gf
+ 		return;
+ 
+ 	/* Hopeless node, leave it to direct reclaim if possible */
+-	if (pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES ||
++	if (atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES ||
+ 	    (pgdat_balanced(pgdat, order, highest_zoneidx) &&
+ 	     !pgdat_watermark_boosted(pgdat, highest_zoneidx))) {
+ 		/*
+--- a/mm/vmstat.c~mm-re-enable-kswapd-when-memory-pressure-subsides-or-demotion-is-toggled
++++ a/mm/vmstat.c
+@@ -1848,7 +1848,7 @@ static void zoneinfo_show_print(struct s
+ 	seq_printf(m,
+ 		   "\n  node_unreclaimable:  %u"
+ 		   "\n  start_pfn:           %lu",
+-		   pgdat->kswapd_failures >= MAX_RECLAIM_RETRIES,
++		   atomic_read(&pgdat->kswapd_failures) >= MAX_RECLAIM_RETRIES,
+ 		   zone->zone_start_pfn);
+ 	seq_putc(m, '\n');
+ }
+_
