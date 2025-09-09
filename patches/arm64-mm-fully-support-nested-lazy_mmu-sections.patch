@@ -1,0 +1,99 @@
+From: Kevin Brodsky <kevin.brodsky@arm.com>
+Subject: arm64: mm: fully support nested lazy_mmu sections
+Date: Mon, 8 Sep 2025 08:39:27 +0100
+
+Despite recent efforts to prevent lazy_mmu sections from nesting, it
+remains difficult to ensure that it never occurs - and in fact it does
+occur on arm64 in certain situations (CONFIG_DEBUG_PAGEALLOC).  Commit
+1ef3095b1405 ("arm64/mm: Permit lazy_mmu_mode to be nested") made nesting
+tolerable on arm64, but without truly supporting it: the inner leave()
+call clears TIF_LAZY_MMU, disabling the batching optimisation before the
+outer section ends.
+
+Now that the lazy_mmu API allows enter() to pass through a state to the
+matching leave() call, we can actually support nesting.  If enter() is
+called inside an active lazy_mmu section, TIF_LAZY_MMU will already be
+set, and we can then return LAZY_MMU_NESTED to instruct the matching
+leave() call not to clear TIF_LAZY_MMU.
+
+The only effect of this patch is to ensure that TIF_LAZY_MMU (and
+therefore the batching optimisation) remains set until the outermost
+lazy_mmu section ends.  leave() still emits barriers if needed, regardless
+of the nesting level, as the caller may expect any page table changes to
+become visible when leave() returns.
+
+Link: https://lkml.kernel.org/r/20250908073931.4159362-4-kevin.brodsky@arm.com
+Signed-off-by: Kevin Brodsky <kevin.brodsky@arm.com>
+Reviewed-by: Yeoreum Yun <yeoreum.yun@arm.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Andreas Larsson <andreas@gaisler.com>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Christophe Leroy <christophe.leroy@csgroup.eu>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Juegren Gross <jgross@suse.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+Cc: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ arch/arm64/include/asm/pgtable.h |   19 +++++--------------
+ 1 file changed, 5 insertions(+), 14 deletions(-)
+
+--- a/arch/arm64/include/asm/pgtable.h~arm64-mm-fully-support-nested-lazy_mmu-sections
++++ a/arch/arm64/include/asm/pgtable.h
+@@ -85,24 +85,14 @@ typedef int lazy_mmu_state_t;
+ 
+ static inline lazy_mmu_state_t arch_enter_lazy_mmu_mode(void)
+ {
+-	/*
+-	 * lazy_mmu_mode is not supposed to permit nesting. But in practice this
+-	 * does happen with CONFIG_DEBUG_PAGEALLOC, where a page allocation
+-	 * inside a lazy_mmu_mode section (such as zap_pte_range()) will change
+-	 * permissions on the linear map with apply_to_page_range(), which
+-	 * re-enters lazy_mmu_mode. So we tolerate nesting in our
+-	 * implementation. The first call to arch_leave_lazy_mmu_mode() will
+-	 * flush and clear the flag such that the remainder of the work in the
+-	 * outer nest behaves as if outside of lazy mmu mode. This is safe and
+-	 * keeps tracking simple.
+-	 */
++	int lazy_mmu_nested;
+ 
+ 	if (in_interrupt())
+ 		return LAZY_MMU_DEFAULT;
+ 
+-	set_thread_flag(TIF_LAZY_MMU);
++	lazy_mmu_nested = test_and_set_thread_flag(TIF_LAZY_MMU);
+ 
+-	return LAZY_MMU_DEFAULT;
++	return lazy_mmu_nested ? LAZY_MMU_NESTED : LAZY_MMU_DEFAULT;
+ }
+ 
+ static inline void arch_leave_lazy_mmu_mode(lazy_mmu_state_t state)
+@@ -113,7 +103,8 @@ static inline void arch_leave_lazy_mmu_m
+ 	if (test_and_clear_thread_flag(TIF_LAZY_MMU_PENDING))
+ 		emit_pte_barriers();
+ 
+-	clear_thread_flag(TIF_LAZY_MMU);
++	if (state != LAZY_MMU_NESTED)
++		clear_thread_flag(TIF_LAZY_MMU);
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+_
