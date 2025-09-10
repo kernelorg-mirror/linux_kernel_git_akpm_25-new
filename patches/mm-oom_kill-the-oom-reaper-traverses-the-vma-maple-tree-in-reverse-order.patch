@@ -1,0 +1,98 @@
+From: zhongjinji <zhongjinji@honor.com>
+Subject: mm/oom_kill: the OOM reaper traverses the VMA maple tree in reverse order
+Date: Tue, 9 Sep 2025 17:06:59 +0800
+
+Although the oom_reaper is delayed and it gives the oom victim chance to
+clean up its address space this might take a while especially for
+processes with a large address space footprint.  In those cases oom_reaper
+might start racing with the dying task and compete for shared resources -
+e.g.  page table lock contention has been observed.
+
+Reduce those races by reaping the oom victim from the other end of the
+address space.
+
+It is also a significant improvement for process_mrelease().  When a
+process is killed, process_mrelease is used to reap the killed process and
+often runs concurrently with the dying task.  The test data shows that
+after applying the patch, lock contention is greatly reduced during the
+procedure of reaping the killed process.
+
+The test is based on arm64.
+
+Without the patch:
+|--99.57%-- oom_reaper
+|    |--0.28%-- [hit in function]
+|    |--73.58%-- unmap_page_range
+|    |    |--8.67%-- [hit in function]
+|    |    |--41.59%-- __pte_offset_map_lock
+|    |    |--29.47%-- folio_remove_rmap_ptes
+|    |    |--16.11%-- tlb_flush_mmu
+|    |    |--1.66%-- folio_mark_accessed
+|    |    |--0.74%-- free_swap_and_cache_nr
+|    |    |--0.69%-- __tlb_remove_folio_pages
+|    |--19.94%-- tlb_finish_mmu
+|    |--3.21%-- folio_remove_rmap_ptes
+|    |--1.16%-- __tlb_remove_folio_pages
+|    |--1.16%-- folio_mark_accessed
+|    |--0.36%-- __pte_offset_map_lock
+
+With the patch:
+|--99.53%-- oom_reaper
+|    |--55.77%-- unmap_page_range
+|    |    |--20.49%-- [hit in function]
+|    |    |--58.30%-- folio_remove_rmap_ptes
+|    |    |--11.48%-- tlb_flush_mmu
+|    |    |--3.33%-- folio_mark_accessed
+|    |    |--2.65%-- __tlb_remove_folio_pages
+|    |    |--1.37%-- _raw_spin_lock
+|    |    |--0.68%-- __mod_lruvec_page_state
+|    |    |--0.51%-- __pte_offset_map_lock
+|    |--32.21%-- tlb_finish_mmu
+|    |--6.93%-- folio_remove_rmap_ptes
+|    |--1.90%-- __tlb_remove_folio_pages
+|    |--1.55%-- folio_mark_accessed
+|    |--0.69%-- __pte_offset_map_lock
+
+Link: https://lkml.kernel.org/r/20250909090659.26400-4-zhongjinji@honor.com
+Signed-off-by: zhongjinji <zhongjinji@honor.com>
+Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Len Brown <lenb@kernel.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/oom_kill.c |   10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+--- a/mm/oom_kill.c~mm-oom_kill-the-oom-reaper-traverses-the-vma-maple-tree-in-reverse-order
++++ a/mm/oom_kill.c
+@@ -516,7 +516,7 @@ static bool __oom_reap_task_mm(struct mm
+ {
+ 	struct vm_area_struct *vma;
+ 	bool ret = true;
+-	VMA_ITERATOR(vmi, mm, 0);
++	MA_STATE(mas, &mm->mm_mt, ULONG_MAX, ULONG_MAX);
+ 
+ 	/*
+ 	 * Tell all users of get_user/copy_from_user etc... that the content
+@@ -526,7 +526,13 @@ static bool __oom_reap_task_mm(struct mm
+ 	 */
+ 	mm_flags_set(MMF_UNSTABLE, mm);
+ 
+-	for_each_vma(vmi, vma) {
++	/*
++	 * It might start racing with the dying task and compete for shared
++	 * resources - e.g. page table lock contention has been observed.
++	 * Reduce those races by reaping the oom victim from the other end
++	 * of the address space.
++	 */
++	mas_for_each_rev(&mas, vma, 0) {
+ 		if (vma->vm_flags & (VM_HUGETLB|VM_PFNMAP))
+ 			continue;
+ 
+_
