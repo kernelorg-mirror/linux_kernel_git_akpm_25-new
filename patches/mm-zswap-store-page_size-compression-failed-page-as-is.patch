@@ -172,6 +172,12 @@ compression attempts that will anyway fail.  One imaginable solution for
 the problem is reusing the swapped-out page and its struct page to store
 in the zswap pool.  But that's out of the scope of this patch.
 
+[sj@kernel.org: mark zswap_stored_incompressible_pages as static]
+  Link: https://lkml.kernel.org/r/20250821161750.78192-1-sj@kernel.org
+[sj@kernel.org: v5]
+  Link: https://lkml.kernel.org/r/20250822190817.49287-1-sj@kernel.org
+[sj@kernel.org: cleanup incompressible pages handling code]
+  Link: https://lkml.kernel.org/r/20250828163913.57957-1-sj@kernel.org
 Link: https://lkml.kernel.org/r/20250819193404.46680-1-sj@kernel.org
 Link: https://github.com/sjp38/eval_zswap/blob/master/run.sh [1] 
 Link: https://lore.kernel.org/20231017003519.1426574-3-nphamcs@gmail.com [2] 
@@ -193,8 +199,8 @@ Cc: Herbert Xu <herbert@gondor.apana.org.au>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zswap.c |   57 ++++++++++++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 54 insertions(+), 3 deletions(-)
+ mm/zswap.c |   53 +++++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 49 insertions(+), 4 deletions(-)
 
 --- a/mm/zswap.c~mm-zswap-store-page_size-compression-failed-page-as-is
 +++ a/mm/zswap.c
@@ -206,20 +212,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +/* The number of pages currently stored in zswap */
  atomic_long_t zswap_stored_pages = ATOMIC_LONG_INIT(0);
 +/* The number of incompressible pages currently stored in zswap */
-+atomic_long_t zswap_stored_incompressible_pages = ATOMIC_LONG_INIT(0);
++static atomic_long_t zswap_stored_incompressible_pages = ATOMIC_LONG_INIT(0);
  
  /*
   * The statistics below are not protected from concurrent access for
-@@ -60,6 +62,8 @@ static u64 zswap_written_back_pages;
- static u64 zswap_reject_reclaim_fail;
- /* Store failed due to compression algorithm failure */
- static u64 zswap_reject_compress_fail;
-+/* Compression failed by the crypto library */
-+static u64 zswap_crypto_compress_fail;
- /* Compressed page was too big for the allocator to (optimally) store */
- static u64 zswap_reject_compress_poor;
- /* Load or writeback failed due to decompression failure */
-@@ -811,6 +815,8 @@ static void zswap_entry_free(struct zswa
+@@ -811,6 +813,8 @@ static void zswap_entry_free(struct zswa
  		obj_cgroup_uncharge_zswap(entry->objcg, entry->length);
  		obj_cgroup_put(entry->objcg);
  	}
@@ -228,7 +225,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	zswap_entry_cache_free(entry);
  	atomic_long_dec(&zswap_stored_pages);
  }
-@@ -976,8 +982,28 @@ static bool zswap_compress(struct page *
+@@ -948,6 +952,7 @@ static bool zswap_compress(struct page *
+ 	struct zpool *zpool;
+ 	gfp_t gfp;
+ 	u8 *dst;
++	bool mapped = false;
+ 
+ 	acomp_ctx = acomp_ctx_get_cpu_lock(pool);
+ 	dst = acomp_ctx->buffer;
+@@ -976,8 +981,26 @@ static bool zswap_compress(struct page *
  	 */
  	comp_ret = crypto_wait_req(crypto_acomp_compress(acomp_ctx->req), &acomp_ctx->wait);
  	dlen = acomp_ctx->req->dlen;
@@ -242,48 +247,59 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * only adds metadata overhead.  swap_writeout() will put the page back
 +	 * to the active LRU list in the case.
 +	 */
-+	if (comp_ret || !dlen) {
-+		zswap_crypto_compress_fail++;
++	if (comp_ret || !dlen || dlen >= PAGE_SIZE) {
 +		dlen = PAGE_SIZE;
-+	}
-+	if (dlen >= PAGE_SIZE) {
 +		if (!mem_cgroup_zswap_writeback_enabled(
 +					folio_memcg(page_folio(page)))) {
-+			comp_ret = -EINVAL;
++			comp_ret = comp_ret ? comp_ret : -EINVAL;
 +			goto unlock;
 +		}
 +		comp_ret = 0;
 +		dlen = PAGE_SIZE;
 +		dst = kmap_local_page(page);
++		mapped = true;
 +	}
  
  	zpool = pool->zpool;
  	gfp = GFP_NOWAIT | __GFP_NORETRY | __GFP_HIGHMEM | __GFP_MOVABLE;
-@@ -990,6 +1016,8 @@ static bool zswap_compress(struct page *
+@@ -990,6 +1013,8 @@ static bool zswap_compress(struct page *
  	entry->length = dlen;
  
  unlock:
-+	if (dst != acomp_ctx->buffer)
++	if (mapped)
 +		kunmap_local(dst);
  	if (comp_ret == -ENOSPC || alloc_ret == -ENOSPC)
  		zswap_reject_compress_poor++;
  	else if (comp_ret)
-@@ -1012,6 +1040,14 @@ static bool zswap_decompress(struct zswa
+@@ -1006,12 +1031,18 @@ static bool zswap_decompress(struct zswa
+ 	struct zpool *zpool = entry->pool->zpool;
+ 	struct scatterlist input, output;
+ 	struct crypto_acomp_ctx *acomp_ctx;
+-	int decomp_ret, dlen;
++	int decomp_ret = 0, dlen = PAGE_SIZE;
+ 	u8 *src, *obj;
+ 
  	acomp_ctx = acomp_ctx_get_cpu_lock(entry->pool);
  	obj = zpool_obj_read_begin(zpool, entry->handle, acomp_ctx->buffer);
  
 +	/* zswap entries of length PAGE_SIZE are not compressed. */
 +	if (entry->length == PAGE_SIZE) {
 +		memcpy_to_folio(folio, 0, obj, entry->length);
-+		zpool_obj_read_end(zpool, entry->handle, obj);
-+		acomp_ctx_put_unlock(acomp_ctx);
-+		return true;
++		goto read_done;
 +	}
 +
  	/*
  	 * zpool_obj_read_begin() might return a kmap address of highmem when
  	 * acomp_ctx->buffer is not used.  However, sg_init_one() does not
-@@ -1524,6 +1560,8 @@ static bool zswap_store_page(struct page
+@@ -1032,6 +1063,7 @@ static bool zswap_decompress(struct zswa
+ 	decomp_ret = crypto_wait_req(crypto_acomp_decompress(acomp_ctx->req), &acomp_ctx->wait);
+ 	dlen = acomp_ctx->req->dlen;
+ 
++read_done:
+ 	zpool_obj_read_end(zpool, entry->handle, obj);
+ 	acomp_ctx_put_unlock(acomp_ctx);
+ 
+@@ -1524,6 +1556,8 @@ static bool zswap_store_page(struct page
  		obj_cgroup_charge_zswap(objcg, entry->length);
  	}
  	atomic_long_inc(&zswap_stored_pages);
@@ -292,7 +308,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * We finish initializing the entry while it's already in xarray.
-@@ -1792,6 +1830,14 @@ static int debugfs_get_stored_pages(void
+@@ -1792,6 +1826,14 @@ static int debugfs_get_stored_pages(void
  }
  DEFINE_DEBUGFS_ATTRIBUTE(stored_pages_fops, debugfs_get_stored_pages, NULL, "%llu\n");
  
@@ -307,16 +323,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int zswap_debugfs_init(void)
  {
  	if (!debugfs_initialized())
-@@ -1809,6 +1855,8 @@ static int zswap_debugfs_init(void)
- 			   zswap_debugfs_root, &zswap_reject_kmemcache_fail);
- 	debugfs_create_u64("reject_compress_fail", 0444,
- 			   zswap_debugfs_root, &zswap_reject_compress_fail);
-+	debugfs_create_u64("crypto_compress_fail", 0444,
-+			   zswap_debugfs_root, &zswap_crypto_compress_fail);
- 	debugfs_create_u64("reject_compress_poor", 0444,
- 			   zswap_debugfs_root, &zswap_reject_compress_poor);
- 	debugfs_create_u64("decompress_fail", 0444,
-@@ -1819,6 +1867,9 @@ static int zswap_debugfs_init(void)
+@@ -1819,6 +1861,9 @@ static int zswap_debugfs_init(void)
  			    zswap_debugfs_root, NULL, &total_size_fops);
  	debugfs_create_file("stored_pages", 0444,
  			    zswap_debugfs_root, NULL, &stored_pages_fops);
