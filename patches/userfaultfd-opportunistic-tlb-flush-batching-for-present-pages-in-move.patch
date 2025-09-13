@@ -24,6 +24,8 @@ Furthermore, system_server, one of the most performance critical system
 processes on android, saw over 50% reduction in GC compaction time on an
 arm64 android device.
 
+[lokeshgidra@google.com: make calculation of largest extent that can be batched unconditional on length, per Barry]
+  Link: https://lkml.kernel.org/r/20250816191123.3601561-1-lokeshgidra@google.com
 Link: https://lkml.kernel.org/r/20250813193024.2279805-1-lokeshgidra@google.com
 Signed-off-by: Lokesh Gidra <lokeshgidra@google.com>
 Acked-by: Peter Xu <peterx@redhat.com>
@@ -34,12 +36,12 @@ Cc: David Hildenbrand <david@redhat.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/userfaultfd.c |  227 ++++++++++++++++++++++++++++++---------------
- 1 file changed, 153 insertions(+), 74 deletions(-)
+ mm/userfaultfd.c |  224 ++++++++++++++++++++++++++++++---------------
+ 1 file changed, 150 insertions(+), 74 deletions(-)
 
 --- a/mm/userfaultfd.c~userfaultfd-opportunistic-tlb-flush-batching-for-present-pages-in-move
 +++ a/mm/userfaultfd.c
-@@ -1026,18 +1026,67 @@ static inline bool is_pte_pages_stable(p
+@@ -1026,18 +1026,64 @@ static inline bool is_pte_pages_stable(p
  	       pmd_same(dst_pmdval, pmdp_get_lockless(dst_pmd));
  }
  
@@ -108,16 +110,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	unsigned long src_start = src_addr;
 +	unsigned long src_end;
 +
-+	if (len > PAGE_SIZE) {
-+		len = pmd_addr_end(dst_addr, dst_addr + len) - dst_addr;
-+		src_end = pmd_addr_end(src_addr, src_addr + len);
-+	} else
-+		src_end = src_addr + len;
++	len = pmd_addr_end(dst_addr, dst_addr + len) - dst_addr;
++	src_end = pmd_addr_end(src_addr, src_addr + len);
 +	flush_cache_range(src_vma, src_addr, src_end);
  	double_pt_lock(dst_ptl, src_ptl);
  
  	if (!is_pte_pages_stable(dst_pte, src_pte, orig_dst_pte, orig_src_pte,
-@@ -1051,31 +1100,56 @@ static int move_present_pte(struct mm_st
+@@ -1051,31 +1097,56 @@ static int move_present_pte(struct mm_st
  		err = -EBUSY;
  		goto out;
  	}
@@ -192,7 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int move_swap_pte(struct mm_struct *mm, struct vm_area_struct *dst_vma,
-@@ -1140,7 +1214,7 @@ static int move_swap_pte(struct mm_struc
+@@ -1140,7 +1211,7 @@ static int move_swap_pte(struct mm_struc
  	set_pte_at(mm, dst_addr, dst_pte, orig_src_pte);
  	double_pt_unlock(dst_ptl, src_ptl);
  
@@ -201,7 +200,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int move_zeropage_pte(struct mm_struct *mm,
-@@ -1167,20 +1241,20 @@ static int move_zeropage_pte(struct mm_s
+@@ -1167,20 +1238,20 @@ static int move_zeropage_pte(struct mm_s
  	set_pte_at(mm, dst_addr, dst_pte, zero_pte);
  	double_pt_unlock(dst_ptl, src_ptl);
  
@@ -231,7 +230,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	swp_entry_t entry;
  	struct swap_info_struct *si = NULL;
-@@ -1194,11 +1268,10 @@ static int move_pages_pte(struct mm_stru
+@@ -1194,11 +1265,10 @@ static int move_pages_pte(struct mm_stru
  	struct folio *src_folio = NULL;
  	struct anon_vma *src_anon_vma = NULL;
  	struct mmu_notifier_range range;
@@ -245,7 +244,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mmu_notifier_invalidate_range_start(&range);
  retry:
  	/*
-@@ -1212,7 +1285,7 @@ retry:
+@@ -1212,7 +1282,7 @@ retry:
  
  	/* Retry if a huge pmd materialized from under us */
  	if (unlikely(!dst_pte)) {
@@ -254,7 +253,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto out;
  	}
  
-@@ -1231,14 +1304,14 @@ retry:
+@@ -1231,14 +1301,14 @@ retry:
  	 * transparent huge pages under us.
  	 */
  	if (unlikely(!src_pte)) {
@@ -271,7 +270,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto out;
  	}
  
-@@ -1246,7 +1319,7 @@ retry:
+@@ -1246,7 +1316,7 @@ retry:
  	orig_dst_pte = ptep_get(dst_pte);
  	spin_unlock(dst_ptl);
  	if (!pte_none(orig_dst_pte)) {
@@ -280,7 +279,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto out;
  	}
  
-@@ -1255,21 +1328,21 @@ retry:
+@@ -1255,21 +1325,21 @@ retry:
  	spin_unlock(src_ptl);
  	if (pte_none(orig_src_pte)) {
  		if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES))
@@ -306,7 +305,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  					       dst_addr, src_addr, dst_pte, src_pte,
  					       orig_dst_pte, orig_src_pte,
  					       dst_pmd, dst_pmdval, dst_ptl, src_ptl);
-@@ -1292,14 +1365,14 @@ retry:
+@@ -1292,14 +1362,14 @@ retry:
  			spin_lock(src_ptl);
  			if (!pte_same(orig_src_pte, ptep_get(src_pte))) {
  				spin_unlock(src_ptl);
@@ -323,7 +322,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			}
  
-@@ -1313,7 +1386,7 @@ retry:
+@@ -1313,7 +1383,7 @@ retry:
  			 */
  			if (!locked && folio_test_large(folio)) {
  				spin_unlock(src_ptl);
@@ -332,7 +331,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			}
  
-@@ -1332,7 +1405,7 @@ retry:
+@@ -1332,7 +1402,7 @@ retry:
  			}
  
  			if (WARN_ON_ONCE(!folio_test_anon(src_folio))) {
@@ -341,7 +340,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			}
  		}
-@@ -1343,8 +1416,8 @@ retry:
+@@ -1343,8 +1413,8 @@ retry:
  			pte_unmap(src_pte);
  			pte_unmap(dst_pte);
  			src_pte = dst_pte = NULL;
@@ -352,7 +351,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			/* have to reacquire the folio after it got split */
  			folio_unlock(src_folio);
-@@ -1362,7 +1435,7 @@ retry:
+@@ -1362,7 +1432,7 @@ retry:
  			src_anon_vma = folio_get_anon_vma(src_folio);
  			if (!src_anon_vma) {
  				/* page was unmapped from under us */
@@ -361,7 +360,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				goto out;
  			}
  			if (!anon_vma_trylock_write(src_anon_vma)) {
-@@ -1375,10 +1448,11 @@ retry:
+@@ -1375,10 +1445,11 @@ retry:
  			}
  		}
  
@@ -377,7 +376,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} else {
  		struct folio *folio = NULL;
  
-@@ -1389,20 +1463,20 @@ retry:
+@@ -1389,20 +1460,20 @@ retry:
  				pte_unmap(dst_pte);
  				src_pte = dst_pte = NULL;
  				migration_entry_wait(mm, src_pmd, src_addr);
@@ -402,7 +401,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto out;
  		}
  		/*
-@@ -1422,7 +1496,7 @@ retry:
+@@ -1422,7 +1493,7 @@ retry:
  					swap_cache_index(entry));
  		if (!IS_ERR_OR_NULL(folio)) {
  			if (folio_test_large(folio)) {
@@ -411,7 +410,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				folio_put(folio);
  				goto out;
  			}
-@@ -1439,7 +1513,7 @@ retry:
+@@ -1439,7 +1510,7 @@ retry:
  				goto retry;
  			}
  		}
@@ -420,7 +419,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				orig_dst_pte, orig_src_pte, dst_pmd, dst_pmdval,
  				dst_ptl, src_ptl, src_folio, si, entry);
  	}
-@@ -1466,7 +1540,7 @@ out:
+@@ -1466,7 +1537,7 @@ out:
  	if (si)
  		put_swap_device(si);
  
@@ -429,7 +428,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-@@ -1737,7 +1811,7 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1737,7 +1808,7 @@ ssize_t move_pages(struct userfaultfd_ct
  {
  	struct mm_struct *mm = ctx->mm;
  	struct vm_area_struct *src_vma, *dst_vma;
@@ -438,7 +437,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pmd_t *src_pmd, *dst_pmd;
  	long err = -EINVAL;
  	ssize_t moved = 0;
-@@ -1780,8 +1854,8 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1780,8 +1851,8 @@ ssize_t move_pages(struct userfaultfd_ct
  	if (err)
  		goto out_unlock;
  
@@ -449,7 +448,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		spinlock_t *ptl;
  		pmd_t dst_pmdval;
  		unsigned long step_size;
-@@ -1849,6 +1923,8 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1849,6 +1920,8 @@ ssize_t move_pages(struct userfaultfd_ct
  						  dst_addr, src_addr);
  			step_size = HPAGE_PMD_SIZE;
  		} else {
@@ -458,7 +457,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			if (pmd_none(*src_pmd)) {
  				if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES)) {
  					err = -ENOENT;
-@@ -1865,10 +1941,13 @@ ssize_t move_pages(struct userfaultfd_ct
+@@ -1865,10 +1938,13 @@ ssize_t move_pages(struct userfaultfd_ct
  				break;
  			}
  
