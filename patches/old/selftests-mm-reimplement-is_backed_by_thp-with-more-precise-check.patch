@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: selftests/mm: reimplement is_backed_by_thp() with more precise check
-Date: Tue, 12 Aug 2025 11:55:11 -0400
+Date: Mon, 18 Aug 2025 14:46:20 -0400
 
 and rename it to is_backed_by_folio().
 
@@ -15,11 +15,15 @@ if order is greater than 0:
 
 pmd_order is added to split_huge_page_test.c and replaces max_order.
 
-Link: https://lkml.kernel.org/r/20250812155512.926011-4-ziy@nvidia.com
+[ziy@nvidia.com: reduce code duplication, per David]
+  Link: https://lkml.kernel.org/r/F54782D6-65A3-4D35-AE03-8ADE636EE258@nvidia.com
+Link: https://lkml.kernel.org/r/20250818184622.1521620-4-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
+Reviewed-by: wang lian <lianux.mm@gmail.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: Dev Jain <dev.jain@arm.com>
 Cc: Donet Tom <donettom@linux.ibm.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
@@ -31,15 +35,13 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Shuah Khan <shuah@kernel.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: wang lian <lianux.mm@gmail.com>
-Cc: Wei Yang <richard.weiyang@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/mm/split_huge_page_test.c |   67 ++++++++----
- tools/testing/selftests/mm/vm_util.c              |    2 
- tools/testing/selftests/mm/vm_util.h              |    1 
- 3 files changed, 48 insertions(+), 22 deletions(-)
+ tools/testing/selftests/mm/split_huge_page_test.c |   89 ++++++++----
+ tools/testing/selftests/mm/vm_util.c              |   13 +
+ tools/testing/selftests/mm/vm_util.h              |    4 
+ 3 files changed, 82 insertions(+), 24 deletions(-)
 
 --- a/tools/testing/selftests/mm/split_huge_page_test.c~selftests-mm-reimplement-is_backed_by_thp-with-more-precise-check
 +++ a/tools/testing/selftests/mm/split_huge_page_test.c
@@ -51,68 +53,90 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #define SPLIT_DEBUGFS "/sys/kernel/debug/split_huge_pages"
  #define SMAP_PATH "/proc/self/smaps"
-@@ -36,23 +37,48 @@ uint64_t pmd_pagesize;
+@@ -34,26 +35,67 @@ uint64_t pmd_pagesize;
+ #define PID_FMT_OFFSET "%d,0x%lx,0x%lx,%d,%d"
+ #define PATH_FMT "%s,0x%lx,0x%lx,%d"
  
- #define GET_ORDER(nr_pages)    (31 - __builtin_clz(nr_pages))
- 
--int is_backed_by_thp(char *vaddr, int pagemap_file, int kpageflags_file)
-+int is_backed_by_folio(char *vaddr, int order, int pagemap_fd, int kpageflags_fd)
+-#define PFN_MASK     ((1UL<<55)-1)
+-#define KPF_THP      (1UL<<22)
+-
+-static int is_backed_by_thp(char *vaddr, int pagemap_file, int kpageflags_file)
++static bool is_backed_by_folio(char *vaddr, int order, int pagemap_fd,
++		int kpageflags_fd)
  {
 -	uint64_t paddr;
 -	uint64_t page_flags;
++	const unsigned long nr_pages = 1UL << order;
 +	unsigned long pfn_head;
 +	uint64_t pfn_flags;
 +	unsigned long pfn;
 +	unsigned long i;
++
++	pfn = pagemap_get_pfn(pagemap_fd, vaddr);
  
 -	if (pagemap_file) {
 -		pread(pagemap_file, &paddr, sizeof(paddr),
 -			((long)vaddr >> pageshift) * sizeof(paddr));
-+	if (!pagemap_fd || !kpageflags_fd)
-+		return 0;
++	/* non present page */
++	if (pfn == -1UL)
++		return false;
  
 -		if (kpageflags_file) {
 -			pread(kpageflags_file, &page_flags, sizeof(page_flags),
--				PAGEMAP_PFN(paddr) * sizeof(page_flags));
-+	pfn = pagemap_get_pfn(pagemap_fd, vaddr);
+-				(paddr & PFN_MASK) * sizeof(page_flags));
++	if (pageflags_get(pfn, kpageflags_fd, &pfn_flags))
++		goto fail;
  
 -			return !!(page_flags & KPF_THP);
 -		}
-+	if (pfn == -1UL)
-+		return 0;
-+
-+	if (get_pfn_flags(pfn, kpageflags_fd, &pfn_flags))
-+		return 0;
-+
++	/* check for order-0 pages */
 +	if (!order) {
 +		if (pfn_flags & (KPF_THP | KPF_COMPOUND_HEAD | KPF_COMPOUND_TAIL))
-+			return 0;
-+		return 1;
++			return false;
++		return true;
  	}
 -	return 0;
 +
++	/* non THP folio */
 +	if (!(pfn_flags & KPF_THP))
-+		return 0;
++		return false;
 +
-+	pfn_head = pfn & ~((1 << order) - 1);
++	pfn_head = pfn & ~(nr_pages - 1);
 +
-+	if (get_pfn_flags(pfn_head, kpageflags_fd, &pfn_flags))
-+		return 0;
++	if (pageflags_get(pfn_head, kpageflags_fd, &pfn_flags))
++		goto fail;
 +
++	/* head PFN has no compound_head flag set */
 +	if (!(pfn_flags & (KPF_THP | KPF_COMPOUND_HEAD)))
-+		return 0;
++		return false;
 +
-+	for (i = 1; i < (1UL << order) - 1; i++) {
-+		if (get_pfn_flags(pfn_head + i, kpageflags_fd, &pfn_flags))
-+			return 0;
++	/* check all tail PFN flags */
++	for (i = 1; i < nr_pages; i++) {
++		if (pageflags_get(pfn_head + i, kpageflags_fd, &pfn_flags))
++			goto fail;
 +		if (!(pfn_flags & (KPF_THP | KPF_COMPOUND_TAIL)))
-+			return 0;
++			return false;
 +	}
-+	return 1;
++
++	/*
++	 * check the PFN after this folio, but if its flags cannot be obtained,
++	 * assume this folio has the expected order
++	 */
++	if (pageflags_get(pfn_head + nr_pages, kpageflags_fd, &pfn_flags))
++		return true;
++
++	/* this folio is bigger than the given order */
++	if (pfn_flags & (KPF_THP | KPF_COMPOUND_TAIL))
++		return false;
++
++	return true;
++fail:
++	ksft_exit_fail_msg("Failed to get folio info\n");
++	return false;
  }
  
  static void write_file(const char *path, const char *buf, size_t buflen)
-@@ -233,7 +259,7 @@ void split_pte_mapped_thp(void)
+@@ -234,7 +276,7 @@ static void split_pte_mapped_thp(void)
  	thp_size = 0;
  	for (i = 0; i < pagesize * 4; i++)
  		if (i % pagesize == 0 &&
@@ -121,7 +145,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			thp_size++;
  
  	if (thp_size != 4)
-@@ -250,7 +276,7 @@ void split_pte_mapped_thp(void)
+@@ -251,7 +293,7 @@ static void split_pte_mapped_thp(void)
  			ksft_exit_fail_msg("%ld byte corrupted\n", i);
  
  		if (i % pagesize == 0 &&
@@ -130,7 +154,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			thp_size++;
  	}
  
-@@ -522,7 +548,6 @@ int main(int argc, char **argv)
+@@ -525,7 +567,6 @@ int main(int argc, char **argv)
  	const char *fs_loc;
  	bool created_tmp;
  	int offset;
@@ -138,13 +162,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	unsigned int nr_pages;
  	unsigned int tests;
  
-@@ -543,28 +568,28 @@ int main(int argc, char **argv)
+@@ -546,28 +587,28 @@ int main(int argc, char **argv)
  		ksft_exit_fail_msg("Reading PMD pagesize failed\n");
  
  	nr_pages = pmd_pagesize / pagesize;
--	max_order = GET_ORDER(nr_pages);
+-	max_order =  sz2ord(pmd_pagesize, pagesize);
 -	tests = 2 + (max_order - 1) + (2 * max_order) + (max_order - 1) * 4 + 2;
-+	pmd_order = GET_ORDER(nr_pages);
++	pmd_order = sz2ord(pmd_pagesize, pagesize);
 +	tests = 2 + (pmd_order - 1) + (2 * pmd_order) + (pmd_order - 1) * 4 + 2;
  	ksft_set_plan(tests);
  
@@ -175,22 +199,43 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		     offset += MAX(nr_pages / 4, 1 << i))
 --- a/tools/testing/selftests/mm/vm_util.c~selftests-mm-reimplement-is_backed_by_thp-with-more-precise-check
 +++ a/tools/testing/selftests/mm/vm_util.c
-@@ -338,7 +338,7 @@ int detect_hugetlb_page_sizes(size_t siz
+@@ -338,6 +338,19 @@ int detect_hugetlb_page_sizes(size_t siz
  	return count;
  }
  
--static int get_pfn_flags(unsigned long pfn, int kpageflags_fd, uint64_t *flags)
-+int get_pfn_flags(unsigned long pfn, int kpageflags_fd, uint64_t *flags)
- {
- 	size_t count;
- 
++int pageflags_get(unsigned long pfn, int kpageflags_fd, uint64_t *flags)
++{
++	size_t count;
++
++	count = pread(kpageflags_fd, flags, sizeof(*flags),
++		      pfn * sizeof(*flags));
++
++	if (count != sizeof(*flags))
++		return -1;
++
++	return 0;
++}
++
+ /* If `ioctls' non-NULL, the allowed ioctls will be returned into the var */
+ int uffd_register_with_ioctls(int uffd, void *addr, uint64_t len,
+ 			      bool miss, bool wp, bool minor, uint64_t *ioctls)
 --- a/tools/testing/selftests/mm/vm_util.h~selftests-mm-reimplement-is_backed_by_thp-with-more-precise-check
 +++ a/tools/testing/selftests/mm/vm_util.h
-@@ -92,6 +92,7 @@ unsigned long default_huge_page_size(voi
+@@ -18,6 +18,9 @@
+ #define PM_SWAP                       BIT_ULL(62)
+ #define PM_PRESENT                    BIT_ULL(63)
+ 
++#define KPF_COMPOUND_HEAD             BIT_ULL(15)
++#define KPF_COMPOUND_TAIL             BIT_ULL(16)
++#define KPF_THP                       BIT_ULL(22)
+ /*
+  * Ignore the checkpatch warning, we must read from x but don't want to do
+  * anything with it in order to trigger a read page fault. We therefore must use
+@@ -85,6 +88,7 @@ bool check_huge_shmem(void *addr, int nr
+ int64_t allocate_transhuge(void *ptr, int pagemap_fd);
+ unsigned long default_huge_page_size(void);
  int detect_hugetlb_page_sizes(size_t sizes[], int max);
- int check_folio_orders(char *vaddr_start, size_t len, int pagemap_file,
- 			int kpageflags_file, int orders[], int nr_orders);
-+int get_pfn_flags(unsigned long pfn, int kpageflags_fd, uint64_t *flags);
++int pageflags_get(unsigned long pfn, int kpageflags_fd, uint64_t *flags);
  
  int uffd_register(int uffd, void *addr, uint64_t len,
  		  bool miss, bool wp, bool minor);

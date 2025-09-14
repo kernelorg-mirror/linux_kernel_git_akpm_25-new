@@ -1,16 +1,20 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: selftests/mm: check after-split folio orders in split_huge_page_test
-Date: Tue, 12 Aug 2025 11:55:12 -0400
+Date: Mon, 18 Aug 2025 14:46:22 -0400
 
-Instead of just checking the existence of PMD folios before and after
-folio split tests, use check_folio_orders() to check after-split folio
-orders.
+Instead of just checking the existence of PMD folios before and after folio
+split tests, use check_folio_orders() to check after-split folio orders.
+
+The split ranges in split_thp_in_pagecache_to_order_at() are changed to
+[addr, addr + pagesize) for every pmd_pagesize. It prevents folios within
+the range being split multiple times due to debugfs split function always
+perform splits with a pagesize step for a given range.
 
 The following tests are not changed:
 1. split_pte_mapped_thp: the test already uses kpageflags to check;
 2. split_file_backed_thp: no vaddr available.
 
-Link: https://lkml.kernel.org/r/20250812155512.926011-5-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20250818184622.1521620-6-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
@@ -31,8 +35,8 @@ Cc: Wei Yang <richard.weiyang@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- tools/testing/selftests/mm/split_huge_page_test.c |   85 ++++++++----
- 1 file changed, 61 insertions(+), 24 deletions(-)
+ tools/testing/selftests/mm/split_huge_page_test.c |   88 ++++++++----
+ 1 file changed, 64 insertions(+), 24 deletions(-)
 
 --- a/tools/testing/selftests/mm/split_huge_page_test.c~selftests-mm-check-after-split-folio-orders-in-split_huge_page_test
 +++ a/tools/testing/selftests/mm/split_huge_page_test.c
@@ -44,66 +48,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #define SPLIT_DEBUGFS "/sys/kernel/debug/split_huge_pages"
  #define SMAP_PATH "/proc/self/smaps"
-@@ -37,6 +38,11 @@ unsigned int pmd_order;
- 
- #define GET_ORDER(nr_pages)    (31 - __builtin_clz(nr_pages))
+@@ -35,6 +36,11 @@ unsigned int pmd_order;
+ #define PID_FMT_OFFSET "%d,0x%lx,0x%lx,%d,%d"
+ #define PATH_FMT "%s,0x%lx,0x%lx,%d"
  
 +const char *pagemap_proc = "/proc/self/pagemap";
 +const char *kpageflags_proc = "/proc/kpageflags";
 +int pagemap_fd;
 +int kpageflags_fd;
 +
- int is_backed_by_folio(char *vaddr, int order, int pagemap_fd, int kpageflags_fd)
+ static bool is_backed_by_folio(char *vaddr, int order, int pagemap_fd,
+ 		int kpageflags_fd)
  {
- 	unsigned long pfn_head;
-@@ -49,18 +55,21 @@ int is_backed_by_folio(char *vaddr, int
- 
- 	pfn = pagemap_get_pfn(pagemap_fd, vaddr);
- 
-+	/* non present page */
- 	if (pfn == -1UL)
- 		return 0;
- 
- 	if (get_pfn_flags(pfn, kpageflags_fd, &pfn_flags))
- 		return 0;
- 
-+	/* check for order-0 pages */
- 	if (!order) {
- 		if (pfn_flags & (KPF_THP | KPF_COMPOUND_HEAD | KPF_COMPOUND_TAIL))
- 			return 0;
- 		return 1;
- 	}
- 
-+	/* non THP folio */
- 	if (!(pfn_flags & KPF_THP))
- 		return 0;
- 
-@@ -69,9 +78,11 @@ int is_backed_by_folio(char *vaddr, int
- 	if (get_pfn_flags(pfn_head, kpageflags_fd, &pfn_flags))
- 		return 0;
- 
-+	/* head PFN has no compound_head flag set */
- 	if (!(pfn_flags & (KPF_THP | KPF_COMPOUND_HEAD)))
- 		return 0;
- 
-+	/* check all tail PFN flags */
- 	for (i = 1; i < (1UL << order) - 1; i++) {
- 		if (get_pfn_flags(pfn_head + i, kpageflags_fd, &pfn_flags))
- 			return 0;
-@@ -198,6 +209,12 @@ void split_pmd_thp_to_order(int order)
+@@ -367,6 +373,13 @@ static void split_pmd_thp_to_order(int o
  		if (one_page[i] != (char)i)
  			ksft_exit_fail_msg("%ld byte corrupted\n", i);
  
 +	memset(expected_orders, 0, sizeof(int) * (pmd_order + 1));
 +	expected_orders[order] = 4 << (pmd_order - order);
 +
-+	if (check_folio_orders(one_page, len, pagemap_fd, kpageflags_fd,
-+			       expected_orders, (pmd_order + 1)))
++	if (check_after_split_folio_orders(one_page, len, pagemap_fd,
++					   kpageflags_fd, expected_orders,
++					   (pmd_order + 1)))
 +		ksft_exit_fail_msg("Unexpected THP split\n");
  
  	if (!check_huge_anon(one_page, 0, pmd_pagesize))
  		ksft_exit_fail_msg("Still AnonHugePages not split\n");
-@@ -212,22 +229,6 @@ void split_pte_mapped_thp(void)
+@@ -381,22 +394,6 @@ static void split_pte_mapped_thp(void)
  	size_t len = 4 * pmd_pagesize;
  	uint64_t thp_size;
  	size_t i;
@@ -126,7 +97,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	one_page = mmap((void *)(1UL << 30), len, PROT_READ | PROT_WRITE,
  			MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-@@ -285,8 +286,6 @@ void split_pte_mapped_thp(void)
+@@ -454,8 +451,6 @@ static void split_pte_mapped_thp(void)
  
  	ksft_test_result_pass("Split PTE-mapped huge pages successful\n");
  	munmap(one_page, len);
@@ -134,16 +105,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	close(kpageflags_fd);
  }
  
- void split_file_backed_thp(int order)
-@@ -489,6 +488,7 @@ void split_thp_in_pagecache_to_order_at(
- 		int order, int offset)
+ static void split_file_backed_thp(int order)
+@@ -660,6 +655,7 @@ static void split_thp_in_pagecache_to_or
+ 		const char *fs_loc, int order, int offset)
  {
  	int fd;
 +	char *split_addr;
  	char *addr;
  	size_t i;
  	char testfile[INPUT_MAX];
-@@ -502,14 +502,27 @@ void split_thp_in_pagecache_to_order_at(
+@@ -673,14 +669,33 @@ static void split_thp_in_pagecache_to_or
  	err = create_pagecache_thp_and_fd(testfile, fd_size, &fd, &addr);
  	if (err)
  		return;
@@ -157,6 +128,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		write_debugfs(PID_FMT_OFFSET, getpid(), (uint64_t)addr,
 -			      (uint64_t)addr + fd_size, order, offset);
 +	memset(expected_orders, 0, sizeof(int) * (pmd_order + 1));
++	/*
++	 * use [split_addr, split_addr + pagesize) range to split THPs, since
++	 * the debugfs function always split a range with pagesize step and
++	 * providing a full [addr, addr + fd_size) range can trigger multiple
++	 * splits, complicating after-split result checking.
++	 */
 +	if (offset == -1) {
 +		for (split_addr = addr; split_addr < addr + fd_size; split_addr += pmd_pagesize)
 +			write_debugfs(PID_FMT, getpid(), (uint64_t)split_addr,
@@ -177,12 +154,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < fd_size; i++)
  		if (*(addr + i) != (char)i) {
-@@ -518,6 +531,13 @@ void split_thp_in_pagecache_to_order_at(
+@@ -689,6 +704,14 @@ static void split_thp_in_pagecache_to_or
  			goto out;
  		}
  
-+	if (check_folio_orders(addr, fd_size, pagemap_fd, kpageflags_fd,
-+			       expected_orders, (pmd_order + 1))) {
++	if (check_after_split_folio_orders(addr, fd_size, pagemap_fd,
++					   kpageflags_fd, expected_orders,
++					   (pmd_order + 1))) {
 +		ksft_print_msg("Unexpected THP split\n");
 +		err = 1;
 +		goto out;
@@ -191,10 +169,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!check_huge_file(addr, 0, pmd_pagesize)) {
  		ksft_print_msg("Still FilePmdMapped not split\n");
  		err = EXIT_FAILURE;
-@@ -569,9 +589,22 @@ int main(int argc, char **argv)
+@@ -740,9 +763,22 @@ int main(int argc, char **argv)
  
  	nr_pages = pmd_pagesize / pagesize;
- 	pmd_order = GET_ORDER(nr_pages);
+ 	pmd_order = sz2ord(pmd_pagesize, pagesize);
 +
 +	expected_orders = (int *)malloc(sizeof(int) * (pmd_order + 1));
 +	if (!expected_orders)
@@ -214,7 +192,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	fd_size = 2 * pmd_pagesize;
  
  	split_pmd_zero_pages();
-@@ -596,6 +629,10 @@ int main(int argc, char **argv)
+@@ -767,6 +803,10 @@ int main(int argc, char **argv)
  			split_thp_in_pagecache_to_order_at(fd_size, fs_loc, i, offset);
  	cleanup_thp_fs(fs_loc, created_tmp);
  
