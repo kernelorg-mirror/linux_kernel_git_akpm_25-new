@@ -1,0 +1,93 @@
+From: Kiryl Shutsemau <kas@kernel.org>
+Subject: mm/khugepaged: do not fail collapse_pte_mapped_thp() on SCAN_PMD_NULL
+Date: Fri, 12 Sep 2025 17:58:11 +0100
+
+MADV_COLLAPSE on a file mapping behaves inconsistently depending on if PMD
+page table is installed or not.
+
+Consider following example:
+
+	p = mmap(NULL, 2UL << 20, PROT_READ | PROT_WRITE,
+		 MAP_SHARED, fd, 0);
+	err = madvise(p, 2UL << 20, MADV_COLLAPSE);
+
+fd is a populated tmpfs file.
+
+The result depends on the address that the kernel returns on mmap().  If
+it is located in an existing PMD table, the madvise() will succeed. 
+However, if the table does not exist, it will fail with -EINVAL.
+
+This occurs because find_pmd_or_thp_or_none() returns SCAN_PMD_NULL when a
+page table is missing, which causes collapse_pte_mapped_thp() to fail.
+
+SCAN_PMD_NULL and SCAN_PMD_NONE should be treated the same in
+collapse_pte_mapped_thp(): install the PMD leaf entry and allocate page
+tables as needed.
+
+Link: https://lkml.kernel.org/r/xhan2av3fyl7qpsl4bhjtds2zeegrl57ehtc5grtkua3c3v3nz@vain5s6gpycl
+Fixes: 7d8faaf15545 ("mm/madvise: introduce MADV_COLLAPSE sync hugepage collapse")
+Signed-off-by: Kiryl Shutsemau <kas@kernel.org>
+Acked-by: David Hildenbrand <david@redhat.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |   25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+--- a/mm/khugepaged.c~mm-khugepaged-do-not-fail-collapse_pte_mapped_thp-on-scan_pmd_null
++++ a/mm/khugepaged.c
+@@ -1476,6 +1476,28 @@ static int set_huge_pmd(struct vm_area_s
+ 	return SCAN_SUCCEED;
+ }
+ 
++static int install_huge_pmd(struct vm_area_struct *vma, unsigned long haddr,
++			    pmd_t *pmd, struct folio *folio)
++{
++	struct mm_struct *mm = vma->vm_mm;
++	pgd_t *pgd;
++	p4d_t *p4d;
++	pud_t *pud;
++
++	pgd = pgd_offset(mm, haddr);
++	p4d = p4d_alloc(mm, pgd, haddr);
++	if (!p4d)
++		return SCAN_FAIL;
++	pud = pud_alloc(mm, p4d, haddr);
++	if (!pud)
++		return SCAN_FAIL;
++	pmd = pmd_alloc(mm, pud, haddr);
++	if (!pmd)
++		return SCAN_FAIL;
++
++	return set_huge_pmd(vma, haddr, pmd, folio, &folio->page);
++}
++
+ /**
+  * collapse_pte_mapped_thp - Try to collapse a pte-mapped THP for mm at
+  * address haddr.
+@@ -1544,6 +1566,7 @@ int collapse_pte_mapped_thp(struct mm_st
+ 	switch (result) {
+ 	case SCAN_SUCCEED:
+ 		break;
++	case SCAN_PMD_NULL:
+ 	case SCAN_PMD_NONE:
+ 		/*
+ 		 * All pte entries have been removed and pmd cleared.
+@@ -1688,7 +1711,7 @@ int collapse_pte_mapped_thp(struct mm_st
+ maybe_install_pmd:
+ 	/* step 5: install pmd entry */
+ 	result = install_pmd
+-			? set_huge_pmd(vma, haddr, pmd, folio, &folio->page)
++			? install_huge_pmd(vma, haddr, pmd, folio)
+ 			: SCAN_SUCCEED;
+ 	goto drop_folio;
+ abort:
+_
