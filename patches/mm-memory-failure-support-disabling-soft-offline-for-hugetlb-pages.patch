@@ -1,0 +1,254 @@
+From: Kyle Meyer <kyle.meyer@hpe.com>
+Subject: mm/memory-failure: support disabling soft offline for HugeTLB pages
+Date: Mon, 15 Sep 2025 19:27:41 -0500
+
+Soft offlining a HugeTLB page reduces the HugeTLB page pool.
+
+Commit 56374430c5dfc ("mm/memory-failure: userspace controls
+soft-offlining pages") introduced the following sysctl interface to
+control soft offline:
+
+/proc/sys/vm/enable_soft_offline
+
+The interface does not distinguish between page types:
+
+    0 - Soft offline is disabled
+    1 - Soft offline is enabled
+
+Convert enable_soft_offline to a bitmask and support disabling soft
+offline for HugeTLB pages:
+
+Bits:
+
+    0 - Enable soft offline
+    1 - Disable soft offline for HugeTLB pages
+
+Supported values:
+
+    0 - Soft offline is disabled
+    1 - Soft offline is enabled
+    3 - Soft offline is enabled (disabled for HugeTLB pages)
+
+Existing behavior is preserved.
+
+Update documentation and HugeTLB soft offline self tests.
+
+Link: https://lkml.kernel.org/r/aMiu_Uku6Y5ZbuhM@hpe.com
+Signed-off-by: Kyle Meyer <kyle.meyer@hpe.com>
+Reported-by: Shawn Fan <shawn.fan@intel.com>
+Suggested-by: Tony Luck <tony.luck@intel.com>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: Joel Granados <joel.granados@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Clapinski <mclapinski@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Russ Anderson <russ.anderson@hpe.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yafang <laoar.shao@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/ABI/testing/sysfs-memory-page-offline |    3 +
+ Documentation/admin-guide/sysctl/vm.rst             |   28 ++++++++--
+ mm/memory-failure.c                                 |   17 +++++-
+ tools/testing/selftests/mm/hugetlb-soft-offline.c   |   19 +++++-
+ 4 files changed, 56 insertions(+), 11 deletions(-)
+
+--- a/Documentation/ABI/testing/sysfs-memory-page-offline~mm-memory-failure-support-disabling-soft-offline-for-hugetlb-pages
++++ a/Documentation/ABI/testing/sysfs-memory-page-offline
+@@ -20,6 +20,9 @@ Description:
+ 		number, or a error when the offlining failed.  Reading
+ 		the file is not allowed.
+ 
++		Soft-offline can be controlled via sysctl, see:
++		Documentation/admin-guide/sysctl/vm.rst
++
+ What:		/sys/devices/system/memory/hard_offline_page
+ Date:		Sep 2009
+ KernelVersion:	2.6.33
+--- a/Documentation/admin-guide/sysctl/vm.rst~mm-memory-failure-support-disabling-soft-offline-for-hugetlb-pages
++++ a/Documentation/admin-guide/sysctl/vm.rst
+@@ -309,19 +309,39 @@ physical memory) vs performance / capaci
+ HugeTLB cases.
+ 
+ For all architectures, enable_soft_offline controls whether to soft offline
+-memory pages.  When set to 1, kernel attempts to soft offline the pages
+-whenever it thinks needed.  When set to 0, kernel returns EOPNOTSUPP to
+-the request to soft offline the pages.  Its default value is 1.
++memory pages.
++
++enable_soft_offline is a bitmask:
++
++Bits::
++
++	0 - Enable soft offline
++	1 - Disable soft offline for HugeTLB pages
++
++Supported values::
++
++	0 - Soft offline is disabled
++	1 - Soft offline is enabled
++	3 - Soft offline is enabled (disabled for HugeTLB pages)
++
++The default value is 1.
++
++If soft offline is disabled for the requested page type, EOPNOTSUPP is returned.
+ 
+ It is worth mentioning that after setting enable_soft_offline to 0, the
+ following requests to soft offline pages will not be performed:
+ 
++- Request to soft offline from sysfs (soft_offline_page).
++
+ - Request to soft offline pages from RAS Correctable Errors Collector.
+ 
+-- On ARM, the request to soft offline pages from GHES driver.
++- On ARM and X86, the request to soft offline pages from GHES driver.
+ 
+ - On PARISC, the request to soft offline pages from Page Deallocation Table.
+ 
++Note:
++	Soft offlining a HugeTLB page reduces the HugeTLB page pool.
++
+ extfrag_threshold
+ =================
+ 
+--- a/mm/memory-failure.c~mm-memory-failure-support-disabling-soft-offline-for-hugetlb-pages
++++ a/mm/memory-failure.c
+@@ -64,11 +64,14 @@
+ #include "internal.h"
+ #include "ras/ras_event.h"
+ 
++#define SOFT_OFFLINE_ENABLED		BIT(0)
++#define SOFT_OFFLINE_SKIP_HUGETLB	BIT(1)
++
+ static int sysctl_memory_failure_early_kill __read_mostly;
+ 
+ static int sysctl_memory_failure_recovery __read_mostly = 1;
+ 
+-static int sysctl_enable_soft_offline __read_mostly = 1;
++static int sysctl_enable_soft_offline __read_mostly = SOFT_OFFLINE_ENABLED;
+ 
+ atomic_long_t num_poisoned_pages __read_mostly = ATOMIC_LONG_INIT(0);
+ 
+@@ -150,7 +153,7 @@ static const struct ctl_table memory_fai
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+ 		.extra1		= SYSCTL_ZERO,
+-		.extra2		= SYSCTL_ONE,
++		.extra2		= SYSCTL_THREE,
+ 	}
+ };
+ 
+@@ -2725,12 +2728,20 @@ int soft_offline_page(unsigned long pfn,
+ 		return -EIO;
+ 	}
+ 
+-	if (!sysctl_enable_soft_offline) {
++	if (!(sysctl_enable_soft_offline & SOFT_OFFLINE_ENABLED)) {
+ 		pr_info_once("disabled by /proc/sys/vm/enable_soft_offline\n");
+ 		put_ref_page(pfn, flags);
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	if (sysctl_enable_soft_offline & SOFT_OFFLINE_SKIP_HUGETLB) {
++		if (folio_test_hugetlb(pfn_folio(pfn))) {
++			pr_info_once("disabled for HugeTLB pages by /proc/sys/vm/enable_soft_offline\n");
++			put_ref_page(pfn, flags);
++			return -EOPNOTSUPP;
++		}
++	}
++
+ 	mutex_lock(&mf_mutex);
+ 
+ 	if (PageHWPoison(page)) {
+--- a/tools/testing/selftests/mm/hugetlb-soft-offline.c~mm-memory-failure-support-disabling-soft-offline-for-hugetlb-pages
++++ a/tools/testing/selftests/mm/hugetlb-soft-offline.c
+@@ -5,6 +5,8 @@
+  *   offlining failed with EOPNOTSUPP.
+  * - if enable_soft_offline = 1, a hugepage should be dissolved and
+  *   nr_hugepages/free_hugepages should be reduced by 1.
++ * - if enable_soft_offline = 3, hugepages should stay intact and soft
++ *   offlining failed with EOPNOTSUPP.
+  *
+  * Before running, make sure more than 2 hugepages of default_hugepagesz
+  * are allocated. For example, if /proc/meminfo/Hugepagesize is 2048kB:
+@@ -32,6 +34,9 @@
+ 
+ #define EPREFIX " !!! "
+ 
++#define SOFT_OFFLINE_ENABLED		(1 << 0)
++#define SOFT_OFFLINE_SKIP_HUGETLB	(1 << 1)
++
+ static int do_soft_offline(int fd, size_t len, int expect_errno)
+ {
+ 	char *filemap = NULL;
+@@ -56,6 +61,7 @@ static int do_soft_offline(int fd, size_
+ 	ksft_print_msg("Allocated %#lx bytes of hugetlb pages\n", len);
+ 
+ 	hwp_addr = filemap + len / 2;
++	errno = 0;
+ 	ret = madvise(hwp_addr, pagesize, MADV_SOFT_OFFLINE);
+ 	ksft_print_msg("MADV_SOFT_OFFLINE %p ret=%d, errno=%d\n",
+ 		       hwp_addr, ret, errno);
+@@ -83,7 +89,7 @@ static int set_enable_soft_offline(int v
+ 	char cmd[256] = {0};
+ 	FILE *cmdfile = NULL;
+ 
+-	if (value != 0 && value != 1)
++	if (value < 0 || value > 3)
+ 		return -EINVAL;
+ 
+ 	sprintf(cmd, "echo %d > /proc/sys/vm/enable_soft_offline", value);
+@@ -155,13 +161,17 @@ close:
+ static void test_soft_offline_common(int enable_soft_offline)
+ {
+ 	int fd;
+-	int expect_errno = enable_soft_offline ? 0 : EOPNOTSUPP;
++	int expect_errno = 0;
+ 	struct statfs file_stat;
+ 	unsigned long hugepagesize_kb = 0;
+ 	unsigned long nr_hugepages_before = 0;
+ 	unsigned long nr_hugepages_after = 0;
+ 	int ret;
+ 
++	if (!(enable_soft_offline & SOFT_OFFLINE_ENABLED) ||
++	     (enable_soft_offline & SOFT_OFFLINE_SKIP_HUGETLB))
++		expect_errno = EOPNOTSUPP;
++
+ 	ksft_print_msg("Test soft-offline when enabled_soft_offline=%d\n",
+ 		       enable_soft_offline);
+ 
+@@ -198,7 +208,7 @@ static void test_soft_offline_common(int
+ 	// No need for the hugetlbfs file from now on.
+ 	close(fd);
+ 
+-	if (enable_soft_offline) {
++	if (expect_errno == 0) {
+ 		if (nr_hugepages_before != nr_hugepages_after + 1) {
+ 			ksft_test_result_fail("MADV_SOFT_OFFLINE should reduced 1 hugepage\n");
+ 			return;
+@@ -219,8 +229,9 @@ static void test_soft_offline_common(int
+ int main(int argc, char **argv)
+ {
+ 	ksft_print_header();
+-	ksft_set_plan(2);
++	ksft_set_plan(3);
+ 
++	test_soft_offline_common(3);
+ 	test_soft_offline_common(1);
+ 	test_soft_offline_common(0);
+ 
+_
