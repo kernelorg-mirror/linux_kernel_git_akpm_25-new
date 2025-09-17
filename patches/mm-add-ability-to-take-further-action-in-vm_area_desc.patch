@@ -1,0 +1,750 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm: add ability to take further action in vm_area_desc
+Date: Wed, 17 Sep 2025 20:11:11 +0100
+
+Some drivers/filesystems need to perform additional tasks after the VMA is
+set up.  This is typically in the form of pre-population.
+
+The forms of pre-population most likely to be performed are a PFN remap
+or the insertion of normal folios and PFNs into a mixed map.
+
+We start by implementing the PFN remap functionality, ensuring that we
+perform the appropriate actions at the appropriate time - that is setting
+flags at the point of .mmap_prepare, and performing the actual remap at the
+point at which the VMA is fully established.
+
+This prevents the driver from doing anything too crazy with a VMA at any
+stage, and we retain complete control over how the mm functionality is
+applied.
+
+Unfortunately callers still do often require some kind of custom action,
+so we add an optional success/error _hook to allow the caller to do
+something after the action has succeeded or failed.
+
+This is done at the point when the VMA has already been established, so
+the harm that can be done is limited.
+
+The error hook can be used to filter errors if necessary.
+
+If any error arises on these final actions, we simply unmap the VMA
+altogether.
+
+Also update the stacked filesystem compatibility layer to utilise the
+action behaviour, and update the VMA tests accordingly.
+
+While we're here, rename __compat_vma_mmap_prepare() to __compat_vma_mmap()
+as we are now performing actions invoked by the mmap_prepare in addition to
+just the mmap_prepare hook.
+
+Link: https://lkml.kernel.org/r/777c55010d2c94cc90913eb5aaeb703e912f99e0.1758135681.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Andreas Larsson <andreas@gaisler.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Chatre, Reinette <reinette.chatre@intel.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Dan Williams <dan.j.williams@intel.com>
+Cc: Dave Jiang <dave.jiang@intel.com>
+Cc: Dave Martin <dave.martin@arm.com>
+Cc: Dave Young <dyoung@redhat.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Guo Ren <guoren@kernel.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Konstantin Komarov <almaz.alexandrovich@paragon-software.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: "Luck, Tony" <tony.luck@intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Nicolas Pitre <nico@fluxnic.net>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Robin Murohy <robin.murphy@arm.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Cc: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vishal Verma <vishal.l.verma@intel.com>
+Cc: Vivek Goyal <vgoyal@redhat.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/fs.h               |    6 -
+ include/linux/mm.h               |   74 +++++++++++++++
+ include/linux/mm_types.h         |   46 +++++++++
+ mm/util.c                        |  143 ++++++++++++++++++++++++++---
+ mm/vma.c                         |   70 +++++++++-----
+ tools/testing/vma/vma_internal.h |   90 ++++++++++++++++--
+ 6 files changed, 385 insertions(+), 44 deletions(-)
+
+--- a/include/linux/fs.h~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/include/linux/fs.h
+@@ -2279,14 +2279,14 @@ static inline bool can_mmap_file(struct
+ 	return true;
+ }
+ 
+-int __compat_vma_mmap_prepare(const struct file_operations *f_op,
++int __compat_vma_mmap(const struct file_operations *f_op,
+ 		struct file *file, struct vm_area_struct *vma);
+-int compat_vma_mmap_prepare(struct file *file, struct vm_area_struct *vma);
++int compat_vma_mmap(struct file *file, struct vm_area_struct *vma);
+ 
+ static inline int vfs_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	if (file->f_op->mmap_prepare)
+-		return compat_vma_mmap_prepare(file, vma);
++		return compat_vma_mmap(file, vma);
+ 
+ 	return file->f_op->mmap(file, vma);
+ }
+--- a/include/linux/mm.h~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/include/linux/mm.h
+@@ -3596,6 +3596,80 @@ static inline unsigned long vma_desc_pag
+ 	return vma_desc_size(desc) >> PAGE_SHIFT;
+ }
+ 
++/**
++ * mmap_action_remap - helper for mmap_prepare hook to specify that a pure PFN
++ * remap is required.
++ * @desc: The VMA descriptor for the VMA requiring remap.
++ * @start: The virtual address to start the remap from, must be within the VMA.
++ * @start_pfn: The first PFN in the range to remap.
++ * @size: The size of the range to remap, in bytes, at most spanning to the end
++ * of the VMA.
++ */
++static inline void mmap_action_remap(struct vm_area_desc *desc,
++				     unsigned long start,
++				     unsigned long start_pfn,
++				     unsigned long size)
++{
++	struct mmap_action *action = &desc->action;
++
++	/* [start, start + size) must be within the VMA. */
++	WARN_ON_ONCE(start < desc->start || start >= desc->end);
++	WARN_ON_ONCE(start + size > desc->end);
++
++	action->type = MMAP_REMAP_PFN;
++	action->remap.start = start;
++	action->remap.start_pfn = start_pfn;
++	action->remap.size = size;
++	action->remap.pgprot = desc->page_prot;
++}
++
++/**
++ * mmap_action_remap_full - helper for mmap_prepare hook to specify that the
++ * entirety of a VMA should be PFN remapped.
++ * @desc: The VMA descriptor for the VMA requiring remap.
++ * @start_pfn: The first PFN in the range to remap.
++ */
++static inline void mmap_action_remap_full(struct vm_area_desc *desc,
++					  unsigned long start_pfn)
++{
++	mmap_action_remap(desc, desc->start, start_pfn, vma_desc_size(desc));
++}
++
++/**
++ * mmap_action_ioremap - helper for mmap_prepare hook to specify that a pure PFN
++ * I/O remap is required.
++ * @desc: The VMA descriptor for the VMA requiring remap.
++ * @start: The virtual address to start the remap from, must be within the VMA.
++ * @start_pfn: The first PFN in the range to remap.
++ * @size: The size of the range to remap, in bytes, at most spanning to the end
++ * of the VMA.
++ */
++static inline void mmap_action_ioremap(struct vm_area_desc *desc,
++				       unsigned long start,
++				       unsigned long start_pfn,
++				       unsigned long size)
++{
++	mmap_action_remap(desc, start, start_pfn, size);
++	desc->action.type = MMAP_IO_REMAP_PFN;
++}
++
++/**
++ * mmap_action_ioremap_full - helper for mmap_prepare hook to specify that the
++ * entirety of a VMA should be PFN I/O remapped.
++ * @desc: The VMA descriptor for the VMA requiring remap.
++ * @start_pfn: The first PFN in the range to remap.
++ */
++static inline void mmap_action_ioremap_full(struct vm_area_desc *desc,
++					  unsigned long start_pfn)
++{
++	mmap_action_ioremap(desc, desc->start, start_pfn, vma_desc_size(desc));
++}
++
++void mmap_action_prepare(struct mmap_action *action,
++			     struct vm_area_desc *desc);
++int mmap_action_complete(struct mmap_action *action,
++			     struct vm_area_struct *vma);
++
+ /* Look up the first VMA which exactly match the interval vm_start ... vm_end */
+ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
+ 				unsigned long vm_start, unsigned long vm_end)
+--- a/include/linux/mm_types.h~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/include/linux/mm_types.h
+@@ -773,6 +773,49 @@ struct pfnmap_track_ctx {
+ };
+ #endif
+ 
++/* What action should be taken after an .mmap_prepare call is complete? */
++enum mmap_action_type {
++	MMAP_NOTHING,		/* Mapping is complete, no further action. */
++	MMAP_REMAP_PFN,		/* Remap PFN range. */
++	MMAP_IO_REMAP_PFN,	/* I/O remap PFN range. */
++};
++
++/*
++ * Describes an action an mmap_prepare hook can instruct to be taken to complete
++ * the mapping of a VMA. Specified in vm_area_desc.
++ */
++struct mmap_action {
++	union {
++		/* Remap range. */
++		struct {
++			unsigned long start;
++			unsigned long start_pfn;
++			unsigned long size;
++			pgprot_t pgprot;
++		} remap;
++	};
++	enum mmap_action_type type;
++
++	/*
++	 * If specified, this hook is invoked after the selected action has been
++	 * successfully completed. Note that the VMA write lock still held.
++	 *
++	 * The absolute minimum ought to be done here.
++	 *
++	 * Returns 0 on success, or an error code.
++	 */
++	int (*success_hook)(const struct vm_area_struct *vma);
++
++	/*
++	 * If specified, this hook is invoked when an error occurred when
++	 * attempting the selection action.
++	 *
++	 * The hook can return an error code in order to filter the error, but
++	 * it is not valid to clear the error here.
++	 */
++	int (*error_hook)(int err);
++};
++
+ /*
+  * Describes a VMA that is about to be mmap()'ed. Drivers may choose to
+  * manipulate mutable fields which will cause those fields to be updated in the
+@@ -796,6 +839,9 @@ struct vm_area_desc {
+ 	/* Write-only fields. */
+ 	const struct vm_operations_struct *vm_ops;
+ 	void *private_data;
++
++	/* Take further action? */
++	struct mmap_action action;
+ };
+ 
+ /*
+--- a/mm/util.c~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/mm/util.c
+@@ -1134,7 +1134,7 @@ EXPORT_SYMBOL(flush_dcache_folio);
+ #endif
+ 
+ /**
+- * __compat_vma_mmap_prepare() - See description for compat_vma_mmap_prepare()
++ * __compat_vma_mmap() - See description for compat_vma_mmap()
+  * for details. This is the same operation, only with a specific file operations
+  * struct which may or may not be the same as vma->vm_file->f_op.
+  * @f_op: The file operations whose .mmap_prepare() hook is specified.
+@@ -1142,7 +1142,7 @@ EXPORT_SYMBOL(flush_dcache_folio);
+  * @vma: The VMA to apply the .mmap_prepare() hook to.
+  * Returns: 0 on success or error.
+  */
+-int __compat_vma_mmap_prepare(const struct file_operations *f_op,
++int __compat_vma_mmap(const struct file_operations *f_op,
+ 		struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct vm_area_desc desc = {
+@@ -1155,21 +1155,24 @@ int __compat_vma_mmap_prepare(const stru
+ 		.vm_file = vma->vm_file,
+ 		.vm_flags = vma->vm_flags,
+ 		.page_prot = vma->vm_page_prot,
++
++		.action.type = MMAP_NOTHING, /* Default */
+ 	};
+ 	int err;
+ 
+ 	err = f_op->mmap_prepare(&desc);
+ 	if (err)
+ 		return err;
+-	set_vma_from_desc(vma, &desc);
+ 
+-	return 0;
++	mmap_action_prepare(&desc.action, &desc);
++	set_vma_from_desc(vma, &desc);
++	return mmap_action_complete(&desc.action, vma);
+ }
+-EXPORT_SYMBOL(__compat_vma_mmap_prepare);
++EXPORT_SYMBOL(__compat_vma_mmap);
+ 
+ /**
+- * compat_vma_mmap_prepare() - Apply the file's .mmap_prepare() hook to an
+- * existing VMA.
++ * compat_vma_mmap() - Apply the file's .mmap_prepare() hook to an
++ * existing VMA and execute any requested actions.
+  * @file: The file which possesss an f_op->mmap_prepare() hook.
+  * @vma: The VMA to apply the .mmap_prepare() hook to.
+  *
+@@ -1184,7 +1187,7 @@ EXPORT_SYMBOL(__compat_vma_mmap_prepare)
+  * .mmap_prepare() hook, as we are in a different context when we invoke the
+  * .mmap() hook, already having a VMA to deal with.
+  *
+- * compat_vma_mmap_prepare() is a compatibility function that takes VMA state,
++ * compat_vma_mmap() is a compatibility function that takes VMA state,
+  * establishes a struct vm_area_desc descriptor, passes to the underlying
+  * .mmap_prepare() hook and applies any changes performed by it.
+  *
+@@ -1193,11 +1196,11 @@ EXPORT_SYMBOL(__compat_vma_mmap_prepare)
+  *
+  * Returns: 0 on success or error.
+  */
+-int compat_vma_mmap_prepare(struct file *file, struct vm_area_struct *vma)
++int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+-	return __compat_vma_mmap_prepare(file->f_op, file, vma);
++	return __compat_vma_mmap(file->f_op, file, vma);
+ }
+-EXPORT_SYMBOL(compat_vma_mmap_prepare);
++EXPORT_SYMBOL(compat_vma_mmap);
+ 
+ static void set_ps_flags(struct page_snapshot *ps, const struct folio *folio,
+ 			 const struct page *page)
+@@ -1279,6 +1282,124 @@ again:
+ 	}
+ }
+ 
++static int mmap_action_finish(struct mmap_action *action,
++		const struct vm_area_struct *vma, int err)
++{
++	/*
++	 * If an error occurs, unmap the VMA altogether and return an error. We
++	 * only clear the newly allocated VMA, since this function is only
++	 * invoked if we do NOT merge, so we only clean up the VMA we created.
++	 */
++	if (err) {
++		const size_t len = vma_pages(vma) << PAGE_SHIFT;
++
++		do_munmap(current->mm, vma->vm_start, len, NULL);
++
++		if (action->error_hook) {
++			/* We may want to filter the error. */
++			err = action->error_hook(err);
++
++			/* The caller should not clear the error. */
++			VM_WARN_ON_ONCE(!err);
++		}
++		return err;
++	}
++
++	if (action->success_hook)
++		return action->success_hook(vma);
++
++	return 0;
++}
++
++#ifdef CONFIG_MMU
++/**
++ * mmap_action_prepare - Perform preparatory setup for an VMA descriptor
++ * action which need to be performed.
++ * @desc: The VMA descriptor to prepare for @action.
++ * @action: The action to perform.
++ */
++void mmap_action_prepare(struct mmap_action *action,
++			 struct vm_area_desc *desc)
++{
++	switch (action->type) {
++	case MMAP_NOTHING:
++		break;
++	case MMAP_REMAP_PFN:
++		remap_pfn_range_prepare(desc, action->remap.start_pfn);
++		break;
++	case MMAP_IO_REMAP_PFN:
++		io_remap_pfn_range_prepare(desc, action->remap.start_pfn,
++					   action->remap.size);
++		break;
++	}
++}
++EXPORT_SYMBOL(mmap_action_prepare);
++
++/**
++ * mmap_action_complete - Execute VMA descriptor action.
++ * @action: The action to perform.
++ * @vma: The VMA to perform the action upon.
++ *
++ * Similar to mmap_action_prepare().
++ *
++ * Return: 0 on success, or error, at which point the VMA will be unmapped.
++ */
++int mmap_action_complete(struct mmap_action *action,
++			 struct vm_area_struct *vma)
++{
++	int err = 0;
++
++	switch (action->type) {
++	case MMAP_NOTHING:
++		break;
++	case MMAP_REMAP_PFN:
++		err = remap_pfn_range_complete(vma, action->remap.start,
++				action->remap.start_pfn, action->remap.size,
++				action->remap.pgprot);
++		break;
++	case MMAP_IO_REMAP_PFN:
++		err = io_remap_pfn_range_complete(vma, action->remap.start,
++				action->remap.start_pfn, action->remap.size,
++				action->remap.pgprot);
++		break;
++	}
++
++	return mmap_action_finish(action, vma, err);
++}
++EXPORT_SYMBOL(mmap_action_complete);
++#else
++void mmap_action_prepare(struct mmap_action *action,
++			struct vm_area_desc *desc)
++{
++	switch (action->type) {
++	case MMAP_NOTHING:
++		break;
++	case MMAP_REMAP_PFN:
++	case MMAP_IO_REMAP_PFN:
++		WARN_ON_ONCE(1); /* nommu cannot handle these. */
++		break;
++	}
++}
++EXPORT_SYMBOL(mmap_action_prepare);
++
++int mmap_action_complete(struct mmap_action *action,
++			struct vm_area_struct *vma)
++{
++	switch (action->type) {
++	case MMAP_NOTHING:
++		break;
++	case MMAP_REMAP_PFN:
++	case MMAP_IO_REMAP_PFN:
++		WARN_ON_ONCE(1); /* nommu cannot handle this. */
++
++		break;
++	}
++
++	return mmap_action_finish(action, vma, /* err = */0);
++}
++EXPORT_SYMBOL(mmap_action_complete);
++#endif
++
+ #ifdef CONFIG_MMU
+ /**
+  * folio_pte_batch - detect a PTE batch for a large folio
+--- a/mm/vma.c~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/mm/vma.c
+@@ -2328,17 +2328,33 @@ static void update_ksm_flags(struct mmap
+ 	map->vm_flags = ksm_vma_flags(map->mm, map->file, map->vm_flags);
+ }
+ 
++static void set_desc_from_map(struct vm_area_desc *desc,
++		const struct mmap_state *map)
++{
++	desc->start = map->addr;
++	desc->end = map->end;
++
++	desc->pgoff = map->pgoff;
++	desc->vm_file = map->file;
++	desc->vm_flags = map->vm_flags;
++	desc->page_prot = map->page_prot;
++}
++
+ /*
+  * __mmap_setup() - Prepare to gather any overlapping VMAs that need to be
+  * unmapped once the map operation is completed, check limits, account mapping
+  * and clean up any pre-existing VMAs.
+  *
++ * As a result it sets up the @map and @desc objects.
++ *
+  * @map: Mapping state.
++ * @desc: VMA descriptor
+  * @uf:  Userfaultfd context list.
+  *
+  * Returns: 0 on success, error code otherwise.
+  */
+-static int __mmap_setup(struct mmap_state *map, struct list_head *uf)
++static int __mmap_setup(struct mmap_state *map, struct vm_area_desc *desc,
++			struct list_head *uf)
+ {
+ 	int error;
+ 	struct vma_iterator *vmi = map->vmi;
+@@ -2395,6 +2411,7 @@ static int __mmap_setup(struct mmap_stat
+ 	 */
+ 	vms_clean_up_area(vms, &map->mas_detach);
+ 
++	set_desc_from_map(desc, map);
+ 	return 0;
+ }
+ 
+@@ -2567,34 +2584,26 @@ static void __mmap_complete(struct mmap_
+  *
+  * Returns 0 on success, or an error code otherwise.
+  */
+-static int call_mmap_prepare(struct mmap_state *map)
++static int call_mmap_prepare(struct mmap_state *map,
++		struct vm_area_desc *desc)
+ {
+ 	int err;
+-	struct vm_area_desc desc = {
+-		.mm = map->mm,
+-		.file = map->file,
+-		.start = map->addr,
+-		.end = map->end,
+-
+-		.pgoff = map->pgoff,
+-		.vm_file = map->file,
+-		.vm_flags = map->vm_flags,
+-		.page_prot = map->page_prot,
+-	};
+ 
+ 	/* Invoke the hook. */
+-	err = vfs_mmap_prepare(map->file, &desc);
++	err = vfs_mmap_prepare(map->file, desc);
+ 	if (err)
+ 		return err;
+ 
++	mmap_action_prepare(&desc->action, desc);
++
+ 	/* Update fields permitted to be changed. */
+-	map->pgoff = desc.pgoff;
+-	map->file = desc.vm_file;
+-	map->vm_flags = desc.vm_flags;
+-	map->page_prot = desc.page_prot;
++	map->pgoff = desc->pgoff;
++	map->file = desc->vm_file;
++	map->vm_flags = desc->vm_flags;
++	map->page_prot = desc->page_prot;
+ 	/* User-defined fields. */
+-	map->vm_ops = desc.vm_ops;
+-	map->vm_private_data = desc.private_data;
++	map->vm_ops = desc->vm_ops;
++	map->vm_private_data = desc->private_data;
+ 
+ 	return 0;
+ }
+@@ -2642,16 +2651,24 @@ static unsigned long __mmap_region(struc
+ {
+ 	struct mm_struct *mm = current->mm;
+ 	struct vm_area_struct *vma = NULL;
+-	int error;
+ 	bool have_mmap_prepare = file && file->f_op->mmap_prepare;
+ 	VMA_ITERATOR(vmi, mm, addr);
+ 	MMAP_STATE(map, mm, &vmi, addr, len, pgoff, vm_flags, file);
++	struct vm_area_desc desc = {
++		.mm = mm,
++		.file = file,
++		.action = {
++			.type = MMAP_NOTHING, /* Default to no further action. */
++		},
++	};
++	bool allocated_new = false;
++	int error;
+ 
+ 	map.check_ksm_early = can_set_ksm_flags_early(&map);
+ 
+-	error = __mmap_setup(&map, uf);
++	error = __mmap_setup(&map, &desc, uf);
+ 	if (!error && have_mmap_prepare)
+-		error = call_mmap_prepare(&map);
++		error = call_mmap_prepare(&map, &desc);
+ 	if (error)
+ 		goto abort_munmap;
+ 
+@@ -2670,6 +2687,7 @@ static unsigned long __mmap_region(struc
+ 		error = __mmap_new_vma(&map, &vma);
+ 		if (error)
+ 			goto unacct_error;
++		allocated_new = true;
+ 	}
+ 
+ 	if (have_mmap_prepare)
+@@ -2677,6 +2695,12 @@ static unsigned long __mmap_region(struc
+ 
+ 	__mmap_complete(&map, vma);
+ 
++	if (have_mmap_prepare && allocated_new) {
++		error = mmap_action_complete(&desc.action, vma);
++		if (error)
++			return error;
++	}
++
+ 	return addr;
+ 
+ 	/* Accounting was done by __mmap_setup(). */
+--- a/tools/testing/vma/vma_internal.h~mm-add-ability-to-take-further-action-in-vm_area_desc
++++ a/tools/testing/vma/vma_internal.h
+@@ -274,6 +274,49 @@ struct mm_struct {
+ 
+ struct vm_area_struct;
+ 
++
++/* What action should be taken after an .mmap_prepare call is complete? */
++enum mmap_action_type {
++	MMAP_NOTHING,		/* Mapping is complete, no further action. */
++	MMAP_REMAP_PFN,		/* Remap PFN range. */
++};
++
++/*
++ * Describes an action an mmap_prepare hook can instruct to be taken to complete
++ * the mapping of a VMA. Specified in vm_area_desc.
++ */
++struct mmap_action {
++	union {
++		/* Remap range. */
++		struct {
++			unsigned long start;
++			unsigned long start_pfn;
++			unsigned long size;
++			pgprot_t pgprot;
++		} remap;
++	};
++	enum mmap_action_type type;
++
++	/*
++	 * If specified, this hook is invoked after the selected action has been
++	 * successfully completed. Note that the VMA write lock still held.
++	 *
++	 * The absolute minimum ought to be done here.
++	 *
++	 * Returns 0 on success, or an error code.
++	 */
++	int (*success_hook)(const struct vm_area_struct *vma);
++
++	/*
++	 * If specified, this hook is invoked when an error occurred when
++	 * attempting the selection action.
++	 *
++	 * The hook can return an error code in order to filter the error, but
++	 * it is not valid to clear the error here.
++	 */
++	int (*error_hook)(int err);
++};
++
+ /*
+  * Describes a VMA that is about to be mmap()'ed. Drivers may choose to
+  * manipulate mutable fields which will cause those fields to be updated in the
+@@ -297,6 +340,9 @@ struct vm_area_desc {
+ 	/* Write-only fields. */
+ 	const struct vm_operations_struct *vm_ops;
+ 	void *private_data;
++
++	/* Take further action? */
++	struct mmap_action action;
+ };
+ 
+ struct file_operations {
+@@ -1466,12 +1512,23 @@ static inline void free_anon_vma_name(st
+ static inline void set_vma_from_desc(struct vm_area_struct *vma,
+ 		struct vm_area_desc *desc);
+ 
+-static inline int __compat_vma_mmap_prepare(const struct file_operations *f_op,
++static inline void mmap_action_prepare(struct mmap_action *action,
++					   struct vm_area_desc *desc)
++{
++}
++
++static inline int mmap_action_complete(struct mmap_action *action,
++					   struct vm_area_struct *vma)
++{
++	return 0;
++}
++
++static inline int __compat_vma_mmap(const struct file_operations *f_op,
+ 		struct file *file, struct vm_area_struct *vma)
+ {
+ 	struct vm_area_desc desc = {
+ 		.mm = vma->vm_mm,
+-		.file = vma->vm_file,
++		.file = file,
+ 		.start = vma->vm_start,
+ 		.end = vma->vm_end,
+ 
+@@ -1479,21 +1536,24 @@ static inline int __compat_vma_mmap_prep
+ 		.vm_file = vma->vm_file,
+ 		.vm_flags = vma->vm_flags,
+ 		.page_prot = vma->vm_page_prot,
++
++		.action.type = MMAP_NOTHING, /* Default */
+ 	};
+ 	int err;
+ 
+ 	err = f_op->mmap_prepare(&desc);
+ 	if (err)
+ 		return err;
+-	set_vma_from_desc(vma, &desc);
+ 
+-	return 0;
++	mmap_action_prepare(&desc.action, &desc);
++	set_vma_from_desc(vma, &desc);
++	return mmap_action_complete(&desc.action, vma);
+ }
+ 
+-static inline int compat_vma_mmap_prepare(struct file *file,
++static inline int compat_vma_mmap(struct file *file,
+ 		struct vm_area_struct *vma)
+ {
+-	return __compat_vma_mmap_prepare(file->f_op, file, vma);
++	return __compat_vma_mmap(file->f_op, file, vma);
+ }
+ 
+ /* Did the driver provide valid mmap hook configuration? */
+@@ -1514,7 +1574,7 @@ static inline bool can_mmap_file(struct
+ static inline int vfs_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	if (file->f_op->mmap_prepare)
+-		return compat_vma_mmap_prepare(file, vma);
++		return compat_vma_mmap(file, vma);
+ 
+ 	return file->f_op->mmap(file, vma);
+ }
+@@ -1548,4 +1608,20 @@ static inline vm_flags_t ksm_vma_flags(c
+ 	return vm_flags;
+ }
+ 
++static inline void remap_pfn_range_prepare(struct vm_area_desc *desc, unsigned long pfn)
++{
++}
++
++static inline int remap_pfn_range_complete(struct vm_area_struct *vma, unsigned long addr,
++		unsigned long pfn, unsigned long size, pgprot_t pgprot)
++{
++	return 0;
++}
++
++static inline int do_munmap(struct mm_struct *, unsigned long, size_t,
++		struct list_head *uf)
++{
++	return 0;
++}
++
+ #endif	/* __MM_VMA_INTERNAL_H */
+_
