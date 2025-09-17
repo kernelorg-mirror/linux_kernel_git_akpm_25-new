@@ -1,24 +1,35 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: wrap swap cache replacement with a helper
-Date: Sat, 6 Sep 2025 03:13:52 +0800
+Date: Thu, 11 Sep 2025 00:08:28 +0800
 
 There are currently three swap cache users that are trying to replace an
 existing folio with a new one: huge memory splitting, migration, and shmem
 replacement.  What they are doing is quite similar.
 
-Introduce a common helper for this.  In later commits, they can be easily
+Introduce a common helper for this.  In later commits, this can be easily
 switched to use the swap table by updating this helper.
 
 The newly added helper also makes the swap cache API better defined, and
-debugging is easier.
+make debugging easier by adding a few more debug checks.
 
-Link: https://lkml.kernel.org/r/20250905191357.78298-11-ryncsn@gmail.com
+Migration and shmem replace are meant to clone the folio, including
+content, swap entry value, and flags.  And splitting will adjust each sub
+folio's swap entry according to order, which could be non-uniform in the
+future.  So document it clearly that it's the caller's responsibility to
+set up the new folio's swap entries and flags before calling the helper. 
+The helper will just follow the new folio's entry value.
+
+This also prepares for replacing high-order folios in the swap cache. 
+Currently, only splitting to order 0 is allowed for swap cache folios. 
+Using the new helper, we can handle high-order folio splitting better.
+
+Link: https://lkml.kernel.org/r/20250910160833.3464-11-ryncsn@gmail.com
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Acked-by: Chris Li <chrisl@kernel.org>
 Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <baohua@kernel.org>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
@@ -31,24 +42,23 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |    5 ++---
+ mm/huge_memory.c |    4 +---
  mm/migrate.c     |   11 +++--------
  mm/shmem.c       |   10 ++--------
- mm/swap.h        |    3 +++
- mm/swap_state.c  |   32 ++++++++++++++++++++++++++++++++
- 5 files changed, 42 insertions(+), 19 deletions(-)
+ mm/swap.h        |    5 +++++
+ mm/swap_state.c  |   33 +++++++++++++++++++++++++++++++++
+ 5 files changed, 44 insertions(+), 19 deletions(-)
 
 --- a/mm/huge_memory.c~mm-swap-wrap-swap-cache-replacement-with-a-helper
 +++ a/mm/huge_memory.c
-@@ -3798,9 +3798,8 @@ static int __folio_split(struct folio *f
+@@ -3798,9 +3798,7 @@ static int __folio_split(struct folio *f
  			 * NOTE: shmem in swap cache is not supported yet.
  			 */
  			if (swap_cache) {
 -				__xa_store(&swap_cache->i_pages,
 -					   swap_cache_index(new_folio->swap),
 -					   new_folio, 0);
-+				__swap_cache_replace_folio(swap_cache, new_folio->swap,
-+							   folio, new_folio);
++				__swap_cache_replace_folio(folio, new_folio);
  				continue;
  			}
  
@@ -79,7 +89,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	/* Swap cache still stores N entries instead of a high-order entry */
 -	for (i = 0; i < entries; i++) {
 +	if (folio_test_swapcache(folio))
-+		__swap_cache_replace_folio(mapping, folio->swap, folio, newfolio);
++		__swap_cache_replace_folio(folio, newfolio);
 +	else
  		xas_store(&xas, newfolio);
 -		xas_next(&xas);
@@ -111,51 +121,61 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		WARN_ON_ONCE(xas_store(&xas, new));
 -		xas_next(&xas);
 -	}
-+	__swap_cache_replace_folio(swap_mapping, entry, old, new);
++	__swap_cache_replace_folio(old, new);
  	xa_unlock_irq(&swap_mapping->i_pages);
  
  	mem_cgroup_replace_folio(old, new);
 --- a/mm/swap.h~mm-swap-wrap-swap-cache-replacement-with-a-helper
 +++ a/mm/swap.h
-@@ -182,6 +182,9 @@ int swap_cache_add_folio(struct folio *f
+@@ -185,6 +185,7 @@ int swap_cache_add_folio(struct folio *f
  void swap_cache_del_folio(struct folio *folio);
  void __swap_cache_del_folio(struct folio *folio,
  			    swp_entry_t entry, void *shadow);
-+void __swap_cache_replace_folio(struct address_space *address_space,
-+				swp_entry_t entry,
-+				struct folio *old, struct folio *new);
++void __swap_cache_replace_folio(struct folio *old, struct folio *new);
  void swap_cache_clear_shadow(int type, unsigned long begin,
  			     unsigned long end);
  
+@@ -336,6 +337,10 @@ static inline void __swap_cache_del_foli
+ {
+ }
+ 
++static inline void __swap_cache_replace_folio(struct folio *old, struct folio *new)
++{
++}
++
+ static inline unsigned int folio_swap_flags(struct folio *folio)
+ {
+ 	return 0;
 --- a/mm/swap_state.c~mm-swap-wrap-swap-cache-replacement-with-a-helper
 +++ a/mm/swap_state.c
-@@ -235,6 +235,38 @@ void swap_cache_del_folio(struct folio *
+@@ -235,6 +235,39 @@ void swap_cache_del_folio(struct folio *
  }
  
  /**
 + * __swap_cache_replace_folio - Replace a folio in the swap cache.
-+ * @mapping: Swap mapping address space.
-+ * @entry: The first swap entry that the new folio corresponds to.
 + * @old: The old folio to be replaced.
 + * @new: The new folio.
 + *
-+ * Replace a existing folio in the swap cache with a new folio.
++ * Replace an existing folio in the swap cache with a new folio. The
++ * caller is responsible for setting up the new folio's flag and swap
++ * entries. Replacement will take the new folio's swap entry value as
++ * the starting offset to override all slots covered by the new folio.
 + *
-+ * Context: Caller must ensure both folios are locked, and lock the
-+ * swap address_space that holds the entries to be replaced.
++ * Context: Caller must ensure both folios are locked, also lock the
++ * swap address_space that holds the old folio to avoid races.
 + */
-+void __swap_cache_replace_folio(struct address_space *mapping,
-+				swp_entry_t entry,
-+				struct folio *old, struct folio *new)
++void __swap_cache_replace_folio(struct folio *old, struct folio *new)
 +{
++	swp_entry_t entry = new->swap;
 +	unsigned long nr_pages = folio_nr_pages(new);
 +	unsigned long offset = swap_cache_index(entry);
 +	unsigned long end = offset + nr_pages;
-+	XA_STATE(xas, &mapping->i_pages, offset);
 +
-+	VM_WARN_ON_ONCE(entry.val != new->swap.val);
-+	VM_WARN_ON_ONCE(!folio_test_locked(old) || !folio_test_locked(new));
++	XA_STATE(xas, &swap_address_space(entry)->i_pages, offset);
++
 +	VM_WARN_ON_ONCE(!folio_test_swapcache(old) || !folio_test_swapcache(new));
++	VM_WARN_ON_ONCE(!folio_test_locked(old) || !folio_test_locked(new));
++	VM_WARN_ON_ONCE(!entry.val);
 +
 +	/* Swap cache still stores N entries instead of a high-order entry */
 +	do {
