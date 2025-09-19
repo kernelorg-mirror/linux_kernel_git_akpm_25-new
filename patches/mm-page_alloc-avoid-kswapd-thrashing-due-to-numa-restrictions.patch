@@ -1,0 +1,100 @@
+From: Johannes Weiner <hannes@cmpxchg.org>
+Subject: mm: page_alloc: avoid kswapd thrashing due to NUMA restrictions
+Date: Fri, 19 Sep 2025 12:21:34 -0400
+
+On NUMA systems without bindings, allocations check all nodes for free
+space, then wake up the kswapds on all nodes and retry. This ensures
+all available space is evenly used before reclaim begins. However,
+when one process or certain allocations have node restrictions, they
+can cause kswapds on only a subset of nodes to be woken up.
+
+Since kswapd hysteresis targets watermarks that are *higher* than
+needed for allocation, even *unrestricted* allocations can now get
+suckered onto such nodes that are already pressured. This ends up
+concentrating all allocations on them, even when there are idle nodes
+available for the unrestricted requests.
+
+This was observed with two numa nodes, where node0 is normal and node1
+is ZONE_MOVABLE to facilitate hotplugging: a kernel allocation wakes
+kswapd on node0 only (since node1 is not eligible); once kswapd0 is
+active, the watermarks hover between low and high, and then even the
+movable allocations end up on node0, only to be kicked out again;
+meanwhile node1 is empty and idle.
+
+Similar behavior is possible when a process with NUMA bindings is
+causing selective kswapd wakeups.
+
+To fix this, on NUMA systems augment the (misleading) watermark test
+with a check for whether kswapd is already active during the first
+iteration through the zonelist. If this fails to place the request,
+kswapd must be running everywhere already, and the watermark test is
+good enough to decide placement.
+
+With this patch, unrestricted requests successfully make use of node1,
+even while kswapd is reclaiming node0 for restricted allocations.
+
+[gourry@gourry.net: don't retry if no kswapds were active]
+Link: https://lkml.kernel.org/r/20250919162134.1098208-1-hannes@cmpxchg.org
+Signed-off-by: Gregory Price <gourry@gourry.net>
+Tested-by: Joshua Hahn <joshua.hahnjy@gmail.com>
+Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Zi Yan <ziy@nvidia.com>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/page_alloc.c |   24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+--- a/mm/page_alloc.c~mm-page_alloc-avoid-kswapd-thrashing-due-to-numa-restrictions
++++ a/mm/page_alloc.c
+@@ -3735,6 +3735,8 @@ get_page_from_freelist(gfp_t gfp_mask, u
+ 	struct pglist_data *last_pgdat = NULL;
+ 	bool last_pgdat_dirty_ok = false;
+ 	bool no_fallback;
++	bool skip_kswapd_nodes = nr_online_nodes > 1;
++	bool skipped_kswapd_nodes = false;
+ 
+ retry:
+ 	/*
+@@ -3797,6 +3799,19 @@ retry:
+ 			}
+ 		}
+ 
++		/*
++		 * If kswapd is already active on a node, keep looking
++		 * for other nodes that might be idle. This can happen
++		 * if another process has NUMA bindings and is causing
++		 * kswapd wakeups on only some nodes. Avoid accidental
++		 * "node_reclaim_mode"-like behavior in this case.
++		 */
++		if (skip_kswapd_nodes &&
++		    !waitqueue_active(&zone->zone_pgdat->kswapd_wait)) {
++			skipped_kswapd_nodes = true;
++			continue;
++		}
++
+ 		cond_accept_memory(zone, order, alloc_flags);
+ 
+ 		/*
+@@ -3889,6 +3904,15 @@ try_this_zone:
+ 	}
+ 
+ 	/*
++	 * If we skipped over nodes with active kswapds and found no
++	 * idle nodes, retry and place anywhere the watermarks permit.
++	 */
++	if (skip_kswapd_nodes && skipped_kswapd_nodes) {
++		skip_kswapd_nodes = false;
++		goto retry;
++	}
++
++	/*
+ 	 * It's possible on a UMA machine to get through all zones that are
+ 	 * fragmented. If avoiding fragmentation, reset and try again.
+ 	 */
+_
