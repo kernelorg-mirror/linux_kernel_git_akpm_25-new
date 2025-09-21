@@ -1,6 +1,6 @@
 From: Kairui Song <kasong@tencent.com>
 Subject: mm, swap: use the swap table for the swap cache and switch API
-Date: Thu, 11 Sep 2025 00:08:29 +0800
+Date: Wed, 17 Sep 2025 00:00:56 +0800
 
 Introduce basic swap table infrastructures, which are now just a
 fixed-sized flat array inside each swap cluster, with access wrappers.
@@ -24,7 +24,7 @@ with original swap cache helpers.  They still require a pin on the swap
 device to prevent the backing data from being freed.
 
 Swap cache updates are now protected by the swap cluster lock instead of
-the Xarray lock.  This is mostly handled internally, but new
+the XArray lock.  This is mostly handled internally, but new
 __swap_cache_* helpers require the caller to lock the cluster.  So, a few
 new cluster access and locking helpers are also introduced.
 
@@ -33,11 +33,12 @@ to take care of all count tracking and synchronization work, with dynamic
 allocation.  It should reduce the memory usage while making the
 performance even better.
 
-Link: https://lkml.kernel.org/r/20250910160833.3464-12-ryncsn@gmail.com
+Link: https://lkml.kernel.org/r/20250916160100.31545-12-ryncsn@gmail.com
 Co-developed-by: Chris Li <chrisl@kernel.org>
 Signed-off-by: Chris Li <chrisl@kernel.org>
 Signed-off-by: Kairui Song <kasong@tencent.com>
 Acked-by: Chris Li <chrisl@kernel.org>
+Suggested-by: Chris Li <chrisl@kernel.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <baohua@kernel.org>
@@ -46,11 +47,13 @@ Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: kernel test robot <oliver.sang@intel.com>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Yosry Ahmed <yosryahmed@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
+Cc: SeongJae Park <sj@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
@@ -153,7 +156,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (!folio_ref_freeze(folio, expected_count)) {
 -		xas_unlock_irq(&xas);
 +		if (ci)
-+			swap_cluster_unlock(ci);
++			swap_cluster_unlock_irq(ci);
 +		else
 +			xas_unlock_irq(&xas);
  		return -EAGAIN;
@@ -194,19 +197,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int nr_pages = folio_nr_pages(old);
  	int error = 0;
  
-@@ -2116,9 +2116,9 @@ static int shmem_replace_folio(struct fo
+@@ -2116,12 +2116,12 @@ static int shmem_replace_folio(struct fo
  	new->swap = entry;
  	folio_set_swapcache(new);
  
 -	xa_lock_irq(&swap_mapping->i_pages);
 -	__swap_cache_replace_folio(old, new);
--	xa_unlock_irq(&swap_mapping->i_pages);
 +	ci = swap_cluster_get_and_lock_irq(old);
 +	__swap_cache_replace_folio(ci, old, new);
-+	swap_cluster_unlock(ci);
- 
  	mem_cgroup_replace_folio(old, new);
  	shmem_update_stats(new, nr_pages);
+ 	shmem_update_stats(old, -nr_pages);
+-	xa_unlock_irq(&swap_mapping->i_pages);
++	swap_cluster_unlock_irq(ci);
+ 
+ 	folio_add_lru(new);
+ 	*foliop = new;
 --- a/mm/swapfile.c~mm-swap-use-the-swap-table-for-the-swap-cache-and-switch-api
 +++ a/mm/swapfile.c
 @@ -46,6 +46,7 @@
@@ -217,7 +223,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include "internal.h"
  #include "swap.h"
  
-@@ -420,6 +421,34 @@ static inline unsigned int cluster_offse
+@@ -421,6 +422,34 @@ static inline unsigned int cluster_offse
  	return cluster_index(si, ci) * SWAPFILE_CLUSTER;
  }
  
@@ -252,7 +258,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void move_cluster(struct swap_info_struct *si,
  			 struct swap_cluster_info *ci, struct list_head *list,
  			 enum swap_cluster_flags new_flags)
-@@ -702,6 +731,26 @@ static bool cluster_scan_range(struct sw
+@@ -703,6 +732,26 @@ static bool cluster_scan_range(struct sw
  	return true;
  }
  
@@ -279,7 +285,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static bool cluster_alloc_range(struct swap_info_struct *si, struct swap_cluster_info *ci,
  				unsigned int start, unsigned char usage,
  				unsigned int order)
-@@ -721,6 +770,7 @@ static bool cluster_alloc_range(struct s
+@@ -722,6 +771,7 @@ static bool cluster_alloc_range(struct s
  		ci->order = order;
  
  	memset(si->swap_map + start, usage, nr_pages);
@@ -287,7 +293,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	swap_range_alloc(si, nr_pages);
  	ci->count += nr_pages;
  
-@@ -1123,7 +1173,7 @@ static void swap_range_free(struct swap_
+@@ -1124,7 +1174,7 @@ static void swap_range_free(struct swap_
  			swap_slot_free_notify(si->bdev, offset);
  		offset++;
  	}
@@ -296,7 +302,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Make sure that try_to_unuse() observes si->inuse_pages reaching 0
-@@ -1280,16 +1330,7 @@ int folio_alloc_swap(struct folio *folio
+@@ -1281,16 +1331,7 @@ int folio_alloc_swap(struct folio *folio
  	if (!entry.val)
  		return -ENOMEM;
  
@@ -314,7 +320,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return 0;
  
-@@ -1555,6 +1596,7 @@ static void swap_entries_free(struct swa
+@@ -1556,6 +1597,7 @@ static void swap_entries_free(struct swa
  
  	mem_cgroup_uncharge_swap(entry, nr_pages);
  	swap_range_free(si, offset, nr_pages);
@@ -322,7 +328,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!ci->count)
  		free_cluster(si, ci);
-@@ -2633,6 +2675,18 @@ static void wait_for_allocation(struct s
+@@ -2634,6 +2676,18 @@ static void wait_for_allocation(struct s
  	}
  }
  
@@ -341,7 +347,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Called after swap device's reference count is dead, so
   * neither scan nor allocation will use it.
-@@ -2767,12 +2821,13 @@ SYSCALL_DEFINE1(swapoff, const char __us
+@@ -2768,12 +2822,13 @@ SYSCALL_DEFINE1(swapoff, const char __us
  
  	swap_file = p->swap_file;
  	p->swap_file = NULL;
@@ -356,7 +362,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	p->cluster_info = NULL;
  	spin_unlock(&p->lock);
  	spin_unlock(&swap_lock);
-@@ -2783,10 +2838,8 @@ SYSCALL_DEFINE1(swapoff, const char __us
+@@ -2784,10 +2839,8 @@ SYSCALL_DEFINE1(swapoff, const char __us
  	p->global_cluster = NULL;
  	vfree(swap_map);
  	kvfree(zeromap);
@@ -367,7 +373,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	inode = mapping->host;
  
-@@ -3170,8 +3223,11 @@ static struct swap_cluster_info *setup_c
+@@ -3171,8 +3224,11 @@ static struct swap_cluster_info *setup_c
  	if (!cluster_info)
  		goto err;
  
@@ -380,7 +386,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!(si->flags & SWP_SOLIDSTATE)) {
  		si->global_cluster = kmalloc(sizeof(*si->global_cluster),
-@@ -3232,9 +3288,8 @@ static struct swap_cluster_info *setup_c
+@@ -3233,9 +3289,8 @@ static struct swap_cluster_info *setup_c
  	}
  
  	return cluster_info;
@@ -391,7 +397,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  err:
  	return ERR_PTR(err);
  }
-@@ -3428,13 +3483,9 @@ SYSCALL_DEFINE2(swapon, const char __use
+@@ -3429,13 +3484,9 @@ SYSCALL_DEFINE2(swapon, const char __use
  		}
  	}
  
@@ -406,7 +412,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Flush any pending IO and dirty mappings before we start using this
-@@ -3469,8 +3520,6 @@ SYSCALL_DEFINE2(swapon, const char __use
+@@ -3470,8 +3521,6 @@ SYSCALL_DEFINE2(swapon, const char __use
  	goto out;
  free_swap_zswap:
  	zswap_swapoff(si->type);
@@ -415,7 +421,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  bad_swap_unlock_inode:
  	inode_unlock(inode);
  bad_swap:
-@@ -3485,7 +3534,8 @@ bad_swap:
+@@ -3486,7 +3535,8 @@ bad_swap:
  	spin_unlock(&swap_lock);
  	vfree(swap_map);
  	kvfree(zeromap);
@@ -996,8 +1002,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
 - * Context: Caller must ensure the range is valid and hold a reference to
 - * the swap device.
-+ * Context: Caller must ensure the range is valid, not occupied by,
-+ * any folio and protect the swap device with reference count or locks.
++ * Context: Caller must ensure the range is valid, all in one single cluster,
++ * not occupied by any folio, and lock the cluster.
   */
 -void swap_cache_clear_shadow(int type, unsigned long begin,
 -			     unsigned long end)
