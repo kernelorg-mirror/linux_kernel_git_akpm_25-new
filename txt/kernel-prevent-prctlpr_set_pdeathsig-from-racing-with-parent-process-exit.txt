@@ -1,0 +1,75 @@
+From: Demi Marie Obenour <demiobenour@gmail.com>
+Subject: kernel: prevent prctl(PR_SET_PDEATHSIG) from racing with parent process exit
+Date: Sat, 13 Sep 2025 18:28:49 -0400
+
+If a process calls prctl(PR_SET_PDEATHSIG) at the same time that the
+parent process exits, the child will write to me->pdeath_sig at the same
+time the parent is reading it.  Since there is no synchronization, this is
+a data race.
+
+Worse, it is possible that a subsequent call to getppid() can continue to
+return the previous parent process ID without the parent death signal
+being delivered.  This happens in the following scenario:
+
+parent                                                 child
+
+forget_original_parent()                               prctl(PR_SET_PDEATHSIG, SIGKILL)
+                                                         sys_prctl()
+                                                           me->pdeath_sig = SIGKILL;
+                                                       getppid();
+  RCU_INIT_POINTER(t->real_parent, reaper);
+  if (t->pdeath_signal) /* reads stale me->pdeath_sig */
+           group_send_sig_info(t->pdeath_signal, ...);
+
+And in the following:
+
+parent                                                 child
+
+forget_original_parent()
+    RCU_INIT_POINTER(t->real_parent, reaper);
+    /* also no barrier */
+     if (t->pdeath_signal) /* reads stale me->pdeath_sig */
+             group_send_sig_info(t->pdeath_signal, ...);
+
+                                                       prctl(PR_SET_PDEATHSIG, SIGKILL)
+                                                         sys_prctl()
+                                                           me->pdeath_sig = SIGKILL;
+                                                       getppid(); /* reads old ppid() */
+
+As a result, the following pattern is racy:
+
+	pid_t parent_pid = getpid();
+	pid_t child_pid = fork();
+	if (child_pid == -1) {
+		/* handle error... */
+		return;
+	}
+	if (child_pid == 0) {
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
+			/* handle error */
+			_exit(126);
+		}
+		if (getppid() != parent_pid) {
+			/* parent died already */
+			raise(SIGKILL);
+		}
+		/* keep going in child */
+	}
+	/* keep going in parent */
+
+If the parent is killed at exactly the wrong time, the child process can
+(wrongly) stay running.
+
+I didn't manage to reproduce this in my testing, but I'm pretty sure the
+race is real.  KCSAN is probably the best way to spot the race.
+
+Fix the bug by holding tasklist_lock for reading whenever pdeath_signal is
+being written to.  This prevents races on me->pdeath_sig, and the locking
+and unlocking of the rwlock provide the needed memory barriers.  If
+prctl(PR_SET_PDEATHSIG) happens before the parent exits, the signal will
+be sent.  If it happens afterwards, a subsequent getppid() will return the
+new value.
+
+Link: https://lkml.kernel.org/r/20250913-fix-prctl-pdeathsig-race-v1-1-44e2eb426fe9@gmail.com
+Signed-off-by: Demi Marie Obenour <demiobenour@gmail.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
