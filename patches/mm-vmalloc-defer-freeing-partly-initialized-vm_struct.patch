@@ -1,0 +1,101 @@
+From: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Subject: mm/vmalloc: defer freeing partly initialized vm_struct
+Date: Tue, 7 Oct 2025 14:20:29 +0200
+
+__vmalloc_area_node() may call free_vmap_area() or vfree() on error paths,
+both of which can sleep.  This becomes problematic if the function is
+invoked from an atomic context, such as when GFP_ATOMIC or GFP_NOWAIT is
+passed via gfp_mask.
+
+To fix this, unify error paths and defer the cleanup of partly initialized
+vm_struct objects to a workqueue.  This ensures that freeing happens in a
+process context and avoids invalid sleeps in atomic regions.
+
+Link: https://lkml.kernel.org/r/20251007122035.56347-5-urezki@gmail.com
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Baoquan He <bhe@redhat.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/vmalloc.h |    6 +++++-
+ mm/vmalloc.c            |   34 +++++++++++++++++++++++++++++++---
+ 2 files changed, 36 insertions(+), 4 deletions(-)
+
+--- a/include/linux/vmalloc.h~mm-vmalloc-defer-freeing-partly-initialized-vm_struct
++++ a/include/linux/vmalloc.h
+@@ -50,7 +50,11 @@ struct iov_iter;		/* in uio.h */
+ #endif
+ 
+ struct vm_struct {
+-	struct vm_struct	*next;
++	union {
++		struct vm_struct *next;	  /* Early registration of vm_areas. */
++		struct llist_node llnode; /* Asynchronous freeing on error paths. */
++	};
++
+ 	void			*addr;
+ 	unsigned long		size;
+ 	unsigned long		flags;
+--- a/mm/vmalloc.c~mm-vmalloc-defer-freeing-partly-initialized-vm_struct
++++ a/mm/vmalloc.c
+@@ -3687,6 +3687,35 @@ vm_area_alloc_pages(gfp_t gfp, int nid,
+ 	return nr_allocated;
+ }
+ 
++static LLIST_HEAD(pending_vm_area_cleanup);
++static void cleanup_vm_area_work(struct work_struct *work)
++{
++	struct vm_struct *area, *tmp;
++	struct llist_node *head;
++
++	head = llist_del_all(&pending_vm_area_cleanup);
++	if (!head)
++		return;
++
++	llist_for_each_entry_safe(area, tmp, head, llnode) {
++		if (!area->pages)
++			free_vm_area(area);
++		else
++			vfree(area->addr);
++	}
++}
++
++/*
++ * Helper for __vmalloc_area_node() to defer cleanup
++ * of partially initialized vm_struct in error paths.
++ */
++static DECLARE_WORK(cleanup_vm_area, cleanup_vm_area_work);
++static void defer_vm_area_cleanup(struct vm_struct *area)
++{
++	if (llist_add(&area->llnode, &pending_vm_area_cleanup))
++		schedule_work(&cleanup_vm_area);
++}
++
+ static void *__vmalloc_area_node(struct vm_struct *area, gfp_t gfp_mask,
+ 				 pgprot_t prot, unsigned int page_shift,
+ 				 int node)
+@@ -3718,8 +3747,7 @@ static void *__vmalloc_area_node(struct
+ 		warn_alloc(gfp_mask, NULL,
+ 			"vmalloc error: size %lu, failed to allocated page array size %lu",
+ 			nr_small_pages * PAGE_SIZE, array_size);
+-		free_vm_area(area);
+-		return NULL;
++		goto fail;
+ 	}
+ 
+ 	set_vm_area_page_order(area, page_shift - PAGE_SHIFT);
+@@ -3796,7 +3824,7 @@ static void *__vmalloc_area_node(struct
+ 	return area->addr;
+ 
+ fail:
+-	vfree(area->addr);
++	defer_vm_area_cleanup(area);
+ 	return NULL;
+ }
+ 
+_

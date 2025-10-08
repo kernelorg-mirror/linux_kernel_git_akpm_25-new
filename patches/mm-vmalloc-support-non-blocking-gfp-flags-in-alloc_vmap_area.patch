@@ -1,0 +1,90 @@
+From: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Subject: mm/vmalloc: support non-blocking GFP flags in alloc_vmap_area()
+Date: Tue, 7 Oct 2025 14:20:28 +0200
+
+alloc_vmap_area() currently assumes that sleeping is allowed during
+allocation.  This is not true for callers which pass non-blocking GFP
+flags, such as GFP_ATOMIC or GFP_NOWAIT.
+
+This patch adds logic to detect whether the given gfp_mask permits
+blocking.  It avoids invoking might_sleep() or falling back to reclaim
+path if blocking is not allowed.
+
+This makes alloc_vmap_area() safer for use in non-sleeping contexts, where
+previously it could hit unexpected sleeps, trigger warnings.
+
+It is a preparation and adjustment step to later allow both GFP_ATOMIC and
+GFP_NOWAIT allocations in this series.
+
+Link: https://lkml.kernel.org/r/20251007122035.56347-4-urezki@gmail.com
+Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Baoquan He <bhe@redhat.com>
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmalloc.c |   20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+--- a/mm/vmalloc.c~mm-vmalloc-support-non-blocking-gfp-flags-in-alloc_vmap_area
++++ a/mm/vmalloc.c
+@@ -2017,6 +2017,7 @@ static struct vmap_area *alloc_vmap_area
+ 	unsigned long freed;
+ 	unsigned long addr;
+ 	unsigned int vn_id;
++	bool allow_block;
+ 	int purged = 0;
+ 	int ret;
+ 
+@@ -2028,7 +2029,8 @@ static struct vmap_area *alloc_vmap_area
+ 
+ 	/* Only reclaim behaviour flags are relevant. */
+ 	gfp_mask = gfp_mask & GFP_RECLAIM_MASK;
+-	might_sleep();
++	allow_block = gfpflags_allow_blocking(gfp_mask);
++	might_sleep_if(allow_block);
+ 
+ 	/*
+ 	 * If a VA is obtained from a global heap(if it fails here)
+@@ -2062,7 +2064,8 @@ retry:
+ 		 * This is not a fast path.  Check if yielding is needed. This
+ 		 * is the only reschedule point in the vmalloc() path.
+ 		 */
+-		cond_resched();
++		if (allow_block)
++			cond_resched();
+ 	}
+ 
+ 	trace_alloc_vmap_area(addr, size, align, vstart, vend, IS_ERR_VALUE(addr));
+@@ -2071,8 +2074,16 @@ retry:
+ 	 * If an allocation fails, the error value is
+ 	 * returned. Therefore trigger the overflow path.
+ 	 */
+-	if (IS_ERR_VALUE(addr))
+-		goto overflow;
++	if (IS_ERR_VALUE(addr)) {
++		if (allow_block)
++			goto overflow;
++
++		/*
++		 * We can not trigger any reclaim logic because
++		 * sleeping is not allowed, thus fail an allocation.
++		 */
++		goto out_free_va;
++	}
+ 
+ 	va->va_start = addr;
+ 	va->va_end = addr + size;
+@@ -2122,6 +2133,7 @@ overflow:
+ 		pr_warn("vmalloc_node_range for size %lu failed: Address range restricted to %#lx - %#lx\n",
+ 				size, vstart, vend);
+ 
++out_free_va:
+ 	kmem_cache_free(vmap_area_cachep, va);
+ 	return ERR_PTR(-EBUSY);
+ }
+_

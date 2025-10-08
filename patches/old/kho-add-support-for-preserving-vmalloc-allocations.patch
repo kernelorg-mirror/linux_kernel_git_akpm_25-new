@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: kho: add support for preserving vmalloc allocations
-Date: Wed, 17 Sep 2025 20:40:32 +0300
+Date: Sun, 21 Sep 2025 08:44:57 +0300
 
 A vmalloc allocation is preserved using binary structure similar to global
 KHO memory tracker.  It's a linked list of pages where each page is an
@@ -11,7 +11,10 @@ the caller.  This address is used as the argument to kho_vmalloc_restore()
 to restore the mapping in the vmalloc address space and populate it with
 the preserved pages.
 
-Link: https://lkml.kernel.org/r/20250917174033.3810435-4-rppt@kernel.org
+[pasha.tatashin@soleen.com: free chunks using free_page() not kfree()]
+  Link: https://lkml.kernel.org/r/mafs0a52idbeg.fsf@kernel.org
+[akpm@linux-foundation.org: coding-style cleanups]
+Link: https://lkml.kernel.org/r/20250921054458.4043761-4-rppt@kernel.org
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Reviewed-by: Pratyush Yadav <pratyush@kernel.org>
 Cc: Alexander Graf <graf@amazon.com>
@@ -19,27 +22,25 @@ Cc: Baoquan He <bhe@redhat.com>
 Cc: Changyuan Lyu <changyuanl@google.com>
 Cc: Chris Li <chrisl@kernel.org>
 Cc: Jason Gunthorpe <jgg@nvidia.com>
-Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
-Cc: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/kexec_handover.h |   21 ++
- kernel/kexec_handover.c        |  244 +++++++++++++++++++++++++++++++
- 2 files changed, 265 insertions(+)
+ include/linux/kexec_handover.h |   28 +++
+ kernel/kexec_handover.c        |  281 +++++++++++++++++++++++++++++++
+ 2 files changed, 309 insertions(+)
 
 --- a/include/linux/kexec_handover.h~kho-add-support-for-preserving-vmalloc-allocations
 +++ a/include/linux/kexec_handover.h
-@@ -39,13 +39,23 @@ struct page;
+@@ -39,13 +39,24 @@ struct page;
  
  struct kho_serialization;
  
 +struct kho_vmalloc_chunk;
 +struct kho_vmalloc {
-+        DECLARE_KHOSER_PTR(first, struct kho_vmalloc_chunk *);
-+        unsigned int total_pages;
-+        unsigned short flags;
-+        unsigned short order;
++	DECLARE_KHOSER_PTR(first, struct kho_vmalloc_chunk *);
++	unsigned int total_pages;
++	unsigned short flags;
++	unsigned short order;
 +};
 +
  #ifdef CONFIG_KEXEC_HANDOVER
@@ -50,11 +51,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int kho_preserve_pages(struct page *page, unsigned int nr_pages);
 +int kho_preserve_vmalloc(void *ptr, struct kho_vmalloc *preservation);
  struct folio *kho_restore_folio(phys_addr_t phys);
++struct page *kho_restore_pages(phys_addr_t phys, unsigned int nr_pages);
 +void *kho_restore_vmalloc(const struct kho_vmalloc *preservation);
  int kho_add_subtree(struct kho_serialization *ser, const char *name, void *fdt);
  int kho_retrieve_subtree(const char *name, phys_addr_t *phys);
  
-@@ -77,10 +87,21 @@ static inline int kho_preserve_pages(str
+@@ -77,10 +88,27 @@ static inline int kho_preserve_pages(str
  	return -EOPNOTSUPP;
  }
  
@@ -68,6 +70,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	return NULL;
  }
++
++static inline struct page *kho_restore_pages(phys_addr_t phys,
++					     unsigned int nr_pages)
++{
++	return NULL;
++}
 +
 +static inline void *kho_restore_vmalloc(const struct kho_vmalloc *preservation)
 +{
@@ -86,7 +94,45 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include <asm/early_ioremap.h>
  
-@@ -727,6 +728,249 @@ int kho_preserve_pages(struct page *page
+@@ -274,6 +275,37 @@ struct folio *kho_restore_folio(phys_add
+ }
+ EXPORT_SYMBOL_GPL(kho_restore_folio);
+ 
++/**
++ * kho_restore_pages - restore list of contiguous order 0 pages.
++ * @phys: physical address of the first page.
++ * @nr_pages: number of pages.
++ *
++ * Restore a contiguous list of order 0 pages that was preserved with
++ * kho_preserve_pages().
++ *
++ * Return: 0 on success, error code on failure
++ */
++struct page *kho_restore_pages(phys_addr_t phys, unsigned int nr_pages)
++{
++	const unsigned long start_pfn = PHYS_PFN(phys);
++	const unsigned long end_pfn = start_pfn + nr_pages;
++	unsigned long pfn = start_pfn;
++
++	while (pfn < end_pfn) {
++		const unsigned int order =
++			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
++		struct page *page = kho_restore_page(PFN_PHYS(pfn));
++
++		if (!page)
++			return NULL;
++		split_page(page, order);
++		pfn += 1 << order;
++	}
++
++	return pfn_to_page(start_pfn);
++}
++EXPORT_SYMBOL_GPL(kho_restore_pages);
++
+ /* Serialize and deserialize struct kho_mem_phys across kexec
+  *
+  * Record all the bitmaps in a linked list of pages for the next kernel to
+@@ -763,6 +795,255 @@ int kho_preserve_pages(struct page *page
  }
  EXPORT_SYMBOL_GPL(kho_preserve_pages);
  
@@ -180,7 +226,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		kho_vmalloc_unpreserve_chunk(chunk);
 +
 +		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
-+		kfree(tmp);
++		free_page((unsigned long)tmp);
 +	}
 +}
 +
@@ -264,21 +310,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +{
 +	struct kho_vmalloc_chunk *chunk = KHOSER_LOAD_PTR(preservation->first);
 +	unsigned int align, order, shift, vm_flags;
-+	unsigned int idx = 0, nr;
++	unsigned long total_pages, contig_pages;
 +	unsigned long addr, size;
 +	struct vm_struct *area;
 +	struct page **pages;
++	unsigned int idx = 0;
 +	int err;
 +
 +	vm_flags = kho_flags_to_vmalloc(preservation->flags);
 +	if (vm_flags & ~KHO_VMALLOC_SUPPORTED_FLAGS)
 +		return NULL;
 +
-+	nr = preservation->total_pages;
-+	pages = kvmalloc_array(nr, sizeof(*pages), GFP_KERNEL);
++	total_pages = preservation->total_pages;
++	pages = kvmalloc_array(total_pages, sizeof(*pages), GFP_KERNEL);
 +	if (!pages)
 +		return NULL;
 +	order = preservation->order;
++	contig_pages = (1 << order);
 +	shift = PAGE_SHIFT + order;
 +	align = 1 << shift;
 +
@@ -288,29 +336,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		for (int i = 0; chunk->phys[i]; i++) {
 +			phys_addr_t phys = chunk->phys[i];
 +
-+			if (idx + (1 << order) > nr)
++			if (idx + contig_pages > total_pages)
 +				goto err_free_pages_array;
 +
-+			for (int j = 0; j < (1 << order); j++) {
-+				page = phys_to_page(phys);
-+				kho_restore_page(page, 0);
++			page = kho_restore_pages(phys, contig_pages);
++			if (!page)
++				goto err_free_pages_array;
++
++			for (int j = 0; j < contig_pages; j++)
 +				pages[idx++] = page;
-+				phys += PAGE_SIZE;
-+			}
++
++			phys += contig_pages * PAGE_SIZE;
 +		}
 +
-+		page = virt_to_page(chunk);
++		page = kho_restore_pages(virt_to_phys(chunk), 1);
++		if (!page)
++			goto err_free_pages_array;
 +		chunk = KHOSER_LOAD_PTR(chunk->hdr.next);
-+		kho_restore_page(page, 0);
 +		__free_page(page);
 +	}
 +
-+	if (idx != nr)
++	if (idx != total_pages)
 +		goto err_free_pages_array;
 +
-+	area = __get_vm_area_node(nr * PAGE_SIZE, align, shift, vm_flags,
-+				  VMALLOC_START, VMALLOC_END, NUMA_NO_NODE,
-+				  GFP_KERNEL, __builtin_return_address(0));
++	area = __get_vm_area_node(total_pages * PAGE_SIZE, align, shift,
++				  vm_flags, VMALLOC_START, VMALLOC_END,
++				  NUMA_NO_NODE, GFP_KERNEL,
++				  __builtin_return_address(0));
 +	if (!area)
 +		goto err_free_pages_array;
 +
@@ -320,8 +372,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (err)
 +		goto err_free_vm_area;
 +
++	area->nr_pages = total_pages;
 +	area->pages = pages;
-+	area->nr_pages = nr;
 +
 +	return area->addr;
 +

@@ -1,0 +1,126 @@
+From: Roman Gushchin <roman.gushchin@linux.dev>
+Subject: mm: readahead: make thp readahead conditional to mmap_miss logic
+Date: Mon, 6 Oct 2025 10:51:06 -0700
+
+Commit 4687fdbb805a ("mm/filemap: Support VM_HUGEPAGE for file mappings")
+introduced a special handling for VM_HUGEPAGE mappings: even if the
+readahead is disabled, 1 or 2 HPAGE_PMD_ORDER pages are allocated.
+
+This change causes a significant regression for containers with a tight
+memory.max limit, if VM_HUGEPAGE is widely used.  Prior to this commit,
+mmap_miss logic would eventually lead to the readahead disablement,
+effectively reducing the memory pressure in the cgroup.  With this change
+the kernel is trying to allocate 1-2 huge pages for each fault, no matter
+if these pages are used or not before being evicted, increasing the memory
+pressure multi-fold.
+
+To fix the regression, let's make the new VM_HUGEPAGE conditional to the
+mmap_miss check, but keep independent from the ra->ra_pages.  This way the
+main intention of commit 4687fdbb805a ("mm/filemap: Support VM_HUGEPAGE
+for file mappings") stays intact, but the regression is resolved.
+
+The logic behind this changes is simple: even if a user explicitly
+requests using huge pages to back the file mapping (using VM_HUGEPAGE
+flag), under a very strong memory pressure it's better to fall back to
+ordinary pages.
+
+Link: https://lkml.kernel.org/r/20251006175106.377411-1-roman.gushchin@linux.dev
+Fixes: 4687fdbb805a ("mm/filemap: Support VM_HUGEPAGE for file mappings")
+Signed-off-by: Roman Gushchin <roman.gushchin@linux.dev>
+Reviewed-by: Dev Jain <dev.jain@arm.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c |   68 +++++++++++++++++++++++++++----------------------
+ 1 file changed, 38 insertions(+), 30 deletions(-)
+
+--- a/mm/filemap.c~mm-readahead-make-thp-readahead-conditional-to-mmap_miss-logic
++++ a/mm/filemap.c
+@@ -3253,11 +3253,47 @@ static struct file *do_sync_mmap_readahe
+ 	DEFINE_READAHEAD(ractl, file, ra, mapping, vmf->pgoff);
+ 	struct file *fpin = NULL;
+ 	vm_flags_t vm_flags = vmf->vma->vm_flags;
++	bool force_thp_readahead = false;
+ 	unsigned short mmap_miss;
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	/* Use the readahead code, even if readahead is disabled */
+-	if ((vm_flags & VM_HUGEPAGE) && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER) {
++	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
++	    (vm_flags & VM_HUGEPAGE) && HPAGE_PMD_ORDER <= MAX_PAGECACHE_ORDER)
++		force_thp_readahead = true;
++
++	if (!force_thp_readahead) {
++		/*
++		 * If we don't want any read-ahead, don't bother.
++		 * VM_EXEC case below is already intended for random access.
++		 */
++		if ((vm_flags & (VM_RAND_READ | VM_EXEC)) == VM_RAND_READ)
++			return fpin;
++
++		if (!ra->ra_pages)
++			return fpin;
++
++		if (vm_flags & VM_SEQ_READ) {
++			fpin = maybe_unlock_mmap_for_io(vmf, fpin);
++			page_cache_sync_ra(&ractl, ra->ra_pages);
++			return fpin;
++		}
++	}
++
++	if (!(vm_flags & VM_SEQ_READ)) {
++		/* Avoid banging the cache line if not needed */
++		mmap_miss = READ_ONCE(ra->mmap_miss);
++		if (mmap_miss < MMAP_LOTSAMISS * 10)
++			WRITE_ONCE(ra->mmap_miss, ++mmap_miss);
++
++		/*
++		 * Do we miss much more than hit in this file? If so,
++		 * stop bothering with read-ahead. It will only hurt.
++		 */
++		if (mmap_miss > MMAP_LOTSAMISS)
++			return fpin;
++	}
++
++	if (force_thp_readahead) {
+ 		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+ 		ractl._index &= ~((unsigned long)HPAGE_PMD_NR - 1);
+ 		ra->size = HPAGE_PMD_NR;
+@@ -3272,34 +3308,6 @@ static struct file *do_sync_mmap_readahe
+ 		page_cache_ra_order(&ractl, ra);
+ 		return fpin;
+ 	}
+-#endif
+-
+-	/*
+-	 * If we don't want any read-ahead, don't bother. VM_EXEC case below is
+-	 * already intended for random access.
+-	 */
+-	if ((vm_flags & (VM_RAND_READ | VM_EXEC)) == VM_RAND_READ)
+-		return fpin;
+-	if (!ra->ra_pages)
+-		return fpin;
+-
+-	if (vm_flags & VM_SEQ_READ) {
+-		fpin = maybe_unlock_mmap_for_io(vmf, fpin);
+-		page_cache_sync_ra(&ractl, ra->ra_pages);
+-		return fpin;
+-	}
+-
+-	/* Avoid banging the cache line if not needed */
+-	mmap_miss = READ_ONCE(ra->mmap_miss);
+-	if (mmap_miss < MMAP_LOTSAMISS * 10)
+-		WRITE_ONCE(ra->mmap_miss, ++mmap_miss);
+-
+-	/*
+-	 * Do we miss much more than hit in this file? If so,
+-	 * stop bothering with read-ahead. It will only hurt.
+-	 */
+-	if (mmap_miss > MMAP_LOTSAMISS)
+-		return fpin;
+ 
+ 	if (vm_flags & VM_EXEC) {
+ 		/*
+_
