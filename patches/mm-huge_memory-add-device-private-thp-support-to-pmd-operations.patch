@@ -1,0 +1,211 @@
+From: Balbir Singh <balbirs@nvidia.com>
+Subject: mm/huge_memory: add device-private THP support to PMD operations
+Date: Wed, 1 Oct 2025 16:56:54 +1000
+
+Extend core huge page management functions to handle device-private THP
+entries.  This enables proper handling of large device-private folios in
+fundamental MM operations.
+
+The following functions have been updated:
+
+- copy_huge_pmd(): Handle device-private entries during fork/clone
+- zap_huge_pmd(): Properly free device-private THP during munmap
+- change_huge_pmd(): Support protection changes on device-private THP
+- __pte_offset_map(): Add device-private entry awareness
+
+Link: https://lkml.kernel.org/r/20251001065707.920170-4-balbirs@nvidia.com
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
+Signed-off-by: Balbir Singh <balbirs@nvidia.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: David Airlie <airlied@gmail.com>
+Cc: Simona Vetter <simona@ffwll.ch>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Mika Penttilä <mpenttil@redhat.com>
+Cc: Francois Dugast <francois.dugast@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/swapops.h |   32 +++++++++++++++++++++
+ mm/huge_memory.c        |   56 +++++++++++++++++++++++++++++++-------
+ mm/pgtable-generic.c    |    2 -
+ 3 files changed, 80 insertions(+), 10 deletions(-)
+
+--- a/include/linux/swapops.h~mm-huge_memory-add-device-private-thp-support-to-pmd-operations
++++ a/include/linux/swapops.h
+@@ -594,10 +594,42 @@ static inline int is_pmd_migration_entry
+ }
+ #endif  /* CONFIG_ARCH_ENABLE_THP_MIGRATION */
+ 
++#if defined(CONFIG_ZONE_DEVICE) && defined(CONFIG_ARCH_ENABLE_THP_MIGRATION)
++
++/**
++ * is_pmd_device_private_entry() - Check if PMD contains a device private swap entry
++ * @pmd: The PMD to check
++ *
++ * Returns true if the PMD contains a swap entry that represents a device private
++ * page mapping. This is used for zone device private pages that have been
++ * swapped out but still need special handling during various memory management
++ * operations.
++ *
++ * Return: 1 if PMD contains device private entry, 0 otherwise
++ */
++static inline int is_pmd_device_private_entry(pmd_t pmd)
++{
++	return is_swap_pmd(pmd) && is_device_private_entry(pmd_to_swp_entry(pmd));
++}
++
++#else /* CONFIG_ZONE_DEVICE && CONFIG_ARCH_ENABLE_THP_MIGRATION */
++
++static inline int is_pmd_device_private_entry(pmd_t pmd)
++{
++	return 0;
++}
++
++#endif /* CONFIG_ZONE_DEVICE && CONFIG_ARCH_ENABLE_THP_MIGRATION */
++
+ static inline int non_swap_entry(swp_entry_t entry)
+ {
+ 	return swp_type(entry) >= MAX_SWAPFILES;
+ }
+ 
++static inline int is_pmd_non_present_folio_entry(pmd_t pmd)
++{
++	return is_pmd_migration_entry(pmd) || is_pmd_device_private_entry(pmd);
++}
++
+ #endif /* CONFIG_MMU */
+ #endif /* _LINUX_SWAPOPS_H */
+--- a/mm/huge_memory.c~mm-huge_memory-add-device-private-thp-support-to-pmd-operations
++++ a/mm/huge_memory.c
+@@ -1788,17 +1788,45 @@ int copy_huge_pmd(struct mm_struct *dst_
+ 	if (unlikely(is_swap_pmd(pmd))) {
+ 		swp_entry_t entry = pmd_to_swp_entry(pmd);
+ 
+-		VM_BUG_ON(!is_pmd_migration_entry(pmd));
+-		if (!is_readable_migration_entry(entry)) {
+-			entry = make_readable_migration_entry(
+-							swp_offset(entry));
++		VM_WARN_ON(!is_pmd_non_present_folio_entry(pmd));
++
++		if (is_writable_migration_entry(entry) ||
++		    is_readable_exclusive_migration_entry(entry)) {
++			entry = make_readable_migration_entry(swp_offset(entry));
+ 			pmd = swp_entry_to_pmd(entry);
+ 			if (pmd_swp_soft_dirty(*src_pmd))
+ 				pmd = pmd_swp_mksoft_dirty(pmd);
+ 			if (pmd_swp_uffd_wp(*src_pmd))
+ 				pmd = pmd_swp_mkuffd_wp(pmd);
+ 			set_pmd_at(src_mm, addr, src_pmd, pmd);
++		} else if (is_device_private_entry(entry)) {
++			/*
++			 * For device private entries, since there are no
++			 * read exclusive entries, writable = !readable
++			 */
++			if (is_writable_device_private_entry(entry)) {
++				entry = make_readable_device_private_entry(swp_offset(entry));
++				pmd = swp_entry_to_pmd(entry);
++
++				if (pmd_swp_soft_dirty(*src_pmd))
++					pmd = pmd_swp_mksoft_dirty(pmd);
++				if (pmd_swp_uffd_wp(*src_pmd))
++					pmd = pmd_swp_mkuffd_wp(pmd);
++				set_pmd_at(src_mm, addr, src_pmd, pmd);
++			}
++
++			src_folio = pfn_swap_entry_folio(entry);
++			VM_WARN_ON(!folio_test_large(src_folio));
++
++			folio_get(src_folio);
++			/*
++			 * folio_try_dup_anon_rmap_pmd does not fail for
++			 * device private entries.
++			 */
++			folio_try_dup_anon_rmap_pmd(src_folio, &src_folio->page,
++							dst_vma, src_vma);
+ 		}
++
+ 		add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+ 		mm_inc_nr_ptes(dst_mm);
+ 		pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
+@@ -2296,15 +2324,16 @@ int zap_huge_pmd(struct mmu_gather *tlb,
+ 			folio_remove_rmap_pmd(folio, page, vma);
+ 			WARN_ON_ONCE(folio_mapcount(folio) < 0);
+ 			VM_BUG_ON_PAGE(!PageHead(page), page);
+-		} else if (thp_migration_supported()) {
++		} else if (is_pmd_non_present_folio_entry(orig_pmd)) {
+ 			swp_entry_t entry;
+ 
+-			VM_BUG_ON(!is_pmd_migration_entry(orig_pmd));
+ 			entry = pmd_to_swp_entry(orig_pmd);
+ 			folio = pfn_swap_entry_folio(entry);
+ 			flush_needed = 0;
+-		} else
+-			WARN_ONCE(1, "Non present huge pmd without pmd migration enabled!");
++
++			if (!thp_migration_supported())
++				WARN_ONCE(1, "Non present huge pmd without pmd migration enabled!");
++		}
+ 
+ 		if (folio_test_anon(folio)) {
+ 			zap_deposited_table(tlb->mm, pmd);
+@@ -2324,6 +2353,12 @@ int zap_huge_pmd(struct mmu_gather *tlb,
+ 				folio_mark_accessed(folio);
+ 		}
+ 
++		if (folio_is_device_private(folio)) {
++			folio_remove_rmap_pmd(folio, &folio->page, vma);
++			WARN_ON_ONCE(folio_mapcount(folio) < 0);
++			folio_put(folio);
++		}
++
+ 		spin_unlock(ptl);
+ 		if (flush_needed)
+ 			tlb_remove_page_size(tlb, &folio->page, HPAGE_PMD_SIZE);
+@@ -2452,7 +2487,7 @@ int change_huge_pmd(struct mmu_gather *t
+ 		struct folio *folio = pfn_swap_entry_folio(entry);
+ 		pmd_t newpmd;
+ 
+-		VM_BUG_ON(!is_pmd_migration_entry(*pmd));
++		VM_WARN_ON(!is_pmd_non_present_folio_entry(*pmd));
+ 		if (is_writable_migration_entry(entry)) {
+ 			/*
+ 			 * A protection check is difficult so
+@@ -2465,6 +2500,9 @@ int change_huge_pmd(struct mmu_gather *t
+ 			newpmd = swp_entry_to_pmd(entry);
+ 			if (pmd_swp_soft_dirty(*pmd))
+ 				newpmd = pmd_swp_mksoft_dirty(newpmd);
++		} else if (is_writable_device_private_entry(entry)) {
++			entry = make_readable_device_private_entry(swp_offset(entry));
++			newpmd = swp_entry_to_pmd(entry);
+ 		} else {
+ 			newpmd = *pmd;
+ 		}
+--- a/mm/pgtable-generic.c~mm-huge_memory-add-device-private-thp-support-to-pmd-operations
++++ a/mm/pgtable-generic.c
+@@ -290,7 +290,7 @@ pte_t *___pte_offset_map(pmd_t *pmd, uns
+ 
+ 	if (pmdvalp)
+ 		*pmdvalp = pmdval;
+-	if (unlikely(pmd_none(pmdval) || is_pmd_migration_entry(pmdval)))
++	if (unlikely(pmd_none(pmdval) || !pmd_present(pmdval)))
+ 		goto nomap;
+ 	if (unlikely(pmd_trans_huge(pmdval)))
+ 		goto nomap;
+_

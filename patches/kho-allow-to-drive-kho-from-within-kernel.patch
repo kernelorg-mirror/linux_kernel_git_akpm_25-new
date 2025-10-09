@@ -1,0 +1,199 @@
+From: Pasha Tatashin <pasha.tatashin@soleen.com>
+Subject: kho: allow to drive kho from within kernel
+Date: Tue, 7 Oct 2025 03:30:54 +0000
+
+Patch series "liveupdate: Rework KHO for in-kernel users", v5.
+
+These patches are taken from the LUOv4 series [1] and address recent
+comments from Pratyush.
+
+This series refactors the KHO framework to better support in-kernel users
+like the upcoming LUO.  The current design, which relies on a notifier
+chain and debugfs for control, is too restrictive for direct programmatic
+use.
+
+The core of this rework is the removal of the notifier chain in favor of a
+direct registration API.  This decouples clients from the shutdown-time
+finalization sequence, allowing them to manage their preserved state more
+flexibly and at any time.
+
+In support of this new model, this series also:
+ - Exports kho_finalize() and kho_abort() for programmatic control.
+ - Makes the debugfs interface optional.
+ - Introduces APIs to unpreserve memory and fixes a bug in the abort
+   path where client state was being incorrectly discarded. Note that
+   this is an interim step, as a more comprehensive fix is planned as
+   part of the stateless KHO work [2].
+ - Moves all KHO code into a new kernel/liveupdate/ directory to
+   consolidate live update components.
+
+
+This patch (of 7):
+
+Allow to do finalize and abort from kernel modules, so LUO could drive the
+KHO sequence via its own state machine.
+
+Link: https://lkml.kernel.org/r/20251007033100.836886-1-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251007033100.836886-2-pasha.tatashin@soleen.com
+Link: https://lore.kernel.org/all/20250929010321.3462457-1-pasha.tatashin@soleen.com [1]
+Link: https://lore.kernel.org/all/20251001011941.1513050-1-jasonmiu@google.com [2]
+Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Pratyush Yadav <pratyush@kernel.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kexec_handover.h |   15 ++++++
+ kernel/kexec_handover.c        |   74 ++++++++++++++++++-------------
+ 2 files changed, 59 insertions(+), 30 deletions(-)
+
+--- a/include/linux/kexec_handover.h~kho-allow-to-drive-kho-from-within-kernel
++++ a/include/linux/kexec_handover.h
+@@ -67,6 +67,10 @@ void kho_memory_init(void);
+ 
+ void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t scratch_phys,
+ 		  u64 scratch_len);
++
++int kho_finalize(void);
++int kho_abort(void);
++
+ #else
+ static inline bool kho_is_enabled(void)
+ {
+@@ -139,6 +143,17 @@ static inline void kho_populate(phys_add
+ 				phys_addr_t scratch_phys, u64 scratch_len)
+ {
+ }
++
++static inline int kho_finalize(void)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline int kho_abort(void)
++{
++	return -EOPNOTSUPP;
++}
++
+ #endif /* CONFIG_KEXEC_HANDOVER */
+ 
+ #endif /* LINUX_KEXEC_HANDOVER_H */
+--- a/kernel/kexec_handover.c~kho-allow-to-drive-kho-from-within-kernel
++++ a/kernel/kexec_handover.c
+@@ -1067,7 +1067,7 @@ static int kho_out_update_debugfs_fdt(vo
+ 	return err;
+ }
+ 
+-static int kho_abort(void)
++static int __kho_abort(void)
+ {
+ 	int err;
+ 	unsigned long order;
+@@ -1100,7 +1100,27 @@ static int kho_abort(void)
+ 	return err;
+ }
+ 
+-static int kho_finalize(void)
++int kho_abort(void)
++{
++	int ret = 0;
++
++	if (!kho_enable)
++		return -EOPNOTSUPP;
++
++	guard(mutex)(&kho_out.lock);
++	if (!kho_out.finalized)
++		return -ENOENT;
++
++	ret = __kho_abort();
++	if (ret)
++		return ret;
++
++	kho_out.finalized = false;
++
++	return kho_out_update_debugfs_fdt();
++}
++
++static int __kho_finalize(void)
+ {
+ 	int err = 0;
+ 	u64 *preserved_mem_map;
+@@ -1143,12 +1163,32 @@ static int kho_finalize(void)
+ abort:
+ 	if (err) {
+ 		pr_err("Failed to convert KHO state tree: %d\n", err);
+-		kho_abort();
++		__kho_abort();
+ 	}
+ 
+ 	return err;
+ }
+ 
++int kho_finalize(void)
++{
++	int ret;
++
++	if (!kho_enable)
++		return -EOPNOTSUPP;
++
++	guard(mutex)(&kho_out.lock);
++	if (kho_out.finalized)
++		return -EEXIST;
++
++	ret = __kho_finalize();
++	if (ret)
++		return ret;
++
++	kho_out.finalized = true;
++
++	return kho_out_update_debugfs_fdt();
++}
++
+ static int kho_out_finalize_get(void *data, u64 *val)
+ {
+ 	mutex_lock(&kho_out.lock);
+@@ -1160,33 +1200,7 @@ static int kho_out_finalize_get(void *da
+ 
+ static int kho_out_finalize_set(void *data, u64 _val)
+ {
+-	int ret = 0;
+-	bool val = !!_val;
+-
+-	mutex_lock(&kho_out.lock);
+-
+-	if (val == kho_out.finalized) {
+-		if (kho_out.finalized)
+-			ret = -EEXIST;
+-		else
+-			ret = -ENOENT;
+-		goto unlock;
+-	}
+-
+-	if (val)
+-		ret = kho_finalize();
+-	else
+-		ret = kho_abort();
+-
+-	if (ret)
+-		goto unlock;
+-
+-	kho_out.finalized = val;
+-	ret = kho_out_update_debugfs_fdt();
+-
+-unlock:
+-	mutex_unlock(&kho_out.lock);
+-	return ret;
++	return (!!_val) ? kho_finalize() : kho_abort();
+ }
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_kho_out_finalize, kho_out_finalize_get,
+_

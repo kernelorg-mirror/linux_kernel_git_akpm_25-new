@@ -1,0 +1,146 @@
+From: Balbir Singh <balbirs@nvidia.com>
+Subject: mm/memremap: add driver callback support for folio splitting
+Date: Wed, 1 Oct 2025 16:57:01 +1000
+
+When a zone device page is split (via huge pmd folio split).  The driver
+callback for folio_split is invoked to let the device driver know that the
+folio size has been split into a smaller order.
+
+Provide a default implementation for drivers that do not provide this
+callback that copies the pgmap and mapping fields for the split folios.
+
+Update the HMM test driver to handle the split.
+
+Link: https://lkml.kernel.org/r/20251001065707.920170-11-balbirs@nvidia.com
+Signed-off-by: Balbir Singh <balbirs@nvidia.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lyude Paul <lyude@redhat.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: David Airlie <airlied@gmail.com>
+Cc: Simona Vetter <simona@ffwll.ch>
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Mika Penttilä <mpenttil@redhat.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Francois Dugast <francois.dugast@intel.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memremap.h |   29 +++++++++++++++++++++++++++++
+ lib/test_hmm.c           |   35 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)
+
+--- a/include/linux/memremap.h~mm-memremap-add-driver-callback-support-for-folio-splitting
++++ a/include/linux/memremap.h
+@@ -100,6 +100,13 @@ struct dev_pagemap_ops {
+ 	 */
+ 	int (*memory_failure)(struct dev_pagemap *pgmap, unsigned long pfn,
+ 			      unsigned long nr_pages, int mf_flags);
++
++	/*
++	 * Used for private (un-addressable) device memory only.
++	 * This callback is used when a folio is split into
++	 * a smaller folio
++	 */
++	void (*folio_split)(struct folio *head, struct folio *tail);
+ };
+ 
+ #define PGMAP_ALTMAP_VALID	(1 << 0)
+@@ -235,6 +242,23 @@ static inline void zone_device_folio_ini
+ 		folio_set_large_rmappable(folio);
+ }
+ 
++static inline void zone_device_private_split_cb(struct folio *original_folio,
++						struct folio *new_folio)
++{
++	if (folio_is_device_private(original_folio)) {
++		if (!original_folio->pgmap->ops->folio_split) {
++			if (new_folio) {
++				new_folio->pgmap = original_folio->pgmap;
++				new_folio->page.mapping =
++					original_folio->page.mapping;
++			}
++		} else {
++			original_folio->pgmap->ops->folio_split(original_folio,
++								 new_folio);
++		}
++	}
++}
++
+ #else
+ static inline void *devm_memremap_pages(struct device *dev,
+ 		struct dev_pagemap *pgmap)
+@@ -268,6 +292,11 @@ static inline unsigned long memremap_com
+ {
+ 	return PAGE_SIZE;
+ }
++
++static inline void zone_device_private_split_cb(struct folio *original_folio,
++						struct folio *new_folio)
++{
++}
+ #endif /* CONFIG_ZONE_DEVICE */
+ 
+ static inline void put_dev_pagemap(struct dev_pagemap *pgmap)
+--- a/lib/test_hmm.c~mm-memremap-add-driver-callback-support-for-folio-splitting
++++ a/lib/test_hmm.c
+@@ -1654,9 +1654,44 @@ err:
+ 	return ret;
+ }
+ 
++static void dmirror_devmem_folio_split(struct folio *head, struct folio *tail)
++{
++	struct page *rpage = BACKING_PAGE(folio_page(head, 0));
++	struct page *rpage_tail;
++	struct folio *rfolio;
++	unsigned long offset = 0;
++
++	if (!rpage) {
++		tail->page.zone_device_data = NULL;
++		return;
++	}
++
++	rfolio = page_folio(rpage);
++
++	if (tail == NULL) {
++		folio_reset_order(rfolio);
++		rfolio->mapping = NULL;
++		folio_set_count(rfolio, 1);
++		return;
++	}
++
++	offset = folio_pfn(tail) - folio_pfn(head);
++
++	rpage_tail = folio_page(rfolio, offset);
++	tail->page.zone_device_data = rpage_tail;
++	rpage_tail->zone_device_data = rpage->zone_device_data;
++	clear_compound_head(rpage_tail);
++	rpage_tail->mapping = NULL;
++
++	folio_page(tail, 0)->mapping = folio_page(head, 0)->mapping;
++	tail->pgmap = head->pgmap;
++	folio_set_count(page_folio(rpage_tail), 1);
++}
++
+ static const struct dev_pagemap_ops dmirror_devmem_ops = {
+ 	.folio_free	= dmirror_devmem_free,
+ 	.migrate_to_ram	= dmirror_devmem_fault,
++	.folio_split	= dmirror_devmem_folio_split,
+ };
+ 
+ static int dmirror_device_init(struct dmirror_device *mdevice, int id)
+_
