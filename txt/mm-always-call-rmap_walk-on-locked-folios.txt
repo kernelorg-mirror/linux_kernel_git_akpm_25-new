@@ -1,0 +1,145 @@
+From: Lokesh Gidra <lokeshgidra@google.com>
+Subject: mm: always call rmap_walk() on locked folios
+Date: Tue, 23 Sep 2025 00:10:18 -0700
+
+Patch series "Improve UFFDIO_MOVE scalability by removing anon_vma lock", v2.
+
+Userfaultfd has a scalability issue in its UFFDIO_MOVE ioctl, which is
+heavily used in Android as its java garbage collector uses it for
+concurrent heap compaction.
+
+The issue arises because UFFDIO_MOVE updates folio->mapping to an anon_vma
+with a different root, in order to move the folio from a src VMA to dst
+VMA.  It performs the operation with the folio locked, but this is
+insufficient, because rmap_walk() can be performed on non-KSM anonymous
+folios without folio lock.
+
+This means that UFFDIO_MOVE has to acquire the anon_vma write lock of the
+root anon_vma belonging to the folio it wishes to move.
+
+This causes scalability bottleneck when multiple threads perform
+UFFDIO_MOVE simultanously on distinct pages of the same src VMA.  In field
+traces of arm64 android devices, we have observed janky user interactions
+due to long (sometimes over ~50ms) uninterruptible sleeps on main UI
+thread caused by anon_vma lock contention in UFFDIO_MOVE.  This is
+particularly severe during the beginning of GC's compaction phase when it
+is likely to have multiple threads involved.
+
+This patch resolves the issue by removing the exception in rmap_walk() for
+non-KSM anon folios by ensuring that all folios are locked during rmap
+walk.  This is less problematic than it might seem, as the only major
+caller which utilises this mode is shrink_active_list(), which is covered
+in detail in the first patch of this series.
+
+As a result of changing our approach to locking, we can remove all the
+code that took steps to acquire an anon_vma write lock instead of a folio
+lock.  This results in a significant simplification and scalability
+improvement of the code (currently only in UFFDIO_MOVE).  Furthermore, as
+a side-effect, folio_lock_anon_vma_read() gets simpler as we don't need to
+worry that folio->mapping may have changed under us.
+
+
+This patch (of 2):
+
+Guarantee that rmap_walk() is called on locked folios so that threads
+changing folio->mapping and folio->index for non-KSM anon folios can
+serialize on fine-grained folio lock rather than anon_vma lock.  Other
+folio types are already always locked before rmap_walk().  With this, we
+are going from 'not necessarily' locking the non-KSM anon folio to
+'definitely' locking it during rmap walks.
+
+This patch is in preparation for removing anon_vma write-lock from
+UFFDIO_MOVE.
+
+With this patch, three functions are now expected to be called with a
+locked folio.  To be careful of not missing any case, here is the
+exhaustive list of all their callers.
+
+1) rmap_walk() is called from:
+
+a) folio_referenced()
+b) damon_folio_mkold()
+c) damon_folio_young()
+d) page_idle_clear_pte_refs()
+e) try_to_unmap()
+f) try_to_migrate()
+g) folio_mkclean()
+h) remove_migration_ptes()
+
+In the above list, first 4 are changed in this patch to try-lock non-KSM
+anon folios, similar to other types of folios.  The remaining functions in
+the list already hold folio lock when calling rmap_walk().
+
+2) folio_lock_anon_vma_read() is called from following functions:
+
+a) collect_procs_anon()
+b) page_idle_clear_pte_refs()
+c) damon_folio_mkold()
+d) damon_folio_young()
+e) folio_referenced()
+f) try_to_unmap()
+g) try_to_migrate()
+
+All the functions in above list, except collect_procs_anon(), are covered
+by the rmap_walk() list above.  For collect_procs_anon(), with
+kill_procs_now() changed to take folio lock in this patch ensures that all
+callers of folio_lock_anon_vma_read() now hold the lock.
+
+3) folio_get_anon_vma() is called from following functions, all of which
+   already hold the folio lock:
+
+a) move_pages_huge_pmd()
+b) __folio_split()
+c) move_pages_ptes()
+d) migrate_folio_unmap()
+e) unmap_and_move_huge_page()
+
+Functionally, this patch doesn't break the logic because rmap walkers
+generally do some other check to see if what is expected to mapped did
+happen so it's fine, or otherwise treat things as best-effort.
+
+Among the 4 functions changed in this patch, folio_referenced() is the
+only core-mm function, and is also frequently accessed.  To assess the
+impact of locking non-KSM anon folios in
+shrink_active_list()->folio_referenced() path, we performed an app cycle
+test on an arm64 android device.  During the whole duration of the test
+there were over 140k invocations of shrink_active_list(), out of which
+over 29k had at least one non-KSM anon folio on which folio_referenced()
+was called.  In none of these invocations folio_trylock() failed.
+
+Of course, we now take a lock where we wouldn't previously have.  In the
+past it would have had a major impact in causing a CoW write fault to copy
+a page in do_wp_page(), as commit 09854ba94c6a ("mm: do_wp_page()
+simplification") caused a failure to obtain folio lock to result in a page
+copy even if one wasn't necessary.
+
+However, since commit 6c287605fd56 ("mm: remember exclusively mapped
+anonymous pages with PG_anon_exclusive"), and the introduction of the
+folio anon exclusive flag, this issue is significantly mitigated.
+
+The only case remaining that we might worry about from this perspective is
+that of read-only folios immediately after fork where the anon exclusive
+bit will not have been set yet.
+
+We note however in the case of read-only just-forked folios that
+wp_can_reuse_anon_folio() will notice the raised reference count
+established by shrink_active_list() via isolate_lru_folios() and refuse to
+reuse in any case, so this will in fact have no impact - the folio lock is
+ultimately immaterial here.
+
+All-in-all it appears that there is little opportunity for meaningful
+negative impact from this change.
+
+Link: https://lkml.kernel.org/r/20250923071019.775806-1-lokeshgidra@google.com
+Link: https://lkml.kernel.org/r/20250923071019.775806-2-lokeshgidra@google.com
+Signed-off-by: Lokesh Gidra <lokeshgidra@google.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Harry Yoo <harry.yoo@oracle.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Nicolas Geoffray <ngeoffray@google.com>

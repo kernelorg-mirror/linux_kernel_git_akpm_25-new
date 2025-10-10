@@ -1,0 +1,239 @@
+From: Lokesh Gidra <lokeshgidra@google.com>
+Subject: mm/userfaultfd: don't lock anon_vma when performing UFFDIO_MOVE
+Date: Tue, 23 Sep 2025 00:10:19 -0700
+
+Now that rmap_walk() is guaranteed to be called with the folio lock held,
+we can stop serializing on the src VMA anon_vma lock when moving an
+exclusive folio from a src VMA to a dst VMA in UFFDIO_MOVE ioctl.
+
+When moving a folio, we modify folio->mapping through
+folio_move_anon_rmap() and adjust folio->index accordingly.  Doing that
+while we could have concurrent RMAP walks would be dangerous.  Therefore,
+to avoid that, we had to acquire anon_vma of src VMA in write-mode.  That
+meant that when multiple threads called UFFDIO_MOVE concurrently on
+distinct pages of the same src VMA, they would serialize on it, hurting
+scalability.
+
+In addition to avoiding the scalability bottleneck, this patch also
+simplifies the complicated lock dance that UFFDIO_MOVE has to go through
+between RCU, folio-lock, ptl, and anon_vma.
+
+folio_move_anon_rmap() already enforces that the folio is locked.  So when
+we have the folio locked we can no longer race with concurrent rmap_walk()
+as used by folio_referenced() and others who call it on unlocked non-KSM
+anon folios, and therefore the anon_vma lock is no longer required.
+
+Note that this handling is now the same as for other
+folio_move_anon_rmap() users that also do not hold the anon_vma lock --
+namely COW reuse handling (do_wp_page()->wp_can_reuse_anon_folio(),
+do_huge_pmd_wp_page(), and hugetlb_wp()).  These users never required the
+anon_vma lock as they are only moving the anon VMA closer to the anon_vma
+leaf of the VMA, for example, from an anon_vma root to a leaf of that
+root.  rmap walks were always able to tolerate that scenario.
+
+Link: https://lkml.kernel.org/r/20250923071019.775806-3-lokeshgidra@google.com
+Signed-off-by: Lokesh Gidra <lokeshgidra@google.com>
+Acked-by: David Hildenbrand <david@redhat.com>
+Acked-by: Peter Xu <peterx@redhat.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Lokesh Gidra <lokeshgidra@google.com>
+Cc: Nicolas Geoffray <ngeoffray@google.com>
+Cc: Harry Yoo <harry.yoo@oracle.com>
+Cc: SeongJae Park <sj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   22 ---------------
+ mm/userfaultfd.c |   62 +++++++--------------------------------------
+ 2 files changed, 12 insertions(+), 72 deletions(-)
+
+--- a/mm/huge_memory.c~mm-userfaultfd-dont-lock-anon_vma-when-performing-uffdio_move
++++ a/mm/huge_memory.c
+@@ -2700,7 +2700,6 @@ int move_pages_huge_pmd(struct mm_struct
+ 	pmd_t _dst_pmd, src_pmdval;
+ 	struct page *src_page;
+ 	struct folio *src_folio;
+-	struct anon_vma *src_anon_vma;
+ 	spinlock_t *src_ptl, *dst_ptl;
+ 	pgtable_t src_pgtable;
+ 	struct mmu_notifier_range range;
+@@ -2749,23 +2748,9 @@ int move_pages_huge_pmd(struct mm_struct
+ 				src_addr + HPAGE_PMD_SIZE);
+ 	mmu_notifier_invalidate_range_start(&range);
+ 
+-	if (src_folio) {
++	if (src_folio)
+ 		folio_lock(src_folio);
+ 
+-		/*
+-		 * split_huge_page walks the anon_vma chain without the page
+-		 * lock. Serialize against it with the anon_vma lock, the page
+-		 * lock is not enough.
+-		 */
+-		src_anon_vma = folio_get_anon_vma(src_folio);
+-		if (!src_anon_vma) {
+-			err = -EAGAIN;
+-			goto unlock_folio;
+-		}
+-		anon_vma_lock_write(src_anon_vma);
+-	} else
+-		src_anon_vma = NULL;
+-
+ 	dst_ptl = pmd_lockptr(mm, dst_pmd);
+ 	double_pt_lock(src_ptl, dst_ptl);
+ 	if (unlikely(!pmd_same(*src_pmd, src_pmdval) ||
+@@ -2810,11 +2795,6 @@ int move_pages_huge_pmd(struct mm_struct
+ 	pgtable_trans_huge_deposit(mm, dst_pmd, src_pgtable);
+ unlock_ptls:
+ 	double_pt_unlock(src_ptl, dst_ptl);
+-	if (src_anon_vma) {
+-		anon_vma_unlock_write(src_anon_vma);
+-		put_anon_vma(src_anon_vma);
+-	}
+-unlock_folio:
+ 	/* unblock rmap walks */
+ 	if (src_folio)
+ 		folio_unlock(src_folio);
+--- a/mm/userfaultfd.c~mm-userfaultfd-dont-lock-anon_vma-when-performing-uffdio_move
++++ a/mm/userfaultfd.c
+@@ -1035,8 +1035,7 @@ static inline bool is_pte_pages_stable(p
+  */
+ static struct folio *check_ptes_for_batched_move(struct vm_area_struct *src_vma,
+ 						 unsigned long src_addr,
+-						 pte_t *src_pte, pte_t *dst_pte,
+-						 struct anon_vma *src_anon_vma)
++						 pte_t *src_pte, pte_t *dst_pte)
+ {
+ 	pte_t orig_dst_pte, orig_src_pte;
+ 	struct folio *folio;
+@@ -1052,8 +1051,7 @@ static struct folio *check_ptes_for_batc
+ 	folio = vm_normal_folio(src_vma, src_addr, orig_src_pte);
+ 	if (!folio || !folio_trylock(folio))
+ 		return NULL;
+-	if (!PageAnonExclusive(&folio->page) || folio_test_large(folio) ||
+-	    folio_anon_vma(folio) != src_anon_vma) {
++	if (!PageAnonExclusive(&folio->page) || folio_test_large(folio)) {
+ 		folio_unlock(folio);
+ 		return NULL;
+ 	}
+@@ -1061,9 +1059,8 @@ static struct folio *check_ptes_for_batc
+ }
+ 
+ /*
+- * Moves src folios to dst in a batch as long as they share the same
+- * anon_vma as the first folio, are not large, and can successfully
+- * take the lock via folio_trylock().
++ * Moves src folios to dst in a batch as long as they are not large, and can
++ * successfully take the lock via folio_trylock().
+  */
+ static long move_present_ptes(struct mm_struct *mm,
+ 			      struct vm_area_struct *dst_vma,
+@@ -1073,8 +1070,7 @@ static long move_present_ptes(struct mm_
+ 			      pte_t orig_dst_pte, pte_t orig_src_pte,
+ 			      pmd_t *dst_pmd, pmd_t dst_pmdval,
+ 			      spinlock_t *dst_ptl, spinlock_t *src_ptl,
+-			      struct folio **first_src_folio, unsigned long len,
+-			      struct anon_vma *src_anon_vma)
++			      struct folio **first_src_folio, unsigned long len)
+ {
+ 	int err = 0;
+ 	struct folio *src_folio = *first_src_folio;
+@@ -1132,8 +1128,8 @@ static long move_present_ptes(struct mm_
+ 		src_pte++;
+ 
+ 		folio_unlock(src_folio);
+-		src_folio = check_ptes_for_batched_move(src_vma, src_addr, src_pte,
+-							dst_pte, src_anon_vma);
++		src_folio = check_ptes_for_batched_move(src_vma, src_addr,
++							src_pte, dst_pte);
+ 		if (!src_folio)
+ 			break;
+ 	}
+@@ -1263,7 +1259,6 @@ static long move_pages_ptes(struct mm_st
+ 	pmd_t dummy_pmdval;
+ 	pmd_t dst_pmdval;
+ 	struct folio *src_folio = NULL;
+-	struct anon_vma *src_anon_vma = NULL;
+ 	struct mmu_notifier_range range;
+ 	long ret = 0;
+ 
+@@ -1347,9 +1342,9 @@ retry:
+ 		}
+ 
+ 		/*
+-		 * Pin and lock both source folio and anon_vma. Since we are in
+-		 * RCU read section, we can't block, so on contention have to
+-		 * unmap the ptes, obtain the lock and retry.
++		 * Pin and lock source folio. Since we are in RCU read section,
++		 * we can't block, so on contention have to unmap the ptes,
++		 * obtain the lock and retry.
+ 		 */
+ 		if (!src_folio) {
+ 			struct folio *folio;
+@@ -1423,33 +1418,11 @@ retry:
+ 			goto retry;
+ 		}
+ 
+-		if (!src_anon_vma) {
+-			/*
+-			 * folio_referenced walks the anon_vma chain
+-			 * without the folio lock. Serialize against it with
+-			 * the anon_vma lock, the folio lock is not enough.
+-			 */
+-			src_anon_vma = folio_get_anon_vma(src_folio);
+-			if (!src_anon_vma) {
+-				/* page was unmapped from under us */
+-				ret = -EAGAIN;
+-				goto out;
+-			}
+-			if (!anon_vma_trylock_write(src_anon_vma)) {
+-				pte_unmap(src_pte);
+-				pte_unmap(dst_pte);
+-				src_pte = dst_pte = NULL;
+-				/* now we can block and wait */
+-				anon_vma_lock_write(src_anon_vma);
+-				goto retry;
+-			}
+-		}
+-
+ 		ret = move_present_ptes(mm, dst_vma, src_vma,
+ 					dst_addr, src_addr, dst_pte, src_pte,
+ 					orig_dst_pte, orig_src_pte, dst_pmd,
+ 					dst_pmdval, dst_ptl, src_ptl, &src_folio,
+-					len, src_anon_vma);
++					len);
+ 	} else {
+ 		struct folio *folio = NULL;
+ 
+@@ -1515,10 +1488,6 @@ retry:
+ 	}
+ 
+ out:
+-	if (src_anon_vma) {
+-		anon_vma_unlock_write(src_anon_vma);
+-		put_anon_vma(src_anon_vma);
+-	}
+ 	if (src_folio) {
+ 		folio_unlock(src_folio);
+ 		folio_put(src_folio);
+@@ -1792,15 +1761,6 @@ static void uffd_move_unlock(struct vm_a
+  * virtual regions without knowing if there are transparent hugepage
+  * in the regions or not, but preventing the risk of having to split
+  * the hugepmd during the remap.
+- *
+- * If there's any rmap walk that is taking the anon_vma locks without
+- * first obtaining the folio lock (the only current instance is
+- * folio_referenced), they will have to verify if the folio->mapping
+- * has changed after taking the anon_vma lock. If it changed they
+- * should release the lock and retry obtaining a new anon_vma, because
+- * it means the anon_vma was changed by move_pages() before the lock
+- * could be obtained. This is the only additional complexity added to
+- * the rmap code to provide this anonymous page remapping functionality.
+  */
+ ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
+ 		   unsigned long src_start, unsigned long len, __u64 mode)
+_
