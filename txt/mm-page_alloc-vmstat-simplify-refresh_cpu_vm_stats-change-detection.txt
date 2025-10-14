@@ -1,0 +1,127 @@
+From: Joshua Hahn <joshua.hahnjy@gmail.com>
+Subject: mm/page_alloc/vmstat: simplify refresh_cpu_vm_stats change detection
+Date: Mon, 13 Oct 2025 12:08:09 -0700
+
+Patch series "mm/page_alloc: Batch callers of free_pcppages_bulk", v4.
+
+Motivation & Approach
+=====================
+
+While testing workloads with high sustained memory pressure on large
+machines in the Meta fleet (1Tb memory, 316 CPUs), we saw an unexpectedly
+high number of softlockups.  Further investigation showed that the zone
+lock in free_pcppages_bulk was being held for a long time, and was called
+to free 2k+ pages over 100 times just during boot.
+
+This causes starvation in other processes for the zone lock, which can
+lead to the system stalling as multiple threads cannot make progress
+without the locks.  We can see these issues manifesting as warnings:
+
+[ 4512.591979] rcu: INFO: rcu_sched self-detected stall on CPU
+[ 4512.604370] rcu:     20-....: (9312 ticks this GP) idle=a654/1/0x4000000000000000 softirq=309340/309344 fqs=5426
+[ 4512.626401] rcu:              hardirqs   softirqs   csw/system
+[ 4512.638793] rcu:      number:        0        145            0
+[ 4512.651177] rcu:     cputime:       30      10410          174   ==> 10558(ms)
+[ 4512.666657] rcu:     (t=21077 jiffies g=783665 q=1242213 ncpus=316)
+
+While these warnings are benign, they do point to the underlying issue of
+lock contention.  To prevent starvation in both locks, batch the freeing
+of pages using pcp->batch.
+
+Because free_pcppages_bulk is called with the pcp lock and acquires the
+zone lock, relinquishing and reacquiring the locks are only effective when
+both of them are broken together (unless the system was built with queued
+spinlocks).  Thus, instead of modifying free_pcppages_bulk to break both
+locks, batch the freeing from its callers instead.
+
+A similar fix has been implemented in the Meta fleet, and we have seen
+significantly less softlockups.
+
+Testing
+=======
+The following are a few synthetic benchmarks, made on three machines. The
+first is a large machine with 754GiB memory and 316 processors.
+The second is a relatively smaller machine with 251GiB memory and 176
+processors. The third and final is the smallest of the three, which has 62GiB
+memory and 36 processors.
+
+On all machines, I kick off a kernel build with -j$(nproc).
+Negative delta is better (faster compilation).
+
+Large machine (754GiB memory, 316 processors)
+make -j$(nproc)
++------------+---------------+-----------+
+| Metric (s) | Variation (%) | Delta(%)  |
++------------+---------------+-----------+
+| real       |        0.8070 |  - 1.4865 |
+| user       |        0.2823 |  + 0.4081 |
+| sys        |        5.0267 |  -11.8737 |
++------------+---------------+-----------+
+
+Medium machine (251GiB memory, 176 processors)
+make -j$(nproc)
++------------+---------------+----------+
+| Metric (s) | Variation (%) | Delta(%) |
++------------+---------------+----------+
+| real       |        0.2806 |  +0.0351 |
+| user       |        0.0994 |  +0.3170 |
+| sys        |        0.6229 |  -0.6277 |
++------------+---------------+----------+
+
+Small machine (62GiB memory, 36 processors)
+make -j$(nproc)
++------------+---------------+----------+
+| Metric (s) | Variation (%) | Delta(%) |
++------------+---------------+----------+
+| real       |        0.1503 |  -2.6585 |
+| user       |        0.0431 |  -2.2984 |
+| sys        |        0.1870 |  -3.2013 |
++------------+---------------+----------+
+
+Here, variation is the coefficient of variation, i.e.  standard deviation
+/ mean.
+
+Based on these results, it seems like there are varying degrees to how
+much lock contention this reduces.  For the largest and smallest machines
+that I ran the tests on, it seems like there is quite some significant
+reduction.  There is also some performance increases visible from
+userspace.
+
+Interestingly, the performance gains don't scale with the size of the
+machine, but rather there seems to be a dip in the gain there is for the
+medium-sized machine.
+
+
+This patch (of 3):
+
+Currently, refresh_cpu_vm_stats returns an int, indicating how many
+changes were made during its updates.  Using this information, callers
+like vmstat_update can heuristically determine if more work will be done
+in the future.
+
+However, all of refresh_cpu_vm_stats's callers either (a) ignore the
+result, only caring about performing the updates, or (b) only care about
+whether changes were made, but not *how many* changes were made.
+
+Simplify the code by returning a bool instead to indicate if updates were
+made.
+
+In addition, simplify fold_diff and decay_pcp_high to return a bool for
+the same reason.
+
+Link: https://lkml.kernel.org/r/20251013190812.787205-1-joshua.hahnjy@gmail.com
+Link: https://lkml.kernel.org/r/20251013190812.787205-2-joshua.hahnjy@gmail.com
+Signed-off-by: Joshua Hahn <joshua.hahnjy@gmail.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: SeongJae Park <sj@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Chris Mason <clm@fb.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
