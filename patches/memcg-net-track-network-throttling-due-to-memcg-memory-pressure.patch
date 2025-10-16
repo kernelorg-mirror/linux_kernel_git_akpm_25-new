@@ -1,0 +1,113 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: memcg: net: track network throttling due to memcg memory pressure
+Date: Thu, 16 Oct 2025 09:10:35 -0700
+
+The kernel can throttle network sockets if the memory cgroup associated
+with the corresponding socket is under memory pressure.  The throttling
+actions include clamping the transmit window, failing to expand receive or
+send buffers, aggressively prune out-of-order receive queue, FIN deferred
+to a retransmitted packet and more.  Let's add memcg metric to track such
+throttling actions.
+
+At the moment memcg memory pressure is defined through vmpressure and in
+future it may be defined using PSI or we may add more flexible way for the
+users to define memory pressure, maybe through ebpf.  However the
+potential throttling actions will remain the same, so this newly
+introduced metric will continue to track throttling actions irrespective
+of how memcg memory pressure is defined.
+
+Link: https://lkml.kernel.org/r/20251016161035.86161-1-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Roman Gushchin <roman.gushchin@linux.dev>
+Reviewed-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Daniel Sedlak <daniel.sedlak@cdn77.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Jakub Kacinski <kuba@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Willem de Bruijn <willemb@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/cgroup-v2.rst |    4 ++++
+ include/linux/memcontrol.h              |    1 +
+ include/net/sock.h                      |    6 +++++-
+ kernel/cgroup/cgroup.c                  |    1 +
+ mm/memcontrol.c                         |    3 +++
+ 5 files changed, 14 insertions(+), 1 deletion(-)
+
+--- a/Documentation/admin-guide/cgroup-v2.rst~memcg-net-track-network-throttling-due-to-memcg-memory-pressure
++++ a/Documentation/admin-guide/cgroup-v2.rst
+@@ -1515,6 +1515,10 @@ The following nested keys are defined.
+           oom_group_kill
+                 The number of times a group OOM has occurred.
+ 
++          sock_throttled
++                The number of times network sockets associated with
++                this cgroup are throttled.
++
+   memory.events.local
+ 	Similar to memory.events but the fields in the file are local
+ 	to the cgroup i.e. not hierarchical. The file modified event
+--- a/include/linux/memcontrol.h~memcg-net-track-network-throttling-due-to-memcg-memory-pressure
++++ a/include/linux/memcontrol.h
+@@ -52,6 +52,7 @@ enum memcg_memory_event {
+ 	MEMCG_SWAP_HIGH,
+ 	MEMCG_SWAP_MAX,
+ 	MEMCG_SWAP_FAIL,
++	MEMCG_SOCK_THROTTLED,
+ 	MEMCG_NR_MEMORY_EVENTS,
+ };
+ 
+--- a/include/net/sock.h~memcg-net-track-network-throttling-due-to-memcg-memory-pressure
++++ a/include/net/sock.h
+@@ -2635,8 +2635,12 @@ static inline bool mem_cgroup_sk_under_m
+ #endif /* CONFIG_MEMCG_V1 */
+ 
+ 	do {
+-		if (time_before64(get_jiffies_64(), mem_cgroup_get_socket_pressure(memcg)))
++		if (time_before64(get_jiffies_64(),
++				  mem_cgroup_get_socket_pressure(memcg))) {
++			memcg_memory_event(mem_cgroup_from_sk(sk),
++					   MEMCG_SOCK_THROTTLED);
+ 			return true;
++		}
+ 	} while ((memcg = parent_mem_cgroup(memcg)));
+ 
+ 	return false;
+--- a/kernel/cgroup/cgroup.c~memcg-net-track-network-throttling-due-to-memcg-memory-pressure
++++ a/kernel/cgroup/cgroup.c
+@@ -4704,6 +4704,7 @@ void cgroup_file_notify(struct cgroup_fi
+ 	}
+ 	spin_unlock_irqrestore(&cgroup_file_kn_lock, flags);
+ }
++EXPORT_SYMBOL_GPL(cgroup_file_notify);
+ 
+ /**
+  * cgroup_file_show - show or hide a hidden cgroup file
+--- a/mm/memcontrol.c~memcg-net-track-network-throttling-due-to-memcg-memory-pressure
++++ a/mm/memcontrol.c
+@@ -81,6 +81,7 @@ struct cgroup_subsys memory_cgrp_subsys
+ EXPORT_SYMBOL(memory_cgrp_subsys);
+ 
+ struct mem_cgroup *root_mem_cgroup __read_mostly;
++EXPORT_SYMBOL(root_mem_cgroup);
+ 
+ /* Active memory cgroup to use from an interrupt context */
+ DEFINE_PER_CPU(struct mem_cgroup *, int_active_memcg);
+@@ -4464,6 +4465,8 @@ static void __memory_events_show(struct
+ 		   atomic_long_read(&events[MEMCG_OOM_KILL]));
+ 	seq_printf(m, "oom_group_kill %lu\n",
+ 		   atomic_long_read(&events[MEMCG_OOM_GROUP_KILL]));
++	seq_printf(m, "sock_throttled %lu\n",
++		   atomic_long_read(&events[MEMCG_SOCK_THROTTLED]));
+ }
+ 
+ static int memory_events_show(struct seq_file *m, void *v)
+_
