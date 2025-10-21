@@ -1,0 +1,92 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/shmem: fix THP allocation size check and fallback
+Date: Wed, 22 Oct 2025 03:04:36 +0800
+
+There are some problems with the code implementations of THP fallback. 
+suitable_orders could be zero, and calling highest_order on a zero value
+returns an overflowed size.  And the order check loop is updating the
+index value on every loop which may cause the index to be aligned by a
+larger value while the loop shrinks the order.  And it forgot to try order
+0 after the final loop.
+
+This is usually fine because shmem_add_to_page_cache ensures the shmem
+mapping is still sane, but it might cause many potential issues like
+allocating random folios into the random position in the map or return
+-ENOMEM by accident.  This triggered some strange userspace errors [1],
+and shouldn't have happened in the first place.
+
+Link: https://lkml.kernel.org/r/20251021190436.81682-1-ryncsn@gmail.com
+Link: https://lore.kernel.org/linux-mm/CAMgjq7DqgAmj25nDUwwu1U2cSGSn8n4-Hqpgottedy0S6YYeUw@mail.gmail.com/ [1]
+Fixes: e7a2ab7b3bb5d ("mm: shmem: add mTHP support for anonymous shmem")
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/shmem.c |   26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+
+--- a/mm/shmem.c~mm-shmem-fix-thp-allocation-size-check-and-fallback
++++ a/mm/shmem.c
+@@ -1824,6 +1824,9 @@ static unsigned long shmem_suitable_orde
+ 	unsigned long pages;
+ 	int order;
+ 
++	if (!orders)
++		return 0;
++
+ 	if (vma) {
+ 		orders = thp_vma_suitable_orders(vma, vmf->address, orders);
+ 		if (!orders)
+@@ -1888,27 +1891,28 @@ static struct folio *shmem_alloc_and_add
+ 	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+ 		orders = 0;
+ 
+-	if (orders > 0) {
+-		suitable_orders = shmem_suitable_orders(inode, vmf,
+-							mapping, index, orders);
++	suitable_orders = shmem_suitable_orders(inode, vmf,
++						mapping, index, orders);
+ 
++	if (suitable_orders) {
+ 		order = highest_order(suitable_orders);
+-		while (suitable_orders) {
++		do {
+ 			pages = 1UL << order;
+-			index = round_down(index, pages);
+-			folio = shmem_alloc_folio(gfp, order, info, index);
+-			if (folio)
++			folio = shmem_alloc_folio(gfp, order, info, round_down(index, pages));
++			if (folio) {
++				index = round_down(index, pages);
+ 				goto allocated;
++			}
+ 
+ 			if (pages == HPAGE_PMD_NR)
+ 				count_vm_event(THP_FILE_FALLBACK);
+ 			count_mthp_stat(order, MTHP_STAT_SHMEM_FALLBACK);
+ 			order = next_order(&suitable_orders, order);
+-		}
+-	} else {
+-		pages = 1;
+-		folio = shmem_alloc_folio(gfp, 0, info, index);
++		} while (suitable_orders);
+ 	}
++
++	pages = 1;
++	folio = shmem_alloc_folio(gfp, 0, info, index);
+ 	if (!folio)
+ 		return ERR_PTR(-ENOMEM);
+ 
+_
