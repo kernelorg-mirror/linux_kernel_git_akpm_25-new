@@ -1,36 +1,73 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
-To: akpm@linux-foundation.org, brauner@kernel.org, corbet@lwn.net, graf@amazon.com, jgg@ziepe.ca, linux-kernel@vger.kernel.org, linux-kselftest@vger.kernel.org, linux-mm@kvack.org, masahiroy@kernel.org, ojeda@kernel.org, pasha.tatashin@soleen.com, pratyush@kernel.org, rdunlap@infradead.org, rppt@kernel.org, tj@kernel.org, jasonmiu@google.com, dmatlack@google.com, skhawaja@google.com
-Subject: [PATCH v3 1/3] liveupdate: kho: warn and fail on metadata or preserved memory in scratch area
+Subject: kho: warn and fail on metadata or preserved memory in scratch area
 Date: Mon, 20 Oct 2025 20:08:50 -0400
-X-Mailer: git-send-email 2.51.0.869.ge66316f041-goog
+
+Patch series "KHO: kfence + KHO memory corruption fix", v3.
+
+This series fixes a memory corruption bug in KHO that occurs when KFENCE
+is enabled.
+
+The root cause is that KHO metadata, allocated via kzalloc(), can be
+randomly serviced by kfence_alloc().  When a kernel boots via KHO, the
+early memblock allocator is restricted to a "scratch area".  This forces
+the KFENCE pool to be allocated within this scratch area, creating a
+conflict.  If KHO metadata is subsequently placed in this pool, it gets
+corrupted during the next kexec operation.
+
+Patch 1/3 introduces a debug-only feature (CONFIG_KEXEC_HANDOVER_DEBUG)
+that adds checks to detect and fail any operation that attempts to place
+KHO metadata or preserved memory within the scratch area.  This serves as
+a validation and diagnostic tool to confirm the problem without affecting
+production builds.
+
+Patch 2/3 Increases bitmap to PAGE_SIZE, so buddy allocator can be used.
+
+Patch 3/3 Provides the fix by modifying KHO to allocate its metadata
+directly from the buddy allocator instead of slab.  This bypasses the
+KFENCE interception entirely.
+
+
+This patch (of 3):
 
 It is invalid for KHO metadata or preserved memory regions to be located
 within the KHO scratch area, as this area is overwritten when the next
-kernel is loaded, and used early in boot by the next kernel. This can
+kernel is loaded, and used early in boot by the next kernel.  This can
 lead to memory corruption.
 
-Adds checks to kho_preserve_* and KHO's internal metadata allocators
+Add checks to kho_preserve_* and KHO's internal metadata allocators
 (xa_load_or_alloc, new_chunk) to verify that the physical address of the
-memory does not overlap with any defined scratch region. If an overlap
-is detected, the operation will fail and a WARN_ON is triggered. To
-avoid performance overhead in production kernels, these checks are
-enabled only when CONFIG_KEXEC_HANDOVER_DEBUG is selected.
+memory does not overlap with any defined scratch region.  If an overlap is
+detected, the operation will fail and a WARN_ON is triggered.  To avoid
+performance overhead in production kernels, these checks are enabled only
+when CONFIG_KEXEC_HANDOVER_DEBUG is selected.
 
+Link: https://lkml.kernel.org/r/20251021000852.2924827-1-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251021000852.2924827-2-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Matlack <dmatlack@google.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Pratyush Yadav <pratyush@kernel.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Samiullah Khawaja <skhawaja@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
- kernel/Kconfig.kexec             |  9 ++++++
- kernel/Makefile                  |  1 +
- kernel/kexec_handover.c          | 53 ++++++++++++++++++++++----------
- kernel/kexec_handover_debug.c    | 25 +++++++++++++++
- kernel/kexec_handover_internal.h | 16 ++++++++++
- 5 files changed, 87 insertions(+), 17 deletions(-)
- create mode 100644 kernel/kexec_handover_debug.c
- create mode 100644 kernel/kexec_handover_internal.h
 
-diff --git a/kernel/Kconfig.kexec b/kernel/Kconfig.kexec
-index 422270d64820..c94d36b5fcd9 100644
---- a/kernel/Kconfig.kexec
-+++ b/kernel/Kconfig.kexec
+ kernel/Kconfig.kexec             |    9 ++++
+ kernel/Makefile                  |    1 
+ kernel/kexec_handover.c          |   53 +++++++++++++++++++----------
+ kernel/kexec_handover_debug.c    |   25 +++++++++++++
+ kernel/kexec_handover_internal.h |   16 ++++++++
+ 5 files changed, 87 insertions(+), 17 deletions(-)
+
+--- a/kernel/Kconfig.kexec~liveupdate-kho-warn-and-fail-on-metadata-or-preserved-memory-in-scratch-area
++++ a/kernel/Kconfig.kexec
 @@ -109,6 +109,15 @@ config KEXEC_HANDOVER
  	  to keep data or state alive across the kexec. For this to work,
  	  both source and target kernels need to have this option enabled.
@@ -47,22 +84,8 @@ index 422270d64820..c94d36b5fcd9 100644
  config CRASH_DUMP
  	bool "kernel crash dumps"
  	default ARCH_DEFAULT_CRASH_DUMP
-diff --git a/kernel/Makefile b/kernel/Makefile
-index df3dd8291bb6..9fe722305c9b 100644
---- a/kernel/Makefile
-+++ b/kernel/Makefile
-@@ -83,6 +83,7 @@ obj-$(CONFIG_KEXEC) += kexec.o
- obj-$(CONFIG_KEXEC_FILE) += kexec_file.o
- obj-$(CONFIG_KEXEC_ELF) += kexec_elf.o
- obj-$(CONFIG_KEXEC_HANDOVER) += kexec_handover.o
-+obj-$(CONFIG_KEXEC_HANDOVER_DEBUG) += kexec_handover_debug.o
- obj-$(CONFIG_BACKTRACE_SELF_TEST) += backtracetest.o
- obj-$(CONFIG_COMPAT) += compat.o
- obj-$(CONFIG_CGROUPS) += cgroup/
-diff --git a/kernel/kexec_handover.c b/kernel/kexec_handover.c
-index 76f0940fb485..7b460806ef4f 100644
---- a/kernel/kexec_handover.c
-+++ b/kernel/kexec_handover.c
+--- a/kernel/kexec_handover.c~liveupdate-kho-warn-and-fail-on-metadata-or-preserved-memory-in-scratch-area
++++ a/kernel/kexec_handover.c
 @@ -8,6 +8,7 @@
  
  #define pr_fmt(fmt) "KHO: " fmt
@@ -117,7 +140,7 @@ index 76f0940fb485..7b460806ef4f 100644
  }
  
  static void __kho_unpreserve(struct kho_mem_track *track, unsigned long pfn,
-@@ -345,15 +347,19 @@ static_assert(sizeof(struct khoser_mem_chunk) == PAGE_SIZE);
+@@ -345,15 +347,19 @@ static_assert(sizeof(struct khoser_mem_c
  static struct khoser_mem_chunk *new_chunk(struct khoser_mem_chunk *cur_chunk,
  					  unsigned long order)
  {
@@ -140,7 +163,7 @@ index 76f0940fb485..7b460806ef4f 100644
  }
  
  static void kho_mem_ser_free(struct khoser_mem_chunk *first_chunk)
-@@ -374,14 +380,17 @@ static int kho_mem_serialize(struct kho_serialization *ser)
+@@ -374,14 +380,17 @@ static int kho_mem_serialize(struct kho_
  	struct khoser_mem_chunk *chunk = NULL;
  	struct kho_mem_phys *physxa;
  	unsigned long order;
@@ -159,7 +182,7 @@ index 76f0940fb485..7b460806ef4f 100644
  
  		if (!first_chunk)
  			first_chunk = chunk;
-@@ -391,8 +400,10 @@ static int kho_mem_serialize(struct kho_serialization *ser)
+@@ -391,8 +400,10 @@ static int kho_mem_serialize(struct kho_
  
  			if (chunk->hdr.num_elms == ARRAY_SIZE(chunk->bitmaps)) {
  				chunk = new_chunk(chunk, order);
@@ -171,7 +194,7 @@ index 76f0940fb485..7b460806ef4f 100644
  			}
  
  			elm = &chunk->bitmaps[chunk->hdr.num_elms];
-@@ -409,7 +420,7 @@ static int kho_mem_serialize(struct kho_serialization *ser)
+@@ -409,7 +420,7 @@ static int kho_mem_serialize(struct kho_
  
  err_free:
  	kho_mem_ser_free(first_chunk);
@@ -180,7 +203,7 @@ index 76f0940fb485..7b460806ef4f 100644
  }
  
  static void __init deserialize_bitmap(unsigned int order,
-@@ -752,6 +763,9 @@ int kho_preserve_folio(struct folio *folio)
+@@ -752,6 +763,9 @@ int kho_preserve_folio(struct folio *fol
  	const unsigned int order = folio_order(folio);
  	struct kho_mem_track *track = &kho_out.ser.track;
  
@@ -190,7 +213,7 @@ index 76f0940fb485..7b460806ef4f 100644
  	return __kho_preserve_order(track, pfn, order);
  }
  EXPORT_SYMBOL_GPL(kho_preserve_folio);
-@@ -775,6 +789,11 @@ int kho_preserve_pages(struct page *page, unsigned int nr_pages)
+@@ -775,6 +789,11 @@ int kho_preserve_pages(struct page *page
  	unsigned long failed_pfn = 0;
  	int err = 0;
  
@@ -202,11 +225,10 @@ index 76f0940fb485..7b460806ef4f 100644
  	while (pfn < end_pfn) {
  		const unsigned int order =
  			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
-diff --git a/kernel/kexec_handover_debug.c b/kernel/kexec_handover_debug.c
+diff --git a/kernel/kexec_handover_debug.c a/kernel/kexec_handover_debug.c
 new file mode 100644
-index 000000000000..6efb696f5426
 --- /dev/null
-+++ b/kernel/kexec_handover_debug.c
++++ a/kernel/kexec_handover_debug.c
 @@ -0,0 +1,25 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
@@ -233,11 +255,10 @@ index 000000000000..6efb696f5426
 +
 +	return false;
 +}
-diff --git a/kernel/kexec_handover_internal.h b/kernel/kexec_handover_internal.h
+diff --git a/kernel/kexec_handover_internal.h a/kernel/kexec_handover_internal.h
 new file mode 100644
-index 000000000000..05e9720ba7b9
 --- /dev/null
-+++ b/kernel/kexec_handover_internal.h
++++ a/kernel/kexec_handover_internal.h
 @@ -0,0 +1,16 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
@@ -255,5 +276,14 @@ index 000000000000..05e9720ba7b9
 +#endif /* CONFIG_KEXEC_HANDOVER_DEBUG */
 +
 +#endif /* LINUX_KEXEC_HANDOVER_INTERNAL_H */
--- 
-2.51.0.869.ge66316f041-goog
+--- a/kernel/Makefile~liveupdate-kho-warn-and-fail-on-metadata-or-preserved-memory-in-scratch-area
++++ a/kernel/Makefile
+@@ -83,6 +83,7 @@ obj-$(CONFIG_KEXEC) += kexec.o
+ obj-$(CONFIG_KEXEC_FILE) += kexec_file.o
+ obj-$(CONFIG_KEXEC_ELF) += kexec_elf.o
+ obj-$(CONFIG_KEXEC_HANDOVER) += kexec_handover.o
++obj-$(CONFIG_KEXEC_HANDOVER_DEBUG) += kexec_handover_debug.o
+ obj-$(CONFIG_BACKTRACE_SELF_TEST) += backtracetest.o
+ obj-$(CONFIG_COMPAT) += compat.o
+ obj-$(CONFIG_CGROUPS) += cgroup/
+_
