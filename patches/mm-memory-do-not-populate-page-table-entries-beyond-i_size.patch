@@ -1,0 +1,144 @@
+From: Kiryl Shutsemau <kas@kernel.org>
+Subject: mm/memory: do not populate page table entries beyond i_size
+Date: Thu, 23 Oct 2025 10:32:50 +0100
+
+Accesses within VMA, but beyond i_size rounded up to PAGE_SIZE are
+supposed to generate SIGBUS.
+
+Recent changes attempted to fault in full folio where possible.  They did
+not respect i_size, which led to populating PTEs beyond i_size and
+breaking SIGBUS semantics.
+
+Darrick reported generic/749 breakage because of this.
+
+However, the problem existed before the recent changes.  With huge=always
+tmpfs, any write to a file leads to PMD-size allocation.  Following the
+fault-in of the folio will install PMD mapping regardless of i_size.
+
+Fix filemap_map_pages() and finish_fault() to not install:
+  - PTEs beyond i_size;
+  - PMD mappings across i_size;
+
+Link: https://lkml.kernel.org/r/20251023093251.54146-2-kirill@shutemov.name
+Fixes: 19773df031bc ("mm/fault: try to map the entire file folio in finish_fault()")
+Fixes: 357b92761d94 ("mm/filemap: map entire large folio faultaround")
+Signed-off-by: Kiryl Shutsemau <kas@kernel.org>
+Reported-by: "Darrick J. Wong" <djwong@kernel.org>
+Tested-by: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/filemap.c |   18 ++++++++++--------
+ mm/memory.c  |   13 +++++++++++--
+ 2 files changed, 21 insertions(+), 10 deletions(-)
+
+--- a/mm/filemap.c~mm-memory-do-not-populate-page-table-entries-beyond-i_size
++++ a/mm/filemap.c
+@@ -3681,7 +3681,8 @@ skip:
+ static vm_fault_t filemap_map_folio_range(struct vm_fault *vmf,
+ 			struct folio *folio, unsigned long start,
+ 			unsigned long addr, unsigned int nr_pages,
+-			unsigned long *rss, unsigned short *mmap_miss)
++			unsigned long *rss, unsigned short *mmap_miss,
++			pgoff_t file_end)
+ {
+ 	unsigned int ref_from_caller = 1;
+ 	vm_fault_t ret = 0;
+@@ -3697,7 +3698,8 @@ static vm_fault_t filemap_map_folio_rang
+ 	 */
+ 	addr0 = addr - start * PAGE_SIZE;
+ 	if (folio_within_vma(folio, vmf->vma) &&
+-	    (addr0 & PMD_MASK) == ((addr0 + folio_size(folio) - 1) & PMD_MASK)) {
++	    (addr0 & PMD_MASK) == ((addr0 + folio_size(folio) - 1) & PMD_MASK) &&
++	    file_end >= folio_next_index(folio)) {
+ 		vmf->pte -= start;
+ 		page -= start;
+ 		addr = addr0;
+@@ -3817,7 +3819,11 @@ vm_fault_t filemap_map_pages(struct vm_f
+ 	if (!folio)
+ 		goto out;
+ 
+-	if (filemap_map_pmd(vmf, folio, start_pgoff)) {
++	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
++	end_pgoff = min(end_pgoff, file_end);
++
++	if (file_end >= folio_next_index(folio) &&
++	    filemap_map_pmd(vmf, folio, start_pgoff)) {
+ 		ret = VM_FAULT_NOPAGE;
+ 		goto out;
+ 	}
+@@ -3830,10 +3836,6 @@ vm_fault_t filemap_map_pages(struct vm_f
+ 		goto out;
+ 	}
+ 
+-	file_end = DIV_ROUND_UP(i_size_read(mapping->host), PAGE_SIZE) - 1;
+-	if (end_pgoff > file_end)
+-		end_pgoff = file_end;
+-
+ 	folio_type = mm_counter_file(folio);
+ 	do {
+ 		unsigned long end;
+@@ -3850,7 +3852,7 @@ vm_fault_t filemap_map_pages(struct vm_f
+ 		else
+ 			ret |= filemap_map_folio_range(vmf, folio,
+ 					xas.xa_index - folio->index, addr,
+-					nr_pages, &rss, &mmap_miss);
++					nr_pages, &rss, &mmap_miss, file_end);
+ 
+ 		folio_unlock(folio);
+ 	} while ((folio = next_uptodate_folio(&xas, mapping, end_pgoff)) != NULL);
+--- a/mm/memory.c~mm-memory-do-not-populate-page-table-entries-beyond-i_size
++++ a/mm/memory.c
+@@ -5480,6 +5480,7 @@ vm_fault_t finish_fault(struct vm_fault
+ 	int type, nr_pages;
+ 	unsigned long addr;
+ 	bool needs_fallback = false;
++	pgoff_t file_end = -1UL;
+ 
+ fallback:
+ 	addr = vmf->address;
+@@ -5501,8 +5502,15 @@ fallback:
+ 			return ret;
+ 	}
+ 
++	if (vma->vm_file) {
++		struct inode *inode = vma->vm_file->f_mapping->host;
++
++		file_end = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
++	}
++
+ 	if (pmd_none(*vmf->pmd)) {
+-		if (folio_test_pmd_mappable(folio)) {
++		if (folio_test_pmd_mappable(folio) &&
++		    file_end >= folio_next_index(folio)) {
+ 			ret = do_set_pmd(vmf, folio, page);
+ 			if (ret != VM_FAULT_FALLBACK)
+ 				return ret;
+@@ -5533,7 +5541,8 @@ fallback:
+ 		if (unlikely(vma_off < idx ||
+ 			    vma_off + (nr_pages - idx) > vma_pages(vma) ||
+ 			    pte_off < idx ||
+-			    pte_off + (nr_pages - idx)  > PTRS_PER_PTE)) {
++			    pte_off + (nr_pages - idx) > PTRS_PER_PTE ||
++			    file_end < folio_next_index(folio))) {
+ 			nr_pages = 1;
+ 		} else {
+ 			/* Now we can set mappings for the whole large folio. */
+_
