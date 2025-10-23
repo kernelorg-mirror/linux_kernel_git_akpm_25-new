@@ -1,0 +1,214 @@
+From: Kefeng Wang <wangkefeng.wang@huawei.com>
+Subject: mm: hugetlb: allocate frozen pages in alloc_gigantic_folio()
+Date: Thu, 23 Oct 2025 19:59:40 +0800
+
+The alloc_gigantic_folio() allocates a folio by alloc_contig_range() with
+refcount increated and then freeze it, convert to allocate a frozen folio
+to remove the atomic operation about folio refcount, and saving atomic
+operation during __update_and_free_hugetlb_folio too.  Also rename
+hugetlb_cma_{alloc,free}_folio() with frozen which make them more
+self-explanatory.
+
+Link: https://lkml.kernel.org/r/20251023115940.3573158-7-wangkefeng.wang@huawei.com
+Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Jane Chu <jane.chu@oracle.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/gfp.h |   23 ----------------
+ mm/hugetlb.c        |   58 ++++++++++--------------------------------
+ mm/hugetlb_cma.c    |    9 ++----
+ mm/hugetlb_cma.h    |   10 +++----
+ 4 files changed, 22 insertions(+), 78 deletions(-)
+
+--- a/include/linux/gfp.h~mm-hugetlb-allocate-frozen-pages-in-alloc_gigantic_folio
++++ a/include/linux/gfp.h
+@@ -454,29 +454,6 @@ void free_contig_frozen_range(unsigned l
+ void free_contig_range(unsigned long pfn, unsigned long nr_pages);
+ #endif
+ 
+-#ifdef CONFIG_CONTIG_ALLOC
+-static inline struct folio *folio_alloc_gigantic_noprof(int order, gfp_t gfp,
+-							int nid, nodemask_t *node)
+-{
+-	struct page *page;
+-
+-	if (WARN_ON(!order || !(gfp & __GFP_COMP)))
+-		return NULL;
+-
+-	page = alloc_contig_pages_noprof(1 << order, gfp, nid, node);
+-
+-	return page ? page_folio(page) : NULL;
+-}
+-#else
+-static inline struct folio *folio_alloc_gigantic_noprof(int order, gfp_t gfp,
+-							int nid, nodemask_t *node)
+-{
+-	return NULL;
+-}
+-#endif
+-/* This should be paired with folio_put() rather than free_contig_range(). */
+-#define folio_alloc_gigantic(...) alloc_hooks(folio_alloc_gigantic_noprof(__VA_ARGS__))
+-
+ DEFINE_FREE(free_page, void *, free_page((unsigned long)_T))
+ 
+ #endif /* __LINUX_GFP_H */
+--- a/mm/hugetlb.c~mm-hugetlb-allocate-frozen-pages-in-alloc_gigantic_folio
++++ a/mm/hugetlb.c
+@@ -124,16 +124,6 @@ static void hugetlb_unshare_pmds(struct
+ 		unsigned long start, unsigned long end, bool take_locks);
+ static struct resv_map *vma_resv_map(struct vm_area_struct *vma);
+ 
+-static void hugetlb_free_folio(struct folio *folio)
+-{
+-	if (folio_test_hugetlb_cma(folio)) {
+-		hugetlb_cma_free_folio(folio);
+-		return;
+-	}
+-
+-	folio_put(folio);
+-}
+-
+ /*
+  * Check if the hstate represents gigantic pages but gigantic page
+  * runtime support is not available. This is a common condition used to
+@@ -1502,46 +1492,24 @@ static int hstate_next_node_to_free(stru
+ 		((node = hstate_next_node_to_free(hs, mask)) || 1);	\
+ 		nr_nodes--)
+ 
+-#ifdef CONFIG_ARCH_HAS_GIGANTIC_PAGE
+-#ifdef CONFIG_CONTIG_ALLOC
++#if defined(CONFIG_ARCH_HAS_GIGANTIC_PAGE) && defined(CONFIG_CONTIG_ALLOC)
+ static struct folio *alloc_gigantic_folio(int order, gfp_t gfp_mask,
+ 		int nid, nodemask_t *nodemask)
+ {
+ 	struct folio *folio;
+-	bool retried = false;
+ 
+-retry:
+-	folio = hugetlb_cma_alloc_folio(order, gfp_mask, nid, nodemask);
+-	if (!folio) {
+-		if (hugetlb_cma_exclusive_alloc())
+-			return NULL;
+-
+-		folio = folio_alloc_gigantic(order, gfp_mask, nid, nodemask);
+-		if (!folio)
+-			return NULL;
+-	}
+-
+-	if (folio_ref_freeze(folio, 1))
++	folio = hugetlb_cma_alloc_frozen_folio(order, gfp_mask, nid, nodemask);
++	if (folio)
+ 		return folio;
+ 
+-	pr_warn("HugeTLB: unexpected refcount on PFN %lu\n", folio_pfn(folio));
+-	hugetlb_free_folio(folio);
+-	if (!retried) {
+-		retried = true;
+-		goto retry;
+-	}
+-	return NULL;
+-}
++	if (hugetlb_cma_exclusive_alloc())
++		return NULL;
+ 
+-#else /* !CONFIG_CONTIG_ALLOC */
+-static struct folio *alloc_gigantic_folio(int order, gfp_t gfp_mask, int nid,
+-					  nodemask_t *nodemask)
+-{
+-	return NULL;
++	folio = (struct folio *)alloc_contig_frozen_pages(1 << order, gfp_mask,
++							  nid, nodemask);
++	return folio;
+ }
+-#endif /* CONFIG_CONTIG_ALLOC */
+-
+-#else /* !CONFIG_ARCH_HAS_GIGANTIC_PAGE */
++#else /* !CONFIG_ARCH_HAS_GIGANTIC_PAGE || !CONFIG_CONTIG_ALLOC */
+ static struct folio *alloc_gigantic_folio(int order, gfp_t gfp_mask, int nid,
+ 					  nodemask_t *nodemask)
+ {
+@@ -1672,9 +1640,11 @@ static void __update_and_free_hugetlb_fo
+ 	if (unlikely(folio_test_hwpoison(folio)))
+ 		folio_clear_hugetlb_hwpoison(folio);
+ 
+-	folio_ref_unfreeze(folio, 1);
+-
+-	hugetlb_free_folio(folio);
++	VM_BUG_ON_FOLIO(folio_ref_count(folio), folio);
++	if (folio_test_hugetlb_cma(folio))
++		hugetlb_cma_free_frozen_folio(folio);
++	else
++		free_frozen_pages(&folio->page, folio_order(folio));
+ }
+ 
+ /*
+--- a/mm/hugetlb_cma.c~mm-hugetlb-allocate-frozen-pages-in-alloc_gigantic_folio
++++ a/mm/hugetlb_cma.c
+@@ -18,16 +18,14 @@ static unsigned long hugetlb_cma_size_in
+ static bool hugetlb_cma_only;
+ static unsigned long hugetlb_cma_size __initdata;
+ 
+-void hugetlb_cma_free_folio(struct folio *folio)
++void hugetlb_cma_free_frozen_folio(struct folio *folio)
+ {
+-	folio_ref_dec(folio);
+-
+ 	WARN_ON_ONCE(!cma_release_frozen(hugetlb_cma[folio_nid(folio)],
+ 					 &folio->page, folio_nr_pages(folio)));
+ }
+ 
+-struct folio *hugetlb_cma_alloc_folio(int order, gfp_t gfp_mask,
+-				      int nid, nodemask_t *nodemask)
++struct folio *hugetlb_cma_alloc_frozen_folio(int order, gfp_t gfp_mask,
++		int nid, nodemask_t *nodemask)
+ {
+ 	int node;
+ 	struct folio *folio;
+@@ -50,7 +48,6 @@ struct folio *hugetlb_cma_alloc_folio(in
+ 	if (!page)
+ 		return NULL;
+ 
+-	set_page_refcounted(page);
+ 	folio = page_folio(page);
+ 	folio_set_hugetlb_cma(folio);
+ 	return folio;
+--- a/mm/hugetlb_cma.h~mm-hugetlb-allocate-frozen-pages-in-alloc_gigantic_folio
++++ a/mm/hugetlb_cma.h
+@@ -3,8 +3,8 @@
+ #define _LINUX_HUGETLB_CMA_H
+ 
+ #ifdef CONFIG_CMA
+-void hugetlb_cma_free_folio(struct folio *folio);
+-struct folio *hugetlb_cma_alloc_folio(int order, gfp_t gfp_mask,
++void hugetlb_cma_free_frozen_folio(struct folio *folio);
++struct folio *hugetlb_cma_alloc_frozen_folio(int order, gfp_t gfp_mask,
+ 				      int nid, nodemask_t *nodemask);
+ struct huge_bootmem_page *hugetlb_cma_alloc_bootmem(struct hstate *h, int *nid,
+ 						    bool node_exact);
+@@ -14,12 +14,12 @@ unsigned long hugetlb_cma_total_size(voi
+ void hugetlb_cma_validate_params(void);
+ bool hugetlb_early_cma(struct hstate *h);
+ #else
+-static inline void hugetlb_cma_free_folio(struct folio *folio)
++static inline void hugetlb_cma_free_frozen_folio(struct folio *folio)
+ {
+ }
+ 
+-static inline struct folio *hugetlb_cma_alloc_folio(int order, gfp_t gfp_mask,
+-		int nid, nodemask_t *nodemask)
++static inline struct folio *hugetlb_cma_alloc_frozen_folio(int order,
++		gfp_t gfp_mask,	int nid, nodemask_t *nodemask)
+ {
+ 	return NULL;
+ }
+_
