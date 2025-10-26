@@ -1,11 +1,11 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
 Subject: liveupdate: kho: move to kernel/liveupdate
-Date: Tue, 7 Oct 2025 03:30:59 +0000
+Date: Fri, 24 Oct 2025 12:10:00 -0400
 
 Move KHO to kernel/liveupdate/ in preparation of placing all Live Update
 core kernel related files to the same place.
 
-Link: https://lkml.kernel.org/r/20251007033100.836886-7-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251024161002.747372-7-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
 Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
 Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
@@ -24,17 +24,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  Documentation/core-api/kho/concepts.rst     |    2 
  MAINTAINERS                                 |    2 
  init/Kconfig                                |    2 
- kernel/Kconfig.kexec                        |   25 
- kernel/Makefile                             |    3 
- kernel/kexec_handover.c                     | 1510 ------------------
- kernel/kexec_handover_debug.c               |  216 --
- kernel/kexec_handover_internal.h            |   45 
- kernel/liveupdate/Kconfig                   |   30 
- kernel/liveupdate/Makefile                  |    4 
- kernel/liveupdate/kexec_handover.c          | 1510 ++++++++++++++++++
- kernel/liveupdate/kexec_handover_debug.c    |  216 ++
- kernel/liveupdate/kexec_handover_internal.h |   45 
- 13 files changed, 1810 insertions(+), 1800 deletions(-)
+ kernel/Kconfig.kexec                        |   34 
+ kernel/Makefile                             |    4 
+ kernel/kexec_handover.c                     | 1527 ------------------
+ kernel/kexec_handover_debug.c               |   25 
+ kernel/kexec_handover_debugfs.c             |  219 --
+ kernel/kexec_handover_internal.h            |   54 
+ kernel/liveupdate/Kconfig                   |   39 
+ kernel/liveupdate/Makefile                  |    5 
+ kernel/liveupdate/kexec_handover.c          | 1527 ++++++++++++++++++
+ kernel/liveupdate/kexec_handover_debug.c    |   25 
+ kernel/liveupdate/kexec_handover_debugfs.c  |  219 ++
+ kernel/liveupdate/kexec_handover_internal.h |   54 
+ 15 files changed, 1874 insertions(+), 1864 deletions(-)
 
 --- a/Documentation/core-api/kho/concepts.rst~liveupdate-kho-move-to-kernel-liveupdate
 +++ a/Documentation/core-api/kho/concepts.rst
@@ -47,7 +49,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
     :export:
 --- a/init/Kconfig~liveupdate-kho-move-to-kernel-liveupdate
 +++ a/init/Kconfig
-@@ -2138,6 +2138,8 @@ config TRACEPOINTS
+@@ -2156,6 +2156,8 @@ config TRACEPOINTS
  
  source "kernel/Kconfig.kexec"
  
@@ -58,7 +60,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  source "arch/Kconfig"
 --- a/kernel/Kconfig.kexec~liveupdate-kho-move-to-kernel-liveupdate
 +++ a/kernel/Kconfig.kexec
-@@ -94,31 +94,6 @@ config KEXEC_JUMP
+@@ -94,40 +94,6 @@ config KEXEC_JUMP
  	  Jump between original kernel and kexeced kernel and invoke
  	  code in physical address mode via KEXEC
  
@@ -77,6 +79,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	  to keep data or state alive across the kexec. For this to work,
 -	  both source and target kernels need to have this option enabled.
 -
+-config KEXEC_HANDOVER_DEBUG
+-	bool "Enable Kexec Handover debug checks"
+-	depends on KEXEC_HANDOVER_DEBUGFS
+-	help
+-	  This option enables extra sanity checks for the Kexec Handover
+-	  subsystem. Since, KHO performance is crucial in live update
+-	  scenarios and the extra code might be adding overhead it is
+-	  only optionally enabled.
+-
 -config KEXEC_HANDOVER_DEBUGFS
 -	bool "kexec handover debugfs interface"
 -	depends on KEXEC_HANDOVER
@@ -94,7 +105,7 @@ diff --git a/kernel/kexec_handover.c a/kernel/kexec_handover.c
 deleted file mode 100644
 --- a/kernel/kexec_handover.c
 +++ /dev/null
-@@ -1,1510 +0,0 @@
+@@ -1,1527 +0,0 @@
 -// SPDX-License-Identifier: GPL-2.0-only
 -/*
 - * kexec_handover.c - kexec handover metadata processing
@@ -105,6 +116,7 @@ deleted file mode 100644
 -
 -#define pr_fmt(fmt) "KHO: " fmt
 -
+-#include <linux/cleanup.h>
 -#include <linux/cma.h>
 -#include <linux/count_zeros.h>
 -#include <linux/kexec.h>
@@ -117,6 +129,7 @@ deleted file mode 100644
 -
 -#include <asm/early_ioremap.h>
 -
+-#include "kexec_handover_internal.h"
 -/*
 - * KHO is tightly coupled with mm init and needs access to some of mm
 - * internal APIs.
@@ -163,10 +176,10 @@ deleted file mode 100644
 - * Keep track of memory that is to be preserved across KHO.
 - *
 - * The serializing side uses two levels of xarrays to manage chunks of per-order
-- * 512 byte bitmaps. For instance if PAGE_SIZE = 4096, the entire 1G order of a
-- * 1TB system would fit inside a single 512 byte bitmap. For order 0 allocations
-- * each bitmap will cover 16M of address space. Thus, for 16G of memory at most
-- * 512K of bitmap memory will be needed for order 0.
+- * PAGE_SIZE byte bitmaps. For instance if PAGE_SIZE = 4096, the entire 1G order
+- * of a 8TB system would fit inside a single 4096 byte bitmap. For order 0
+- * allocations each bitmap will cover 128M of address space. Thus, for 16G of
+- * memory at most 512K of bitmap memory will be needed for order 0.
 - *
 - * This approach is fully incremental, as the serialization progresses folios
 - * can continue be aggregated to the tracker. The final step, immediately prior
@@ -174,11 +187,13 @@ deleted file mode 100644
 - * successor kernel to parse.
 - */
 -
--#define PRESERVE_BITS (512 * 8)
+-#define PRESERVE_BITS (PAGE_SIZE * 8)
 -
 -struct kho_mem_phys_bits {
 -	DECLARE_BITMAP(preserve, PRESERVE_BITS);
 -};
+-
+-static_assert(sizeof(struct kho_mem_phys_bits) == PAGE_SIZE);
 -
 -struct kho_mem_phys {
 -	/*
@@ -226,28 +241,28 @@ deleted file mode 100644
 -	.finalized = false,
 -};
 -
--static void *xa_load_or_alloc(struct xarray *xa, unsigned long index, size_t sz)
+-static void *xa_load_or_alloc(struct xarray *xa, unsigned long index)
 -{
--	void *elm, *res;
+-	void *res = xa_load(xa, index);
 -
--	elm = xa_load(xa, index);
--	if (elm)
--		return elm;
+-	if (res)
+-		return res;
 -
--	elm = kzalloc(sz, GFP_KERNEL);
+-	void *elm __free(free_page) = (void *)get_zeroed_page(GFP_KERNEL);
+-
 -	if (!elm)
 -		return ERR_PTR(-ENOMEM);
 -
+-	if (WARN_ON(kho_scratch_overlap(virt_to_phys(elm), PAGE_SIZE)))
+-		return ERR_PTR(-EINVAL);
+-
 -	res = xa_cmpxchg(xa, index, NULL, elm, GFP_KERNEL);
 -	if (xa_is_err(res))
--		res = ERR_PTR(xa_err(res));
--
--	if (res) {
--		kfree(elm);
+-		return ERR_PTR(xa_err(res));
+-	else if (res)
 -		return res;
--	}
 -
--	return elm;
+-	return no_free_ptr(elm);
 -}
 -
 -static void __kho_unpreserve_order(struct kho_mem_track *track, unsigned long pfn,
@@ -318,8 +333,7 @@ deleted file mode 100644
 -		}
 -	}
 -
--	bits = xa_load_or_alloc(&physxa->phys_bits, pfn_high / PRESERVE_BITS,
--				sizeof(*bits));
+-	bits = xa_load_or_alloc(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
 -	if (IS_ERR(bits))
 -		return PTR_ERR(bits);
 -
@@ -447,15 +461,19 @@ deleted file mode 100644
 -static struct khoser_mem_chunk *new_chunk(struct khoser_mem_chunk *cur_chunk,
 -					  unsigned long order)
 -{
--	struct khoser_mem_chunk *chunk;
+-	struct khoser_mem_chunk *chunk __free(free_page) = NULL;
 -
--	chunk = kzalloc(PAGE_SIZE, GFP_KERNEL);
+-	chunk = (void *)get_zeroed_page(GFP_KERNEL);
 -	if (!chunk)
--		return NULL;
+-		return ERR_PTR(-ENOMEM);
+-
+-	if (WARN_ON(kho_scratch_overlap(virt_to_phys(chunk), PAGE_SIZE)))
+-		return ERR_PTR(-EINVAL);
+-
 -	chunk->hdr.order = order;
 -	if (cur_chunk)
 -		KHOSER_STORE_PTR(cur_chunk->hdr.next, chunk);
--	return chunk;
+-	return no_free_ptr(chunk);
 -}
 -
 -static void kho_mem_ser_free(struct khoser_mem_chunk *first_chunk)
@@ -476,14 +494,17 @@ deleted file mode 100644
 -	struct khoser_mem_chunk *chunk = NULL;
 -	struct kho_mem_phys *physxa;
 -	unsigned long order;
+-	int err = -ENOMEM;
 -
 -	xa_for_each(&kho_out->track.orders, order, physxa) {
 -		struct kho_mem_phys_bits *bits;
 -		unsigned long phys;
 -
 -		chunk = new_chunk(chunk, order);
--		if (!chunk)
+-		if (IS_ERR(chunk)) {
+-			err = PTR_ERR(chunk);
 -			goto err_free;
+-		}
 -
 -		if (!first_chunk)
 -			first_chunk = chunk;
@@ -493,8 +514,10 @@ deleted file mode 100644
 -
 -			if (chunk->hdr.num_elms == ARRAY_SIZE(chunk->bitmaps)) {
 -				chunk = new_chunk(chunk, order);
--				if (!chunk)
+-				if (IS_ERR(chunk)) {
+-					err = PTR_ERR(chunk);
 -					goto err_free;
+-				}
 -			}
 -
 -			elm = &chunk->bitmaps[chunk->hdr.num_elms];
@@ -511,7 +534,7 @@ deleted file mode 100644
 -
 -err_free:
 -	kho_mem_ser_free(first_chunk);
--	return -ENOMEM;
+-	return err;
 -}
 -
 -static void __init deserialize_bitmap(unsigned int order,
@@ -782,7 +805,6 @@ deleted file mode 100644
 -int kho_add_subtree(const char *name, void *fdt)
 -{
 -	struct kho_sub_fdt *sub_fdt;
--	int err;
 -
 -	sub_fdt = kmalloc(sizeof(*sub_fdt), GFP_KERNEL);
 -	if (!sub_fdt)
@@ -792,12 +814,11 @@ deleted file mode 100644
 -	sub_fdt->name = name;
 -	sub_fdt->fdt = fdt;
 -
--	mutex_lock(&kho_out.fdts_lock);
+-	guard(mutex)(&kho_out.fdts_lock);
 -	list_add_tail(&sub_fdt->l, &kho_out.sub_fdts);
--	err = kho_debugfs_fdt_add(&kho_out.dbg, name, fdt, false);
--	mutex_unlock(&kho_out.fdts_lock);
+-	WARN_ON_ONCE(kho_debugfs_fdt_add(&kho_out.dbg, name, fdt, false));
 -
--	return err;
+-	return 0;
 -}
 -EXPORT_SYMBOL_GPL(kho_add_subtree);
 -
@@ -805,7 +826,7 @@ deleted file mode 100644
 -{
 -	struct kho_sub_fdt *sub_fdt;
 -
--	mutex_lock(&kho_out.fdts_lock);
+-	guard(mutex)(&kho_out.fdts_lock);
 -	list_for_each_entry(sub_fdt, &kho_out.sub_fdts, l) {
 -		if (sub_fdt->fdt == fdt) {
 -			list_del(&sub_fdt->l);
@@ -814,8 +835,6 @@ deleted file mode 100644
 -			break;
 -		}
 -	}
--	mutex_unlock(&kho_out.fdts_lock);
--
 -}
 -EXPORT_SYMBOL_GPL(kho_remove_subtree);
 -
@@ -833,6 +852,9 @@ deleted file mode 100644
 -	const unsigned long pfn = folio_pfn(folio);
 -	const unsigned int order = folio_order(folio);
 -	struct kho_mem_track *track = &kho_out.track;
+-
+-	if (WARN_ON(kho_scratch_overlap(pfn << PAGE_SHIFT, PAGE_SIZE << order)))
+-		return -EINVAL;
 -
 -	return __kho_preserve_order(track, pfn, order);
 -}
@@ -881,6 +903,11 @@ deleted file mode 100644
 -	unsigned long failed_pfn = 0;
 -	int err = 0;
 -
+-	if (WARN_ON(kho_scratch_overlap(start_pfn << PAGE_SHIFT,
+-					nr_pages << PAGE_SHIFT))) {
+-		return -EINVAL;
+-	}
+-
 -	while (pfn < end_pfn) {
 -		const unsigned int order =
 -			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
@@ -906,11 +933,10 @@ deleted file mode 100644
 - * @page: first page in the list.
 - * @nr_pages: number of pages.
 - *
-- * Instructs KHO to unpreserve @nr_pages contigious  pages starting from @page.
-- * This call must exactly match a granularity at which memory was originally
-- * preserved by kho_preserve_pages, call with the same @page and
-- * @nr_pages). Unpreserving arbitrary sub-ranges of larger preserved blocks is
-- * not supported.
+- * Instructs KHO to unpreserve @nr_pages contiguous pages starting from @page.
+- * This must be called with the same @page and @nr_pages as the corresponding
+- * kho_preserve_pages() call. Unpreserving arbitrary sub-ranges of larger
+- * preserved blocks is not supported.
 - *
 - * Return: 0 on success, error code on failure
 - */
@@ -1249,7 +1275,7 @@ deleted file mode 100644
 -		err |= fdt_begin_node(root, fdt->name);
 -		err |= fdt_property(root, PROP_SUB_FDT, &phys, sizeof(phys));
 -		err |= fdt_end_node(root);
--	};
+-	}
 -	mutex_unlock(&kho_out.fdts_lock);
 -
 -	err |= fdt_end_node(root);
@@ -1281,8 +1307,10 @@ deleted file mode 100644
 -
 -	kho_out.finalized = true;
 -
--	return kho_debugfs_fdt_add(&kho_out.dbg, "fdt",
--				  kho_out.fdt, true);
+-	WARN_ON_ONCE(kho_debugfs_fdt_add(&kho_out.dbg, "fdt",
+-					 kho_out.fdt, true));
+-
+-	return 0;
 -}
 -
 -bool kho_finalized(void)
@@ -1609,10 +1637,40 @@ diff --git a/kernel/kexec_handover_debug.c a/kernel/kexec_handover_debug.c
 deleted file mode 100644
 --- a/kernel/kexec_handover_debug.c
 +++ /dev/null
-@@ -1,216 +0,0 @@
+@@ -1,25 +0,0 @@
 -// SPDX-License-Identifier: GPL-2.0-only
 -/*
-- * kexec_handover.c - kexec handover metadata processing
+- * kexec_handover_debug.c - kexec handover optional debug functionality
+- * Copyright (C) 2025 Google LLC, Pasha Tatashin <pasha.tatashin@soleen.com>
+- */
+-
+-#define pr_fmt(fmt) "KHO: " fmt
+-
+-#include "kexec_handover_internal.h"
+-
+-bool kho_scratch_overlap(phys_addr_t phys, size_t size)
+-{
+-	phys_addr_t scratch_start, scratch_end;
+-	unsigned int i;
+-
+-	for (i = 0; i < kho_scratch_cnt; i++) {
+-		scratch_start = kho_scratch[i].addr;
+-		scratch_end = kho_scratch[i].addr + kho_scratch[i].size;
+-
+-		if (phys < scratch_end && (phys + size) > scratch_start)
+-			return true;
+-	}
+-
+-	return false;
+-}
+diff --git a/kernel/kexec_handover_debugfs.c a/kernel/kexec_handover_debugfs.c
+deleted file mode 100644
+--- a/kernel/kexec_handover_debugfs.c
++++ /dev/null
+@@ -1,219 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * kexec_handover_debugfs.c - kexec handover debugfs interfaces
 - * Copyright (C) 2023 Alexander Graf <graf@amazon.com>
 - * Copyright (C) 2025 Microsoft Corporation, Mike Rapoport <rppt@kernel.org>
 - * Copyright (C) 2025 Google LLC, Changyuan Lyu <changyuanl@google.com>
@@ -1694,9 +1752,12 @@ deleted file mode 100644
 -	return 0;
 -}
 -
--static int kho_out_finalize_set(void *data, u64 _val)
+-static int kho_out_finalize_set(void *data, u64 val)
 -{
--	return (!!_val) ? kho_finalize() : kho_abort();
+-	if (val)
+-		return kho_finalize();
+-	else
+-		return kho_abort();
 -}
 -
 -DEFINE_DEBUGFS_ATTRIBUTE(kho_out_finalize_fops, kho_out_finalize_get,
@@ -1830,7 +1891,7 @@ diff --git a/kernel/kexec_handover_internal.h a/kernel/kexec_handover_internal.h
 deleted file mode 100644
 --- a/kernel/kexec_handover_internal.h
 +++ /dev/null
-@@ -1,45 +0,0 @@
+@@ -1,54 +0,0 @@
 -/* SPDX-License-Identifier: GPL-2.0 */
 -#ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
 -#define LINUX_KEXEC_HANDOVER_INTERNAL_H
@@ -1875,15 +1936,24 @@ deleted file mode 100644
 -					  void *fdt) { }
 -#endif /* CONFIG_KEXEC_HANDOVER_DEBUGFS */
 -
+-#ifdef CONFIG_KEXEC_HANDOVER_DEBUG
+-bool kho_scratch_overlap(phys_addr_t phys, size_t size);
+-#else
+-static inline bool kho_scratch_overlap(phys_addr_t phys, size_t size)
+-{
+-	return false;
+-}
+-#endif /* CONFIG_KEXEC_HANDOVER_DEBUG */
+-
 -#endif /* LINUX_KEXEC_HANDOVER_INTERNAL_H */
 diff --git a/kernel/liveupdate/Kconfig a/kernel/liveupdate/Kconfig
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/Kconfig
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,39 @@
 +# SPDX-License-Identifier: GPL-2.0-only
 +
-+menu "Live Update"
++menu "Live Update and Kexec HandOver"
 +
 +config KEXEC_HANDOVER
 +	bool "kexec handover"
@@ -1900,6 +1970,15 @@ new file mode 100644
 +	  to keep data or state alive across the kexec. For this to work,
 +	  both source and target kernels need to have this option enabled.
 +
++config KEXEC_HANDOVER_DEBUG
++	bool "Enable Kexec Handover debug checks"
++	depends on KEXEC_HANDOVER_DEBUGFS
++	help
++	  This option enables extra sanity checks for the Kexec Handover
++	  subsystem. Since, KHO performance is crucial in live update
++	  scenarios and the extra code might be adding overhead it is
++	  only optionally enabled.
++
 +config KEXEC_HANDOVER_DEBUGFS
 +	bool "kexec handover debugfs interface"
 +	depends on KEXEC_HANDOVER
@@ -1912,10 +1991,10 @@ new file mode 100644
 +
 +endmenu
 diff --git a/kernel/liveupdate/kexec_handover.c a/kernel/liveupdate/kexec_handover.c
-new file mode 100664
+new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/kexec_handover.c
-@@ -0,0 +1,1510 @@
+@@ -0,0 +1,1527 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * kexec_handover.c - kexec handover metadata processing
@@ -1926,6 +2005,7 @@ new file mode 100664
 +
 +#define pr_fmt(fmt) "KHO: " fmt
 +
++#include <linux/cleanup.h>
 +#include <linux/cma.h>
 +#include <linux/count_zeros.h>
 +#include <linux/kexec.h>
@@ -1938,6 +2018,7 @@ new file mode 100664
 +
 +#include <asm/early_ioremap.h>
 +
++#include "kexec_handover_internal.h"
 +/*
 + * KHO is tightly coupled with mm init and needs access to some of mm
 + * internal APIs.
@@ -1984,10 +2065,10 @@ new file mode 100664
 + * Keep track of memory that is to be preserved across KHO.
 + *
 + * The serializing side uses two levels of xarrays to manage chunks of per-order
-+ * 512 byte bitmaps. For instance if PAGE_SIZE = 4096, the entire 1G order of a
-+ * 1TB system would fit inside a single 512 byte bitmap. For order 0 allocations
-+ * each bitmap will cover 16M of address space. Thus, for 16G of memory at most
-+ * 512K of bitmap memory will be needed for order 0.
++ * PAGE_SIZE byte bitmaps. For instance if PAGE_SIZE = 4096, the entire 1G order
++ * of a 8TB system would fit inside a single 4096 byte bitmap. For order 0
++ * allocations each bitmap will cover 128M of address space. Thus, for 16G of
++ * memory at most 512K of bitmap memory will be needed for order 0.
 + *
 + * This approach is fully incremental, as the serialization progresses folios
 + * can continue be aggregated to the tracker. The final step, immediately prior
@@ -1995,11 +2076,13 @@ new file mode 100664
 + * successor kernel to parse.
 + */
 +
-+#define PRESERVE_BITS (512 * 8)
++#define PRESERVE_BITS (PAGE_SIZE * 8)
 +
 +struct kho_mem_phys_bits {
 +	DECLARE_BITMAP(preserve, PRESERVE_BITS);
 +};
++
++static_assert(sizeof(struct kho_mem_phys_bits) == PAGE_SIZE);
 +
 +struct kho_mem_phys {
 +	/*
@@ -2047,28 +2130,28 @@ new file mode 100664
 +	.finalized = false,
 +};
 +
-+static void *xa_load_or_alloc(struct xarray *xa, unsigned long index, size_t sz)
++static void *xa_load_or_alloc(struct xarray *xa, unsigned long index)
 +{
-+	void *elm, *res;
++	void *res = xa_load(xa, index);
 +
-+	elm = xa_load(xa, index);
-+	if (elm)
-+		return elm;
++	if (res)
++		return res;
 +
-+	elm = kzalloc(sz, GFP_KERNEL);
++	void *elm __free(free_page) = (void *)get_zeroed_page(GFP_KERNEL);
++
 +	if (!elm)
 +		return ERR_PTR(-ENOMEM);
 +
++	if (WARN_ON(kho_scratch_overlap(virt_to_phys(elm), PAGE_SIZE)))
++		return ERR_PTR(-EINVAL);
++
 +	res = xa_cmpxchg(xa, index, NULL, elm, GFP_KERNEL);
 +	if (xa_is_err(res))
-+		res = ERR_PTR(xa_err(res));
-+
-+	if (res) {
-+		kfree(elm);
++		return ERR_PTR(xa_err(res));
++	else if (res)
 +		return res;
-+	}
 +
-+	return elm;
++	return no_free_ptr(elm);
 +}
 +
 +static void __kho_unpreserve_order(struct kho_mem_track *track, unsigned long pfn,
@@ -2139,8 +2222,7 @@ new file mode 100664
 +		}
 +	}
 +
-+	bits = xa_load_or_alloc(&physxa->phys_bits, pfn_high / PRESERVE_BITS,
-+				sizeof(*bits));
++	bits = xa_load_or_alloc(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
 +	if (IS_ERR(bits))
 +		return PTR_ERR(bits);
 +
@@ -2268,15 +2350,19 @@ new file mode 100664
 +static struct khoser_mem_chunk *new_chunk(struct khoser_mem_chunk *cur_chunk,
 +					  unsigned long order)
 +{
-+	struct khoser_mem_chunk *chunk;
++	struct khoser_mem_chunk *chunk __free(free_page) = NULL;
 +
-+	chunk = kzalloc(PAGE_SIZE, GFP_KERNEL);
++	chunk = (void *)get_zeroed_page(GFP_KERNEL);
 +	if (!chunk)
-+		return NULL;
++		return ERR_PTR(-ENOMEM);
++
++	if (WARN_ON(kho_scratch_overlap(virt_to_phys(chunk), PAGE_SIZE)))
++		return ERR_PTR(-EINVAL);
++
 +	chunk->hdr.order = order;
 +	if (cur_chunk)
 +		KHOSER_STORE_PTR(cur_chunk->hdr.next, chunk);
-+	return chunk;
++	return no_free_ptr(chunk);
 +}
 +
 +static void kho_mem_ser_free(struct khoser_mem_chunk *first_chunk)
@@ -2297,14 +2383,17 @@ new file mode 100664
 +	struct khoser_mem_chunk *chunk = NULL;
 +	struct kho_mem_phys *physxa;
 +	unsigned long order;
++	int err = -ENOMEM;
 +
 +	xa_for_each(&kho_out->track.orders, order, physxa) {
 +		struct kho_mem_phys_bits *bits;
 +		unsigned long phys;
 +
 +		chunk = new_chunk(chunk, order);
-+		if (!chunk)
++		if (IS_ERR(chunk)) {
++			err = PTR_ERR(chunk);
 +			goto err_free;
++		}
 +
 +		if (!first_chunk)
 +			first_chunk = chunk;
@@ -2314,8 +2403,10 @@ new file mode 100664
 +
 +			if (chunk->hdr.num_elms == ARRAY_SIZE(chunk->bitmaps)) {
 +				chunk = new_chunk(chunk, order);
-+				if (!chunk)
++				if (IS_ERR(chunk)) {
++					err = PTR_ERR(chunk);
 +					goto err_free;
++				}
 +			}
 +
 +			elm = &chunk->bitmaps[chunk->hdr.num_elms];
@@ -2332,7 +2423,7 @@ new file mode 100664
 +
 +err_free:
 +	kho_mem_ser_free(first_chunk);
-+	return -ENOMEM;
++	return err;
 +}
 +
 +static void __init deserialize_bitmap(unsigned int order,
@@ -2603,7 +2694,6 @@ new file mode 100664
 +int kho_add_subtree(const char *name, void *fdt)
 +{
 +	struct kho_sub_fdt *sub_fdt;
-+	int err;
 +
 +	sub_fdt = kmalloc(sizeof(*sub_fdt), GFP_KERNEL);
 +	if (!sub_fdt)
@@ -2613,12 +2703,11 @@ new file mode 100664
 +	sub_fdt->name = name;
 +	sub_fdt->fdt = fdt;
 +
-+	mutex_lock(&kho_out.fdts_lock);
++	guard(mutex)(&kho_out.fdts_lock);
 +	list_add_tail(&sub_fdt->l, &kho_out.sub_fdts);
-+	err = kho_debugfs_fdt_add(&kho_out.dbg, name, fdt, false);
-+	mutex_unlock(&kho_out.fdts_lock);
++	WARN_ON_ONCE(kho_debugfs_fdt_add(&kho_out.dbg, name, fdt, false));
 +
-+	return err;
++	return 0;
 +}
 +EXPORT_SYMBOL_GPL(kho_add_subtree);
 +
@@ -2626,7 +2715,7 @@ new file mode 100664
 +{
 +	struct kho_sub_fdt *sub_fdt;
 +
-+	mutex_lock(&kho_out.fdts_lock);
++	guard(mutex)(&kho_out.fdts_lock);
 +	list_for_each_entry(sub_fdt, &kho_out.sub_fdts, l) {
 +		if (sub_fdt->fdt == fdt) {
 +			list_del(&sub_fdt->l);
@@ -2635,8 +2724,6 @@ new file mode 100664
 +			break;
 +		}
 +	}
-+	mutex_unlock(&kho_out.fdts_lock);
-+
 +}
 +EXPORT_SYMBOL_GPL(kho_remove_subtree);
 +
@@ -2654,6 +2741,9 @@ new file mode 100664
 +	const unsigned long pfn = folio_pfn(folio);
 +	const unsigned int order = folio_order(folio);
 +	struct kho_mem_track *track = &kho_out.track;
++
++	if (WARN_ON(kho_scratch_overlap(pfn << PAGE_SHIFT, PAGE_SIZE << order)))
++		return -EINVAL;
 +
 +	return __kho_preserve_order(track, pfn, order);
 +}
@@ -2702,6 +2792,11 @@ new file mode 100664
 +	unsigned long failed_pfn = 0;
 +	int err = 0;
 +
++	if (WARN_ON(kho_scratch_overlap(start_pfn << PAGE_SHIFT,
++					nr_pages << PAGE_SHIFT))) {
++		return -EINVAL;
++	}
++
 +	while (pfn < end_pfn) {
 +		const unsigned int order =
 +			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
@@ -2727,11 +2822,10 @@ new file mode 100664
 + * @page: first page in the list.
 + * @nr_pages: number of pages.
 + *
-+ * Instructs KHO to unpreserve @nr_pages contigious  pages starting from @page.
-+ * This call must exactly match a granularity at which memory was originally
-+ * preserved by kho_preserve_pages, call with the same @page and
-+ * @nr_pages). Unpreserving arbitrary sub-ranges of larger preserved blocks is
-+ * not supported.
++ * Instructs KHO to unpreserve @nr_pages contiguous pages starting from @page.
++ * This must be called with the same @page and @nr_pages as the corresponding
++ * kho_preserve_pages() call. Unpreserving arbitrary sub-ranges of larger
++ * preserved blocks is not supported.
 + *
 + * Return: 0 on success, error code on failure
 + */
@@ -3042,7 +3136,7 @@ new file mode 100664
 +	err |= fdt_finish_reservemap(root);
 +	err |= fdt_begin_node(root, "");
 +	err |= fdt_property_string(root, "compatible", KHO_FDT_COMPATIBLE);
-+	/*
++	/**
 +	 * Reserve the preserved-memory-map property in the root FDT, so
 +	 * that all property definitions will precede subnodes created by
 +	 * KHO callers.
@@ -3070,7 +3164,7 @@ new file mode 100664
 +		err |= fdt_begin_node(root, fdt->name);
 +		err |= fdt_property(root, PROP_SUB_FDT, &phys, sizeof(phys));
 +		err |= fdt_end_node(root);
-+	};
++	}
 +	mutex_unlock(&kho_out.fdts_lock);
 +
 +	err |= fdt_end_node(root);
@@ -3102,8 +3196,10 @@ new file mode 100664
 +
 +	kho_out.finalized = true;
 +
-+	return kho_debugfs_fdt_add(&kho_out.dbg, "fdt",
-+				  kho_out.fdt, true);
++	WARN_ON_ONCE(kho_debugfs_fdt_add(&kho_out.dbg, "fdt",
++					 kho_out.fdt, true));
++
++	return 0;
 +}
 +
 +bool kho_finalized(void)
@@ -3430,10 +3526,40 @@ diff --git a/kernel/liveupdate/kexec_handover_debug.c a/kernel/liveupdate/kexec_
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/kexec_handover_debug.c
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,25 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
-+ * kexec_handover.c - kexec handover metadata processing
++ * kexec_handover_debug.c - kexec handover optional debug functionality
++ * Copyright (C) 2025 Google LLC, Pasha Tatashin <pasha.tatashin@soleen.com>
++ */
++
++#define pr_fmt(fmt) "KHO: " fmt
++
++#include "kexec_handover_internal.h"
++
++bool kho_scratch_overlap(phys_addr_t phys, size_t size)
++{
++	phys_addr_t scratch_start, scratch_end;
++	unsigned int i;
++
++	for (i = 0; i < kho_scratch_cnt; i++) {
++		scratch_start = kho_scratch[i].addr;
++		scratch_end = kho_scratch[i].addr + kho_scratch[i].size;
++
++		if (phys < scratch_end && (phys + size) > scratch_start)
++			return true;
++	}
++
++	return false;
++}
+diff --git a/kernel/liveupdate/kexec_handover_debugfs.c a/kernel/liveupdate/kexec_handover_debugfs.c
+new file mode 100644
+--- /dev/null
++++ a/kernel/liveupdate/kexec_handover_debugfs.c
+@@ -0,0 +1,219 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * kexec_handover_debugfs.c - kexec handover debugfs interfaces
 + * Copyright (C) 2023 Alexander Graf <graf@amazon.com>
 + * Copyright (C) 2025 Microsoft Corporation, Mike Rapoport <rppt@kernel.org>
 + * Copyright (C) 2025 Google LLC, Changyuan Lyu <changyuanl@google.com>
@@ -3515,9 +3641,12 @@ new file mode 100644
 +	return 0;
 +}
 +
-+static int kho_out_finalize_set(void *data, u64 _val)
++static int kho_out_finalize_set(void *data, u64 val)
 +{
-+	return (!!_val) ? kho_finalize() : kho_abort();
++	if (val)
++		return kho_finalize();
++	else
++		return kho_abort();
 +}
 +
 +DEFINE_DEBUGFS_ATTRIBUTE(kho_out_finalize_fops, kho_out_finalize_get,
@@ -3651,7 +3780,7 @@ diff --git a/kernel/liveupdate/kexec_handover_internal.h a/kernel/liveupdate/kex
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/kexec_handover_internal.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
 +#define LINUX_KEXEC_HANDOVER_INTERNAL_H
@@ -3696,16 +3825,26 @@ new file mode 100644
 +					  void *fdt) { }
 +#endif /* CONFIG_KEXEC_HANDOVER_DEBUGFS */
 +
++#ifdef CONFIG_KEXEC_HANDOVER_DEBUG
++bool kho_scratch_overlap(phys_addr_t phys, size_t size);
++#else
++static inline bool kho_scratch_overlap(phys_addr_t phys, size_t size)
++{
++	return false;
++}
++#endif /* CONFIG_KEXEC_HANDOVER_DEBUG */
++
 +#endif /* LINUX_KEXEC_HANDOVER_INTERNAL_H */
 diff --git a/kernel/liveupdate/Makefile a/kernel/liveupdate/Makefile
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/Makefile
-@@ -0,0 +1,4 @@
+@@ -0,0 +1,5 @@
 +# SPDX-License-Identifier: GPL-2.0
 +
 +obj-$(CONFIG_KEXEC_HANDOVER)		+= kexec_handover.o
-+obj-$(CONFIG_KEXEC_HANDOVER_DEBUGFS)	+= kexec_handover_debug.o
++obj-$(CONFIG_KEXEC_HANDOVER_DEBUG)	+= kexec_handover_debug.o
++obj-$(CONFIG_KEXEC_HANDOVER_DEBUGFS)	+= kexec_handover_debugfs.o
 --- a/kernel/Makefile~liveupdate-kho-move-to-kernel-liveupdate
 +++ a/kernel/Makefile
 @@ -52,6 +52,7 @@ obj-y += printk/
@@ -3716,12 +3855,13 @@ new file mode 100644
  obj-y += dma/
  obj-y += entry/
  obj-y += unwind/
-@@ -82,8 +83,6 @@ obj-$(CONFIG_CRASH_DUMP_KUNIT_TEST) += c
+@@ -82,9 +83,6 @@ obj-$(CONFIG_CRASH_DUMP_KUNIT_TEST) += c
  obj-$(CONFIG_KEXEC) += kexec.o
  obj-$(CONFIG_KEXEC_FILE) += kexec_file.o
  obj-$(CONFIG_KEXEC_ELF) += kexec_elf.o
 -obj-$(CONFIG_KEXEC_HANDOVER) += kexec_handover.o
--obj-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kexec_handover_debug.o
+-obj-$(CONFIG_KEXEC_HANDOVER_DEBUG) += kexec_handover_debug.o
+-obj-$(CONFIG_KEXEC_HANDOVER_DEBUGFS) += kexec_handover_debugfs.o
  obj-$(CONFIG_BACKTRACE_SELF_TEST) += backtracetest.o
  obj-$(CONFIG_COMPAT) += compat.o
  obj-$(CONFIG_CGROUPS) += cgroup/
