@@ -1,0 +1,67 @@
+From: Jiayuan Chen <jiayuan.chen@linux.dev>
+Subject: mm/vmscan: skip increasing kswapd_failures when reclaim was boosted
+Date: Fri, 24 Oct 2025 10:27:11 +0800
+
+We encountered a scenario where direct memory reclaim was triggered,
+leading to increased system latency:
+
+1. The memory.low values set on host pods are actually quite large, some
+   pods are set to 10GB, others to 20GB, etc.
+2. Since most pods have memory protection configured, each time kswapd is
+   woken up, if a pod's memory usage hasn't exceeded its own memory.low,
+   its memory won't be reclaimed.
+3. When applications start up, rapidly consume memory, or experience
+   network traffic bursts, the kernel reaches steal_suitable_fallback(),
+   which sets watermark_boost and subsequently wakes kswapd.
+4. In the core logic of kswapd thread (balance_pgdat()), when reclaim is
+   triggered by watermark_boost, the maximum priority is 10. Higher
+   priority values mean less aggressive LRU scanning, which can result in
+   no pages being reclaimed during a single scan cycle:
+
+if (nr_boost_reclaim && sc.priority == DEF_PRIORITY - 2)
+    raise_priority = false;
+
+5. This eventually causes pgdat->kswapd_failures to continuously
+   accumulate, exceeding MAX_RECLAIM_RETRIES, and consequently kswapd stops
+   working. At this point, the system's available memory is still
+   significantly above the high watermark — it's inappropriate for kswapd
+   to stop under these conditions.
+
+The final observable issue is that a brief period of rapid memory
+allocation causes kswapd to stop running, ultimately triggering direct
+reclaim and making the applications unresponsive.
+
+Link: https://lkml.kernel.org/r/20251024022711.382238-1-jiayuan.chen@linux.dev
+Signed-off-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmscan.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/mm/vmscan.c~mm-vmscan-skip-increasing-kswapd_failures-when-reclaim-was-boosted
++++ a/mm/vmscan.c
+@@ -7128,7 +7128,12 @@ restart:
+ 		goto restart;
+ 	}
+ 
+-	if (!sc.nr_reclaimed)
++	/*
++	 * If the reclaim was boosted, we might still be far from the
++	 * watermark_high at this point. We need to avoid increasing the
++	 * failure count to prevent the kswapd thread from stopping.
++	 */
++	if (!sc.nr_reclaimed && !boosted)
+ 		atomic_inc(&pgdat->kswapd_failures);
+ 
+ out:
+_

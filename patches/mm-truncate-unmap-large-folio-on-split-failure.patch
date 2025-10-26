@@ -1,0 +1,105 @@
+From: Kiryl Shutsemau <kas@kernel.org>
+Subject: mm/truncate: unmap large folio on split failure
+Date: Mon, 20 Oct 2025 14:08:21 +0100
+
+Accesses within VMA, but beyond i_size rounded up to PAGE_SIZE are
+supposed to generate SIGBUS.
+
+This behavior might not be respected on truncation.
+
+During truncation, the kernel splits a large folio in order to reclaim
+memory.  As a side effect, it unmaps the folio and destroys PMD mappings
+of the folio.  The folio will be refaulted as PTEs and SIGBUS semantics
+are preserved.
+
+However, if the split fails, PMD mappings are preserved and the user will
+not receive SIGBUS on any accesses within the PMD.
+
+Unmap the folio on split failure.  It will lead to refault as PTEs and
+preserve SIGBUS semantics.
+
+Link: https://lkml.kernel.org/r/20251023093251.54146-1-kirill@shutemov.name
+Link: https://lkml.kernel.org/r/efm75n5srtb4xp5akp4x6sq6522p4hivzge7ufwnkodsw2yixt@ahntf6d2qe4h
+Signed-off-by: Kiryl Shutsemau <kas@kernel.org>
+Acked-by: David Hildenbrand <david@redhat.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/truncate.c |   32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+--- a/mm/truncate.c~mm-truncate-unmap-large-folio-on-split-failure
++++ a/mm/truncate.c
+@@ -177,6 +177,29 @@ int truncate_inode_folio(struct address_
+ 	return 0;
+ }
+ 
++static int try_folio_split_or_unmap(struct folio *folio, struct page *split_at,
++				    unsigned long min_order)
++{
++	enum ttu_flags ttu_flags =
++		TTU_SYNC |
++		TTU_SPLIT_HUGE_PMD |
++		TTU_IGNORE_MLOCK;
++	int ret;
++
++	ret = try_folio_split_to_order(folio, split_at, min_order);
++
++	/*
++	 * If the split fails, unmap the folio, so it will be refaulted
++	 * with PTEs to respect SIGBUS semantics.
++	 */
++	if (ret) {
++		try_to_unmap(folio, ttu_flags);
++		WARN_ON(folio_mapped(folio));
++	}
++
++	return ret;
++}
++
+ /*
+  * Handle partial folios.  The folio may be entirely within the
+  * range if a split has raced with us.  If not, we zero the part of the
+@@ -226,7 +249,7 @@ bool truncate_inode_partial_folio(struct
+ 
+ 	min_order = mapping_min_folio_order(folio->mapping);
+ 	split_at = folio_page(folio, PAGE_ALIGN_DOWN(offset) / PAGE_SIZE);
+-	if (!try_folio_split_to_order(folio, split_at, min_order)) {
++	if (!try_folio_split_or_unmap(folio, split_at, min_order)) {
+ 		/*
+ 		 * try to split at offset + length to make sure folios within
+ 		 * the range can be dropped, especially to avoid memory waste
+@@ -250,13 +273,10 @@ bool truncate_inode_partial_folio(struct
+ 		if (!folio_trylock(folio2))
+ 			goto out;
+ 
+-		/*
+-		 * make sure folio2 is large and does not change its mapping.
+-		 * Its split result does not matter here.
+-		 */
++		/* make sure folio2 is large and does not change its mapping */
+ 		if (folio_test_large(folio2) &&
+ 		    folio2->mapping == folio->mapping)
+-			try_folio_split_to_order(folio2, split_at2, min_order);
++			try_folio_split_or_unmap(folio2, split_at2, min_order);
+ 
+ 		folio_unlock(folio2);
+ out:
+_
