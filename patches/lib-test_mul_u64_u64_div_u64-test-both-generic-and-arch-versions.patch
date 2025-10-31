@@ -1,0 +1,152 @@
+From: David Laight <david.laight.linux@gmail.com>
+Subject: lib: test_mul_u64_u64_div_u64: test both generic and arch versions
+Date: Wed, 29 Oct 2025 17:38:25 +0000
+
+Change the #if in div64.c so that test_mul_u64_u64_div_u64.c can compile
+and test the generic version (including the 'long multiply') on
+architectures (eg amd64) that define their own copy.
+
+Test the kernel version and the locally compiled version on all arch. 
+Output the time taken (in ns) on the 'test completed' trace.
+
+For reference, on my zen 5, the optimised version takes ~220ns and the
+generic version ~3350ns.  Using the native multiply saves ~200ns and
+adding back the ilog2() 'optimisation' test adds ~50ms.
+
+Link: https://lkml.kernel.org/r/20251029173828.3682-7-david.laight.linux@gmail.com
+Signed-off-by: David Laight <david.laight.linux@gmail.com>
+Reviewed-by: Nicolas Pitre <npitre@baylibre.com>
+Cc: Biju Das <biju.das.jz@bp.renesas.com>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jens Axboe <axboe@kernel.dk>
+Cc: Li RongQing <lirongqing@baidu.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: Uwe Kleine-König <u.kleine-koenig@baylibre.com>
+Cc: "yukuai (C)" <yukuai3@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ lib/math/div64.c                    |    8 +++-
+ lib/math/test_mul_u64_u64_div_u64.c |   51 ++++++++++++++++++++++----
+ 2 files changed, 50 insertions(+), 9 deletions(-)
+
+--- a/lib/math/div64.c~lib-test_mul_u64_u64_div_u64-test-both-generic-and-arch-versions
++++ a/lib/math/div64.c
+@@ -177,16 +177,18 @@ EXPORT_SYMBOL(div64_s64);
+  * Iterative div/mod for use when dividend is not expected to be much
+  * bigger than divisor.
+  */
++#ifndef iter_div_u64_rem
+ u32 iter_div_u64_rem(u64 dividend, u32 divisor, u64 *remainder)
+ {
+ 	return __iter_div_u64_rem(dividend, divisor, remainder);
+ }
+ EXPORT_SYMBOL(iter_div_u64_rem);
++#endif
+ 
+-#ifndef mul_u64_add_u64_div_u64
++#if !defined(mul_u64_add_u64_div_u64) || defined(test_mul_u64_add_u64_div_u64)
+ u64 mul_u64_add_u64_div_u64(u64 a, u64 b, u64 c, u64 d)
+ {
+-#if defined(__SIZEOF_INT128__)
++#if defined(__SIZEOF_INT128__) && !defined(test_mul_u64_add_u64_div_u64)
+ 
+ 	/* native 64x64=128 bits multiplication */
+ 	u128 prod = (u128)a * b + c;
+@@ -267,5 +269,7 @@ u64 mul_u64_add_u64_div_u64(u64 a, u64 b
+ 
+ 	return res;
+ }
++#if !defined(test_mul_u64_add_u64_div_u64)
+ EXPORT_SYMBOL(mul_u64_add_u64_div_u64);
+ #endif
++#endif
+--- a/lib/math/test_mul_u64_u64_div_u64.c~lib-test_mul_u64_u64_div_u64-test-both-generic-and-arch-versions
++++ a/lib/math/test_mul_u64_u64_div_u64.c
+@@ -73,21 +73,34 @@ done
+ 
+  */
+ 
+-static int __init test_init(void)
++static u64 test_mul_u64_add_u64_div_u64(u64 a, u64 b, u64 c, u64 d);
++
++static int __init test_run(unsigned int fn_no, const char *fn_name)
+ {
++	u64 start_time;
+ 	int errors = 0;
+ 	int tests = 0;
+ 	int i;
+ 
+-	pr_info("Starting mul_u64_u64_div_u64() test\n");
++	start_time = ktime_get_ns();
+ 
+ 	for (i = 0; i < ARRAY_SIZE(test_values); i++) {
+ 		u64 a = test_values[i].a;
+ 		u64 b = test_values[i].b;
+ 		u64 d = test_values[i].d;
+ 		u64 expected_result = test_values[i].result;
+-		u64 result = mul_u64_u64_div_u64(a, b, d);
+-		u64 result_up = mul_u64_u64_div_u64_roundup(a, b, d);
++		u64 result, result_up;
++
++		switch (fn_no) {
++		default:
++			result = mul_u64_u64_div_u64(a, b, d);
++			result_up = mul_u64_u64_div_u64_roundup(a, b, d);
++			break;
++		case 1:
++			result = test_mul_u64_add_u64_div_u64(a, b, 0, d);
++			result_up = test_mul_u64_add_u64_div_u64(a, b, d - 1, d);
++			break;
++		}
+ 
+ 		tests += 2;
+ 
+@@ -106,15 +119,39 @@ static int __init test_init(void)
+ 		}
+ 	}
+ 
+-	pr_info("Completed mul_u64_u64_div_u64() test, %d tests, %d errors\n",
+-		tests, errors);
+-	return errors ? -EINVAL : 0;
++	pr_info("Completed %s() test, %d tests, %d errors, %llu ns\n",
++		fn_name, tests, errors, ktime_get_ns() - start_time);
++	return errors;
++}
++
++static int __init test_init(void)
++{
++	pr_info("Starting mul_u64_u64_div_u64() test\n");
++	if (test_run(0, "mul_u64_u64_div_u64"))
++		return -EINVAL;
++	if (test_run(1, "test_mul_u64_u64_div_u64"))
++		return -EINVAL;
++	return 0;
+ }
+ 
+ static void __exit test_exit(void)
+ {
+ }
+ 
++/* Compile the generic mul_u64_add_u64_div_u64() code */
++#define __div64_32 __div64_32
++#define div_s64_rem div_s64_rem
++#define div64_u64_rem div64_u64_rem
++#define div64_u64 div64_u64
++#define div64_s64 div64_s64
++#define iter_div_u64_rem iter_div_u64_rem
++
++#undef mul_u64_add_u64_div_u64
++#define mul_u64_add_u64_div_u64 test_mul_u64_add_u64_div_u64
++#define test_mul_u64_add_u64_div_u64 test_mul_u64_add_u64_div_u64
++
++#include "div64.c"
++
+ module_init(test_init);
+ module_exit(test_exit);
+ 
+_
