@@ -1,0 +1,218 @@
+From: Pasha Tatashin <pasha.tatashin@soleen.com>
+Subject: kho: add interfaces to unpreserve folios, page ranges, and vmalloc
+Date: Sat, 1 Nov 2025 10:23:19 -0400
+
+Allow users of KHO to cancel the previous preservation by adding the
+necessary interfaces to unpreserve folio, pages, and vmallocs.
+
+Link: https://lkml.kernel.org/r/20251101142325.1326536-4-pasha.tatashin@soleen.com
+Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Pratyush Yadav <pratyush@kernel.org>
+Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Changyuan Lyu <changyuanl@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Miguel Ojeda <ojeda@kernel.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Zhu Yanjun <yanjun.zhu@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kexec_handover.h |   18 +++++
+ kernel/kexec_handover.c        |  104 +++++++++++++++++++++++++++----
+ 2 files changed, 109 insertions(+), 13 deletions(-)
+
+--- a/include/linux/kexec_handover.h~kho-add-interfaces-to-unpreserve-folios-page-ranges-and-vmalloc
++++ a/include/linux/kexec_handover.h
+@@ -43,8 +43,11 @@ bool kho_is_enabled(void);
+ bool is_kho_boot(void);
+ 
+ int kho_preserve_folio(struct folio *folio);
++int kho_unpreserve_folio(struct folio *folio);
+ int kho_preserve_pages(struct page *page, unsigned int nr_pages);
++int kho_unpreserve_pages(struct page *page, unsigned int nr_pages);
+ int kho_preserve_vmalloc(void *ptr, struct kho_vmalloc *preservation);
++int kho_unpreserve_vmalloc(struct kho_vmalloc *preservation);
+ struct folio *kho_restore_folio(phys_addr_t phys);
+ struct page *kho_restore_pages(phys_addr_t phys, unsigned int nr_pages);
+ void *kho_restore_vmalloc(const struct kho_vmalloc *preservation);
+@@ -72,16 +75,31 @@ static inline int kho_preserve_folio(str
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int kho_unpreserve_folio(struct folio *folio)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int kho_preserve_pages(struct page *page, unsigned int nr_pages)
+ {
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline int kho_unpreserve_pages(struct page *page, unsigned int nr_pages)
++{
++	return -EOPNOTSUPP;
++}
++
+ static inline int kho_preserve_vmalloc(void *ptr,
+ 				       struct kho_vmalloc *preservation)
+ {
+ 	return -EOPNOTSUPP;
+ }
++
++static inline int kho_unpreserve_vmalloc(struct kho_vmalloc *preservation)
++{
++	return -EOPNOTSUPP;
++}
+ 
+ static inline struct folio *kho_restore_folio(phys_addr_t phys)
+ {
+--- a/kernel/kexec_handover.c~kho-add-interfaces-to-unpreserve-folios-page-ranges-and-vmalloc
++++ a/kernel/kexec_handover.c
+@@ -157,26 +157,33 @@ static void *xa_load_or_alloc(struct xar
+ 	return no_free_ptr(elm);
+ }
+ 
+-static void __kho_unpreserve(struct kho_mem_track *track, unsigned long pfn,
+-			     unsigned long end_pfn)
++static void __kho_unpreserve_order(struct kho_mem_track *track, unsigned long pfn,
++				   unsigned int order)
+ {
+ 	struct kho_mem_phys_bits *bits;
+ 	struct kho_mem_phys *physxa;
++	const unsigned long pfn_high = pfn >> order;
+ 
+-	while (pfn < end_pfn) {
+-		const unsigned int order =
+-			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
+-		const unsigned long pfn_high = pfn >> order;
++	physxa = xa_load(&track->orders, order);
++	if (WARN_ON_ONCE(!physxa))
++		return;
+ 
+-		physxa = xa_load(&track->orders, order);
+-		if (WARN_ON_ONCE(!physxa))
+-			return;
++	bits = xa_load(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
++	if (WARN_ON_ONCE(!bits))
++		return;
+ 
+-		bits = xa_load(&physxa->phys_bits, pfn_high / PRESERVE_BITS);
+-		if (WARN_ON_ONCE(!bits))
+-			return;
++	clear_bit(pfn_high % PRESERVE_BITS, bits->preserve);
++}
++
++static void __kho_unpreserve(struct kho_mem_track *track, unsigned long pfn,
++			     unsigned long end_pfn)
++{
++	unsigned int order;
++
++	while (pfn < end_pfn) {
++		order = min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
+ 
+-		clear_bit(pfn_high % PRESERVE_BITS, bits->preserve);
++		__kho_unpreserve_order(track, pfn, order);
+ 
+ 		pfn += 1 << order;
+ 	}
+@@ -746,6 +753,30 @@ int kho_preserve_folio(struct folio *fol
+ EXPORT_SYMBOL_GPL(kho_preserve_folio);
+ 
+ /**
++ * kho_unpreserve_folio - unpreserve a folio.
++ * @folio: folio to unpreserve.
++ *
++ * Instructs KHO to unpreserve a folio that was preserved by
++ * kho_preserve_folio() before. The provided @folio (pfn and order)
++ * must exactly match a previously preserved folio.
++ *
++ * Return: 0 on success, error code on failure
++ */
++int kho_unpreserve_folio(struct folio *folio)
++{
++	const unsigned long pfn = folio_pfn(folio);
++	const unsigned int order = folio_order(folio);
++	struct kho_mem_track *track = &kho_out.track;
++
++	if (kho_out.finalized)
++		return -EBUSY;
++
++	__kho_unpreserve_order(track, pfn, order);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(kho_unpreserve_folio);
++
++/**
+  * kho_preserve_pages - preserve contiguous pages across kexec
+  * @page: first page in the list.
+  * @nr_pages: number of pages.
+@@ -789,6 +820,33 @@ int kho_preserve_pages(struct page *page
+ }
+ EXPORT_SYMBOL_GPL(kho_preserve_pages);
+ 
++/**
++ * kho_unpreserve_pages - unpreserve contiguous pages.
++ * @page: first page in the list.
++ * @nr_pages: number of pages.
++ *
++ * Instructs KHO to unpreserve @nr_pages contiguous pages starting from @page.
++ * This must be called with the same @page and @nr_pages as the corresponding
++ * kho_preserve_pages() call. Unpreserving arbitrary sub-ranges of larger
++ * preserved blocks is not supported.
++ *
++ * Return: 0 on success, error code on failure
++ */
++int kho_unpreserve_pages(struct page *page, unsigned int nr_pages)
++{
++	struct kho_mem_track *track = &kho_out.track;
++	const unsigned long start_pfn = page_to_pfn(page);
++	const unsigned long end_pfn = start_pfn + nr_pages;
++
++	if (kho_out.finalized)
++		return -EBUSY;
++
++	__kho_unpreserve(track, start_pfn, end_pfn);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(kho_unpreserve_pages);
++
+ struct kho_vmalloc_hdr {
+ 	DECLARE_KHOSER_PTR(next, struct kho_vmalloc_chunk *);
+ };
+@@ -951,6 +1009,26 @@ err_free:
+ EXPORT_SYMBOL_GPL(kho_preserve_vmalloc);
+ 
+ /**
++ * kho_unpreserve_vmalloc - unpreserve memory allocated with vmalloc()
++ * @preservation: preservation metadata returned by kho_preserve_vmalloc()
++ *
++ * Instructs KHO to unpreserve the area in vmalloc address space that was
++ * previously preserved with kho_preserve_vmalloc().
++ *
++ * Return: 0 on success, error code on failure
++ */
++int kho_unpreserve_vmalloc(struct kho_vmalloc *preservation)
++{
++	if (kho_out.finalized)
++		return -EBUSY;
++
++	kho_vmalloc_free_chunks(preservation);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(kho_unpreserve_vmalloc);
++
++/**
+  * kho_restore_vmalloc - recreates and populates an area in vmalloc address
+  * space from the preserved memory.
+  * @preservation: preservation metadata.
+_
