@@ -1,6 +1,6 @@
 From: Muchun Song <songmuchun@bytedance.com>
 Subject: mm: thp: use folio_batch to handle THP splitting in deferred_split_scan()
-Date: Sat, 4 Oct 2025 00:53:17 +0800
+Date: Wed, 15 Oct 2025 14:35:32 +0800
 
 The maintenance of the folio->_deferred_list is intricate because it's
 reused in a local list.
@@ -14,7 +14,7 @@ Here are some peculiarities:
 
    2) When the folio is split via split_folio() later, it's removed from
       the local list while holding the split queue lock. At this time,
-      this lock protects the local list, not the split queue.
+      the lock is not needed as it is not protecting anything.
 
    3) To handle the race condition with a third-party freeing or migrating
       the preceding folio, we must ensure there's always one safe (with
@@ -33,58 +33,58 @@ eliminate dying memory cgroups, which requires reparenting the split queue
 to its parent first.  So this patch prepares for using
 folio_split_queue_lock_irqsave() as the memcg may change then.
 
-Link: https://lkml.kernel.org/r/304df1ad1e8180e102c4d6931733bcc77774eb9e.1759510072.git.zhengqi.arch@bytedance.com
+Link: https://lkml.kernel.org/r/4f5d7a321c72dfe65e0e19a3f89180d5988eae2e.1760509767.git.zhengqi.arch@bytedance.com
 Signed-off-by: Muchun Song <songmuchun@bytedance.com>
 Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
 Reviewed-by: Zi Yan <ziy@nvidia.com>
 Acked-by: David Hildenbrand <david@redhat.com>
 Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
-Cc: Harry Yoo <harry.yoo@oracle.com>
+Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
+Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Hugh Dickins <hughd@google.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mariano Pache <npache@redhat.com>
+Cc: Michal Hocko <mhocko@suse.com>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/huge_memory.c |   85 ++++++++++++++++++++-------------------------
- 1 file changed, 39 insertions(+), 46 deletions(-)
+ mm/huge_memory.c |   81 +++++++++++++++++++++++----------------------
+ 1 file changed, 42 insertions(+), 39 deletions(-)
 
 --- a/mm/huge_memory.c~mm-thp-use-folio_batch-to-handle-thp-splitting-in-deferred_split_scan
 +++ a/mm/huge_memory.c
-@@ -3782,21 +3782,22 @@ static int __folio_split(struct folio *f
+@@ -3908,9 +3908,18 @@ static int __folio_split(struct folio *f
  		struct lruvec *lruvec;
  		int expected_refs;
  
--		if (folio_order(folio) > 1 &&
+-		if (old_order > 1 &&
 -		    !list_empty(&folio->_deferred_list)) {
 -			ds_queue->split_queue_len--;
-+		if (folio_order(folio) > 1) {
++		if (old_order > 1) {
 +			if (!list_empty(&folio->_deferred_list)) {
 +				ds_queue->split_queue_len--;
 +				/*
-+				 * Reinitialize page_deferred_list after removing the
-+				 * page from the split_queue, otherwise a subsequent
-+				 * split will see list corruption when checking the
++				 * Reinitialize page_deferred_list after
++				 * removing the page from the split_queue,
++				 * otherwise a subsequent split will see list
++				 * corruption when checking the
 +				 * page_deferred_list.
 +				 */
 +				list_del_init(&folio->_deferred_list);
 +			}
  			if (folio_test_partially_mapped(folio)) {
  				folio_clear_partially_mapped(folio);
- 				mod_mthp_stat(folio_order(folio),
- 					      MTHP_STAT_NR_ANON_PARTIALLY_MAPPED, -1);
- 			}
--			/*
--			 * Reinitialize page_deferred_list after removing the
--			 * page from the split_queue, otherwise a subsequent
--			 * split will see list corruption when checking the
--			 * page_deferred_list.
--			 */
--			list_del_init(&folio->_deferred_list);
- 		}
- 		split_queue_unlock(ds_queue);
- 		if (mapping) {
-@@ -4185,35 +4186,40 @@ static unsigned long deferred_split_scan
+ 				mod_mthp_stat(old_order,
+@@ -4319,35 +4328,40 @@ static unsigned long deferred_split_scan
  {
  	struct deferred_split *ds_queue;
  	unsigned long flags;
@@ -94,9 +94,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	struct folio *folio, *next;
 +	int split = 0, i;
 +	struct folio_batch fbatch;
- 
-+	folio_batch_init(&fbatch);
 +
++	folio_batch_init(&fbatch);
+ 
 +retry:
  	ds_queue = split_queue_lock_irqsave(sc->nid, sc->memcg, &flags);
  	/* Take pin on all head pages to avoid freeing them under us */
@@ -138,7 +138,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!folio_test_partially_mapped(folio)) {
  			/*
  			 * See try_to_map_unused_to_zeropage(): we cannot
-@@ -4236,38 +4242,25 @@ static unsigned long deferred_split_scan
+@@ -4370,38 +4384,27 @@ static unsigned long deferred_split_scan
  		}
  		folio_unlock(folio);
  next:
@@ -182,8 +182,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -
 -	if (prev)
 -		folio_put(prev);
-+	if (sc->nr_to_scan)
++	if (sc->nr_to_scan && !list_empty(&ds_queue->split_queue)) {
++		cond_resched();
 +		goto retry;
++	}
  
  	/*
  	 * Stop shrinker if we didn't split any page, but the queue is empty.
