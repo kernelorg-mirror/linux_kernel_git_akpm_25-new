@@ -1,24 +1,66 @@
 From: Pedro Demarchi Gomes <pedrodemargomes@gmail.com>
 Subject: ksm: use range-walk function to jump over holes in scan_get_next_rmap_item
-Date: Wed, 15 Oct 2025 22:22:36 -0300
+Date: Wed, 22 Oct 2025 12:30:59 -0300
 
 Currently, scan_get_next_rmap_item() walks every page address in a VMA to
 locate mergeable pages.  This becomes highly inefficient when scanning
-large virtual memory areas that contain mostly unmapped regions.
+large virtual memory areas that contain mostly unmapped regions, causing
+ksmd to use large amount of cpu without deduplicating much pages.
 
 This patch replaces the per-address lookup with a range walk using
 walk_page_range().  The range walker allows KSM to skip over entire
 unmapped holes in a VMA, avoiding unnecessary lookups.  This problem was
 previously discussed in [1].
 
-[1] https://lore.kernel.org/linux-mm/423de7a3-1c62-4e72-8e79-19a6413e420c@redhat.com/
+Consider the following test program which creates a 32 TiB mapping in the
+virtual address space but only populates a single page:
 
-Link: https://lkml.kernel.org/r/20251016012236.4189-1-pedrodemargomes@gmail.com
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/mman.h>
+
+/* 32 TiB */
+const size_t size = 32ul * 1024 * 1024 * 1024 * 1024;
+
+int main() {
+        char *area = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                          MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0);
+
+        if (area == MAP_FAILED) {
+                perror("mmap() failed\n");
+                return -1;
+        }
+
+        /* Populate a single page such that we get an anon_vma. */
+        *area = 0;
+
+        /* Enable KSM. */
+        madvise(area, size, MADV_MERGEABLE);
+        pause();
+        return 0;
+}
+
+$ ./ksm-sparse  &
+$ echo 1 > /sys/kernel/mm/ksm/run 
+
+Without this patch ksmd uses 100% of the cpu for a long time (more then 1
+hour in my test machine) scanning all the 32 TiB virtual address space
+that contain only one mapped page.  This makes ksmd essentially deadlocked
+not able to deduplicate anything of value.  With this patch ksmd walks
+only the one mapped page and skips the rest of the 32 TiB virtual address
+space, making the scan fast using little cpu.
+
+Link: https://lkml.kernel.org/r/20251023035841.41406-1-pedrodemargomes@gmail.com
+Link: https://lkml.kernel.org/r/20251022153059.22763-1-pedrodemargomes@gmail.com
 Link: https://lore.kernel.org/linux-mm/423de7a3-1c62-4e72-8e79-19a6413e420c@redhat.com/ [1]
+Fixes: 31dbd01f3143 ("ksm: Kernel SamePage Merging")
 Signed-off-by: Pedro Demarchi Gomes <pedrodemargomes@gmail.com>
+Co-developed-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: David Hildenbrand <david@redhat.com>
 Reported-by: craftfever <craftfever@airmail.cc>
 Closes: https://lkml.kernel.org/r/020cf8de6e773bb78ba7614ef250129f11a63781@murena.io
 Suggested-by: David Hildenbrand <david@redhat.com>
+Acked-by: David Hildenbrand <david@redhat.com>
 Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: xu xin <xu.xin16@zte.com.cn>
 Cc: <stable@vger.kernel.org>
