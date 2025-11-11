@@ -1,0 +1,167 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/huge_memory: refactor change_huge_pmd() non-present logic
+Date: Mon, 10 Nov 2025 22:21:27 +0000
+
+Similar to copy_huge_pmd(), there is a large mass of open-coded logic for
+the CONFIG_ARCH_ENABLE_THP_MIGRATION non-present entry case that does not
+use thp_migration_supported() consistently.
+
+Resolve this by separating out this logic and introduce
+change_non_present_huge_pmd().
+
+No functional change intended.
+
+Link: https://lkml.kernel.org/r/451b85636ad711e307fdfbff19af699fdab4d05f.1762812360.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Janosch Frank <frankja@linux.ibm.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Mathew Brost <matthew.brost@intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Xu <weixugc@google.com>
+Cc: xu xin <xu.xin16@zte.com.cn>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/huge_memory.c |   72 ++++++++++++++++++++++++---------------------
+ 1 file changed, 39 insertions(+), 33 deletions(-)
+
+--- a/mm/huge_memory.c~mm-huge_memory-refactor-change_huge_pmd-non-present-logic
++++ a/mm/huge_memory.c
+@@ -2424,6 +2424,42 @@ bool move_huge_pmd(struct vm_area_struct
+ 	return false;
+ }
+ 
++static void change_non_present_huge_pmd(struct mm_struct *mm,
++		unsigned long addr, pmd_t *pmd, bool uffd_wp,
++		bool uffd_wp_resolve)
++{
++	swp_entry_t entry = pmd_to_swp_entry(*pmd);
++	struct folio *folio = pfn_swap_entry_folio(entry);
++	pmd_t newpmd;
++
++	VM_WARN_ON(!is_pmd_non_present_folio_entry(*pmd));
++	if (is_writable_migration_entry(entry)) {
++		/*
++		 * A protection check is difficult so
++		 * just be safe and disable write
++		 */
++		if (folio_test_anon(folio))
++			entry = make_readable_exclusive_migration_entry(swp_offset(entry));
++		else
++			entry = make_readable_migration_entry(swp_offset(entry));
++		newpmd = swp_entry_to_pmd(entry);
++		if (pmd_swp_soft_dirty(*pmd))
++			newpmd = pmd_swp_mksoft_dirty(newpmd);
++	} else if (is_writable_device_private_entry(entry)) {
++		entry = make_readable_device_private_entry(swp_offset(entry));
++		newpmd = swp_entry_to_pmd(entry);
++	} else {
++		newpmd = *pmd;
++	}
++
++	if (uffd_wp)
++		newpmd = pmd_swp_mkuffd_wp(newpmd);
++	else if (uffd_wp_resolve)
++		newpmd = pmd_swp_clear_uffd_wp(newpmd);
++	if (!pmd_same(*pmd, newpmd))
++		set_pmd_at(mm, addr, pmd, newpmd);
++}
++
+ /*
+  * Returns
+  *  - 0 if PMD could not be locked
+@@ -2452,41 +2488,11 @@ int change_huge_pmd(struct mmu_gather *t
+ 	if (!ptl)
+ 		return 0;
+ 
+-#ifdef CONFIG_ARCH_ENABLE_THP_MIGRATION
+-	if (is_swap_pmd(*pmd)) {
+-		swp_entry_t entry = pmd_to_swp_entry(*pmd);
+-		struct folio *folio = pfn_swap_entry_folio(entry);
+-		pmd_t newpmd;
+-
+-		VM_WARN_ON(!is_pmd_non_present_folio_entry(*pmd));
+-		if (is_writable_migration_entry(entry)) {
+-			/*
+-			 * A protection check is difficult so
+-			 * just be safe and disable write
+-			 */
+-			if (folio_test_anon(folio))
+-				entry = make_readable_exclusive_migration_entry(swp_offset(entry));
+-			else
+-				entry = make_readable_migration_entry(swp_offset(entry));
+-			newpmd = swp_entry_to_pmd(entry);
+-			if (pmd_swp_soft_dirty(*pmd))
+-				newpmd = pmd_swp_mksoft_dirty(newpmd);
+-		} else if (is_writable_device_private_entry(entry)) {
+-			entry = make_readable_device_private_entry(swp_offset(entry));
+-			newpmd = swp_entry_to_pmd(entry);
+-		} else {
+-			newpmd = *pmd;
+-		}
+-
+-		if (uffd_wp)
+-			newpmd = pmd_swp_mkuffd_wp(newpmd);
+-		else if (uffd_wp_resolve)
+-			newpmd = pmd_swp_clear_uffd_wp(newpmd);
+-		if (!pmd_same(*pmd, newpmd))
+-			set_pmd_at(mm, addr, pmd, newpmd);
++	if (thp_migration_supported() && is_swap_pmd(*pmd)) {
++		change_non_present_huge_pmd(mm, addr, pmd, uffd_wp,
++					    uffd_wp_resolve);
+ 		goto unlock;
+ 	}
+-#endif
+ 
+ 	if (prot_numa) {
+ 
+_
