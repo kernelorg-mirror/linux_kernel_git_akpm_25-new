@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: introduce leaf entry type and use to simplify leaf entry logic
-Date: Mon, 3 Nov 2025 12:31:43 +0000
+Date: Sat, 8 Nov 2025 17:08:16 +0000
 
 The kernel maintains leaf page table entries which contain either:
 
@@ -22,14 +22,15 @@ turn to satisfy this.
 
 This patch lays the foundation for reducing this confusion.
 
-We refer to 'everything else' as a 'leaf entry'.  And in fact we scoop up
-the 'none' entries into this concept also so we are left with:
+We refer to 'everything else' as a 'software-define leaf entry' or
+'softleaf'.  for short And in fact we scoop up the 'none' entries into
+this concept also so we are left with:
 
-- Present entries
-- Leaf entries (which may be empty)
+- Present entries.
+- Softleaf entries (which may be empty).
 
 This allows for radical simplification across the board - one can simply
-convert any leaf page table entry to a leaf entry via leafent_from_pte().
+convert any leaf page table entry to a leaf entry via softleaf_from_pte().
 
 If the entry is present, we return an empty leaf entry, so it is assumed
 the caller is aware that they must differentiate between the two
@@ -41,10 +42,10 @@ need to use predicates to see if we can proceed with leaf page table entry
 conversion and instead just go ahead and do it unconditionally.
 
 We do so where we can, adjusting surrounding logic as necessary to
-integrate the new leaf_entry_t logic as far as seems reasonable at this
+integrate the new softleaf_t logic as far as seems reasonable at this
 stage.
 
-We typedef swp_entry_t to leaf_entry_t for the time being until the
+We typedef swp_entry_t to softleaf_t for the time being until the
 conversion can be complete, meaning everything remains compatible
 regardless of which type is used.  We will eventually remove swp_entry_t
 when the conversion is complete.
@@ -55,7 +56,7 @@ we do so in all the files that require it.
 
 Additionally, add new leafops.h file to core mm maintainers entry.
 
-Link: https://lkml.kernel.org/r/2c75a316f1b91a502fad718de9b1bb151aafe717.1762171281.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/cd103d9bdc8c0dbb63a0361599b02081520191b4.1762621568.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Alistair Popple <apopple@nvidia.com>
@@ -68,7 +69,6 @@ Cc: Barry Song <baohua@kernel.org>
 Cc: Byungchul Park <byungchul@sk.com>
 Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: Chris Li <chrisl@kernel.org>
-Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -118,8 +118,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  MAINTAINERS                   |    1 
  fs/proc/task_mmu.c            |   26 +-
  fs/userfaultfd.c              |    6 
- include/linux/leafops.h       |  394 ++++++++++++++++++++++++++++++++
+ include/linux/leafops.h       |  382 ++++++++++++++++++++++++++++++++
  include/linux/mm_inline.h     |    6 
+ include/linux/mm_types.h      |   25 ++
  include/linux/swapops.h       |   28 --
  include/linux/userfaultfd_k.h |   51 ----
  mm/hmm.c                      |    2 
@@ -132,7 +133,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  mm/page_vma_mapped.c          |   11 
  mm/shmem.c                    |    7 
  mm/userfaultfd.c              |    6 
- 17 files changed, 484 insertions(+), 164 deletions(-)
+ 18 files changed, 497 insertions(+), 164 deletions(-)
 
 --- a/fs/proc/task_mmu.c~mm-introduce-leaf-entry-type-and-use-to-simplify-leaf-entry-logic
 +++ a/fs/proc/task_mmu.c
@@ -152,12 +153,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	} else if (is_swap_pte(ptent)) {
 -		swp_entry_t swpent = pte_to_swp_entry(ptent);
 +	} else {
-+		const leaf_entry_t entry = leafent_from_pte(ptent);
++		const softleaf_t entry = softleaf_from_pte(ptent);
  
 -		if (is_pfn_swap_entry(swpent))
 -			folio = pfn_swap_entry_folio(swpent);
-+		if (leafent_has_pfn(entry))
-+			folio = leafent_to_folio(entry);
++		if (softleaf_has_pfn(entry))
++			folio = softleaf_to_folio(entry);
  	}
  
  	if (folio) {
@@ -166,10 +167,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (is_pfn_swap_entry(entry))
  			page = pfn_swap_entry_to_page(entry);
 -		if (pte_marker_entry_uffd_wp(entry))
-+		if (leafent_is_uffd_wp_marker(entry))
++		if (softleaf_is_uffd_wp_marker(entry))
  			flags |= PM_UFFD_WP;
 -		if (is_guard_swp_entry(entry))
-+		if (leafent_is_guard_marker(entry))
++		if (softleaf_is_guard_marker(entry))
  			flags |=  PM_GUARD_REGION;
  	}
  
@@ -178,7 +179,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			categories |= PAGE_IS_SOFT_DIRTY;
  	} else if (is_swap_pte(pte)) {
 -		swp_entry_t swp;
-+		leaf_entry_t entry;
++		softleaf_t entry;
  
  		categories |= PAGE_IS_SWAPPED;
  		if (!pte_swp_uffd_wp_any(pte))
@@ -186,14 +187,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -		swp = pte_to_swp_entry(pte);
 -		if (is_guard_swp_entry(swp))
-+		entry = leafent_from_pte(pte);
-+		if (leafent_is_guard_marker(entry))
++		entry = softleaf_from_pte(pte);
++		if (softleaf_is_guard_marker(entry))
  			categories |= PAGE_IS_GUARD;
  		else if ((p->masks_of_interest & PAGE_IS_FILE) &&
 -			 is_pfn_swap_entry(swp) &&
 -			 !folio_test_anon(pfn_swap_entry_folio(swp)))
-+			 leafent_has_pfn(entry) &&
-+			 !folio_test_anon(leafent_to_folio(entry)))
++			 softleaf_has_pfn(entry) &&
++			 !folio_test_anon(softleaf_to_folio(entry)))
  			categories |= PAGE_IS_FILE;
  
  		if (pte_swp_soft_dirty(pte))
@@ -239,8 +240,13 @@ diff --git a/include/linux/leafops.h a/include/linux/leafops.h
 new file mode 100644
 --- /dev/null
 +++ a/include/linux/leafops.h
-@@ -0,0 +1,394 @@
+@@ -0,0 +1,382 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Describes operations that can be performed on software-defined page table
++ * leaf entries. These are abstracted from the hardware page table entries
++ * themselves by the softleaf_t type, see mm_types.h.
++ */
 +#ifndef _LINUX_LEAFOPS_H
 +#define _LINUX_LEAFOPS_H
 +
@@ -248,57 +254,40 @@ new file mode 100644
 +#include <linux/swapops.h>
 +#include <linux/swap.h>
 +
-+/**
-+ * leaf_entry_t - Describes a page table 'leaf entry'.
-+ *
-+ * Leaf entries are an abstract representation of all page table entries which
-+ * are non-present. Therefore these describe:
-+ *
-+ * - None or 'empty' entries.
-+ *
-+ * - All other entries which cause page faults and therefore encode
-+ *   software-controlled metadata.
-+ *
-+ * NOTE: While we transition from the confusing swp_entry_t type used for this
-+ *       purpose, we simply alias this type. This will be removed once the
-+ *       transition is complete.
-+ */
-+typedef swp_entry_t leaf_entry_t;
-+
 +#ifdef CONFIG_MMU
 +
 +/* Temporary until swp_entry_t eliminated. */
 +#define LEAF_TYPE_SHIFT SWP_TYPE_SHIFT
 +
-+enum leaf_entry_type {
++enum softleaf_type {
 +	/* Fundamental types. */
-+	LEAFENT_NONE,
-+	LEAFENT_SWAP,
++	SOFTLEAF_NONE,
++	SOFTLEAF_SWAP,
 +	/* Migration types. */
-+	LEAFENT_MIGRATION_READ,
-+	LEAFENT_MIGRATION_READ_EXCLUSIVE,
-+	LEAFENT_MIGRATION_WRITE,
++	SOFTLEAF_MIGRATION_READ,
++	SOFTLEAF_MIGRATION_READ_EXCLUSIVE,
++	SOFTLEAF_MIGRATION_WRITE,
 +	/* Device types. */
-+	LEAFENT_DEVICE_PRIVATE_READ,
-+	LEAFENT_DEVICE_PRIVATE_WRITE,
-+	LEAFENT_DEVICE_EXCLUSIVE,
++	SOFTLEAF_DEVICE_PRIVATE_READ,
++	SOFTLEAF_DEVICE_PRIVATE_WRITE,
++	SOFTLEAF_DEVICE_EXCLUSIVE,
 +	/* H/W posion types. */
-+	LEAFENT_HWPOISON,
++	SOFTLEAF_HWPOISON,
 +	/* Marker types. */
-+	LEAFENT_MARKER,
++	SOFTLEAF_MARKER,
 +};
 +
 +/**
-+ * leafent_mk_none() - Create an empty ('none') leaf entry.
++ * softleaf_mk_none() - Create an empty ('none') leaf entry.
 + * Returns: empty leaf entry.
 + */
-+static inline leaf_entry_t leafent_mk_none(void)
++static inline softleaf_t softleaf_mk_none(void)
 +{
-+	return ((leaf_entry_t) { 0 });
++	return ((softleaf_t) { 0 });
 +}
 +
 +/**
-+ * leafent_from_pte() - Obtain a leaf entry from a PTE entry.
++ * softleaf_from_pte() - Obtain a leaf entry from a PTE entry.
 + * @pte: PTE entry.
 + *
 + * If @pte is present (therefore not a leaf entry) the function returns an empty
@@ -306,17 +295,17 @@ new file mode 100644
 + *
 + * Returns: Leaf entry.
 + */
-+static inline leaf_entry_t leafent_from_pte(pte_t pte)
++static inline softleaf_t softleaf_from_pte(pte_t pte)
 +{
 +	if (pte_present(pte))
-+		return leafent_mk_none();
++		return softleaf_mk_none();
 +
 +	/* Temporary until swp_entry_t eliminated. */
 +	return pte_to_swp_entry(pte);
 +}
 +
 +/**
-+ * leafent_is_none() - Is the leaf entry empty?
++ * softleaf_is_none() - Is the leaf entry empty?
 + * @entry: Leaf entry.
 + *
 + * Empty entries are typically the result of a 'none' page table leaf entry
@@ -324,82 +313,82 @@ new file mode 100644
 + *
 + * Returns: true if the entry is empty, false otherwise.
 + */
-+static inline bool leafent_is_none(leaf_entry_t entry)
++static inline bool softleaf_is_none(softleaf_t entry)
 +{
 +	return entry.val == 0;
 +}
 +
 +/**
-+ * leafent_type() - Identify the type of leaf entry.
++ * softleaf_type() - Identify the type of leaf entry.
 + * @enntry: Leaf entry.
 + *
 + * Returns: the leaf entry type associated with @entry.
 + */
-+static inline enum leaf_entry_type leafent_type(leaf_entry_t entry)
++static inline enum softleaf_type softleaf_type(softleaf_t entry)
 +{
 +	unsigned int type_num;
 +
-+	if (leafent_is_none(entry))
-+		return LEAFENT_NONE;
++	if (softleaf_is_none(entry))
++		return SOFTLEAF_NONE;
 +
 +	type_num = entry.val >> LEAF_TYPE_SHIFT;
 +
 +	if (type_num < MAX_SWAPFILES)
-+		return LEAFENT_SWAP;
++		return SOFTLEAF_SWAP;
 +
 +	switch (type_num) {
 +#ifdef CONFIG_MIGRATION
 +	case SWP_MIGRATION_READ:
-+		return LEAFENT_MIGRATION_READ;
++		return SOFTLEAF_MIGRATION_READ;
 +	case SWP_MIGRATION_READ_EXCLUSIVE:
-+		return LEAFENT_MIGRATION_READ_EXCLUSIVE;
++		return SOFTLEAF_MIGRATION_READ_EXCLUSIVE;
 +	case SWP_MIGRATION_WRITE:
-+		return LEAFENT_MIGRATION_WRITE;
++		return SOFTLEAF_MIGRATION_WRITE;
 +#endif
 +#ifdef CONFIG_DEVICE_PRIVATE
 +	case SWP_DEVICE_WRITE:
-+		return LEAFENT_DEVICE_PRIVATE_WRITE;
++		return SOFTLEAF_DEVICE_PRIVATE_WRITE;
 +	case SWP_DEVICE_READ:
-+		return LEAFENT_DEVICE_PRIVATE_READ;
++		return SOFTLEAF_DEVICE_PRIVATE_READ;
 +	case SWP_DEVICE_EXCLUSIVE:
-+		return LEAFENT_DEVICE_EXCLUSIVE;
++		return SOFTLEAF_DEVICE_EXCLUSIVE;
 +#endif
 +#ifdef CONFIG_MEMORY_FAILURE
 +	case SWP_HWPOISON:
-+		return LEAFENT_HWPOISON;
++		return SOFTLEAF_HWPOISON;
 +#endif
 +	case SWP_PTE_MARKER:
-+		return LEAFENT_MARKER;
++		return SOFTLEAF_MARKER;
 +	}
 +
 +	/* Unknown entry type. */
 +	VM_WARN_ON_ONCE(1);
-+	return LEAFENT_NONE;
++	return SOFTLEAF_NONE;
 +}
 +
 +/**
-+ * leafent_is_swap() - Is this leaf entry a swap entry?
++ * softleaf_is_swap() - Is this leaf entry a swap entry?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a swap entry, otherwise false.
 + */
-+static inline bool leafent_is_swap(leaf_entry_t entry)
++static inline bool softleaf_is_swap(softleaf_t entry)
 +{
-+	return leafent_type(entry) == LEAFENT_SWAP;
++	return softleaf_type(entry) == SOFTLEAF_SWAP;
 +}
 +
 +/**
-+ * leafent_is_swap() - Is this leaf entry a migration entry?
++ * softleaf_is_swap() - Is this leaf entry a migration entry?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a migration entry, otherwise false.
 + */
-+static inline bool leafent_is_migration(leaf_entry_t entry)
++static inline bool softleaf_is_migration(softleaf_t entry)
 +{
-+	switch (leafent_type(entry)) {
-+	case LEAFENT_MIGRATION_READ:
-+	case LEAFENT_MIGRATION_READ_EXCLUSIVE:
-+	case LEAFENT_MIGRATION_WRITE:
++	switch (softleaf_type(entry)) {
++	case SOFTLEAF_MIGRATION_READ:
++	case SOFTLEAF_MIGRATION_READ_EXCLUSIVE:
++	case SOFTLEAF_MIGRATION_WRITE:
 +		return true;
 +	default:
 +		return false;
@@ -407,64 +396,64 @@ new file mode 100644
 +}
 +
 +/**
-+ * leafent_is_device_private() - Is this leaf entry a device private entry?
++ * softleaf_is_device_private() - Is this leaf entry a device private entry?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a device private entry, otherwise false.
 + */
-+static inline bool leafent_is_device_private(leaf_entry_t entry)
++static inline bool softleaf_is_device_private(softleaf_t entry)
 +{
-+	switch (leafent_type(entry)) {
-+	case LEAFENT_DEVICE_PRIVATE_WRITE:
-+	case LEAFENT_DEVICE_PRIVATE_READ:
++	switch (softleaf_type(entry)) {
++	case SOFTLEAF_DEVICE_PRIVATE_WRITE:
++	case SOFTLEAF_DEVICE_PRIVATE_READ:
 +		return true;
 +	default:
 +		return false;
 +	}
 +}
 +
-+static inline bool leafent_is_device_exclusive(leaf_entry_t entry)
++static inline bool softleaf_is_device_exclusive(softleaf_t entry)
 +{
-+	return leafent_type(entry) == LEAFENT_DEVICE_EXCLUSIVE;
++	return softleaf_type(entry) == SOFTLEAF_DEVICE_EXCLUSIVE;
 +}
 +
 +/**
-+ * leafent_is_hwpoison() - Is this leaf entry a hardware poison entry?
++ * softleaf_is_hwpoison() - Is this leaf entry a hardware poison entry?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a hardware poison entry, otherwise false.
 + */
-+static inline bool leafent_is_hwpoison(leaf_entry_t entry)
++static inline bool softleaf_is_hwpoison(softleaf_t entry)
 +{
-+	return leafent_type(entry) == LEAFENT_HWPOISON;
++	return softleaf_type(entry) == SOFTLEAF_HWPOISON;
 +}
 +
 +/**
-+ * leafent_is_marker() - Is this leaf entry a marker?
++ * softleaf_is_marker() - Is this leaf entry a marker?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a marker entry, otherwise false.
 + */
-+static inline bool leafent_is_marker(leaf_entry_t entry)
++static inline bool softleaf_is_marker(softleaf_t entry)
 +{
-+	return leafent_type(entry) == LEAFENT_MARKER;
++	return softleaf_type(entry) == SOFTLEAF_MARKER;
 +}
 +
 +/**
-+ * leafent_to_marker() - Obtain marker associated with leaf entry.
-+ * @entry: Leaf entry, leafent_is_marker(@entry) must return true.
++ * softleaf_to_marker() - Obtain marker associated with leaf entry.
++ * @entry: Leaf entry, softleaf_is_marker(@entry) must return true.
 + *
 + * Returns: Marker associated with the leaf entry.
 + */
-+static inline pte_marker leafent_to_marker(leaf_entry_t entry)
++static inline pte_marker softleaf_to_marker(softleaf_t entry)
 +{
-+	VM_WARN_ON_ONCE(!leafent_is_marker(entry));
++	VM_WARN_ON_ONCE(!softleaf_is_marker(entry));
 +
 +	return swp_offset(entry) & PTE_MARKER_MASK;
 +}
 +
 +/**
-+ * leafent_has_pfn() - Does this leaf entry encode a valid PFN number?
++ * softleaf_has_pfn() - Does this leaf entry encode a valid PFN number?
 + * @entry: Leaf entry.
 + *
 + * A pfn swap entry is a special type of swap entry that always has a pfn stored
@@ -474,98 +463,98 @@ new file mode 100644
 + *
 + * Returns: true if the leaf entry encodes a PFN, otherwise false.
 + */
-+static inline bool leafent_has_pfn(leaf_entry_t entry)
++static inline bool softleaf_has_pfn(softleaf_t entry)
 +{
 +	/* Make sure the swp offset can always store the needed fields. */
 +	BUILD_BUG_ON(SWP_TYPE_SHIFT < SWP_PFN_BITS);
 +
-+	if (leafent_is_migration(entry))
++	if (softleaf_is_migration(entry))
 +		return true;
-+	if (leafent_is_device_private(entry))
++	if (softleaf_is_device_private(entry))
 +		return true;
-+	if (leafent_is_device_exclusive(entry))
++	if (softleaf_is_device_exclusive(entry))
 +		return true;
-+	if (leafent_is_hwpoison(entry))
++	if (softleaf_is_hwpoison(entry))
 +		return true;
 +
 +	return false;
 +}
 +
 +/**
-+ * leafent_to_pfn() - Obtain PFN encoded within leaf entry.
-+ * @entry: Leaf entry, leafent_has_pfn(@entry) must return true.
++ * softleaf_to_pfn() - Obtain PFN encoded within leaf entry.
++ * @entry: Leaf entry, softleaf_has_pfn(@entry) must return true.
 + *
 + * Returns: The PFN associated with the leaf entry.
 + */
-+static inline unsigned long leafent_to_pfn(leaf_entry_t entry)
++static inline unsigned long softleaf_to_pfn(softleaf_t entry)
 +{
-+	VM_WARN_ON_ONCE(!leafent_has_pfn(entry));
++	VM_WARN_ON_ONCE(!softleaf_has_pfn(entry));
 +
 +	/* Temporary until swp_entry_t eliminated. */
 +	return swp_offset_pfn(entry);
 +}
 +
 +/**
-+ * leafent_to_page() - Obtains struct page for PFN encoded within leaf entry.
-+ * @entry: Leaf entry, leafent_has_pfn(@entry) must return true.
++ * softleaf_to_page() - Obtains struct page for PFN encoded within leaf entry.
++ * @entry: Leaf entry, softleaf_has_pfn(@entry) must return true.
 + *
 + * Returns: Pointer to the struct page associated with the leaf entry's PFN.
 + */
-+static inline struct page *leafent_to_page(leaf_entry_t entry)
++static inline struct page *softleaf_to_page(softleaf_t entry)
 +{
-+	VM_WARN_ON_ONCE(!leafent_has_pfn(entry));
++	VM_WARN_ON_ONCE(!softleaf_has_pfn(entry));
 +
 +	/* Temporary until swp_entry_t eliminated. */
 +	return pfn_swap_entry_to_page(entry);
 +}
 +
 +/**
-+ * leafent_to_folio() - Obtains struct folio for PFN encoded within leaf entry.
-+ * @entry: Leaf entry, leafent_has_pfn(@entry) must return true.
++ * softleaf_to_folio() - Obtains struct folio for PFN encoded within leaf entry.
++ * @entry: Leaf entry, softleaf_has_pfn(@entry) must return true.
 + *
 + * Returns: Pointer to the struct folio associated with the leaf entry's PFN.
 + * Returns:
 + */
-+static inline struct folio *leafent_to_folio(leaf_entry_t entry)
++static inline struct folio *softleaf_to_folio(softleaf_t entry)
 +{
-+	VM_WARN_ON_ONCE(!leafent_has_pfn(entry));
++	VM_WARN_ON_ONCE(!softleaf_has_pfn(entry));
 +
 +	/* Temporary until swp_entry_t eliminated. */
 +	return pfn_swap_entry_folio(entry);
 +}
 +
 +/**
-+ * leafent_is_poison_marker() - Is this leaf entry a poison marker?
++ * softleaf_is_poison_marker() - Is this leaf entry a poison marker?
 + * @entry: Leaf entry.
 + *
 + * The poison marker is set via UFFDIO_POISON. Userfaultfd-specific.
 + *
 + * Returns: true if the leaf entry is a poison marker, otherwise false.
 + */
-+static inline bool leafent_is_poison_marker(leaf_entry_t entry)
++static inline bool softleaf_is_poison_marker(softleaf_t entry)
 +{
-+	if (!leafent_is_marker(entry))
++	if (!softleaf_is_marker(entry))
 +		return false;
 +
-+	return leafent_to_marker(entry) & PTE_MARKER_POISONED;
++	return softleaf_to_marker(entry) & PTE_MARKER_POISONED;
 +}
 +
 +/**
-+ * leafent_is_guard_marker() - Is this leaf entry a guard region marker?
++ * softleaf_is_guard_marker() - Is this leaf entry a guard region marker?
 + * @entry: Leaf entry.
 + *
 + * Returns: true if the leaf entry is a guard marker, otherwise false.
 + */
-+static inline bool leafent_is_guard_marker(leaf_entry_t entry)
++static inline bool softleaf_is_guard_marker(softleaf_t entry)
 +{
-+	if (!leafent_is_marker(entry))
++	if (!softleaf_is_marker(entry))
 +		return false;
 +
-+	return leafent_to_marker(entry) & PTE_MARKER_GUARD;
++	return softleaf_to_marker(entry) & PTE_MARKER_GUARD;
 +}
 +
 +/**
-+ * leafent_is_uffd_wp_marker() - Is this leaf entry a userfautlfd write protect
++ * softleaf_is_uffd_wp_marker() - Is this leaf entry a userfautlfd write protect
 + * marker?
 + * @entry: Leaf entry.
 + *
@@ -573,12 +562,12 @@ new file mode 100644
 + *
 + * Returns: true if the leaf entry is a UFFD WP marker, otherwise false.
 + */
-+static inline bool leafent_is_uffd_wp_marker(leaf_entry_t entry)
++static inline bool softleaf_is_uffd_wp_marker(softleaf_t entry)
 +{
-+	if (!leafent_is_marker(entry))
++	if (!softleaf_is_marker(entry))
 +		return false;
 +
-+	return leafent_to_marker(entry) & PTE_MARKER_UFFD_WP;
++	return softleaf_to_marker(entry) & PTE_MARKER_UFFD_WP;
 +}
 +
 +/**
@@ -589,7 +578,7 @@ new file mode 100644
 + */
 +static inline bool pte_is_marker(pte_t pte)
 +{
-+	return leafent_is_marker(leafent_from_pte(pte));
++	return softleaf_is_marker(softleaf_from_pte(pte));
 +}
 +
 +/**
@@ -601,9 +590,9 @@ new file mode 100644
 + */
 +static inline bool pte_is_uffd_wp_marker(pte_t pte)
 +{
-+	const leaf_entry_t entry = leafent_from_pte(pte);
++	const softleaf_t entry = softleaf_from_pte(pte);
 +
-+	return leafent_is_uffd_wp_marker(entry);
++	return softleaf_is_uffd_wp_marker(entry);
 +}
 +
 +/**
@@ -618,15 +607,15 @@ new file mode 100644
 + */
 +static inline bool pte_is_uffd_marker(pte_t pte)
 +{
-+	const leaf_entry_t entry = leafent_from_pte(pte);
++	const softleaf_t entry = softleaf_from_pte(pte);
 +
-+	if (!leafent_is_marker(entry))
++	if (!softleaf_is_marker(entry))
 +		return false;
 +
 +	/* UFFD WP, poisoned swap entries are UFFD-handled. */
-+	if (leafent_is_uffd_wp_marker(entry))
++	if (softleaf_is_uffd_wp_marker(entry))
 +		return true;
-+	if (leafent_is_poison_marker(entry))
++	if (softleaf_is_poison_marker(entry))
 +		return true;
 +
 +	return false;
@@ -650,13 +639,47 @@ new file mode 100644
   */
  static inline pte_marker copy_pte_marker(
 -		swp_entry_t entry, struct vm_area_struct *dst_vma)
-+		leaf_entry_t entry, struct vm_area_struct *dst_vma)
++		softleaf_t entry, struct vm_area_struct *dst_vma)
  {
 -	pte_marker srcm = pte_marker_get(entry);
-+	const pte_marker srcm = leafent_to_marker(entry);
++	const pte_marker srcm = softleaf_to_marker(entry);
  	/* Always copy error entries. */
  	pte_marker dstm = srcm & (PTE_MARKER_POISONED | PTE_MARKER_GUARD);
  
+--- a/include/linux/mm_types.h~mm-introduce-leaf-entry-type-and-use-to-simplify-leaf-entry-logic
++++ a/include/linux/mm_types.h
+@@ -285,6 +285,31 @@ typedef struct {
+ 	unsigned long val;
+ } swp_entry_t;
+ 
++/**
++ * typedef softleaf_t - Describes a page table software leaf entry, abstracted
++ * from its architecture-specific encoding.
++ *
++ * Page table leaf entries are those which do not reference any descendent page
++ * tables but rather either reference a data page, are an empty (or 'none'
++ * entry), or contain a non-present entry.
++ *
++ * If referencing another page table or a data page then the page table entry is
++ * pertinent to hardware - that is it tells the hardware how to decode the page
++ * table entry.
++ *
++ * Otherwise it is a software-defined leaf page table entry, which this type
++ * describes. See leafops.h and specifically @softleaf_type for a list of all
++ * possible kinds of software leaf entry.
++ *
++ * A softleaf_t entry is abstracted from the hardware page table entry, so is
++ * not architecture-specific.
++ *
++ * NOTE: While we transition from the confusing swp_entry_t type used for this
++ *       purpose, we simply alias this type. This will be removed once the
++ *       transition is complete.
++ */
++typedef swp_entry_t softleaf_t;
++
+ #if defined(CONFIG_MEMCG) || defined(CONFIG_SLAB_OBJ_EXT)
+ /* We have some extra room after the refcount in tail pages. */
+ #define NR_PAGES_IN_LARGE_FOLIO
 --- a/include/linux/swapops.h~mm-introduce-leaf-entry-type-and-use-to-simplify-leaf-entry-logic
 +++ a/include/linux/swapops.h
 @@ -426,21 +426,6 @@ static inline swp_entry_t make_pte_marke
@@ -785,7 +808,7 @@ new file mode 100644
  #endif /* _LINUX_USERFAULTFD_K_H */
 --- a/MAINTAINERS~mm-introduce-leaf-entry-type-and-use-to-simplify-leaf-entry-logic
 +++ a/MAINTAINERS
-@@ -16256,6 +16256,7 @@ T:	git git://git.kernel.org/pub/scm/linu
+@@ -16259,6 +16259,7 @@ T:	git git://git.kernel.org/pub/scm/linu
  F:	include/linux/gfp.h
  F:	include/linux/gfp_types.h
  F:	include/linux/highmem.h
@@ -820,11 +843,11 @@ new file mode 100644
  			set_huge_pte_at(dst, addr, dst_pte, entry, sz);
  		} else if (unlikely(is_hugetlb_entry_migration(entry))) {
 -			swp_entry_t swp_entry = pte_to_swp_entry(entry);
-+			leaf_entry_t leafent = leafent_from_pte(entry);
++			softleaf_t softleaf = softleaf_from_pte(entry);
  			bool uffd_wp = pte_swp_uffd_wp(entry);
  
 -			if (!is_readable_migration_entry(swp_entry) && cow) {
-+			if (!is_readable_migration_entry(leafent) && cow) {
++			if (!is_readable_migration_entry(softleaf) && cow) {
  				/*
  				 * COW mappings require pages in both
  				 * parent and child to be set to read.
@@ -832,9 +855,9 @@ new file mode 100644
 -				swp_entry = make_readable_migration_entry(
 -							swp_offset(swp_entry));
 -				entry = swp_entry_to_pte(swp_entry);
-+				leafent = make_readable_migration_entry(
-+							swp_offset(leafent));
-+				entry = swp_entry_to_pte(leafent);
++				softleaf = make_readable_migration_entry(
++							swp_offset(softleaf));
++				entry = swp_entry_to_pte(softleaf);
  				if (userfaultfd_wp(src_vma) && uffd_wp)
  					entry = pte_swp_mkuffd_wp(entry);
  				set_huge_pte_at(src, addr, src_pte, entry, sz);
@@ -846,8 +869,8 @@ new file mode 100644
 -			pte_marker marker = copy_pte_marker(
 -				pte_to_swp_entry(entry), dst_vma);
 +		} else if (unlikely(pte_is_marker(entry))) {
-+			const leaf_entry_t leafent = leafent_from_pte(entry);
-+			const pte_marker marker = copy_pte_marker(leafent, dst_vma);
++			const softleaf_t softleaf = softleaf_from_pte(entry);
++			const pte_marker marker = copy_pte_marker(softleaf, dst_vma);
  
  			if (marker)
  				set_huge_pte_at(dst, addr, dst_pte,
@@ -877,7 +900,7 @@ new file mode 100644
 +	if (pte_is_marker(vmf.orig_pte)) {
  		const pte_marker marker =
 -			pte_marker_get(pte_to_swp_entry(vmf.orig_pte));
-+			leafent_to_marker(leafent_from_pte(vmf.orig_pte));
++			softleaf_to_marker(softleaf_from_pte(vmf.orig_pte));
  
  		if (marker & PTE_MARKER_POISONED) {
  			ret = VM_FAULT_HWPOISON_LARGE |
@@ -896,9 +919,9 @@ new file mode 100644
  		} else if (unlikely(is_hugetlb_entry_migration(pte))) {
 -			swp_entry_t entry = pte_to_swp_entry(pte);
 -			struct folio *folio = pfn_swap_entry_folio(entry);
-+			leaf_entry_t entry = leafent_from_pte(pte);
++			softleaf_t entry = softleaf_from_pte(pte);
 +
-+			struct folio *folio = leafent_to_folio(entry);
++			struct folio *folio = softleaf_to_folio(entry);
  			pte_t newpte = pte;
  
  			if (is_writable_migration_entry(entry)) {
@@ -935,11 +958,11 @@ new file mode 100644
  		 */
  		if (!pte_present(ptent)) {
 -			swp_entry_t entry;
-+			leaf_entry_t entry = leafent_from_pte(ptent);
++			softleaf_t entry = softleaf_from_pte(ptent);
  
 -			entry = pte_to_swp_entry(ptent);
 -			if (!non_swap_entry(entry)) {
-+			if (leafent_is_swap(entry)) {
++			if (softleaf_is_swap(entry)) {
  				max_nr = (end - addr) / PAGE_SIZE;
  				nr = swap_pte_batch(pte, max_nr, ptent);
  				nr_swap -= nr;
@@ -947,8 +970,8 @@ new file mode 100644
  				clear_not_present_full_ptes(mm, addr, pte, nr, tlb->fullmm);
 -			} else if (is_hwpoison_entry(entry) ||
 -				   is_poisoned_swp_entry(entry)) {
-+			} else if (leafent_is_hwpoison(entry) ||
-+				   leafent_is_poison_marker(entry)) {
++			} else if (softleaf_is_hwpoison(entry) ||
++				   softleaf_is_poison_marker(entry)) {
  				pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
  			}
  			continue;
@@ -958,9 +981,9 @@ new file mode 100644
  {
 -	return is_swap_pte(ptent) &&
 -	       is_guard_swp_entry(pte_to_swp_entry(ptent));
-+	const leaf_entry_t entry = leafent_from_pte(ptent);
++	const softleaf_t entry = softleaf_from_pte(ptent);
 +
-+	return leafent_is_guard_marker(entry);
++	return softleaf_is_guard_marker(entry);
  }
  
  static int guard_install_pud_entry(pud_t *pud, unsigned long addr,
@@ -988,7 +1011,7 @@ new file mode 100644
  {
  	vm_flags_t vm_flags = dst_vma->vm_flags;
  	pte_t orig_pte = ptep_get(src_pte);
-+	leaf_entry_t entry = leafent_from_pte(orig_pte);
++	softleaf_t entry = softleaf_from_pte(orig_pte);
  	pte_t pte = orig_pte;
  	struct folio *folio;
  	struct page *page;
@@ -1001,7 +1024,7 @@ new file mode 100644
  			return -EBUSY;
  		return -ENOENT;
 -	} else if (is_pte_marker_entry(entry)) {
-+	} else if (leafent_is_marker(entry)) {
++	} else if (softleaf_is_marker(entry)) {
  		pte_marker marker = copy_pte_marker(entry, dst_vma);
  
  		if (marker)
@@ -1010,7 +1033,7 @@ new file mode 100644
  		struct zap_details *details, int *rss, bool *any_skipped)
  {
 -	swp_entry_t entry;
-+	leaf_entry_t entry;
++	softleaf_t entry;
  	int nr = 1;
  
  	*any_skipped = true;
@@ -1018,10 +1041,10 @@ new file mode 100644
 -	if (is_device_private_entry(entry) ||
 -		is_device_exclusive_entry(entry)) {
 -		struct page *page = pfn_swap_entry_to_page(entry);
-+	entry = leafent_from_pte(ptent);
-+	if (leafent_is_device_private(entry) ||
-+	    leafent_is_device_exclusive(entry)) {
-+		struct page *page = leafent_to_page(entry);
++	entry = softleaf_from_pte(ptent);
++	if (softleaf_is_device_private(entry) ||
++	    softleaf_is_device_exclusive(entry)) {
++		struct page *page = softleaf_to_page(entry);
  		struct folio *folio = page_folio(page);
  
  		if (unlikely(!should_zap_folio(details, folio)))
@@ -1030,7 +1053,7 @@ new file mode 100644
  		folio_remove_rmap_pte(folio, page, vma);
  		folio_put(folio);
 -	} else if (!non_swap_entry(entry)) {
-+	} else if (leafent_is_swap(entry)) {
++	} else if (softleaf_is_swap(entry)) {
  		/* Genuine swap entries, hence a private anon pages */
  		if (!should_zap_cows(details))
  			return 1;
@@ -1040,14 +1063,14 @@ new file mode 100644
  		free_swap_and_cache_nr(entry, nr);
 -	} else if (is_migration_entry(entry)) {
 -		struct folio *folio = pfn_swap_entry_folio(entry);
-+	} else if (leafent_is_migration(entry)) {
-+		struct folio *folio = leafent_to_folio(entry);
++	} else if (softleaf_is_migration(entry)) {
++		struct folio *folio = softleaf_to_folio(entry);
  
  		if (!should_zap_folio(details, folio))
  			return 1;
  		rss[mm_counter(folio)]--;
 -	} else if (pte_marker_entry_uffd_wp(entry)) {
-+	} else if (leafent_is_uffd_wp_marker(entry)) {
++	} else if (softleaf_is_uffd_wp_marker(entry)) {
  		/*
  		 * For anon: always drop the marker; for file: only
  		 * drop the marker if explicitly requested.
@@ -1055,7 +1078,7 @@ new file mode 100644
  		if (!vma_is_anonymous(vma) && !zap_drop_markers(details))
  			return 1;
 -	} else if (is_guard_swp_entry(entry)) {
-+	} else if (leafent_is_guard_marker(entry)) {
++	} else if (softleaf_is_guard_marker(entry)) {
  		/*
  		 * Ordinary zapping should not remove guard PTE
  		 * markers. Only do so if we should remove PTE markers
@@ -1064,8 +1087,8 @@ new file mode 100644
  		if (!zap_drop_markers(details))
  			return 1;
 -	} else if (is_hwpoison_entry(entry) || is_poisoned_swp_entry(entry)) {
-+	} else if (leafent_is_hwpoison(entry) ||
-+		   leafent_is_poison_marker(entry)) {
++	} else if (softleaf_is_hwpoison(entry) ||
++		   softleaf_is_poison_marker(entry)) {
  		if (!should_zap_cows(details))
  			return 1;
  	} else {
@@ -1084,8 +1107,8 @@ new file mode 100644
  {
 -	swp_entry_t entry = pte_to_swp_entry(vmf->orig_pte);
 -	unsigned long marker = pte_marker_get(entry);
-+	const leaf_entry_t entry = leafent_from_pte(vmf->orig_pte);
-+	const pte_marker marker = leafent_to_marker(entry);
++	const softleaf_t entry = softleaf_from_pte(vmf->orig_pte);
++	const pte_marker marker = softleaf_to_marker(entry);
  
  	/*
  	 * PTE markers should never be empty.  If anything weird happened,
@@ -1094,7 +1117,7 @@ new file mode 100644
  		return VM_FAULT_SIGSEGV;
  
 -	if (pte_marker_entry_uffd_wp(entry))
-+	if (leafent_is_uffd_wp_marker(entry))
++	if (softleaf_is_uffd_wp_marker(entry))
  		return pte_marker_handle_uffd_wp(vmf);
  
  	/* This is an unknown pte marker */
@@ -1103,7 +1126,7 @@ new file mode 100644
  		} else if (is_hwpoison_entry(entry)) {
  			ret = VM_FAULT_HWPOISON;
 -		} else if (is_pte_marker_entry(entry)) {
-+		} else if (leafent_is_marker(entry)) {
++		} else if (softleaf_is_marker(entry)) {
  			ret = handle_pte_marker(vmf);
  		} else {
  			print_bad_pte(vma, vmf->address, vmf->orig_pte, NULL);
@@ -1143,7 +1166,7 @@ new file mode 100644
  				if (pte_swp_uffd_wp(oldpte))
  					newpte = pte_swp_mkuffd_wp(newpte);
 -			} else if (is_pte_marker_entry(entry)) {
-+			} else if (leafent_is_marker(entry)) {
++			} else if (softleaf_is_marker(entry)) {
  				/*
  				 * Ignore error swap entries unconditionally,
  				 * because any access should sigbus/sigsegv
@@ -1151,8 +1174,8 @@ new file mode 100644
  				 */
 -				if (is_poisoned_swp_entry(entry) ||
 -				    is_guard_swp_entry(entry))
-+				if (leafent_is_poison_marker(entry) ||
-+				    leafent_is_guard_marker(entry))
++				if (softleaf_is_poison_marker(entry) ||
++				    softleaf_is_guard_marker(entry))
  					continue;
  				/*
  				 * If this is uffd-wp pte marker and we'd like
@@ -1195,14 +1218,14 @@ new file mode 100644
 -		if (!is_swap_pte(ptent))
 -			return false;
 -		entry = pte_to_swp_entry(ptent);
-+		const leaf_entry_t entry = leafent_from_pte(ptent);
++		const softleaf_t entry = softleaf_from_pte(ptent);
  
 -		if (!is_migration_entry(entry))
-+		if (!leafent_is_migration(entry))
++		if (!softleaf_is_migration(entry))
  			return false;
  
 -		pfn = swp_offset_pfn(entry);
-+		pfn = leafent_to_pfn(entry);
++		pfn = softleaf_to_pfn(entry);
  	} else if (is_swap_pte(ptent)) {
  		swp_entry_t entry;
  
@@ -1223,7 +1246,7 @@ new file mode 100644
  	struct shmem_inode_info *info = SHMEM_I(inode);
 -	swp_entry_t swap, index_entry;
 +	swp_entry_t swap;
-+	leaf_entry_t index_entry;
++	softleaf_t index_entry;
  	struct swap_info_struct *si;
  	struct folio *folio = NULL;
  	bool skip_swapcache = false;
@@ -1232,7 +1255,7 @@ new file mode 100644
  	*foliop = NULL;
  
 -	if (is_poisoned_swp_entry(index_entry))
-+	if (leafent_is_poison_marker(index_entry))
++	if (softleaf_is_poison_marker(index_entry))
  		return -EIO;
  
  	si = get_swap_device(index_entry);
