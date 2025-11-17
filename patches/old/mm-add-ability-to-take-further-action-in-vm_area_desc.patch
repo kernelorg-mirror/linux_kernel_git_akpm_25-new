@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: add ability to take further action in vm_area_desc
-Date: Wed, 17 Sep 2025 20:11:11 +0100
+Date: Mon, 20 Oct 2025 13:11:27 +0100
 
 Some drivers/filesystems need to perform additional tasks after the VMA is
 set up.  This is typically in the form of pre-population.
@@ -26,6 +26,19 @@ the harm that can be done is limited.
 
 The error hook can be used to filter errors if necessary.
 
+There may be cases in which the caller absolutely must hold the file rmap
+lock until the operation is entirely complete. It is an edge case, but
+certainly the hugetlbfs mmap hook requires it.
+
+To accommodate this, we add the hide_from_rmap_until_complete flag to the
+mmap_action type. In this case, if a new VMA is allocated, we will hold the
+file rmap lock until the operation is entirely completed (including any
+success/error hooks).
+
+Note that we do not need to update __compat_vma_mmap() to accommodate this
+flag, as this function will be invoked from an .mmap handler whose VMA is
+not yet visible, so we implicitly hide it from the rmap.
+
 If any error arises on these final actions, we simply unmap the VMA
 altogether.
 
@@ -36,9 +49,7 @@ While we're here, rename __compat_vma_mmap_prepare() to __compat_vma_mmap()
 as we are now performing actions invoked by the mmap_prepare in addition to
 just the mmap_prepare hook.
 
-[lorenzo.stoakes@oracle.com: return error on broken path, update vma_internal.h]
-  Link: https://lkml.kernel.org/r/20f1c97d-b958-474c-b3a1-8ea9a177e096@lucifer.local
-Link: https://lkml.kernel.org/r/777c55010d2c94cc90913eb5aaeb703e912f99e0.1758135681.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/2601199a7b2eaeadfcd8ab6e199c6d1706650c94.1760959442.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Al Viro <viro@zeniv.linux.org.uk>
@@ -78,6 +89,7 @@ Cc: Nicolas Pitre <nico@fluxnic.net>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Pedro Falcato <pfalcato@suse.de>
 Cc: Robin Murohy <robin.murphy@arm.com>
+Cc: Sumanth Korikkar <sumanthk@linux.ibm.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Sven Schnelle <svens@linux.ibm.com>
 Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
@@ -86,16 +98,17 @@ Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vishal Verma <vishal.l.verma@intel.com>
 Cc: Vivek Goyal <vgoyal@redhat.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Will Deacon <will@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/fs.h               |    6 -
  include/linux/mm.h               |   74 ++++++++++++++
- include/linux/mm_types.h         |   46 +++++++++
- mm/util.c                        |  145 ++++++++++++++++++++++++++---
- mm/vma.c                         |   70 +++++++++-----
- tools/testing/vma/vma_internal.h |   91 ++++++++++++++++--
- 6 files changed, 388 insertions(+), 44 deletions(-)
+ include/linux/mm_types.h         |   53 ++++++++++
+ mm/util.c                        |  146 ++++++++++++++++++++++++++---
+ mm/vma.c                         |  113 ++++++++++++++++------
+ tools/testing/vma/vma_internal.h |   98 ++++++++++++++++++-
+ 6 files changed, 441 insertions(+), 49 deletions(-)
 
 --- a/include/linux/fs.h~mm-add-ability-to-take-further-action-in-vm_area_desc
 +++ a/include/linux/fs.h
@@ -119,7 +132,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
 --- a/include/linux/mm.h~mm-add-ability-to-take-further-action-in-vm_area_desc
 +++ a/include/linux/mm.h
-@@ -3601,6 +3601,80 @@ static inline unsigned long vma_desc_pag
+@@ -3608,6 +3608,80 @@ static inline unsigned long vma_desc_pag
  	return vma_desc_size(desc) >> PAGE_SHIFT;
  }
  
@@ -193,16 +206,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +void mmap_action_prepare(struct mmap_action *action,
-+			     struct vm_area_desc *desc);
++			 struct vm_area_desc *desc);
 +int mmap_action_complete(struct mmap_action *action,
-+			     struct vm_area_struct *vma);
++			 struct vm_area_struct *vma);
 +
  /* Look up the first VMA which exactly match the interval vm_start ... vm_end */
  static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
  				unsigned long vm_start, unsigned long vm_end)
 --- a/include/linux/mm_types.h~mm-add-ability-to-take-further-action-in-vm_area_desc
 +++ a/include/linux/mm_types.h
-@@ -773,6 +773,49 @@ struct pfnmap_track_ctx {
+@@ -773,6 +773,56 @@ struct pfnmap_track_ctx {
  };
  #endif
  
@@ -247,12 +260,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * it is not valid to clear the error here.
 +	 */
 +	int (*error_hook)(int err);
++
++	/*
++	 * This should be set in rare instances where the operation required
++	 * that the rmap should not be able to access the VMA until
++	 * completely set up.
++	 */
++	bool hide_from_rmap_until_complete :1;
 +};
 +
  /*
   * Describes a VMA that is about to be mmap()'ed. Drivers may choose to
   * manipulate mutable fields which will cause those fields to be updated in the
-@@ -796,6 +839,9 @@ struct vm_area_desc {
+@@ -796,6 +846,9 @@ struct vm_area_desc {
  	/* Write-only fields. */
  	const struct vm_operations_struct *vm_ops;
  	void *private_data;
@@ -336,7 +356,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  static void set_ps_flags(struct page_snapshot *ps, const struct folio *folio,
  			 const struct page *page)
-@@ -1280,6 +1283,126 @@ again:
+@@ -1280,6 +1283,127 @@ again:
  	}
  }
  
@@ -451,6 +471,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	case MMAP_REMAP_PFN:
 +	case MMAP_IO_REMAP_PFN:
 +		WARN_ON_ONCE(1); /* nommu cannot handle this. */
++
 +		err = -EINVAL;
 +		break;
 +	}
@@ -465,7 +486,46 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * folio_pte_batch - detect a PTE batch for a large folio
 --- a/mm/vma.c~mm-add-ability-to-take-further-action-in-vm_area_desc
 +++ a/mm/vma.c
-@@ -2328,17 +2328,33 @@ static void update_ksm_flags(struct mmap
+@@ -34,7 +34,9 @@ struct mmap_state {
+ 	struct maple_tree mt_detach;
+ 
+ 	/* Determine if we can check KSM flags early in mmap() logic. */
+-	bool check_ksm_early;
++	bool check_ksm_early :1;
++	/* If we map new, hold the file rmap lock on mapping. */
++	bool hold_file_rmap_lock :1;
+ };
+ 
+ #define MMAP_STATE(name, mm_, vmi_, addr_, len_, pgoff_, vm_flags_, file_) \
+@@ -1754,7 +1756,7 @@ void unlink_file_vma_batch_final(struct
+ 		unlink_file_vma_batch_process(vb);
+ }
+ 
+-static void vma_link_file(struct vm_area_struct *vma)
++static void vma_link_file(struct vm_area_struct *vma, bool hold_rmap_lock)
+ {
+ 	struct file *file = vma->vm_file;
+ 	struct address_space *mapping;
+@@ -1763,7 +1765,8 @@ static void vma_link_file(struct vm_area
+ 		mapping = file->f_mapping;
+ 		i_mmap_lock_write(mapping);
+ 		__vma_link_file(vma, mapping);
+-		i_mmap_unlock_write(mapping);
++		if (!hold_rmap_lock)
++			i_mmap_unlock_write(mapping);
+ 	}
+ }
+ 
+@@ -1777,7 +1780,7 @@ static int vma_link(struct mm_struct *mm
+ 
+ 	vma_start_write(vma);
+ 	vma_iter_store_new(&vmi, vma);
+-	vma_link_file(vma);
++	vma_link_file(vma, /* hold_rmap_lock= */false);
+ 	mm->map_count++;
+ 	validate_mm(mm);
+ 	return 0;
+@@ -2311,17 +2314,33 @@ static void update_ksm_flags(struct mmap
  	map->vm_flags = ksm_vma_flags(map->mm, map->file, map->vm_flags);
  }
  
@@ -500,7 +560,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	int error;
  	struct vma_iterator *vmi = map->vmi;
-@@ -2395,6 +2411,7 @@ static int __mmap_setup(struct mmap_stat
+@@ -2378,6 +2397,7 @@ static int __mmap_setup(struct mmap_stat
  	 */
  	vms_clean_up_area(vms, &map->mas_detach);
  
@@ -508,7 +568,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return 0;
  }
  
-@@ -2567,34 +2584,26 @@ static void __mmap_complete(struct mmap_
+@@ -2479,7 +2499,7 @@ static int __mmap_new_vma(struct mmap_st
+ 	vma_start_write(vma);
+ 	vma_iter_store_new(vmi, vma);
+ 	map->mm->map_count++;
+-	vma_link_file(vma);
++	vma_link_file(vma, map->hold_file_rmap_lock);
+ 
+ 	/*
+ 	 * vma_merge_new_range() calls khugepaged_enter_vma() too, the below
+@@ -2539,6 +2559,17 @@ static void __mmap_complete(struct mmap_
+ 	vma_set_page_prot(vma);
+ }
+ 
++static void call_action_prepare(struct mmap_state *map,
++				struct vm_area_desc *desc)
++{
++	struct mmap_action *action = &desc->action;
++
++	mmap_action_prepare(action, desc);
++
++	if (action->hide_from_rmap_until_complete)
++		map->hold_file_rmap_lock = true;
++}
++
+ /*
+  * Invoke the f_op->mmap_prepare() callback for a file-backed mapping that
+  * specifies it.
+@@ -2550,34 +2581,26 @@ static void __mmap_complete(struct mmap_
   *
   * Returns 0 on success, or an error code otherwise.
   */
@@ -535,7 +622,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (err)
  		return err;
  
-+	mmap_action_prepare(&desc->action, desc);
++	call_action_prepare(map, desc);
 +
  	/* Update fields permitted to be changed. */
 -	map->pgoff = desc.pgoff;
@@ -554,7 +641,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return 0;
  }
-@@ -2642,16 +2651,24 @@ static unsigned long __mmap_region(struc
+@@ -2619,22 +2642,48 @@ static bool can_set_ksm_flags_early(stru
+ 	return false;
+ }
+ 
++static int call_action_complete(struct mmap_state *map,
++				struct vm_area_desc *desc,
++				struct vm_area_struct *vma)
++{
++	struct mmap_action *action = &desc->action;
++	int ret;
++
++	ret = mmap_action_complete(action, vma);
++
++	/* If we held the file rmap we need to release it. */
++	if (map->hold_file_rmap_lock) {
++		struct file *file = vma->vm_file;
++
++		i_mmap_unlock_write(file->f_mapping);
++	}
++	return ret;
++}
++
+ static unsigned long __mmap_region(struct file *file, unsigned long addr,
+ 		unsigned long len, vm_flags_t vm_flags, unsigned long pgoff,
+ 		struct list_head *uf)
  {
  	struct mm_struct *mm = current->mm;
  	struct vm_area_struct *vma = NULL;
@@ -582,7 +693,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (error)
  		goto abort_munmap;
  
-@@ -2670,6 +2687,7 @@ static unsigned long __mmap_region(struc
+@@ -2653,6 +2702,7 @@ static unsigned long __mmap_region(struc
  		error = __mmap_new_vma(&map, &vma);
  		if (error)
  			goto unacct_error;
@@ -590,12 +701,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	if (have_mmap_prepare)
-@@ -2677,6 +2695,12 @@ static unsigned long __mmap_region(struc
+@@ -2660,6 +2710,13 @@ static unsigned long __mmap_region(struc
  
  	__mmap_complete(&map, vma);
  
 +	if (have_mmap_prepare && allocated_new) {
-+		error = mmap_action_complete(&desc.action, vma);
++		error = call_action_complete(&map, &desc, vma);
++
 +		if (error)
 +			return error;
 +	}
@@ -605,7 +717,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Accounting was done by __mmap_setup(). */
 --- a/tools/testing/vma/vma_internal.h~mm-add-ability-to-take-further-action-in-vm_area_desc
 +++ a/tools/testing/vma/vma_internal.h
-@@ -275,6 +275,50 @@ struct mm_struct {
+@@ -275,6 +275,57 @@ struct mm_struct {
  
  struct vm_area_struct;
  
@@ -651,12 +763,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * it is not valid to clear the error here.
 +	 */
 +	int (*error_hook)(int err);
++
++	/*
++	 * This should be set in rare instances where the operation required
++	 * that the rmap should not be able to access the VMA until
++	 * completely set up.
++	 */
++	bool hide_from_rmap_until_complete :1;
 +};
 +
  /*
   * Describes a VMA that is about to be mmap()'ed. Drivers may choose to
   * manipulate mutable fields which will cause those fields to be updated in the
-@@ -298,6 +342,9 @@ struct vm_area_desc {
+@@ -298,6 +349,9 @@ struct vm_area_desc {
  	/* Write-only fields. */
  	const struct vm_operations_struct *vm_ops;
  	void *private_data;
@@ -666,7 +785,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  struct file_operations {
-@@ -1326,12 +1373,23 @@ static inline void free_anon_vma_name(st
+@@ -1326,12 +1380,23 @@ static inline void free_anon_vma_name(st
  static inline void set_vma_from_desc(struct vm_area_struct *vma,
  		struct vm_area_desc *desc);
  
@@ -692,7 +811,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		.start = vma->vm_start,
  		.end = vma->vm_end,
  
-@@ -1339,21 +1397,24 @@ static inline int __compat_vma_mmap_prep
+@@ -1339,21 +1404,24 @@ static inline int __compat_vma_mmap_prep
  		.vm_file = vma->vm_file,
  		.vm_flags = vma->vm_flags,
  		.page_prot = vma->vm_page_prot,
@@ -721,7 +840,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /* Did the driver provide valid mmap hook configuration? */
-@@ -1374,7 +1435,7 @@ static inline bool can_mmap_file(struct
+@@ -1374,7 +1442,7 @@ static inline bool can_mmap_file(struct
  static inline int vfs_mmap(struct file *file, struct vm_area_struct *vma)
  {
  	if (file->f_op->mmap_prepare)
@@ -730,7 +849,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return file->f_op->mmap(file, vma);
  }
-@@ -1407,4 +1468,20 @@ static inline vm_flags_t ksm_vma_flags(c
+@@ -1407,4 +1475,20 @@ static inline vm_flags_t ksm_vma_flags(c
  	return vm_flags;
  }
  

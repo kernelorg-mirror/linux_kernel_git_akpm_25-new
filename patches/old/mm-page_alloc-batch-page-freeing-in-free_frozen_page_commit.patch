@@ -1,6 +1,6 @@
 From: Joshua Hahn <joshua.hahnjy@gmail.com>
 Subject: mm/page_alloc: batch page freeing in free_frozen_page_commit
-Date: Mon, 13 Oct 2025 12:08:11 -0700
+Date: Tue, 14 Oct 2025 07:50:10 -0700
 
 Before returning, free_frozen_page_commit calls free_pcppages_bulk using
 nr_pcp_free to determine how many pages can appropritately be freed, based
@@ -11,9 +11,9 @@ since we have seen the value consistently go above 2000 in the Meta fleet
 on larger machines.
 
 As such, perform batched page freeing in free_pcppages_bulk by using
-pcp->batch member.  In order to ensure that other processes are not
-starved of the zone lock, free both the zone lock and pcp lock to yield to
-other threads.
+pcp->batch.  In order to ensure that other processes are not starved of
+the zone lock, free both the zone lock and pcp lock to yield to other
+threads.
 
 Note that because free_frozen_page_commit now performs a spinlock inside
 the function (and can fail), the function may now return with a freed pcp.
@@ -64,28 +64,27 @@ make -j$(nproc)
 | sys        |        0.1870 |  -3.2013 |
 +------------+---------------+----------+
 
-Here, variation is the coefficient of variation, i.e. standard deviation / mean.
+Here, variation is the coefficient of variation, i.e.  standard deviation
+/ mean.
 
-Link: https://lkml.kernel.org/r/20251013190812.787205-4-joshua.hahnjy@gmail.com
+[joshua.hahnjy@gmail.com: simplify checks]
+  Link: https://lkml.kernel.org/r/20251014192827.851389-1-joshua.hahnjy@gmail.com
+Link: https://lkml.kernel.org/r/20251014145011.3427205-4-joshua.hahnjy@gmail.com
 Signed-off-by: Joshua Hahn <joshua.hahnjy@gmail.com>
 Suggested-by: Chris Mason <clm@fb.com>
 Co-developed-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: Brendan Jackman <jackmanb@google.com>
-Cc: David Hildenbrand <david@redhat.com>
 Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
-Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Michal Hocko <mhocko@suse.com>
-Cc: Mike Rapoport <rppt@kernel.org>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/page_alloc.c |   66 +++++++++++++++++++++++++++++++++++++++-------
- 1 file changed, 57 insertions(+), 9 deletions(-)
+ mm/page_alloc.c |   65 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 56 insertions(+), 9 deletions(-)
 
 --- a/mm/page_alloc.c~mm-page_alloc-batch-page-freeing-in-free_frozen_page_commit
 +++ a/mm/page_alloc.c
@@ -114,7 +113,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	bool free_high = false;
  
  	/*
-@@ -2861,15 +2871,47 @@ static void free_frozen_page_commit(stru
+@@ -2861,15 +2871,46 @@ static void free_frozen_page_commit(stru
  		 * Do not attempt to take a zone lock. Let pcp->count get
  		 * over high mark temporarily.
  		 */
@@ -128,36 +127,35 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return true;
 +
 +	to_free = nr_pcp_free(pcp, batch, high, free_high);
-+	if (to_free == 0)
-+		return true;
-+
-+	while (to_free > 0 && pcp->count >= high) {
++	while (to_free > 0 && pcp->count > 0) {
 +		to_free_batched = min(to_free, batch);
 +		free_pcppages_bulk(zone, to_free_batched, pcp, pindex);
 +		to_free -= to_free_batched;
-+		if (pcp->count >= high) {
++
++		if (to_free == 0 || pcp->count == 0)
++			break;
++
++		pcp_spin_unlock(pcp);
++		pcp_trylock_finish(*UP_flags);
++
++		pcp_trylock_prepare(*UP_flags);
++		pcp = pcp_spin_trylock(zone->per_cpu_pageset);
++		if (!pcp) {
++			pcp_trylock_finish(*UP_flags);
++			ret = false;
++			break;
++		}
++
++		/*
++		 * Check if this thread has been migrated to a different CPU.
++		 * If that is the case, give up and indicate that the pcp is
++		 * returned in an unlocked state.
++		 */
++		if (smp_processor_id() != cpu) {
 +			pcp_spin_unlock(pcp);
 +			pcp_trylock_finish(*UP_flags);
-+
-+			pcp_trylock_prepare(*UP_flags);
-+			pcp = pcp_spin_trylock(zone->per_cpu_pageset);
-+			if (!pcp) {
-+				pcp_trylock_finish(*UP_flags);
-+				ret = false;
-+				break;
-+			}
-+
-+			/*
-+			 * Check if this thread has been migrated to a different
-+			 * CPU. If that is the case, give up and indicate that
-+			 * the pcp is returned in an unlocked state.
-+			 */
-+			if (smp_processor_id() != cpu) {
-+				pcp_spin_unlock(pcp);
-+				pcp_trylock_finish(*UP_flags);
-+				ret = false;
-+				break;
-+			}
++			ret = false;
++			break;
 +		}
 +	}
  
@@ -166,7 +164,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (test_bit(ZONE_BELOW_HIGH, &zone->flags) &&
  	    zone_watermark_ok(zone, 0, high_wmark_pages(zone),
  			      ZONE_MOVABLE, 0)) {
-@@ -2887,6 +2929,7 @@ static void free_frozen_page_commit(stru
+@@ -2887,6 +2928,7 @@ static void free_frozen_page_commit(stru
  		    next_memory_node(pgdat->node_id) < MAX_NUMNODES)
  			atomic_set(&pgdat->kswapd_failures, 0);
  	}
@@ -174,7 +172,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -2934,7 +2977,9 @@ static void __free_frozen_pages(struct p
+@@ -2934,7 +2976,9 @@ static void __free_frozen_pages(struct p
  	pcp_trylock_prepare(UP_flags);
  	pcp = pcp_spin_trylock(zone->per_cpu_pageset);
  	if (pcp) {
@@ -185,7 +183,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pcp_spin_unlock(pcp);
  	} else {
  		free_one_page(zone, page, pfn, order, fpi_flags);
-@@ -3034,8 +3079,11 @@ void free_unref_folios(struct folio_batc
+@@ -3034,8 +3078,11 @@ void free_unref_folios(struct folio_batc
  			migratetype = MIGRATE_MOVABLE;
  
  		trace_mm_page_free_batched(&folio->page);
