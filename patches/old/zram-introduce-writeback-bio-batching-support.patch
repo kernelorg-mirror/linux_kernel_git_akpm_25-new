@@ -1,6 +1,15 @@
 From: Yuwen Chen <ywen.chen@foxmail.com>
 Subject: zram: introduce writeback bio batching support
-Date: Thu, 13 Nov 2025 17:53:59 +0900
+Date: Sat, 15 Nov 2025 11:34:44 +0900
+
+Patch series "zram: introduce writeback bio batching", v3.
+
+This is a rework of Yuwen's patch [1] that adds writeback bio
+batching support to zram, which can improve throughput of
+writeback operation.
+
+
+This patch (of 4):
 
 Currently, zram writeback supports only a single bio writeback operation,
 waiting for bio completion before post-processing next pp-slot.  This
@@ -9,11 +18,11 @@ batched (multiple) bio writeback support to take advantage of parallel
 requests processing and better requests scheduling.
 
 For the time being the writeback batch size (maximum number of in-flight
-bio requests) is set to 1, so the behaviors is the same as the previous
-single-bio writeback.  This is addressed in a follow up patch, which adds
-a writeback_batch_size device attribute.
+bio requests) is set to 32 for all devices.  A follow up patch adds a
+writeback_batch_size device attribute, so the batch size becomes run-time
+configurable.
 
-Please refer to [1] and [2] for benchmarks:
+Please refer to [2] and [3] for benchmarks:
 
 : After applying this patch, a large number of pages being merged
 : into batch write operations can be observed via the following test
@@ -52,14 +61,15 @@ Please refer to [1] and [2] for benchmarks:
 : user	0m 0.00s
 : sys	0m 1.16s
 
-[senozhatsky@chromium.org: significantly reworked the initial patch so
- that the approach and implementation resemble current zram
- post-processing code]
+[senozhatsky: significantly reworked the initial patch so that the
+approach and implementation resemble current zram post-processing
+code]
 
-Link: https://lkml.kernel.org/r/20251113085402.1811522-1-senozhatsky@chromium.org
-Link: https://lkml.kernel.org/r/20251113085402.1811522-2-senozhatsky@chromium.org
-Link: https://lore.kernel.org/linux-block/tencent_B2DC37E3A2AED0E7F179365FCB5D82455B08@qq.com [1]
-Link :https://lore.kernel.org/linux-block/tencent_0FBBFC8AE0B97BC63B5D47CE1FF2BABFDA09@qq.com [2]
+Link: https://lkml.kernel.org/r/20251115023447.495417-1-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20251115023447.495417-2-senozhatsky@chromium.org
+Link: https://lore.kernel.org/linux-block/tencent_0FBBFC8AE0B97BC63B5D47CE1FF2BABFDA09@qq.com/ [1]
+Link: https://lore.kernel.org/linux-block/tencent_B2DC37E3A2AED0E7F179365FCB5D82455B08@qq.com [2]
+Link: https://lore.kernel.org/linux-block/tencent_0FBBFC8AE0B97BC63B5D47CE1FF2BABFDA09@qq.com [3]
 Signed-off-by: Yuwen Chen <ywen.chen@foxmail.com>
 Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
 Co-developed-by: Richard Chang <richardycc@google.com>
@@ -69,38 +79,40 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  drivers/block/zram/zram_drv.c |  343 +++++++++++++++++++++++++-------
- 1 file changed, 278 insertions(+), 65 deletions(-)
+ 1 file changed, 277 insertions(+), 66 deletions(-)
 
 --- a/drivers/block/zram/zram_drv.c~zram-introduce-writeback-bio-batching-support
 +++ a/drivers/block/zram/zram_drv.c
-@@ -734,20 +734,226 @@ static void read_from_bdev_async(struct
- 	submit_bio(bio);
+@@ -500,6 +500,24 @@ out:
  }
  
--static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
--{
--	unsigned long blk_idx = 0;
--	struct page *page = NULL;
+ #ifdef CONFIG_ZRAM_WRITEBACK
 +struct zram_wb_ctl {
 +	struct list_head idle_reqs;
 +	struct list_head inflight_reqs;
 +
 +	atomic_t num_inflight;
 +	struct completion done;
-+	struct blk_plug plug;
 +};
 +
 +struct zram_wb_req {
 +	unsigned long blk_idx;
 +	struct page *page;
- 	struct zram_pp_slot *pps;
- 	struct bio_vec bio_vec;
- 	struct bio bio;
--	int ret = 0, err;
++	struct zram_pp_slot *pps;
++	struct bio_vec bio_vec;
++	struct bio bio;
 +
 +	struct list_head entry;
 +};
 +
+ static ssize_t writeback_limit_enable_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t len)
+ {
+@@ -734,20 +752,207 @@ static void read_from_bdev_async(struct
+ 	submit_bio(bio);
+ }
+ 
+-static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 +static void release_wb_req(struct zram_wb_req *req)
 +{
 +	__free_page(req->page);
@@ -125,7 +137,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
 +/* XXX: should be a per-device sysfs attr */
-+#define ZRAM_WB_REQ_CNT 1
++#define ZRAM_WB_REQ_CNT 32
 +
 +static struct zram_wb_ctl *init_wb_ctl(void)
 +{
@@ -151,17 +163,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * writeback can still proceed, even if there is only one
 +		 * request on the idle list.
 +		 */
-+		req = kzalloc(sizeof(*req), GFP_NOIO | __GFP_NOWARN);
++		req = kzalloc(sizeof(*req), GFP_KERNEL | __GFP_NOWARN);
 +		if (!req)
 +			break;
 +
-+		req->page = alloc_page(GFP_NOIO | __GFP_NOWARN);
++		req->page = alloc_page(GFP_KERNEL | __GFP_NOWARN);
 +		if (!req->page) {
 +			kfree(req);
 +			break;
 +		}
 +
-+		INIT_LIST_HEAD(&req->entry);
 +		list_add(&req->entry, &wb_ctl->idle_reqs);
 +	}
 +
@@ -194,16 +205,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static int zram_writeback_complete(struct zram *zram, struct zram_wb_req *req)
 +{
- 	u32 index;
++	u32 index;
 +	int err;
- 
--	page = alloc_page(GFP_KERNEL);
--	if (!page)
--		return -ENOMEM;
++
 +	index = req->pps->index;
 +	release_pp_slot(zram, req->pps);
 +	req->pps = NULL;
- 
++
 +	err = blk_status_to_errno(req->bio.bi_status);
 +	if (err) {
 +		/*
@@ -247,7 +255,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static void zram_submit_wb_request(struct zram *zram,
 +				   struct zram_wb_ctl *wb_ctl,
 +				   struct zram_wb_req *req)
-+{
+ {
 +	/*
 +	 * wb_limit (if enabled) should be adjusted before submission,
 +	 * so that we don't over-submit.
@@ -299,16 +307,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				struct zram_wb_ctl *wb_ctl)
 +{
 +	struct zram_wb_req *req = NULL;
-+	unsigned long blk_idx = 0;
-+	struct zram_pp_slot *pps;
-+	int ret = 0, err;
+ 	unsigned long blk_idx = 0;
+-	struct page *page = NULL;
+ 	struct zram_pp_slot *pps;
+-	struct bio_vec bio_vec;
+-	struct bio bio;
++	struct blk_plug io_plug;
+ 	int ret = 0, err;
+-	u32 index;
+-
+-	page = alloc_page(GFP_KERNEL);
+-	if (!page)
+-		return -ENOMEM;
 +	u32 index = 0;
-+
-+	blk_start_plug(&wb_ctl->plug);
+ 
++	blk_start_plug(&io_plug);
  	while ((pps = select_pp_slot(ctl))) {
  		spin_lock(&zram->wb_limit_lock);
  		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
-@@ -757,6 +963,26 @@ static int zram_writeback_slots(struct z
+@@ -757,6 +962,26 @@ static int zram_writeback_slots(struct z
  		}
  		spin_unlock(&zram->wb_limit_lock);
  
@@ -317,9 +334,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (req)
 +				break;
 +
-+			blk_finish_plug(&wb_ctl->plug);
++			blk_finish_plug(&io_plug);
 +			err = zram_wb_wait_for_completion(zram, wb_ctl);
-+			blk_start_plug(&wb_ctl->plug);
++			blk_start_plug(&io_plug);
 +			/*
 +			 * BIO errors are not fatal, we continue and simply
 +			 * attempt to writeback the remaining objects (pages).
@@ -335,7 +352,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!blk_idx) {
  			blk_idx = alloc_block_bdev(zram);
  			if (!blk_idx) {
-@@ -765,7 +991,6 @@ static int zram_writeback_slots(struct z
+@@ -765,7 +990,6 @@ static int zram_writeback_slots(struct z
  			}
  		}
  
@@ -343,7 +360,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		zram_slot_lock(zram, index);
  		/*
  		 * scan_slots() sets ZRAM_PP_SLOT and relases slot lock, so
-@@ -775,67 +1000,47 @@ static int zram_writeback_slots(struct z
+@@ -775,67 +999,46 @@ static int zram_writeback_slots(struct z
  		 */
  		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT))
  			goto next;
@@ -361,7 +378,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		 * XXX: A single page IO would be inefficient for write
 -		 * but it would be not bad as starter.
 +		 * From now on pp-slot is owned by the req, remove it from
-+		 * its pps bucket.
++		 * its pp bucket.
  		 */
 -		err = submit_bio_wait(&bio);
 -		if (err) {
@@ -393,8 +410,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			goto next;
 +		req->blk_idx = blk_idx;
 +		req->pps = pps;
-+		bio_init(&req->bio, zram->bdev, &req->bio_vec, 1,
-+			 REQ_OP_WRITE | REQ_SYNC);
++		bio_init(&req->bio, zram->bdev, &req->bio_vec, 1, REQ_OP_WRITE);
 +		req->bio.bi_iter.bi_sector = req->blk_idx * (PAGE_SIZE >> 9);
 +		req->bio.bi_end_io = zram_writeback_endio;
 +		req->bio.bi_private = wb_ctl;
@@ -431,14 +447,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (req)
 +		release_wb_req(req);
 +
-+	blk_finish_plug(&wb_ctl->plug);
++	blk_finish_plug(&io_plug);
 +	err = zram_wb_wait_for_completion(zram, wb_ctl);
 +	if (err)
 +		ret = err;
  
  	return ret;
  }
-@@ -948,7 +1153,8 @@ static ssize_t writeback_store(struct de
+@@ -948,7 +1151,8 @@ static ssize_t writeback_store(struct de
  	struct zram *zram = dev_to_zram(dev);
  	u64 nr_pages = zram->disksize >> PAGE_SHIFT;
  	unsigned long lo = 0, hi = nr_pages;
@@ -448,7 +464,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	char *args, *param, *val;
  	ssize_t ret = len;
  	int err, mode = 0;
-@@ -970,8 +1176,14 @@ static ssize_t writeback_store(struct de
+@@ -970,8 +1174,14 @@ static ssize_t writeback_store(struct de
  		goto release_init_lock;
  	}
  
@@ -465,7 +481,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		ret = -ENOMEM;
  		goto release_init_lock;
  	}
-@@ -1000,7 +1212,7 @@ static ssize_t writeback_store(struct de
+@@ -1000,7 +1210,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -474,7 +490,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		}
  
-@@ -1011,7 +1223,7 @@ static ssize_t writeback_store(struct de
+@@ -1011,7 +1221,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -483,7 +499,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		}
  
-@@ -1022,7 +1234,7 @@ static ssize_t writeback_store(struct de
+@@ -1022,7 +1232,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -492,7 +508,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			continue;
  		}
  
-@@ -1033,17 +1245,18 @@ static ssize_t writeback_store(struct de
+@@ -1033,17 +1243,18 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
