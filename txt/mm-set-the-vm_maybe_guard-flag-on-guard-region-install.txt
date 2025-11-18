@@ -1,0 +1,100 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm: set the VM_MAYBE_GUARD flag on guard region install
+Date: Tue, 18 Nov 2025 10:17:48 +0000
+
+Now we have established the VM_MAYBE_GUARD flag and added the capacity to
+set it atomically, do so upon MADV_GUARD_INSTALL.
+
+The places where this flag is used currently and matter are:
+
+* VMA merge - performed under mmap/VMA write lock, therefore excluding
+  racing writes.
+
+* /proc/$pid/smaps - can race the write, however this isn't meaningful
+  as the flag write is performed at the point of the guard region being
+  established, and thus an smaps reader can't reasonably expect to avoid
+  races.  Due to atomicity, a reader will observe either the flag being
+  set or not.  Therefore consistency will be maintained.
+
+In all other cases the flag being set is irrelevant and atomicity
+guarantees other flags will be read correctly.
+
+Note that non-atomic updates of unrelated flags do not cause an issue with
+this flag being set atomically, as writes of other flags are performed
+under mmap/VMA write lock, and these atomic writes are performed under
+mmap/VMA read lock, which excludes the write, avoiding RMW races.
+
+Note that we do not encounter issues with KCSAN by adjusting this flag
+atomically, as we are only updating a single bit in the flag bitmap and
+therefore we do not need to annotate these changes.
+
+We intentionally set this flag in advance of actually updating the page
+tables, to ensure that any racing atomic read of this flag will only
+return false prior to page tables being updated, to allow for
+serialisation via page table locks.
+
+Note that we set vma->anon_vma for anonymous mappings.  This is because
+the expectation for anonymous mappings is that an anon_vma is established
+should they possess any page table mappings.  This is also consistent with
+what we were doing prior to this patch (unconditionally setting anon_vma
+on guard region installation).
+
+We also need to update retract_page_tables() to ensure that madvise(...,
+MADV_COLLAPSE) doesn't incorrectly collapse file-backed ranges contain
+guard regions.
+
+This was previously guarded by anon_vma being set to catch MAP_PRIVATE
+cases, but the introduction of VM_MAYBE_GUARD necessitates that we check
+this flag instead.
+
+We utilise vma_flag_test_atomic() to do so - we first perform an
+optimistic check, then after the PTE page table lock is held, we can check
+again safely, as upon guard marker install the flag is set atomically
+prior to the page table lock being taken to actually apply it.
+
+So if the initial check fails either:
+
+* Page table retraction acquires page table lock prior to VM_MAYBE_GUARD
+  being set - guard marker installation will be blocked until page table
+  retraction is complete.
+
+OR:
+
+* Guard marker installation acquires page table lock after setting
+  VM_MAYBE_GUARD, which raced and didn't pick this up in the initial
+  optimistic check, blocking page table retraction until the guard regions
+  are installed - the second VM_MAYBE_GUARD check will prevent page table
+  retraction.
+
+Either way we're safe.
+
+We refactor the retraction checks into a single
+file_backed_vma_is_retractable(), there doesn't seem to be any reason that
+the checks were separated as before.
+
+Note that VM_MAYBE_GUARD being set atomically remains correct as
+vma_needs_copy() is invoked with the mmap and VMA write locks held,
+excluding any race with madvise_guard_install().
+
+Link: https://lkml.kernel.org/r/e9e9ce95b6ac17497de7f60fc110c7dd9e489e8d.1763460113.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Cc: Andrei Vagin <avagin@gmail.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: David Hildenbrand (Red Hat) <david@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
