@@ -92,6 +92,12 @@ which would otherwise break.
 Finally, we update the rust binding helper as now it cannot auto-detect
 the flags at all.
 
+[lorenzo.stoakes@oracle.com: fix RUST bindgen, per Alice]
+  Link: https://lkml.kernel.org/r/536f483b-ea10-4190-ab22-c2ad2cf8cc78@lucifer.local
+[lorenzo.stoakes@oracle.com: fix nommu]
+  Link: https://lkml.kernel.org/r/b0418f22-5d35-400d-9285-eeea9e34d3ae@lucifer.local
+[lorenzo.stoakes@oracle.com: fix parisc build]
+  Link: https://lkml.kernel.org/r/ad8ce21f-7be8-4d9b-be49-d71010e92055@lucifer.local
 Link: https://lkml.kernel.org/r/cover.1763126447.git.lorenzo.stoakes@oracle.com
 Link: https://lkml.kernel.org/r/6289d60b6731ea7a111c87c87fb8486881151c25.1763126447.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
@@ -162,16 +168,17 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  fs/proc/task_mmu.c               |    4 
- include/linux/mm.h               |  382 ++++++++++++++++-------------
+ include/linux/mm.h               |  377 ++++++++++++++++-------------
  mm/khugepaged.c                  |    2 
  mm/madvise.c                     |    2 
+ rust/bindgen_parameters          |   25 +
  rust/bindings/bindings_helper.h  |   25 +
  tools/testing/vma/vma_internal.h |  303 +++++++++++++++++++----
- 6 files changed, 503 insertions(+), 215 deletions(-)
+ 7 files changed, 522 insertions(+), 216 deletions(-)
 
 --- a/fs/proc/task_mmu.c~mm-declare-vma-flags-by-bit
 +++ a/fs/proc/task_mmu.c
-@@ -1183,10 +1183,10 @@ static void show_smap_vma_flags(struct s
+@@ -1182,10 +1182,10 @@ static void show_smap_vma_flags(struct s
  		[ilog2(VM_PKEY_BIT0)]	= "",
  		[ilog2(VM_PKEY_BIT1)]	= "",
  		[ilog2(VM_PKEY_BIT2)]	= "",
@@ -186,7 +193,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif /* CONFIG_ARCH_HAS_PKEYS */
 --- a/include/linux/mm.h~mm-declare-vma-flags-by-bit
 +++ a/include/linux/mm.h
-@@ -271,185 +271,238 @@ extern struct rw_semaphore nommu_region_
+@@ -271,185 +271,239 @@ extern struct rw_semaphore nommu_region_
  extern unsigned int kobjsize(const void *objp);
  #endif
  
@@ -366,6 +373,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define VM_UFFD_MISSING	INIT_VM_FLAG(UFFD_MISSING)
 +#else
 +#define VM_UFFD_MISSING	VM_NONE
++#define VM_MAYOVERLAY	INIT_VM_FLAG(MAYOVERLAY)
 +#endif
 +#define VM_PFNMAP	INIT_VM_FLAG(PFNMAP)
 +#define VM_MAYBE_GUARD	INIT_VM_FLAG(MAYBE_GUARD)
@@ -499,7 +507,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define VM_ARCH_CLEAR	INIT_VM_FLAG(ARCH_CLEAR)
  #elif !defined(CONFIG_MMU)
 -# define VM_MAPPED_COPY	VM_ARCH_1	/* T if mapped copy of data (nommu mmap) */
--#endif
++#define VM_MAPPED_COPY	INIT_VM_FLAG(MAPPED_COPY)
+ #endif
 -
 -#if defined(CONFIG_ARM64_MTE)
 -# define VM_MTE		VM_HIGH_ARCH_4	/* Use Tagged memory for access control */
@@ -507,8 +516,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -#else
 -# define VM_MTE		VM_NONE
 -# define VM_MTE_ALLOWED	VM_NONE
-+#define VM_MAPPED_COPY	INIT_VM_FLAG(MAPPED_COPY)
- #endif
+-#endif
 -
  #ifndef VM_GROWSUP
 -# define VM_GROWSUP	VM_NONE
@@ -569,30 +577,23 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
  
  /* Bits set in the VMA until the stack is in its final location */
-@@ -475,12 +528,18 @@ extern unsigned int kobjsize(const void
+@@ -475,12 +529,10 @@ extern unsigned int kobjsize(const void
  
  #define VM_STARTGAP_FLAGS (VM_GROWSDOWN | VM_SHADOW_STACK)
  
-+
-+
- #ifdef CONFIG_STACK_GROWSUP
+-#ifdef CONFIG_STACK_GROWSUP
 -#define VM_STACK	VM_GROWSUP
 -#define VM_STACK_EARLY	VM_GROWSDOWN
-+#define VM_STACK_EARLY	VMA_BIT(VMA_STACK_EARLY_BIT)
++#ifdef CONFIG_MSEAL_SYSTEM_MAPPINGS
++#define VM_SEALED_SYSMAP	VM_SEALED
  #else
 -#define VM_STACK	VM_GROWSDOWN
 -#define VM_STACK_EARLY	0
-+#define VM_STACK_EARLY	VM_NONE
-+#endif
-+
-+#ifdef CONFIG_MSEAL_SYSTEM_MAPPINGS
-+#define VM_SEALED_SYSMAP	VM_SEALED
-+#else
 +#define VM_SEALED_SYSMAP	VM_NONE
  #endif
  
  #define VM_STACK_FLAGS	(VM_STACK | VM_STACK_DEFAULT_FLAGS | VM_ACCOUNT)
-@@ -488,7 +547,6 @@ extern unsigned int kobjsize(const void
+@@ -488,7 +540,6 @@ extern unsigned int kobjsize(const void
  /* VMA basic access permission flags */
  #define VM_ACCESS_FLAGS (VM_READ | VM_WRITE | VM_EXEC)
  
@@ -600,7 +601,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Special vmas that are non-mergable, non-mlock()able.
   */
-@@ -523,7 +581,7 @@ extern unsigned int kobjsize(const void
+@@ -523,7 +574,7 @@ extern unsigned int kobjsize(const void
  
  /* Arch-specific flags to clear when updating VM flags on protection change */
  #ifndef VM_ARCH_CLEAR
@@ -609,7 +610,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif
  #define VM_FLAGS_CLEAR	(ARCH_VM_PKEY_FLAGS | VM_ARCH_CLEAR)
  
-@@ -917,9 +975,9 @@ static inline void vm_flags_mod(struct v
+@@ -917,9 +968,9 @@ static inline void vm_flags_mod(struct v
  }
  
  static inline bool __vma_flag_atomic_valid(struct vm_area_struct *vma,
@@ -621,7 +622,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* Only specific flags are permitted */
  	if (WARN_ON_ONCE(!(mask & VM_ATOMIC_SET_ALLOWED)))
-@@ -932,14 +990,15 @@ static inline bool __vma_flag_atomic_val
+@@ -932,14 +983,15 @@ static inline bool __vma_flag_atomic_val
   * Set VMA flag atomically. Requires only VMA/mmap read lock. Only specific
   * valid flags are allowed to do this.
   */
@@ -639,7 +640,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -949,10 +1008,11 @@ static inline void vma_flag_set_atomic(s
+@@ -949,10 +1001,11 @@ static inline void vma_flag_set_atomic(s
   * This is necessarily racey, so callers must ensure that serialisation is
   * achieved through some other means, or that races are permissible.
   */
@@ -653,7 +654,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return false;
  }
-@@ -4514,16 +4574,6 @@ int arch_get_shadow_stack_status(struct
+@@ -4514,16 +4567,6 @@ int arch_get_shadow_stack_status(struct
  int arch_set_shadow_stack_status(struct task_struct *t, unsigned long status);
  int arch_lock_shadow_stack_status(struct task_struct *t, unsigned long status);
  
@@ -672,7 +673,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
 --- a/mm/khugepaged.c~mm-declare-vma-flags-by-bit
 +++ a/mm/khugepaged.c
-@@ -1742,7 +1742,7 @@ static bool file_backed_vma_is_retractab
+@@ -1748,7 +1748,7 @@ static bool file_backed_vma_is_retractab
  	 * obtained on guard region installation after the flag is set, so this
  	 * check being performed under this lock excludes races.
  	 */
@@ -683,7 +684,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return true;
 --- a/mm/madvise.c~mm-declare-vma-flags-by-bit
 +++ a/mm/madvise.c
-@@ -1142,7 +1142,7 @@ static long madvise_guard_install(struct
+@@ -1144,7 +1144,7 @@ static long madvise_guard_install(struct
  	 * acquire an mmap/VMA write lock to read it. All remaining readers may
  	 * or may not see the flag set, but we don't care.
  	 */
@@ -692,6 +693,40 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * If anonymous and we are establishing page tables the VMA ought to
+--- a/rust/bindgen_parameters~mm-declare-vma-flags-by-bit
++++ a/rust/bindgen_parameters
+@@ -35,6 +35,31 @@
+ # recognized, block generation of the non-helper constants.
+ --blocklist-item ARCH_SLAB_MINALIGN
+ --blocklist-item ARCH_KMALLOC_MINALIGN
++--blocklist-item VM_MERGEABLE
++--blocklist-item VM_READ
++--blocklist-item VM_WRITE
++--blocklist-item VM_EXEC
++--blocklist-item VM_SHARED
++--blocklist-item VM_MAYREAD
++--blocklist-item VM_MAYWRITE
++--blocklist-item VM_MAYEXEC
++--blocklist-item VM_MAYEXEC
++--blocklist-item VM_PFNMAP
++--blocklist-item VM_IO
++--blocklist-item VM_DONTCOPY
++--blocklist-item VM_DONTEXPAND
++--blocklist-item VM_LOCKONFAULT
++--blocklist-item VM_ACCOUNT
++--blocklist-item VM_NORESERVE
++--blocklist-item VM_HUGETLB
++--blocklist-item VM_SYNC
++--blocklist-item VM_ARCH_1
++--blocklist-item VM_WIPEONFORK
++--blocklist-item VM_DONTDUMP
++--blocklist-item VM_SOFTDIRTY
++--blocklist-item VM_MIXEDMAP
++--blocklist-item VM_HUGEPAGE
++--blocklist-item VM_NOHUGEPAGE
+ 
+ # Structs should implement `Zeroable` when all of their fields do.
+ --with-derive-custom-struct .*=MaybeZeroable
 --- a/rust/bindings/bindings_helper.h~mm-declare-vma-flags-by-bit
 +++ a/rust/bindings/bindings_helper.h
 @@ -108,7 +108,32 @@ const xa_mark_t RUST_CONST_HELPER_XA_PRE
