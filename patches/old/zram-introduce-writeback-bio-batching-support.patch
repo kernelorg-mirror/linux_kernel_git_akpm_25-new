@@ -1,15 +1,14 @@
 From: Yuwen Chen <ywen.chen@foxmail.com>
 Subject: zram: introduce writeback bio batching support
-Date: Sat, 15 Nov 2025 11:34:44 +0900
+Date: Tue, 18 Nov 2025 16:29:55 +0900
 
-Patch series "zram: introduce writeback bio batching", v3.
+Patch series "zram: introduce writeback bio batching", v4.
 
-This is a rework of Yuwen's patch [1] that adds writeback bio
-batching support to zram, which can improve throughput of
-writeback operation.
+This is a rework of Yuwen's patch [1] that adds writeback bio batching
+support to zram, which can improve throughput of writeback operation.
 
 
-This patch (of 4):
+This patch (of 6):
 
 Currently, zram writeback supports only a single bio writeback operation,
 waiting for bio completion before post-processing next pp-slot.  This
@@ -65,8 +64,7 @@ Please refer to [2] and [3] for benchmarks:
 approach and implementation resemble current zram post-processing
 code]
 
-Link: https://lkml.kernel.org/r/20251115023447.495417-1-senozhatsky@chromium.org
-Link: https://lkml.kernel.org/r/20251115023447.495417-2-senozhatsky@chromium.org
+Link: https://lkml.kernel.org/r/20251118073000.1928107-2-senozhatsky@chromium.org
 Link: https://lore.kernel.org/linux-block/tencent_0FBBFC8AE0B97BC63B5D47CE1FF2BABFDA09@qq.com/ [1]
 Link: https://lore.kernel.org/linux-block/tencent_B2DC37E3A2AED0E7F179365FCB5D82455B08@qq.com [2]
 Link: https://lore.kernel.org/linux-block/tencent_0FBBFC8AE0B97BC63B5D47CE1FF2BABFDA09@qq.com [3]
@@ -78,8 +76,8 @@ Cc: Brian Geffon <bgeffon@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/block/zram/zram_drv.c |  343 +++++++++++++++++++++++++-------
- 1 file changed, 277 insertions(+), 66 deletions(-)
+ drivers/block/zram/zram_drv.c |  348 +++++++++++++++++++++++++-------
+ 1 file changed, 282 insertions(+), 66 deletions(-)
 
 --- a/drivers/block/zram/zram_drv.c~zram-introduce-writeback-bio-batching-support
 +++ a/drivers/block/zram/zram_drv.c
@@ -108,7 +106,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static ssize_t writeback_limit_enable_store(struct device *dev,
  		struct device_attribute *attr, const char *buf, size_t len)
  {
-@@ -734,20 +752,207 @@ static void read_from_bdev_async(struct
+@@ -734,20 +752,209 @@ static void read_from_bdev_async(struct
  	submit_bio(bio);
  }
  
@@ -140,7 +138,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define ZRAM_WB_REQ_CNT 32
 +
 +static struct zram_wb_ctl *init_wb_ctl(void)
-+{
+ {
 +	struct zram_wb_ctl *wb_ctl;
 +	int i;
 +
@@ -205,12 +203,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +static int zram_writeback_complete(struct zram *zram, struct zram_wb_req *req)
 +{
-+	u32 index;
++	u32 index = req->pps->index;
 +	int err;
-+
-+	index = req->pps->index;
-+	release_pp_slot(zram, req->pps);
-+	req->pps = NULL;
 +
 +	err = blk_status_to_errno(req->bio.bi_status);
 +	if (err) {
@@ -219,6 +213,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * (if enabled).
 +		 */
 +		zram_account_writeback_rollback(zram);
++		free_block_bdev(zram, req->blk_idx);
 +		return err;
 +	}
 +
@@ -231,8 +226,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * set ZRAM_PP_SLOT on such slots until current post-processing
 +	 * finishes.
 +	 */
-+	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT))
++	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
++		free_block_bdev(zram, req->blk_idx);
 +		goto out;
++	}
 +
 +	zram_free_page(zram, index);
 +	zram_set_flag(zram, index, ZRAM_WB);
@@ -255,7 +252,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +static void zram_submit_wb_request(struct zram *zram,
 +				   struct zram_wb_ctl *wb_ctl,
 +				   struct zram_wb_req *req)
- {
++{
 +	/*
 +	 * wb_limit (if enabled) should be adjusted before submission,
 +	 * so that we don't over-submit.
@@ -297,6 +294,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		err = zram_writeback_complete(zram, req);
 +		if (err)
 +			ret = err;
++
++		release_pp_slot(zram, req->pps);
++		req->pps = NULL;
 +	}
 +
 +	return ret;
@@ -325,7 +325,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	while ((pps = select_pp_slot(ctl))) {
  		spin_lock(&zram->wb_limit_lock);
  		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
-@@ -757,6 +962,26 @@ static int zram_writeback_slots(struct z
+@@ -757,6 +964,26 @@ static int zram_writeback_slots(struct z
  		}
  		spin_unlock(&zram->wb_limit_lock);
  
@@ -352,15 +352,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (!blk_idx) {
  			blk_idx = alloc_block_bdev(zram);
  			if (!blk_idx) {
-@@ -765,7 +990,6 @@ static int zram_writeback_slots(struct z
- 			}
- 		}
- 
--		index = pps->index;
- 		zram_slot_lock(zram, index);
- 		/*
- 		 * scan_slots() sets ZRAM_PP_SLOT and relases slot lock, so
-@@ -775,67 +999,46 @@ static int zram_writeback_slots(struct z
+@@ -775,67 +1002,46 @@ static int zram_writeback_slots(struct z
  		 */
  		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT))
  			goto next;
@@ -454,7 +446,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return ret;
  }
-@@ -948,7 +1151,8 @@ static ssize_t writeback_store(struct de
+@@ -948,7 +1154,8 @@ static ssize_t writeback_store(struct de
  	struct zram *zram = dev_to_zram(dev);
  	u64 nr_pages = zram->disksize >> PAGE_SHIFT;
  	unsigned long lo = 0, hi = nr_pages;
@@ -464,7 +456,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	char *args, *param, *val;
  	ssize_t ret = len;
  	int err, mode = 0;
-@@ -970,8 +1174,14 @@ static ssize_t writeback_store(struct de
+@@ -970,8 +1177,14 @@ static ssize_t writeback_store(struct de
  		goto release_init_lock;
  	}
  
@@ -481,7 +473,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		ret = -ENOMEM;
  		goto release_init_lock;
  	}
-@@ -1000,7 +1210,7 @@ static ssize_t writeback_store(struct de
+@@ -1000,7 +1213,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -490,7 +482,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		}
  
-@@ -1011,7 +1221,7 @@ static ssize_t writeback_store(struct de
+@@ -1011,7 +1224,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -499,7 +491,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			break;
  		}
  
-@@ -1022,7 +1232,7 @@ static ssize_t writeback_store(struct de
+@@ -1022,7 +1235,7 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -508,7 +500,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			continue;
  		}
  
-@@ -1033,17 +1243,18 @@ static ssize_t writeback_store(struct de
+@@ -1033,17 +1246,18 @@ static ssize_t writeback_store(struct de
  				goto release_init_lock;
  			}
  
@@ -530,4 +522,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	atomic_set(&zram->pp_in_progress, 0);
  	up_read(&zram->init_lock);
  
+@@ -1112,7 +1326,9 @@ static int read_from_bdev(struct zram *z
+ 	return -EIO;
+ }
+ 
+-static void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
++static void free_block_bdev(struct zram *zram, unsigned long blk_idx)
++{
++}
+ #endif
+ 
+ #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 _
