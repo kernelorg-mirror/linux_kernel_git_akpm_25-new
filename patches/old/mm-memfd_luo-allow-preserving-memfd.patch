@@ -1,6 +1,6 @@
 From: Pratyush Yadav <ptyadav@amazon.de>
 Subject: mm: memfd_luo: allow preserving memfd
-Date: Fri, 7 Nov 2025 16:03:15 -0500
+Date: Sat, 15 Nov 2025 18:34:01 -0500
 
 The ability to preserve a memfd allows userspace to use KHO and LUO to
 transfer its memory contents to the next kernel.  This is useful in many
@@ -23,14 +23,14 @@ the file are not preserved; only its memory contents, position, and size.
 The recreated file gets the UID and GID of the task doing the restore, and
 the task's cgroup gets charged with the memory.
 
-After LUO is in prepared state, the file cannot grow or shrink, and all
-its pages are pinned to avoid migrations and swapping.  The file can still
-be read from or written to.
+Once preserved, the file cannot grow or shrink, and all its pages are
+pinned to avoid migrations and swapping.  The file can still be read from
+or written to.
 
 Use vmalloc to get the buffer to hold the folios, and preserve it using
 kho_preserve_vmalloc().  This doesn't have the size limit.
 
-Link: https://lkml.kernel.org/r/20251107210526.257742-18-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251115233409.768044-16-pasha.tatashin@soleen.com
 Co-developed-by: Pasha Tatashin <pasha.tatashin@soleen.com>
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
 Signed-off-by: Pratyush Yadav <ptyadav@amazon.de>
@@ -79,7 +79,6 @@ Cc: Miguel Ojeda <ojeda@kernel.org>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Myugnjoo Ham <myungjoo.ham@samsung.com>
 Cc: Parav Pandit <parav@nvidia.com>
-Cc: Pasha Tatashin <pahsa.tatashin@soleen.com>
 Cc: Pratyush Yadav <pratyush@kernel.org>
 Cc: Randy Dunlap <rdunlap@infradead.org>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
@@ -94,7 +93,6 @@ Cc: Thomas Weißschuh <linux@weissschuh.net>
 Cc: Vincent Guittot <vincent.guittot@linaro.org>
 Cc: William Tu <witu@nvidia.com>
 Cc: Yoann Congal <yoann.congal@smile.fr>
-Cc: zhangguopeng <zhangguopeng@kylinos.cn>
 Cc: Zijun Hu <quic_zijuhu@quicinc.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
@@ -102,8 +100,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  MAINTAINERS                          |    2 
  include/linux/liveupdate/abi/memfd.h |   88 +++
  mm/Makefile                          |    1 
- mm/memfd_luo.c                       |  609 +++++++++++++++++++++++++
- 4 files changed, 700 insertions(+)
+ mm/memfd_luo.c                       |  671 +++++++++++++++++++++++++
+ 4 files changed, 762 insertions(+)
 
 diff --git a/include/linux/liveupdate/abi/memfd.h a/include/linux/liveupdate/abi/memfd.h
 new file mode 100644
@@ -200,7 +198,7 @@ new file mode 100644
 +#endif /* _LINUX_LIVEUPDATE_ABI_MEMFD_H */
 --- a/MAINTAINERS~mm-memfd_luo-allow-preserving-memfd
 +++ a/MAINTAINERS
-@@ -14466,6 +14466,7 @@ F:	tools/testing/selftests/livepatch/
+@@ -14468,6 +14468,7 @@ F:	tools/testing/selftests/livepatch/
  
  LIVE UPDATE
  M:	Pasha Tatashin <pasha.tatashin@soleen.com>
@@ -208,7 +206,7 @@ new file mode 100644
  L:	linux-kernel@vger.kernel.org
  S:	Maintained
  F:	Documentation/core-api/liveupdate.rst
-@@ -14474,6 +14475,7 @@ F:	include/linux/liveupdate.h
+@@ -14476,6 +14477,7 @@ F:	include/linux/liveupdate.h
  F:	include/linux/liveupdate/
  F:	include/uapi/linux/liveupdate.h
  F:	kernel/liveupdate/
@@ -230,7 +228,7 @@ diff --git a/mm/memfd_luo.c a/mm/memfd_luo.c
 new file mode 100644
 --- /dev/null
 +++ a/mm/memfd_luo.c
-@@ -0,0 +1,609 @@
+@@ -0,0 +1,671 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +/*
@@ -241,16 +239,76 @@ new file mode 100644
 + * Pratyush Yadav <ptyadav@amazon.de>
 + */
 +
++/**
++ * DOC: Memfd Preservation via LUO
++ *
++ * Overview
++ * ========
++ *
++ * Memory file descriptors (memfd) can be preserved over a kexec using the Live
++ * Update Orchestrator (LUO) file preservation. This allows userspace to
++ * transfer its memory contents to the next kernel after a kexec.
++ *
++ * The preservation is not intended to be transparent. Only select properties of
++ * the file are preserved. All others are reset to default. The preserved
++ * properties are described below.
++ *
++ * .. note::
++ *    The LUO API is not stabilized yet, so the preserved properties of a memfd
++ *    are also not stable and are subject to backwards incompatible changes.
++ *
++ * .. note::
++ *    Currently a memfd backed by Hugetlb is not supported. Memfds created
++ *    with ``MFD_HUGETLB`` will be rejected.
++ *
++ * Preserved Properties
++ * ====================
++ *
++ * The following properties of the memfd are preserved across kexec:
++ *
++ * File Contents
++ *   All data stored in the file is preserved.
++ *
++ * File Size
++ *   The size of the file is preserved. Holes in the file are filled by
++ *   allocating pages for them during preservation.
++ *
++ * File Position
++ *   The current file position is preserved, allowing applications to continue
++ *   reading/writing from their last position.
++ *
++ * File Status Flags
++ *   memfds are always opened with ``O_RDWR`` and ``O_LARGEFILE``. This property
++ *   is maintained.
++ *
++ * Non-Preserved Properties
++ * ========================
++ *
++ * All properties which are not preserved must be assumed to be reset to
++ * default. This section describes some of those properties which may be more of
++ * note.
++ *
++ * ``FD_CLOEXEC`` flag
++ *   A memfd can be created with the ``MFD_CLOEXEC`` flag that sets the
++ *   ``FD_CLOEXEC`` on the file. This flag is not preserved and must be set
++ *   again after restore via ``fcntl()``.
++ *
++ * Seals
++ *   File seals are not preserved. The file is unsealed on restore and if
++ *   needed, must be sealed again via ``fcntl()``.
++ */
++
 +#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 +
++#include <linux/bits.h>
++#include <linux/err.h>
 +#include <linux/file.h>
 +#include <linux/io.h>
++#include <linux/kexec_handover.h>
 +#include <linux/libfdt.h>
 +#include <linux/liveupdate.h>
 +#include <linux/liveupdate/abi/memfd.h>
-+#include <linux/kexec_handover.h>
 +#include <linux/shmem_fs.h>
-+#include <linux/bits.h>
 +#include <linux/vmalloc.h>
 +#include "internal.h"
 +
@@ -371,7 +429,7 @@ new file mode 100644
 +err_unpreserve:
 +	i--;
 +	for (; i >= 0; i--)
-+		WARN_ON_ONCE(kho_unpreserve_folio(folios[i]));
++		kho_unpreserve_folio(folios[i]);
 +	vfree(pfolios);
 +err_unpin:
 +	unpin_folios(folios, nr_folios);
@@ -403,7 +461,7 @@ new file mode 100644
 +
 +		folio = pfn_folio(PRESERVED_FOLIO_PFN(pfolio->foliodesc));
 +
-+		WARN_ON_ONCE(kho_unpreserve_folio(folio));
++		kho_unpreserve_folio(folio);
 +		unpin_folio(folio);
 +	}
 +
@@ -831,13 +889,15 @@ new file mode 100644
 +
 +static int __init memfd_luo_init(void)
 +{
-+	int err;
++	int err = liveupdate_register_file_handler(&memfd_luo_handler);
 +
-+	err = liveupdate_register_file_handler(&memfd_luo_handler);
-+	if (err)
-+		pr_err("Could not register luo filesystem handler: %d\n", err);
++	if (err && err != -EOPNOTSUPP) {
++		pr_err("Could not register luo filesystem handler: %pe\n", ERR_PTR(err));
 +
-+	return err;
++		return err;
++	}
++
++	return 0;
 +}
 +late_initcall(memfd_luo_init);
 _

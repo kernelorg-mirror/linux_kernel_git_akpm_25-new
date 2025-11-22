@@ -1,6 +1,6 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
 Subject: liveupdate: luo_file: implement file systems callbacks
-Date: Fri, 7 Nov 2025 16:03:06 -0500
+Date: Sat, 15 Nov 2025 18:33:52 -0500
 
 This patch implements the core mechanism for managing preserved files
 throughout the live update lifecycle.  It provides the logic to invoke the
@@ -13,7 +13,7 @@ memory region preserved by KHO.  In the new kernel, luo_file_deserialize()
 reconstructs the in-memory file list from this data, preparing the session
 for retrieval.
 
-Link: https://lkml.kernel.org/r/20251107210526.257742-9-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251115233409.768044-7-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
 Cc: Aleksander Lobakin <aleksander.lobakin@intel.com>
 Cc: Alexander Graf <graf@amazon.com>
@@ -60,7 +60,6 @@ Cc: Miguel Ojeda <ojeda@kernel.org>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Myugnjoo Ham <myungjoo.ham@samsung.com>
 Cc: Parav Pandit <parav@nvidia.com>
-Cc: Pasha Tatashin <pahsa.tatashin@soleen.com>
 Cc: Pratyush Yadav <pratyush@kernel.org>
 Cc: Pratyush Yadav <ptyadav@amazon.de>
 Cc: Randy Dunlap <rdunlap@infradead.org>
@@ -76,7 +75,6 @@ Cc: Thomas Weißschuh <linux@weissschuh.net>
 Cc: Vincent Guittot <vincent.guittot@linaro.org>
 Cc: William Tu <witu@nvidia.com>
 Cc: Yoann Congal <yoann.congal@smile.fr>
-Cc: zhangguopeng <zhangguopeng@kylinos.cn>
 Cc: Zijun Hu <quic_zijuhu@quicinc.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
@@ -84,9 +82,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  include/linux/liveupdate.h         |  109 +++
  include/linux/liveupdate/abi/luo.h |   22 
  kernel/liveupdate/Makefile         |    1 
- kernel/liveupdate/luo_file.c       |  882 +++++++++++++++++++++++++++
+ kernel/liveupdate/luo_file.c       |  887 +++++++++++++++++++++++++++
  kernel/liveupdate/luo_internal.h   |    9 
- 5 files changed, 1023 insertions(+)
+ 5 files changed, 1028 insertions(+)
 
 --- a/include/linux/liveupdate/abi/luo.h~liveupdate-luo_file-implement-file-systems-callbacks
 +++ a/include/linux/liveupdate/abi/luo.h
@@ -111,7 +109,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +/**
 + * struct luo_file_ser - Represents the serialized preserves files.
-+ * @compatible:  File handler compatabile string.
++ * @compatible:  File handler compatible string.
 + * @data:        Private data
 + * @token:       User provided token for this file
 + *
@@ -215,7 +213,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #ifdef CONFIG_LIVEUPDATE
  
-@@ -21,6 +103,16 @@ bool liveupdate_enabled(void);
+@@ -19,6 +101,16 @@ bool liveupdate_enabled(void);
  /* Called during kexec to tell LUO that entered into reboot */
  int liveupdate_reboot(void);
  
@@ -231,14 +229,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  #else /* CONFIG_LIVEUPDATE */
  
- static inline void liveupdate_init(void)
-@@ -37,5 +129,22 @@ static inline int liveupdate_reboot(void
+ static inline bool liveupdate_enabled(void)
+@@ -31,5 +123,22 @@ static inline int liveupdate_reboot(void
  	return 0;
  }
  
 +static inline int liveupdate_register_file_handler(struct liveupdate_file_handler *h)
 +{
-+	return 0;
++	return -EOPNOTSUPP;
 +}
 +
 +static inline int liveupdate_get_file_incoming(struct liveupdate_session *s,
@@ -259,7 +257,7 @@ diff --git a/kernel/liveupdate/luo_file.c a/kernel/liveupdate/luo_file.c
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/luo_file.c
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,887 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +/*
@@ -358,12 +356,13 @@ new file mode 100644
 +
 +#include <linux/cleanup.h>
 +#include <linux/err.h>
++#include <linux/errno.h>
 +#include <linux/file.h>
++#include <linux/fs.h>
 +#include <linux/kexec_handover.h>
 +#include <linux/liveupdate.h>
 +#include <linux/liveupdate/abi/luo.h>
 +#include <linux/module.h>
-+#include <linux/rwsem.h>
 +#include <linux/sizes.h>
 +#include <linux/slab.h>
 +#include <linux/string.h>
@@ -430,7 +429,7 @@ new file mode 100644
 +	WARN_ON_ONCE(session->count);
 +
 +	size = LUO_FILE_PGCNT << PAGE_SHIFT;
-+	mem = luo_alloc_preserve(size);
++	mem = kho_alloc_preserve(size);
 +	if (IS_ERR(mem))
 +		return PTR_ERR(mem);
 +
@@ -449,7 +448,7 @@ new file mode 100644
 +	if (!session->files)
 +		return;
 +
-+	luo_free_unpreserve(session->files, session->pgcnt << PAGE_SHIFT);
++	kho_unpreserve_free(session->files);
 +	session->files = NULL;
 +	session->pgcnt = 0;
 +}
@@ -511,7 +510,7 @@ new file mode 100644
 +	struct liveupdate_file_handler *fh;
 +	struct luo_file *luo_file;
 +	struct file *file;
-+	int err = -ENOENT;
++	int err;
 +
 +	lockdep_assert_held(&session->mutex);
 +
@@ -531,6 +530,7 @@ new file mode 100644
 +		goto exit_err;
 +	}
 +
++	err = -ENOENT;
 +	list_for_each_entry(fh, &luo_file_handler_list, list) {
 +		if (fh->ops->can_preserve(fh, file)) {
 +			err = 0;
@@ -952,7 +952,7 @@ new file mode 100644
 +	}
 +
 +	if (session->files) {
-+		luo_free_restore(session->files, session->pgcnt << PAGE_SHIFT);
++		kho_restore_free(session->files);
 +		session->files = NULL;
 +		session->pgcnt = 0;
 +	}
@@ -1046,6 +1046,9 @@ new file mode 100644
 +	static DEFINE_MUTEX(register_file_handler_lock);
 +	struct liveupdate_file_handler *fh_iter;
 +
++	if (!liveupdate_enabled())
++		return -EOPNOTSUPP;
++
 +	/*
 +	 * Once sessions have been deserialized, file handlers cannot be
 +	 * registered, it is too late.
@@ -1125,8 +1128,8 @@ new file mode 100644
 + * The operation is idempotent; subsequent calls for the same token will return
 + * a pointer to the same 'struct file' object.
 + *
-+ * The caller receives a pointer to the file but does not receive a new
-+ * reference. The file's lifetime is managed by LUO and any userspace file
++ * The caller receives a pointer to the file with a reference incremented. The
++ * file's lifetime is managed by LUO and any userspace file
 + * descriptors. If the caller needs to hold a reference to the file beyond the
 + * immediate scope, it must call get_file() itself.
 + *
@@ -1144,7 +1147,7 @@ new file mode 100644
 +}
 --- a/kernel/liveupdate/luo_internal.h~liveupdate-luo_file-implement-file-systems-callbacks
 +++ a/kernel/liveupdate/luo_internal.h
-@@ -74,4 +74,13 @@ int luo_session_serialize(void);
+@@ -70,4 +70,13 @@ int luo_session_serialize(void);
  int luo_session_deserialize(void);
  bool luo_session_is_deserialized(void);
  
