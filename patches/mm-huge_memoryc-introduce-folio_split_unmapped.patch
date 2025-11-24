@@ -15,6 +15,11 @@ common to both __folio_split() and folio_split_unmapped().
 This in turn removes the special casing introduced by the unmapped
 parameter in __folio_split().
 
+[balbirs@nvidia.com: v2]
+  Link: https://lkml.kernel.org/r/20251115084041.3914728-1-balbirs@nvidia.com
+[balbirs@nvidia.com: fix clang-20 build]
+  Link: https://lkml.kernel.org/r/20251120134232.3588203-1-balbirs@nvidia.com
+[akpm@linux-foundation.org: add `inline' to shmem_uncharge() stub, per Balbir]
 Link: https://lkml.kernel.org/r/20251114012228.2634882-1-balbirs@nvidia.com
 Signed-off-by: Balbir Singh <balbirs@nvidia.com>
 Suggested-by: Zi Yan <ziy@nvidia.com>
@@ -45,10 +50,11 @@ Cc: Francois Dugast <francois.dugast@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/huge_mm.h |    5 
- mm/huge_memory.c        |  332 +++++++++++++++++++++-----------------
- mm/migrate_device.c     |    3 
- 3 files changed, 191 insertions(+), 149 deletions(-)
+ include/linux/huge_mm.h  |    5 
+ include/linux/shmem_fs.h |    6 
+ mm/huge_memory.c         |  348 +++++++++++++++++++++----------------
+ mm/migrate_device.c      |    3 
+ 4 files changed, 211 insertions(+), 151 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-huge_memoryc-introduce-folio_split_unmapped
 +++ a/include/linux/huge_mm.h
@@ -71,9 +77,36 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  static inline int split_huge_page_to_order(struct page *page, unsigned int new_order)
  {
+--- a/include/linux/shmem_fs.h~mm-huge_memoryc-introduce-folio_split_unmapped
++++ a/include/linux/shmem_fs.h
+@@ -136,11 +136,16 @@ static inline bool shmem_hpage_pmd_enabl
+ 
+ #ifdef CONFIG_SHMEM
+ extern unsigned long shmem_swap_usage(struct vm_area_struct *vma);
++extern void shmem_uncharge(struct inode *inode, long pages);
+ #else
+ static inline unsigned long shmem_swap_usage(struct vm_area_struct *vma)
+ {
+ 	return 0;
+ }
++
++static inline void shmem_uncharge(struct inode *inode, long pages)
++{
++}
+ #endif
+ extern unsigned long shmem_partial_swap_usage(struct address_space *mapping,
+ 						pgoff_t start, pgoff_t end);
+@@ -194,7 +199,6 @@ static inline pgoff_t shmem_fallocend(st
+ }
+ 
+ extern bool shmem_charge(struct inode *inode, long pages);
+-extern void shmem_uncharge(struct inode *inode, long pages);
+ 
+ #ifdef CONFIG_USERFAULTFD
+ #ifdef CONFIG_SHMEM
 --- a/mm/huge_memory.c~mm-huge_memoryc-introduce-folio_split_unmapped
 +++ a/mm/huge_memory.c
-@@ -3739,6 +3739,151 @@ bool folio_split_supported(struct folio
+@@ -3739,6 +3739,152 @@ bool folio_split_supported(struct folio
  	return true;
  }
  
@@ -81,15 +114,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +					     struct page *split_at, struct xa_state *xas,
 +					     struct address_space *mapping, bool do_lru,
 +					     struct list_head *list, enum split_type split_type,
-+					     pgoff_t end, int extra_pins)
++					     pgoff_t end, int *nr_shmem_dropped, int extra_pins)
 +{
 +	struct folio *end_folio = folio_next(folio);
 +	struct folio *new_folio, *next;
 +	int old_order = folio_order(folio);
-+	int nr_shmem_dropped = 0;
 +	int ret = 0;
 +	struct deferred_split *ds_queue;
 +
++	VM_WARN_ON_ONCE(!mapping && end);
 +	/* Prevent deferred_split_scan() touching ->_refcount */
 +	ds_queue = folio_split_queue_lock(folio);
 +	if (folio_ref_freeze(folio, 1 + extra_pins)) {
@@ -189,9 +222,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				continue;
 +			}
 +
++			VM_WARN_ON_ONCE(!nr_shmem_dropped);
 +			/* Drop folio beyond EOF: ->index >= end */
-+			if (shmem_mapping(mapping))
-+				nr_shmem_dropped += nr_pages;
++			if (shmem_mapping(mapping) && nr_shmem_dropped)
++				*nr_shmem_dropped += nr_pages;
 +			else if (folio_test_clear_dirty(new_folio))
 +				folio_account_cleaned(
 +					new_folio, inode_to_wb(mapping->host));
@@ -225,7 +259,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * __folio_split() - split a folio at @split_at to a @new_order folio
   * @folio: folio to split
-@@ -3747,7 +3892,6 @@ bool folio_split_supported(struct folio
+@@ -3747,7 +3893,6 @@ bool folio_split_supported(struct folio
   * @lock_at: a page within @folio to be left locked to caller
   * @list: after-split folios will be put on it if non NULL
   * @split_type: perform uniform split or not (non-uniform split)
@@ -233,7 +267,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
   * It calls __split_unmapped_folio() to perform uniform and non-uniform split.
   * It is in charge of checking whether the split is supported or not and
-@@ -3763,9 +3907,8 @@ bool folio_split_supported(struct folio
+@@ -3763,9 +3908,8 @@ bool folio_split_supported(struct folio
   */
  static int __folio_split(struct folio *folio, unsigned int new_order,
  		struct page *split_at, struct page *lock_at,
@@ -244,7 +278,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	XA_STATE(xas, &folio->mapping->i_pages, folio->index);
  	struct folio *end_folio = folio_next(folio);
  	bool is_anon = folio_test_anon(folio);
-@@ -3819,14 +3962,12 @@ static int __folio_split(struct folio *f
+@@ -3776,7 +3920,7 @@ static int __folio_split(struct folio *f
+ 	int nr_shmem_dropped = 0;
+ 	int remap_flags = 0;
+ 	int extra_pins, ret;
+-	pgoff_t end;
++	pgoff_t end = 0;
+ 	bool is_hzp;
+ 
+ 	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
+@@ -3819,14 +3963,12 @@ static int __folio_split(struct folio *f
  		 * is taken to serialise against parallel split or collapse
  		 * operations.
  		 */
@@ -264,7 +307,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		mapping = NULL;
  	} else {
  		unsigned int min_order;
-@@ -3880,8 +4021,7 @@ static int __folio_split(struct folio *f
+@@ -3880,8 +4022,7 @@ static int __folio_split(struct folio *f
  		goto out_unlock;
  	}
  
@@ -274,7 +317,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* block interrupt reentry in xa_lock and spinlock */
  	local_irq_disable();
-@@ -3898,142 +4038,14 @@ static int __folio_split(struct folio *f
+@@ -3898,142 +4039,15 @@ static int __folio_split(struct folio *f
  		}
  	}
  
@@ -406,7 +449,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		ret = -EAGAIN;
 -	}
 +	ret = __folio_freeze_and_split_unmapped(folio, new_order, split_at, &xas, mapping,
-+						true, list, split_type, end, extra_pins);
++						true, list, split_type, end, &nr_shmem_dropped,
++						extra_pins);
  fail:
  	if (mapping)
  		xas_unlock(&xas);
@@ -419,27 +463,40 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (nr_shmem_dropped)
  		shmem_uncharge(mapping->host, nr_shmem_dropped);
  
-@@ -4078,6 +4090,36 @@ out:
+@@ -4077,6 +4091,48 @@ out:
+ 	return ret;
  }
  
- /*
-+ * This function is a helper for splitting folios that have already been unmapped.
-+ * The use case is that the device or the CPU can refuse to migrate THP pages in
-+ * the middle of migration, due to allocation issues on either side
++/**
++ * folio_split_unmapped() - split a large anon folio that is already unmapped
++ * @folio: folio to split
++ * @new_order: the order of folios after split
 + *
-+ * The high level code is copied from __folio_split, since the pages are anonymous
-+ * and are already isolated from the LRU, the code has been simplified to not
-+ * burden __folio_split with unmapped sprinkled into the code.
++ * This function is a helper for splitting folios that have already been
++ * unmapped. The use case is that the device or the CPU can refuse to migrate
++ * THP pages in the middle of migration, due to allocation issues on either
++ * side.
 + *
-+ * None of the split folios are unlocked
++ * anon_vma_lock is not required to be held, mmap_read_lock() or
++ * mmap_write_lock() should be held. @folio is expected to be locked by the
++ * caller. device-private and non device-private folios are supported along
++ * with folios that are in the swapcache. @folio should also be unmapped and
++ * isolated from LRU (if applicable)
++ *
++ * Upon return, the folio is not remapped, split folios are not added to LRU,
++ * free_folio_and_swap_cache() is not called, and new folios remain locked.
++ *
++ * Return: 0 on success, -EAGAIN if the folio cannot be split (e.g., due to
++ *         insufficient reference count or extra pins).
 + */
 +int folio_split_unmapped(struct folio *folio, unsigned int new_order)
 +{
 +	int extra_pins, ret = 0;
 +
-+	VM_WARN_ON_FOLIO(folio_mapped(folio), folio);
++	VM_WARN_ON_ONCE_FOLIO(folio_mapped(folio), folio);
 +	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
 +	VM_WARN_ON_ONCE_FOLIO(!folio_test_large(folio), folio);
++	VM_WARN_ON_ONCE_FOLIO(!folio_test_anon(folio), folio);
 +
 +	if (!can_split_folio(folio, 1, &extra_pins))
 +		return -EAGAIN;
@@ -447,16 +504,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	local_irq_disable();
 +	ret = __folio_freeze_and_split_unmapped(folio, new_order, &folio->page, NULL,
 +						NULL, false, NULL, SPLIT_TYPE_UNIFORM,
-+						0, extra_pins);
++						0, NULL, extra_pins);
 +	local_irq_enable();
 +	return ret;
 +}
 +
-+/*
+ /*
   * This function splits a large folio into smaller folios of order @new_order.
   * @page can point to any page of the large folio to split. The split operation
-  * does not change the position of @page.
-@@ -4125,12 +4167,12 @@ out:
+@@ -4125,12 +4181,12 @@ out:
   * with the folio. Splitting to order 0 is compatible with all folios.
   */
  int __split_huge_page_to_list_to_order(struct page *page, struct list_head *list,
@@ -471,7 +527,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -4161,7 +4203,7 @@ int folio_split(struct folio *folio, uns
+@@ -4161,7 +4217,7 @@ int folio_split(struct folio *folio, uns
  		struct page *split_at, struct list_head *list)
  {
  	return __folio_split(folio, new_order, split_at, &folio->page, list,
