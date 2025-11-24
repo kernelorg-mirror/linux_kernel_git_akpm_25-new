@@ -9,8 +9,11 @@ During PTE walk in the collection phase, if a large folio is only
 partially mapped in the migration range, it must be split to ensure the
 folio is correctly migrated.
 
+[matthew.brost@intel.com: handle partially mapped folios during split]
+  Link: https://lkml.kernel.org/r/20251120230825.181072-1-matthew.brost@intel.com
 Link: https://lkml.kernel.org/r/20251001065707.920170-7-balbirs@nvidia.com
 Signed-off-by: Balbir Singh <balbirs@nvidia.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
@@ -33,17 +36,16 @@ Cc: David Airlie <airlied@gmail.com>
 Cc: Simona Vetter <simona@ffwll.ch>
 Cc: Ralph Campbell <rcampbell@nvidia.com>
 Cc: Mika Penttilä <mpenttil@redhat.com>
-Cc: Matthew Brost <matthew.brost@intel.com>
 Cc: Francois Dugast <francois.dugast@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/migrate_device.c |   63 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 63 insertions(+)
+ mm/migrate_device.c |   70 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 69 insertions(+), 1 deletion(-)
 
 --- a/mm/migrate_device.c~mm-migrate_device-handle-partially-mapped-folios-during-collection
 +++ a/mm/migrate_device.c
-@@ -54,6 +54,53 @@ static int migrate_vma_collect_hole(unsi
+@@ -54,6 +54,55 @@ static int migrate_vma_collect_hole(unsi
  	return 0;
  }
  
@@ -85,8 +87,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		folio_unlock(folio);
 +		folio_put(folio);
 +	} else if (folio != new_fault_folio) {
-+		folio_get(new_fault_folio);
-+		folio_lock(new_fault_folio);
++		if (new_fault_folio != fault_folio) {
++			folio_get(new_fault_folio);
++			folio_lock(new_fault_folio);
++		}
 +		folio_unlock(folio);
 +		folio_put(folio);
 +	}
@@ -97,7 +101,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static int migrate_vma_collect_pmd(pmd_t *pmdp,
  				   unsigned long start,
  				   unsigned long end,
-@@ -171,6 +218,22 @@ again:
+@@ -107,10 +156,11 @@ again:
+ 		}
+ 	}
+ 
+-	ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
++	ptep = pte_offset_map_lock(mm, pmdp, start, &ptl);
+ 	if (!ptep)
+ 		goto again;
+ 	arch_enter_lazy_mmu_mode();
++	ptep += (addr - start) / PAGE_SIZE;
+ 
+ 	for (; addr < end; addr += PAGE_SIZE, ptep++) {
+ 		struct dev_pagemap *pgmap;
+@@ -171,6 +221,24 @@ again:
  					pgmap->owner != migrate->pgmap_owner)
  					goto next;
  			}
@@ -105,16 +122,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			if (folio && folio_test_large(folio)) {
 +				int ret;
 +
++				arch_leave_lazy_mmu_mode();
 +				pte_unmap_unlock(ptep, ptl);
 +				ret = migrate_vma_split_folio(folio,
 +							  migrate->fault_page);
 +
 +				if (ret) {
-+					ptep = pte_offset_map_lock(mm, pmdp, addr, &ptl);
-+					goto next;
++					if (unmapped)
++						flush_tlb_range(walk->vma, start, end);
++
++					return migrate_vma_collect_skip(addr, end, walk);
 +				}
 +
-+				addr = start;
 +				goto again;
 +			}
  			mpfn = migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
