@@ -1,6 +1,6 @@
 From: Balbir Singh <balbirs@nvidia.com>
 Subject: mm/migrate_device: add THP splitting during migration
-Date: Mon, 8 Sep 2025 10:04:43 +1000
+Date: Wed, 1 Oct 2025 16:57:02 +1000
 
 Implement migrate_vma_split_pages() to handle THP splitting during the
 migration process when destination cannot allocate compound pages.
@@ -17,8 +17,11 @@ Key changes:
 This provides a fallback mechansim to ensure migration succeeds even when
 large page allocation fails at the destination.
 
-Link: https://lkml.kernel.org/r/20250908000448.180088-11-balbirs@nvidia.com
+[matthew.brost@intel.com: add THP splitting during migration]
+  Link: https://lkml.kernel.org/r/20251120230825.181072-2-matthew.brost@intel.com
+Link: https://lkml.kernel.org/r/20251001065707.920170-12-balbirs@nvidia.com
 Signed-off-by: Balbir Singh <balbirs@nvidia.com>
+Signed-off-by: Matthew Brost <matthew.brost@intel.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
@@ -41,16 +44,15 @@ Cc: David Airlie <airlied@gmail.com>
 Cc: Simona Vetter <simona@ffwll.ch>
 Cc: Ralph Campbell <rcampbell@nvidia.com>
 Cc: Mika Penttilä <mpenttil@redhat.com>
-Cc: Matthew Brost <matthew.brost@intel.com>
 Cc: Francois Dugast <francois.dugast@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/huge_mm.h |   11 ++++--
- lib/test_hmm.c          |    9 ++++
- mm/huge_memory.c        |   45 +++++++++++++-----------
- mm/migrate_device.c     |   69 +++++++++++++++++++++++++++++++-------
- 4 files changed, 100 insertions(+), 34 deletions(-)
+ include/linux/huge_mm.h |   11 +++-
+ lib/test_hmm.c          |    9 +++
+ mm/huge_memory.c        |   46 ++++++++++----------
+ mm/migrate_device.c     |   87 +++++++++++++++++++++++++++++++++-----
+ 4 files changed, 119 insertions(+), 34 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-migrate_device-add-thp-splitting-during-migration
 +++ a/include/linux/huge_mm.h
@@ -77,11 +79,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +}
 +
  /*
-  * try_folio_split - try to split a @folio at @page using non uniform split.
-  * @folio: folio to be split
+  * try_folio_split_to_order - try to split a @folio at @page to @new_order using
+  * non uniform split.
 --- a/lib/test_hmm.c~mm-migrate_device-add-thp-splitting-during-migration
 +++ a/lib/test_hmm.c
-@@ -1612,6 +1612,15 @@ static vm_fault_t dmirror_devmem_fault(s
+@@ -1613,6 +1613,15 @@ static vm_fault_t dmirror_devmem_fault(s
  	nr = 1 << order;
  
  	/*
@@ -99,7 +101,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 */
 --- a/mm/huge_memory.c~mm-migrate_device-add-thp-splitting-during-migration
 +++ a/mm/huge_memory.c
-@@ -3459,15 +3459,6 @@ static void __split_folio_to_order(struc
+@@ -3452,15 +3452,6 @@ static void __split_folio_to_order(struc
  		new_folio->mapping = folio->mapping;
  		new_folio->index = folio->index + i;
  
@@ -115,7 +117,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (folio_test_swapcache(folio))
  			new_folio->swap.val = folio->swap.val + i;
  
-@@ -3696,6 +3687,7 @@ bool uniform_split_supported(struct foli
+@@ -3661,6 +3652,7 @@ bool uniform_split_supported(struct foli
   * @lock_at: a page within @folio to be left locked to caller
   * @list: after-split folios will be put on it if non NULL
   * @uniform_split: perform uniform split or not (non-uniform split)
@@ -123,7 +125,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *
   * It calls __split_unmapped_folio() to perform uniform and non-uniform split.
   * It is in charge of checking whether the split is supported or not and
-@@ -3711,7 +3703,7 @@ bool uniform_split_supported(struct foli
+@@ -3676,7 +3668,7 @@ bool uniform_split_supported(struct foli
   */
  static int __folio_split(struct folio *folio, unsigned int new_order,
  		struct page *split_at, struct page *lock_at,
@@ -132,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct deferred_split *ds_queue = get_deferred_split_queue(folio);
  	XA_STATE(xas, &folio->mapping->i_pages, folio->index);
-@@ -3761,13 +3753,15 @@ static int __folio_split(struct folio *f
+@@ -3736,13 +3728,15 @@ static int __folio_split(struct folio *f
  		 * is taken to serialise against parallel split or collapse
  		 * operations.
  		 */
@@ -153,7 +155,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	} else {
  		unsigned int min_order;
  		gfp_t gfp;
-@@ -3834,7 +3828,8 @@ static int __folio_split(struct folio *f
+@@ -3795,7 +3789,8 @@ static int __folio_split(struct folio *f
  		goto out_unlock;
  	}
  
@@ -163,7 +165,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* block interrupt reentry in xa_lock and spinlock */
  	local_irq_disable();
-@@ -3920,10 +3915,13 @@ static int __folio_split(struct folio *f
+@@ -3882,10 +3877,13 @@ static int __folio_split(struct folio *f
  
  			next = folio_next(new_folio);
  
@@ -178,15 +180,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  			/*
  			 * Anonymous folio with swap cache.
-@@ -3955,6 +3953,7 @@ static int __folio_split(struct folio *f
+@@ -3916,6 +3914,8 @@ static int __folio_split(struct folio *f
+ 			__filemap_remove_folio(new_folio, NULL);
  			folio_put_refs(new_folio, nr_pages);
  		}
- 
++
 +		zone_device_private_split_cb(folio, NULL);
  		/*
  		 * Unfreeze @folio only after all page cache entries, which
  		 * used to point to it, have been updated with new folios.
-@@ -3978,6 +3977,9 @@ fail:
+@@ -3939,6 +3939,9 @@ fail:
  
  	local_irq_enable();
  
@@ -196,7 +199,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (nr_shmem_dropped)
  		shmem_uncharge(mapping->host, nr_shmem_dropped);
  
-@@ -4068,12 +4070,13 @@ out:
+@@ -4029,12 +4032,13 @@ out:
   * Returns -EINVAL when trying to split to an order that is incompatible
   * with the folio. Splitting to order 0 is compatible with all folios.
   */
@@ -213,7 +216,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -4102,7 +4105,7 @@ int folio_split(struct folio *folio, uns
+@@ -4063,7 +4067,7 @@ int folio_split(struct folio *folio, uns
  		struct page *split_at, struct list_head *list)
  {
  	return __folio_split(folio, new_order, split_at, &folio->page, list,
@@ -224,14 +227,40 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  int min_order_for_split(struct folio *folio)
 --- a/mm/migrate_device.c~mm-migrate_device-add-thp-splitting-during-migration
 +++ a/mm/migrate_device.c
-@@ -898,6 +898,29 @@ abort:
+@@ -309,6 +309,25 @@ again:
+ 			    pgmap->owner != migrate->pgmap_owner)
+ 				goto next;
+ 
++			folio = page_folio(page);
++			if (folio_test_large(folio)) {
++				int ret;
++
++				arch_leave_lazy_mmu_mode();
++				pte_unmap_unlock(ptep, ptl);
++				ret = migrate_vma_split_folio(folio,
++							  migrate->fault_page);
++
++				if (ret) {
++					if (unmapped)
++						flush_tlb_range(walk->vma, start, end);
++
++					return migrate_vma_collect_skip(addr, end, walk);
++				}
++
++				goto again;
++			}
++
+ 			mpfn = migrate_pfn(page_to_pfn(page)) |
+ 					MIGRATE_PFN_MIGRATE;
+ 			if (is_writable_device_private_entry(entry))
+@@ -885,6 +904,29 @@ abort:
  		src[i] &= ~MIGRATE_PFN_MIGRATE;
  	return 0;
  }
 +
-+static int migrate_vma_split_pages(struct migrate_vma *migrate,
-+					unsigned long idx, unsigned long addr,
-+					struct folio *folio)
++static int migrate_vma_split_unmapped_folio(struct migrate_vma *migrate,
++					    unsigned long idx, unsigned long addr,
++					    struct folio *folio)
 +{
 +	unsigned long i;
 +	unsigned long pfn;
@@ -254,21 +283,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #else /* !CONFIG_ARCH_ENABLE_THP_MIGRATION */
  static int migrate_vma_insert_huge_pmd_page(struct migrate_vma *migrate,
  					 unsigned long addr,
-@@ -907,6 +930,13 @@ static int migrate_vma_insert_huge_pmd_p
+@@ -894,6 +936,13 @@ static int migrate_vma_insert_huge_pmd_p
  {
  	return 0;
  }
 +
-+static int migrate_vma_split_pages(struct migrate_vma *migrate,
-+					unsigned long idx, unsigned long addr,
-+					struct folio *folio)
++static int migrate_vma_split_unmapped_folio(struct migrate_vma *migrate,
++					    unsigned long idx, unsigned long addr,
++					    struct folio *folio)
 +{
 +	return 0;
 +}
  #endif
  
- /*
-@@ -1056,8 +1086,9 @@ static void __migrate_device_pages(unsig
+ static unsigned long migrate_vma_nr_pages(unsigned long *src)
+@@ -1055,8 +1104,9 @@ static void __migrate_device_pages(unsig
  				struct migrate_vma *migrate)
  {
  	struct mmu_notifier_range range;
@@ -279,9 +308,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	for (i = 0; i < npages; ) {
  		struct page *newpage = migrate_pfn_to_page(dst_pfns[i]);
-@@ -1099,12 +1130,16 @@ static void __migrate_device_pages(unsig
+@@ -1098,12 +1148,16 @@ static void __migrate_device_pages(unsig
  				(!(dst_pfns[i] & MIGRATE_PFN_COMPOUND))) {
- 				nr = HPAGE_PMD_NR;
+ 				nr = migrate_vma_nr_pages(&src_pfns[i]);
  				src_pfns[i] &= ~MIGRATE_PFN_COMPOUND;
 -				src_pfns[i] &= ~MIGRATE_PFN_MIGRATE;
 -				goto next;
@@ -300,15 +329,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			goto next;
  		}
  
-@@ -1126,7 +1161,14 @@ static void __migrate_device_pages(unsig
+@@ -1125,7 +1179,13 @@ static void __migrate_device_pages(unsig
  							 MIGRATE_PFN_COMPOUND);
  					goto next;
  				}
 -				src_pfns[i] &= ~MIGRATE_PFN_MIGRATE;
 +				nr = 1 << folio_order(folio);
 +				addr = migrate->start + i * PAGE_SIZE;
-+				if (migrate_vma_split_pages(migrate, i, addr,
-+								folio)) {
++				if (migrate_vma_split_unmapped_folio(migrate, i, addr, folio)) {
 +					src_pfns[i] &= ~(MIGRATE_PFN_MIGRATE |
 +							 MIGRATE_PFN_COMPOUND);
 +					goto next;
@@ -316,7 +344,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  			} else if ((src_pfns[i] & MIGRATE_PFN_MIGRATE) &&
  				(dst_pfns[i] & MIGRATE_PFN_COMPOUND) &&
  				!(src_pfns[i] & MIGRATE_PFN_COMPOUND)) {
-@@ -1162,11 +1204,16 @@ static void __migrate_device_pages(unsig
+@@ -1161,11 +1221,16 @@ static void __migrate_device_pages(unsig
  
  		if (migrate && migrate->fault_page == page)
  			extra_cnt = 1;
