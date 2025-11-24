@@ -9,6 +9,8 @@ Update migration and eviction code paths to handle compound page sizes
 appropriately, improving memory bandwidth utilization and reducing
 migration overhead for large GPU memory allocations.
 
+[balbirs@nvidia.com: fix sparse error]
+  Link: https://lkml.kernel.org/r/20251115003333.3516870-1-balbirs@nvidia.com
 Link: https://lkml.kernel.org/r/20251001065707.920170-17-balbirs@nvidia.com
 Signed-off-by: Balbir Singh <balbirs@nvidia.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -38,10 +40,10 @@ Cc: Francois Dugast <francois.dugast@intel.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/gpu/drm/nouveau/nouveau_dmem.c |  303 ++++++++++++++++-------
+ drivers/gpu/drm/nouveau/nouveau_dmem.c |  306 ++++++++++++++++-------
  drivers/gpu/drm/nouveau/nouveau_svm.c  |    6 
  drivers/gpu/drm/nouveau/nouveau_svm.h  |    3 
- 3 files changed, 229 insertions(+), 83 deletions(-)
+ 3 files changed, 231 insertions(+), 84 deletions(-)
 
 --- a/drivers/gpu/drm/nouveau/nouveau_dmem.c~gpu-drm-nouveau-enable-thp-support-for-gpu-memory-migration
 +++ a/drivers/gpu/drm/nouveau/nouveau_dmem.c
@@ -122,7 +124,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return -EIO;
  	}
  
-@@ -166,22 +186,48 @@ static vm_fault_t nouveau_dmem_migrate_t
+@@ -166,22 +186,49 @@ static vm_fault_t nouveau_dmem_migrate_t
  	struct nouveau_dmem *dmem = drm->dmem;
  	struct nouveau_fence *fence;
  	struct nouveau_svmm *svmm;
@@ -131,6 +133,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	dma_addr_t dma_addr = 0;
 +	struct page *dpage;
  	vm_fault_t ret = 0;
++	int err;
  	struct migrate_vma args = {
  		.vma		= vmf->vma,
 -		.start		= vmf->address,
@@ -179,7 +182,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * FIXME what we really want is to find some heuristic to migrate more
  	 * than just one page on CPU fault. When such fault happens it is very
  	 * likely that more surrounding page will CPU fault too.
-@@ -191,20 +237,26 @@ static vm_fault_t nouveau_dmem_migrate_t
+@@ -191,22 +238,28 @@ static vm_fault_t nouveau_dmem_migrate_t
  	if (!args.cpages)
  		return 0;
  
@@ -211,11 +214,14 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	mutex_lock(&svmm->mutex);
  	nouveau_svmm_invalidate(svmm, args.start, args.end);
 -	ret = nouveau_dmem_copy_one(drm, spage, dpage, &dma_addr);
-+	ret = nouveau_dmem_copy_folio(drm, sfolio, dfolio, &dma_info);
++	err = nouveau_dmem_copy_folio(drm, sfolio, dfolio, &dma_info);
  	mutex_unlock(&svmm->mutex);
- 	if (ret) {
+-	if (ret) {
++	if (err) {
  		ret = VM_FAULT_SIGBUS;
-@@ -214,25 +266,40 @@ static vm_fault_t nouveau_dmem_migrate_t
+ 		goto done;
+ 	}
+@@ -214,25 +267,40 @@ static vm_fault_t nouveau_dmem_migrate_t
  	nouveau_fence_new(&fence, dmem->migrate.chan);
  	migrate_vma_pages(&args);
  	nouveau_dmem_fence_done(&fence);
@@ -259,7 +265,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	int ret;
  
  	chunk = kzalloc(sizeof(*chunk), GFP_KERNEL);
-@@ -242,7 +309,7 @@ nouveau_dmem_chunk_alloc(struct nouveau_
+@@ -242,7 +310,7 @@ nouveau_dmem_chunk_alloc(struct nouveau_
  	}
  
  	/* Allocate unused physical address space for device private pages. */
@@ -268,7 +274,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  				      "nouveau_dmem");
  	if (IS_ERR(res)) {
  		ret = PTR_ERR(res);
-@@ -275,16 +342,40 @@ nouveau_dmem_chunk_alloc(struct nouveau_
+@@ -275,16 +343,40 @@ nouveau_dmem_chunk_alloc(struct nouveau_
  	pfn_first = chunk->pagemap.range.start >> PAGE_SHIFT;
  	page = pfn_to_page(pfn_first);
  	spin_lock(&drm->dmem->lock);
@@ -292,7 +298,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			drm->dmem->free_folios = page_folio(page);
 +			pfn += DMEM_CHUNK_NPAGES;
 +		}
-+	}
+ 	}
+-	*ppage = page;
 +
 +	/* Move to next page */
 +	if (is_large) {
@@ -301,8 +308,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	} else {
 +		*ppage = drm->dmem->free_pages;
 +		drm->dmem->free_pages = (*ppage)->zone_device_data;
- 	}
--	*ppage = page;
++	}
 +
  	chunk->callocated++;
  	spin_unlock(&drm->dmem->lock);
@@ -315,7 +321,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	return 0;
  
-@@ -299,27 +390,41 @@ out:
+@@ -299,27 +391,41 @@ out:
  }
  
  static struct page *
@@ -361,7 +367,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return page;
  }
  
-@@ -370,12 +475,12 @@ nouveau_dmem_evict_chunk(struct nouveau_
+@@ -370,12 +476,12 @@ nouveau_dmem_evict_chunk(struct nouveau_
  {
  	unsigned long i, npages = range_len(&chunk->pagemap.range) >> PAGE_SHIFT;
  	unsigned long *src_pfns, *dst_pfns;
@@ -376,7 +382,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	migrate_device_range(src_pfns, chunk->pagemap.range.start >> PAGE_SHIFT,
  			npages);
-@@ -383,17 +488,28 @@ nouveau_dmem_evict_chunk(struct nouveau_
+@@ -383,17 +489,28 @@ nouveau_dmem_evict_chunk(struct nouveau_
  	for (i = 0; i < npages; i++) {
  		if (src_pfns[i] & MIGRATE_PFN_MIGRATE) {
  			struct page *dpage;
@@ -414,7 +420,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		}
  	}
  
-@@ -404,8 +520,9 @@ nouveau_dmem_evict_chunk(struct nouveau_
+@@ -404,8 +521,9 @@ nouveau_dmem_evict_chunk(struct nouveau_
  	kvfree(src_pfns);
  	kvfree(dst_pfns);
  	for (i = 0; i < npages; i++)
@@ -426,7 +432,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  void
-@@ -608,31 +725,36 @@ nouveau_dmem_init(struct nouveau_drm *dr
+@@ -608,31 +726,36 @@ nouveau_dmem_init(struct nouveau_drm *dr
  
  static unsigned long nouveau_dmem_migrate_copy_one(struct nouveau_drm *drm,
  		struct nouveau_svmm *svmm, unsigned long src,
@@ -470,7 +476,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		if (drm->dmem->migrate.clear_func(drm, page_size(dpage),
  			NOUVEAU_APER_VRAM, paddr))
  			goto out_free_page;
-@@ -643,10 +765,13 @@ static unsigned long nouveau_dmem_migrat
+@@ -643,10 +766,13 @@ static unsigned long nouveau_dmem_migrat
  		((paddr >> PAGE_SHIFT) << NVIF_VMM_PFNMAP_V0_ADDR_SHIFT);
  	if (src & MIGRATE_PFN_WRITE)
  		*pfn |= NVIF_VMM_PFNMAP_V0_W;
@@ -486,7 +492,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  out_free_page:
  	nouveau_dmem_page_free_locked(drm, dpage);
  out:
-@@ -656,27 +781,38 @@ out:
+@@ -656,27 +782,38 @@ out:
  
  static void nouveau_dmem_migrate_chunk(struct nouveau_drm *drm,
  		struct nouveau_svmm *svmm, struct migrate_vma *args,
@@ -533,7 +539,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	migrate_vma_finalize(args);
  }
-@@ -689,20 +825,27 @@ nouveau_dmem_migrate_vma(struct nouveau_
+@@ -689,20 +826,27 @@ nouveau_dmem_migrate_vma(struct nouveau_
  			 unsigned long end)
  {
  	unsigned long npages = (end - start) >> PAGE_SHIFT;
@@ -566,7 +572,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	args.src = kcalloc(max, sizeof(*args.src), GFP_KERNEL);
  	if (!args.src)
-@@ -711,8 +854,8 @@ nouveau_dmem_migrate_vma(struct nouveau_
+@@ -711,8 +855,8 @@ nouveau_dmem_migrate_vma(struct nouveau_
  	if (!args.dst)
  		goto out_free_src;
  
@@ -577,7 +583,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto out_free_dst;
  
  	pfns = nouveau_pfns_alloc(max);
-@@ -730,7 +873,7 @@ nouveau_dmem_migrate_vma(struct nouveau_
+@@ -730,7 +874,7 @@ nouveau_dmem_migrate_vma(struct nouveau_
  			goto out_free_pfns;
  
  		if (args.cpages)
@@ -586,7 +592,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  						   pfns);
  		args.start = args.end;
  	}
-@@ -739,7 +882,7 @@ nouveau_dmem_migrate_vma(struct nouveau_
+@@ -739,7 +883,7 @@ nouveau_dmem_migrate_vma(struct nouveau_
  out_free_pfns:
  	nouveau_pfns_free(pfns);
  out_free_dma:
