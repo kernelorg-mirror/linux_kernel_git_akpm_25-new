@@ -1,26 +1,31 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
 Subject: liveupdate: luo_core: integrate with KHO
-Date: Sat, 15 Nov 2025 18:33:48 -0500
+Date: Sat, 22 Nov 2025 17:23:29 -0500
 
 Integrate the LUO with the KHO framework to enable passing LUO state
 across a kexec reboot.
 
-When LUO is transitioned to a "prepared" state, it tells KHO to finalize,
-so all memory segments that were added to KHO preservation list are
-getting preserved.  After "Prepared" state no new segments can be
-preserved.  If LUO is canceled, it also tells KHO to cancel the
-serialization, and therefore, later LUO can go back into the prepared
-state.
+This patch implements the lifecycle integration with KHO:
 
-This patch introduces the following changes:
-- During the KHO finalization phase allocate FDT blob.
-- Populate this FDT with a LUO compatibility string ("luo-v1").
+1. Incoming State: During early boot (`early_initcall`), LUO checks if
+   KHO is active. If so, it retrieves the "LUO" subtree, verifies the
+   "luo-v1" compatibility string, and reads the `liveupdate-number` to
+   track the update count.
 
-LUO now depends on `CONFIG_KEXEC_HANDOVER`. The core state transition
-logic (`luo_do_*_calls`) remains unimplemented in this patch.
+2. Outgoing State: During late initialization (`late_initcall`), LUO
+   allocates a new FDT for the next kernel, populates it with the basic
+   header (compatible string and incremented update number), and
+   registers it with KHO (`kho_add_subtree`).
 
-Link: https://lkml.kernel.org/r/20251115233409.768044-3-pasha.tatashin@soleen.com
+3. Finalization: The `liveupdate_reboot()` notifier is updated to invoke
+   `kho_finalize()`. This ensures that all memory segments marked for
+   preservation are properly serialized before the kexec jump.
+
+LUO now depends on `CONFIG_KEXEC_HANDOVER`.
+
+Link: https://lkml.kernel.org/r/20251122222351.1059049-3-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Reviewed-by: Pratyush Yadav <pratyush@kernel.org>
 Cc: Aleksander Lobakin <aleksander.lobakin@intel.com>
 Cc: Alexander Graf <graf@amazon.com>
 Cc: Alice Ryhl <aliceryhl@google.com>
@@ -63,11 +68,9 @@ Cc: Marc Rutland <mark.rutland@arm.com>
 Cc: Masahiro Yamada <masahiroy@kernel.org>
 Cc: Matthew Maurer <mmaurer@google.com>
 Cc: Miguel Ojeda <ojeda@kernel.org>
-Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Cc: Myugnjoo Ham <myungjoo.ham@samsung.com>
 Cc: Parav Pandit <parav@nvidia.com>
-Cc: Pratyush Yadav <pratyush@kernel.org>
-Cc: Pratyush Yadav <ptyadav@amazon.de>
 Cc: Randy Dunlap <rdunlap@infradead.org>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Saeed Mahameed <saeedm@nvidia.com>
@@ -81,18 +84,20 @@ Cc: Thomas Weißschuh <linux@weissschuh.net>
 Cc: Vincent Guittot <vincent.guittot@linaro.org>
 Cc: William Tu <witu@nvidia.com>
 Cc: Yoann Congal <yoann.congal@smile.fr>
+Cc: Zhu Yanjun <yanjun.zhu@linux.dev>
 Cc: Zijun Hu <quic_zijuhu@quicinc.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/liveupdate/abi/luo.h |   54 +++++++++
- kernel/liveupdate/luo_core.c       |  153 ++++++++++++++++++++++++++-
- 2 files changed, 206 insertions(+), 1 deletion(-)
+ include/linux/kho/abi/luo.h      |   54 ++++++++++
+ kernel/liveupdate/luo_core.c     |  154 ++++++++++++++++++++++++++++-
+ kernel/liveupdate/luo_internal.h |   22 ++++
+ 3 files changed, 229 insertions(+), 1 deletion(-)
 
-diff --git a/include/linux/liveupdate/abi/luo.h a/include/linux/liveupdate/abi/luo.h
+diff --git a/include/linux/kho/abi/luo.h a/include/linux/kho/abi/luo.h
 new file mode 100644
 --- /dev/null
-+++ a/include/linux/liveupdate/abi/luo.h
++++ a/include/linux/kho/abi/luo.h
 @@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +
@@ -134,12 +139,12 @@ new file mode 100644
 + *     A counter tracking the number of successful live updates performed.
 + */
 +
-+#ifndef _LINUX_LIVEUPDATE_ABI_LUO_H
-+#define _LINUX_LIVEUPDATE_ABI_LUO_H
++#ifndef _LINUX_KHO_ABI_LUO_H
++#define _LINUX_KHO_ABI_LUO_H
 +
 +/*
 + * The LUO FDT hooks all LUO state for sessions, fds, etc.
-+ * In the root it allso carries "liveupdate-number" 64-bit property that
++ * In the root it also carries "liveupdate-number" 64-bit property that
 + * corresponds to the number of live-updates performed on this machine.
 + */
 +#define LUO_FDT_SIZE		PAGE_SIZE
@@ -147,25 +152,27 @@ new file mode 100644
 +#define LUO_FDT_COMPATIBLE	"luo-v1"
 +#define LUO_FDT_LIVEUPDATE_NUM	"liveupdate-number"
 +
-+#endif /* _LINUX_LIVEUPDATE_ABI_LUO_H */
++#endif /* _LINUX_KHO_ABI_LUO_H */
 --- a/kernel/liveupdate/luo_core.c~liveupdate-luo_core-integrate-with-kho
 +++ a/kernel/liveupdate/luo_core.c
-@@ -42,11 +42,24 @@
+@@ -41,12 +41,26 @@
  
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  
 +#include <linux/io.h>
 +#include <linux/kexec_handover.h>
++#include <linux/kho/abi/luo.h>
  #include <linux/kobject.h>
 +#include <linux/libfdt.h>
  #include <linux/liveupdate.h>
-+#include <linux/liveupdate/abi/luo.h>
+ #include <linux/miscdevice.h>
 +#include <linux/mm.h>
 +#include <linux/sizes.h>
 +#include <linux/string.h>
 +#include <linux/unaligned.h>
 +
 +#include "kexec_handover_internal.h"
++#include "luo_internal.h"
  
  static struct {
  	bool enabled;
@@ -175,7 +182,7 @@ new file mode 100644
  } luo_global;
  
  static int __init early_liveupdate_param(char *buf)
-@@ -55,6 +68,129 @@ static int __init early_liveupdate_param
+@@ -55,6 +69,129 @@ static int __init early_liveupdate_param
  }
  early_param("liveupdate", early_liveupdate_param);
  
@@ -237,9 +244,9 @@ new file mode 100644
 +
 +	err = luo_early_startup();
 +	if (err) {
-+		pr_err("The incoming tree failed to initialize properly [%pe], disabling live update\n",
-+		       ERR_PTR(err));
 +		luo_global.enabled = false;
++		luo_restore_fail("The incoming tree failed to initialize properly [%pe], disabling live update\n",
++				 ERR_PTR(err));
 +	}
 +
 +	return err;
@@ -305,7 +312,7 @@ new file mode 100644
  /* Public Functions */
  
  /**
-@@ -69,7 +205,22 @@ early_param("liveupdate", early_liveupda
+@@ -69,7 +206,22 @@ early_param("liveupdate", early_liveupda
   */
  int liveupdate_reboot(void)
  {
@@ -329,4 +336,31 @@ new file mode 100644
  }
  
  /**
+diff --git a/kernel/liveupdate/luo_internal.h a/kernel/liveupdate/luo_internal.h
+new file mode 100644
+--- /dev/null
++++ a/kernel/liveupdate/luo_internal.h
+@@ -0,0 +1,22 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++/*
++ * Copyright (c) 2025, Google LLC.
++ * Pasha Tatashin <pasha.tatashin@soleen.com>
++ */
++
++#ifndef _LINUX_LUO_INTERNAL_H
++#define _LINUX_LUO_INTERNAL_H
++
++#include <linux/liveupdate.h>
++
++/*
++ * Handles a deserialization failure: devices and memory is in unpredictable
++ * state.
++ *
++ * Continuing the boot process after a failure is dangerous because it could
++ * lead to leaks of private data.
++ */
++#define luo_restore_fail(__fmt, ...) panic(__fmt, ##__VA_ARGS__)
++
++#endif /* _LINUX_LUO_INTERNAL_H */
 _

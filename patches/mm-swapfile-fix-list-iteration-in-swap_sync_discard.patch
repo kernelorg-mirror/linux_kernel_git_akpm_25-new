@@ -1,0 +1,80 @@
+From: Youngjun Park <youngjun.park@lge.com>
+Subject: mm/swapfile: fix list iteration in swap_sync_discard
+Date: Wed, 26 Nov 2025 01:30:26 +0900
+
+Patch series "mm/swapfile: fix and cleanup swap list iterations".
+
+This series addresses an issue in swap_sync_discard() where list
+iteration can fail when devices are removed, and includes a cleanup
+for __folio_throttle_swaprate().
+
+The issue was identified during discussion at:
+https://lore.kernel.org/linux-mm/aR53i1G45XAqCzBd@yjaykim-PowerEdge-T330/
+
+
+This patch (of 2):
+
+swap_sync_discard() has an issue where if the next device becomes full and
+is removed from the plist during iteration, the operation fails even when
+other swap devices with pending discard entries remain available.
+
+Fix by checking plist_node_empty(&next->list) and restarting iteration
+when the next node is removed during discard operations.
+
+Additionally, switch from swap_avail_lock/swap_avail_head to swap_lock/
+swap_active_head.  This means the iteration is only affected by swapoff
+operations rather than frequent availability changes, reducing exceptional
+condition checks and lock contention.
+
+Link: https://lkml.kernel.org/r/20251125163027.4165450-1-youngjun.park@lge.com
+Link: https://lkml.kernel.org/r/20251125163027.4165450-2-youngjun.park@lge.com
+Fixes: 686ea517f471 ("mm, swap: do not perform synchronous discard during allocation")
+Signed-off-by: Youngjun Park <youngjun.park@lge.com>
+Suggested-by: Kairui Song <kasong@tencent.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/swapfile.c |   18 +++++++++++-------
+ 1 file changed, 11 insertions(+), 7 deletions(-)
+
+--- a/mm/swapfile.c~mm-swapfile-fix-list-iteration-in-swap_sync_discard
++++ a/mm/swapfile.c
+@@ -1387,21 +1387,25 @@ static bool swap_sync_discard(void)
+ 	bool ret = false;
+ 	struct swap_info_struct *si, *next;
+ 
+-	spin_lock(&swap_avail_lock);
+-	plist_for_each_entry_safe(si, next, &swap_avail_head, avail_list) {
+-		spin_unlock(&swap_avail_lock);
++	spin_lock(&swap_lock);
++start_over:
++	plist_for_each_entry_safe(si, next, &swap_active_head, list) {
++		spin_unlock(&swap_lock);
+ 		if (get_swap_device_info(si)) {
+ 			if (si->flags & SWP_PAGE_DISCARD)
+ 				ret = swap_do_scheduled_discard(si);
+ 			put_swap_device(si);
+ 		}
+ 		if (ret)
+-			return true;
+-		spin_lock(&swap_avail_lock);
++			return ret;
++
++		spin_lock(&swap_lock);
++		if (plist_node_empty(&next->list))
++			goto start_over;
+ 	}
+-	spin_unlock(&swap_avail_lock);
++	spin_unlock(&swap_lock);
+ 
+-	return false;
++	return ret;
+ }
+ 
+ /**
+_

@@ -1,0 +1,87 @@
+From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
+Subject: kho: fix restoring of contiguous ranges of order-0 pages
+Date: Tue, 25 Nov 2025 13:09:17 +0200
+
+When contiguous ranges of order-0 pages are restored, kho_restore_page()
+calls prep_compound_page() with the first page in the range and order as
+parameters and then kho_restore_pages() calls split_page() to make sure
+all pages in the range are order-0.
+
+However, since split_page() is not intended to split compound pages and
+with VM_DEBUG enabled it will trigger a VM_BUG_ON_PAGE().
+
+Update kho_restore_page() so that it will use prep_compound_page() when it
+restores a folio and make sure it properly sets page count for both large
+folios and ranges of order-0 pages.
+
+Link: https://lkml.kernel.org/r/20251125110917.843744-3-rppt@kernel.org
+Fixes: a667300bd53f ("kho: add support for preserving vmalloc allocations")
+Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Reported-by: Pratyush Yadav <pratyush@kernel.org>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/liveupdate/kexec_handover.c |   20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+--- a/kernel/liveupdate/kexec_handover.c~kho-fix-restoring-of-contiguous-ranges-of-order-0-pages
++++ a/kernel/liveupdate/kexec_handover.c
+@@ -219,11 +219,11 @@ static int __kho_preserve_order(struct k
+ 	return 0;
+ }
+ 
+-static struct page *kho_restore_page(phys_addr_t phys)
++static struct page *kho_restore_page(phys_addr_t phys, bool is_folio)
+ {
+ 	struct page *page = pfn_to_online_page(PHYS_PFN(phys));
++	unsigned int nr_pages, ref_cnt;
+ 	union kho_page_info info;
+-	unsigned int nr_pages;
+ 
+ 	if (!page)
+ 		return NULL;
+@@ -243,11 +243,16 @@ static struct page *kho_restore_page(phy
+ 	/* Head page gets refcount of 1. */
+ 	set_page_count(page, 1);
+ 
+-	/* For higher order folios, tail pages get a page count of zero. */
++	/*
++	 * For higher order folios, tail pages get a page count of zero.
++	 * For physically contiguous order-0 pages every pages gets a page
++	 * count of 1
++	 */
++	ref_cnt = is_folio ? 0 : 1;
+ 	for (unsigned int i = 1; i < nr_pages; i++)
+-		set_page_count(page + i, 0);
++		set_page_count(page + i, ref_cnt);
+ 
+-	if (info.order > 0)
++	if (is_folio && info.order)
+ 		prep_compound_page(page, info.order);
+ 
+ 	adjust_managed_page_count(page, nr_pages);
+@@ -262,7 +267,7 @@ static struct page *kho_restore_page(phy
+  */
+ struct folio *kho_restore_folio(phys_addr_t phys)
+ {
+-	struct page *page = kho_restore_page(phys);
++	struct page *page = kho_restore_page(phys, true);
+ 
+ 	return page ? page_folio(page) : NULL;
+ }
+@@ -287,11 +292,10 @@ struct page *kho_restore_pages(phys_addr
+ 	while (pfn < end_pfn) {
+ 		const unsigned int order =
+ 			min(count_trailing_zeros(pfn), ilog2(end_pfn - pfn));
+-		struct page *page = kho_restore_page(PFN_PHYS(pfn));
++		struct page *page = kho_restore_page(PFN_PHYS(pfn), false);
+ 
+ 		if (!page)
+ 			return NULL;
+-		split_page(page, order);
+ 		pfn += 1 << order;
+ 	}
+ 
+_
