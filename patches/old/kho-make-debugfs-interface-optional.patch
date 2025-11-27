@@ -1,6 +1,30 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
 Subject: kho: make debugfs interface optional
-Date: Fri, 24 Oct 2025 12:09:56 -0400
+Date: Sat, 1 Nov 2025 10:23:17 -0400
+
+Patch series "liveupdate: Rework KHO for in-kernel users", v9.
+
+This series refactors the KHO framework to better support in-kernel users
+like the upcoming LUO.  The current design, which relies on a notifier
+chain and debugfs for control, is too restrictive for direct programmatic
+use.
+
+The core of this rework is the removal of the notifier chain in favor of a
+direct registration API.  This decouples clients from the shutdown-time
+finalization sequence, allowing them to manage their preserved state more
+flexibly and at any time.
+
+In support of this new model, this series also:
+ - Makes the debugfs interface optional.
+ - Introduces APIs to unpreserve memory and fixes a bug in the abort
+   path where client state was being incorrectly discarded. Note that
+   this is an interim step, as a more comprehensive fix is planned as
+   part of the stateless KHO work [1].
+ - Moves all KHO code into a new kernel/liveupdate/ directory to
+   consolidate live update components.
+
+
+This patch (of 9):
 
 Currently, KHO is controlled via debugfs interface, but once LUO is
 introduced, it can control KHO, and the debug interface becomes optional.
@@ -11,42 +35,56 @@ debugfs interface, and allows to inspect the tree.
 Move all debugfs related code to a new file to keep the .c files clear of
 ifdefs.
 
-Link: https://lkml.kernel.org/r/20251024161002.747372-3-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251101142325.1326536-1-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251101142325.1326536-2-pasha.tatashin@soleen.com
+Link: https://lore.kernel.org/all/20251020100306.2709352-1-jasonmiu@google.com [1]
 Co-developed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
 Reviewed-by: Pratyush Yadav <pratyush@kernel.org>
 Cc: Alexander Graf <graf@amazon.com>
 Cc: Christian Brauner <brauner@kernel.org>
-Cc: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Jason Gunthorpe <jgg@ziepe.ca>
 Cc: Jonathan Corbet <corbet@lwn.net>
 Cc: Masahiro Yamada <masahiroy@kernel.org>
 Cc: Miguel Ojeda <ojeda@kernel.org>
 Cc: Randy Dunlap <rdunlap@infradead.org>
 Cc: Tejun Heo <tj@kernel.org>
+Cc: Changyuan Lyu <changyuanl@google.com>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Zhu Yanjun <yanjun.zhu@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- MAINTAINERS                           |    3 
- kernel/Kconfig.kexec                  |   10 +
+ MAINTAINERS                           |    2 
+ kernel/Kconfig.kexec                  |   12 -
  kernel/Makefile                       |    1 
- kernel/kexec_handover.c               |  226 ++----------------------
- kernel/kexec_handover_debugfs.c       |  216 ++++++++++++++++++++++
- kernel/kexec_handover_internal.h      |   37 +++
+ kernel/kexec_handover.c               |  269 ++++--------------------
+ kernel/kexec_handover_debugfs.c       |  216 +++++++++++++++++++
+ kernel/kexec_handover_internal.h      |   35 +++
  tools/testing/selftests/kho/vmtest.sh |    1 
- 7 files changed, 286 insertions(+), 208 deletions(-)
+ 7 files changed, 314 insertions(+), 222 deletions(-)
 
 --- a/kernel/Kconfig.kexec~kho-make-debugfs-interface-optional
 +++ a/kernel/Kconfig.kexec
-@@ -118,6 +118,16 @@ config KEXEC_HANDOVER_DEBUG
+@@ -100,7 +100,6 @@ config KEXEC_HANDOVER
+ 	depends on !DEFERRED_STRUCT_PAGE_INIT
+ 	select MEMBLOCK_KHO_SCRATCH
+ 	select KEXEC_FILE
+-	select DEBUG_FS
+ 	select LIBFDT
+ 	select CMA
+ 	help
+@@ -118,6 +117,17 @@ config KEXEC_HANDOVER_DEBUG
  	  scenarios and the extra code might be adding overhead it is
  	  only optionally enabled.
  
 +config KEXEC_HANDOVER_DEBUGFS
 +	bool "kexec handover debugfs interface"
++	default KEXEC_HANDOVER
 +	depends on KEXEC_HANDOVER
-+	depends on DEBUG_FS
++	select DEBUG_FS
 +	help
 +	  Allow to control kexec handover device tree via debugfs
 +	  interface, i.e. finalize the state or aborting the finalization.
@@ -105,17 +143,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		.track = {
  			.orders = XARRAY_INIT(kho_out.ser.track.orders, 0),
  		},
-@@ -477,8 +471,8 @@ static void __init kho_mem_deserialize(c
-  * area for early allocations that happen before page allocator is
-  * initialized.
-  */
--static struct kho_scratch *kho_scratch;
--static unsigned int kho_scratch_cnt;
-+struct kho_scratch *kho_scratch;
-+unsigned int kho_scratch_cnt;
- 
- /*
-  * The scratch areas are scaled by default as percent of memory allocated from
 @@ -674,37 +668,6 @@ err_disable_kho:
  	kho_enable = false;
  }
@@ -173,7 +200,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  EXPORT_SYMBOL_GPL(kho_add_subtree);
  
-@@ -1064,29 +1028,6 @@ err_free_pages_array:
+@@ -1065,30 +1029,7 @@ err_free_pages_array:
  }
  EXPORT_SYMBOL_GPL(kho_restore_vmalloc);
  
@@ -200,42 +227,98 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	return err;
 -}
 -
- static int __kho_abort(void)
+-static int kho_abort(void)
++static int __kho_abort(void)
  {
  	int err;
-@@ -1136,8 +1077,9 @@ int kho_abort(void)
- 		return ret;
- 
- 	kho_out.finalized = false;
-+	kho_debugfs_cleanup(&kho_out.dbg);
- 
--	return kho_out_update_debugfs_fdt();
-+	return 0;
+ 	unsigned long order;
+@@ -1121,7 +1062,28 @@ static int kho_abort(void)
+ 	return err;
  }
  
- static int __kho_finalize(void)
-@@ -1206,92 +1148,23 @@ int kho_finalize(void)
+-static int kho_finalize(void)
++int kho_abort(void)
++{
++	int ret = 0;
++
++	if (!kho_enable)
++		return -EOPNOTSUPP;
++
++	guard(mutex)(&kho_out.lock);
++	if (!kho_out.finalized)
++		return -ENOENT;
++
++	ret = __kho_abort();
++	if (ret)
++		return ret;
++
++	kho_out.finalized = false;
++	kho_debugfs_cleanup(&kho_out.dbg);
++
++	return 0;
++}
++
++static int __kho_finalize(void)
+ {
+ 	int err = 0;
+ 	u64 *preserved_mem_map;
+@@ -1164,118 +1126,46 @@ static int kho_finalize(void)
+ abort:
+ 	if (err) {
+ 		pr_err("Failed to convert KHO state tree: %d\n", err);
+-		kho_abort();
++		__kho_abort();
+ 	}
  
- 	kho_out.finalized = true;
+ 	return err;
+ }
  
--	return kho_out_update_debugfs_fdt();
--}
--
 -static int kho_out_finalize_get(void *data, u64 *val)
--{
++int kho_finalize(void)
+ {
 -	mutex_lock(&kho_out.lock);
 -	*val = kho_out.finalized;
 -	mutex_unlock(&kho_out.lock);
 -
 -	return 0;
 -}
--
--static int kho_out_finalize_set(void *data, u64 val)
++	int ret;
+ 
+-static int kho_out_finalize_set(void *data, u64 _val)
 -{
+-	int ret = 0;
+-	bool val = !!_val;
+-
+-	mutex_lock(&kho_out.lock);
++	if (!kho_enable)
++		return -EOPNOTSUPP;
+ 
+-	if (val == kho_out.finalized) {
+-		if (kho_out.finalized)
+-			ret = -EEXIST;
+-		else
+-			ret = -ENOENT;
+-		goto unlock;
+-	}
+-
 -	if (val)
--		return kho_finalize();
+-		ret = kho_finalize();
 -	else
--		return kho_abort();
+-		ret = kho_abort();
++	guard(mutex)(&kho_out.lock);
++	if (kho_out.finalized)
++		return -EEXIST;
+ 
++	ret = __kho_finalize();
+ 	if (ret)
+-		goto unlock;
+-
+-	kho_out.finalized = val;
+-	ret = kho_out_update_debugfs_fdt();
+-
+-unlock:
+-	mutex_unlock(&kho_out.lock);
+-	return ret;
 -}
 -
 -DEFINE_DEBUGFS_ATTRIBUTE(fops_kho_out_finalize, kho_out_finalize_get,
@@ -247,23 +330,25 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		seq_printf(m, "0x%llx\n", kho_scratch[i].addr);
 -
 -	return 0;
+-}
+-DEFINE_SHOW_ATTRIBUTE(scratch_phys);
++		return ret;
+ 
+-static int scratch_len_show(struct seq_file *m, void *v)
+-{
+-	for (int i = 0; i < kho_scratch_cnt; i++)
+-		seq_printf(m, "0x%llx\n", kho_scratch[i].size);
++	kho_out.finalized = true;
+ 
+-	return 0;
 +	return kho_debugfs_fdt_add(&kho_out.dbg, "fdt",
 +				   page_to_virt(kho_out.ser.fdt), true);
  }
--DEFINE_SHOW_ATTRIBUTE(scratch_phys);
+-DEFINE_SHOW_ATTRIBUTE(scratch_len);
  
--static int scratch_len_show(struct seq_file *m, void *v)
+-static __init int kho_out_debugfs_init(void)
 +bool kho_finalized(void)
  {
--	for (int i = 0; i < kho_scratch_cnt; i++)
--		seq_printf(m, "0x%llx\n", kho_scratch[i].size);
--
--	return 0;
--}
--DEFINE_SHOW_ATTRIBUTE(scratch_len);
--
--static __init int kho_out_debugfs_init(void)
--{
 -	struct dentry *dir, *f, *sub_fdt_dir;
 -
 -	dir = debugfs_create_dir("out", debugfs_root);
@@ -313,7 +398,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  static const void *kho_get_fdt(void)
-@@ -1355,56 +1228,6 @@ int kho_retrieve_subtree(const char *nam
+@@ -1339,56 +1229,6 @@ int kho_retrieve_subtree(const char *nam
  }
  EXPORT_SYMBOL_GPL(kho_retrieve_subtree);
  
@@ -370,7 +455,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static __init int kho_init(void)
  {
  	int err = 0;
-@@ -1419,27 +1242,16 @@ static __init int kho_init(void)
+@@ -1403,27 +1243,16 @@ static __init int kho_init(void)
  		goto err_free_scratch;
  	}
  
@@ -625,11 +710,10 @@ new file mode 100644
 +}
 --- a/kernel/kexec_handover_internal.h~kho-make-debugfs-interface-optional
 +++ a/kernel/kexec_handover_internal.h
-@@ -2,8 +2,45 @@
- #ifndef LINUX_KEXEC_HANDOVER_INTERNAL_H
+@@ -3,11 +3,46 @@
  #define LINUX_KEXEC_HANDOVER_INTERNAL_H
  
-+#include <linux/kexec_handover.h>
+ #include <linux/kexec_handover.h>
 +#include <linux/list.h>
  #include <linux/types.h>
  
@@ -646,10 +730,12 @@ new file mode 100644
 +struct kho_debugfs {};
 +#endif
 +
-+extern struct kho_scratch *kho_scratch;
-+extern unsigned int kho_scratch_cnt;
-+
+ extern struct kho_scratch *kho_scratch;
+ extern unsigned int kho_scratch_cnt;
+ 
 +bool kho_finalized(void);
++int kho_finalize(void);
++int kho_abort(void);
 +
 +#ifdef CONFIG_KEXEC_HANDOVER_DEBUGFS
 +int kho_debugfs_init(void);
@@ -683,22 +769,15 @@ new file mode 100644
  obj-$(CONFIG_CGROUPS) += cgroup/
 --- a/MAINTAINERS~kho-make-debugfs-interface-optional
 +++ a/MAINTAINERS
-@@ -13774,13 +13774,14 @@ KEXEC HANDOVER (KHO)
- M:	Alexander Graf <graf@amazon.com>
- M:	Mike Rapoport <rppt@kernel.org>
- M:	Changyuan Lyu <changyuanl@google.com>
-+M:	Pasha Tatashin <pasha.tatashin@soleen.com>
- L:	kexec@lists.infradead.org
- L:	linux-mm@kvack.org
- S:	Maintained
+@@ -13799,7 +13799,7 @@ S:	Maintained
  F:	Documentation/admin-guide/mm/kho.rst
  F:	Documentation/core-api/kho/*
  F:	include/linux/kexec_handover.h
 -F:	kernel/kexec_handover.c
 +F:	kernel/kexec_handover*
+ F:	lib/test_kho.c
  F:	tools/testing/selftests/kho/
  
- KEYS-ENCRYPTED
 --- a/tools/testing/selftests/kho/vmtest.sh~kho-make-debugfs-interface-optional
 +++ a/tools/testing/selftests/kho/vmtest.sh
 @@ -59,6 +59,7 @@ function build_kernel() {
