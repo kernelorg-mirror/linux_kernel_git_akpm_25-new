@@ -1,8 +1,8 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/huge_memory: change folio_split_supported() to folio_check_splittable()
-Date: Fri, 21 Nov 2025 21:55:26 -0500
+Date: Tue, 25 Nov 2025 22:50:05 -0500
 
-Patch series "Improve folio split related functions", v2.
+Patch series "Improve folio split related functions", v3.
 
 This patchset improves several folio split related functions to avoid
 future misuse.  The changes are:
@@ -13,7 +13,7 @@ future misuse.  The changes are:
    to folio_check_splittable() for clarification.
 
 2. Replaced can_split_folio() with open coded folio_expected_ref_count()
-   and folio_ref_count().
+   and folio_ref_count() and introduced folio_cache_ref_count().
 
 3. Changed min_order_for_split() to always return an order.
 
@@ -21,9 +21,8 @@ future misuse.  The changes are:
 
 Motivation
 ==========
+This is based on Wei's observation[1] and solves several potential issues:
 
-This is based on Wei's observation[1] and solves several potential
-issues:
 1. Dereferencing NULL folio->mapping in try_folio_split_to_order() if it
    is called on truncated folios.
 2. Not handling of negative return value of min_order_for_split() in
@@ -50,13 +49,17 @@ folio_check_splittable() to match the return type change.
 While at it, move is_huge_zero_folio() check and folio_test_writeback()
 check into folio_check_splittable() and add kernel-doc.
 
-Link: https://lkml.kernel.org/r/20251122025529.1562592-1-ziy@nvidia.com
-Link: https://lkml.kernel.org/r/20251122025529.1562592-2-ziy@nvidia.com
+Remove all warnings inside folio_check_splittable() and give warnings in
+__folio_split() instead, so that bool warns parameter can be removed.
+
+Link: https://lkml.kernel.org/r/20251126035008.1919461-1-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20251126035008.1919461-2-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
+Acked-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Reviewed-by: Barry Song <baohua@kernel.org>
 Cc: Balbir Singh <balbirs@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: Barry Song <baohua@kernel.org>
 Cc: Dev Jain <dev.jain@arm.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam Howlett <liam.howlett@oracle.com>
@@ -65,13 +68,12 @@ Cc: Miaohe Lin <linmiaohe@huawei.com>
 Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
 Cc: Nico Pache <npache@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
-Cc: David Hildenbrand (Red Hat) <david@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/huge_mm.h |   10 +++--
- mm/huge_memory.c        |   74 +++++++++++++++++++++++---------------
- 2 files changed, 53 insertions(+), 31 deletions(-)
+ include/linux/huge_mm.h |    6 +--
+ mm/huge_memory.c        |   76 +++++++++++++++++++++-----------------
+ 2 files changed, 46 insertions(+), 36 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-huge_memory-change-folio_split_supported-to-folio_check_splittable
 +++ a/include/linux/huge_mm.h
@@ -82,26 +84,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -bool folio_split_supported(struct folio *folio, unsigned int new_order,
 -		enum split_type split_type, bool warns);
 +int folio_check_splittable(struct folio *folio, unsigned int new_order,
-+			   enum split_type split_type, bool warns);
++			   enum split_type split_type);
  int folio_split(struct folio *folio, unsigned int new_order, struct page *page,
  		struct list_head *list);
  
-@@ -407,7 +407,11 @@ static inline int split_huge_page_to_ord
+@@ -407,7 +407,7 @@ static inline int split_huge_page_to_ord
  static inline int try_folio_split_to_order(struct folio *folio,
  		struct page *page, unsigned int new_order)
  {
 -	if (!folio_split_supported(folio, new_order, SPLIT_TYPE_NON_UNIFORM, /* warns= */ false))
-+	int ret;
-+
-+	ret = folio_check_splittable(folio, new_order, SPLIT_TYPE_NON_UNIFORM,
-+				     /* warns= */ false);
-+	if (ret)
++	if (folio_check_splittable(folio, new_order, SPLIT_TYPE_NON_UNIFORM))
  		return split_huge_page_to_order(&folio->page, new_order);
  	return folio_split(folio, new_order, page, NULL);
  }
 --- a/mm/huge_memory.c~mm-huge_memory-change-folio_split_supported-to-folio_check_splittable
 +++ a/mm/huge_memory.c
-@@ -3688,15 +3688,43 @@ static int __split_unmapped_folio(struct
+@@ -3688,15 +3688,40 @@ static int __split_unmapped_folio(struct
  	return 0;
  }
  
@@ -114,7 +112,6 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *             allocator like split generates folios with orders from @folio's
 + *             order - 1 to new_order).
 + * @split_type: uniform or non-uniform split
-+ * @warns: whether gives warnings or not for the checks in the function
 + *
 + * folio_check_splittable() checks if @folio can be split to @new_order using
 + * @split_type method. The truncated folio check must come first.
@@ -125,51 +122,53 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * returned.
 + */
 +int folio_check_splittable(struct folio *folio, unsigned int new_order,
-+			   enum split_type split_type, bool warns)
++			   enum split_type split_type)
  {
 +	VM_WARN_ON_FOLIO(!folio_test_locked(folio), folio);
 +	/*
 +	 * Folios that just got truncated cannot get split. Signal to the
 +	 * caller that there was a race.
 +	 *
-+	 * TODO: this will also currently refuse shmem folios that are in the
-+	 * swapcache.
++	 * TODO: this will also currently refuse folios without a mapping in the
++	 * swapcache (shmem or to-be-anon folios).
 +	 */
 +	if (!folio_test_anon(folio) && !folio->mapping)
 +		return -EBUSY;
 +
  	if (folio_test_anon(folio)) {
  		/* order-1 is not supported for anonymous THP. */
- 		VM_WARN_ONCE(warns && new_order == 1,
- 				"Cannot split to order-1 folio");
+-		VM_WARN_ONCE(warns && new_order == 1,
+-				"Cannot split to order-1 folio");
  		if (new_order == 1)
 -			return false;
 +			return -EINVAL;
  	} else if (split_type == SPLIT_TYPE_NON_UNIFORM || new_order) {
  		if (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) &&
  		    !mapping_large_folio_support(folio->mapping)) {
-@@ -3719,7 +3747,7 @@ bool folio_split_supported(struct folio
+@@ -3717,9 +3742,7 @@ bool folio_split_supported(struct folio
+ 			 * case, the mapping does not actually support large
+ 			 * folios properly.
  			 */
- 			VM_WARN_ONCE(warns,
- 				"Cannot split file folio to non-0 order");
+-			VM_WARN_ONCE(warns,
+-				"Cannot split file folio to non-0 order");
 -			return false;
 +			return -EINVAL;
  		}
  	}
  
-@@ -3734,10 +3762,18 @@ bool folio_split_supported(struct folio
+@@ -3732,12 +3755,16 @@ bool folio_split_supported(struct folio
+ 	 * here.
+ 	 */
  	if ((split_type == SPLIT_TYPE_NON_UNIFORM || new_order) && folio_test_swapcache(folio)) {
- 		VM_WARN_ONCE(warns,
- 			"Cannot split swapcache folio to non-0 order");
+-		VM_WARN_ONCE(warns,
+-			"Cannot split swapcache folio to non-0 order");
 -		return false;
 +		return -EINVAL;
  	}
  
 -	return true;
-+	if (is_huge_zero_folio(folio)) {
-+		pr_warn_ratelimited("Called split_huge_page for huge zero page\n");
++	if (is_huge_zero_folio(folio))
 +		return -EINVAL;
-+	}
 +
 +	if (folio_test_writeback(folio))
 +		return -EBUSY;
@@ -178,7 +177,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int __folio_freeze_and_split_unmapped(struct folio *folio, unsigned int new_order,
-@@ -3922,7 +3958,6 @@ static int __folio_split(struct folio *f
+@@ -3922,7 +3949,6 @@ static int __folio_split(struct folio *f
  	int remap_flags = 0;
  	int extra_pins, ret;
  	pgoff_t end = 0;
@@ -186,7 +185,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
  	VM_WARN_ON_ONCE_FOLIO(!folio_test_large(folio), folio);
-@@ -3930,30 +3965,13 @@ static int __folio_split(struct folio *f
+@@ -3930,31 +3956,15 @@ static int __folio_split(struct folio *f
  	if (folio != page_folio(split_at) || folio != page_folio(lock_at))
  		return -EINVAL;
  
@@ -210,15 +209,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (is_hzp) {
 -		pr_warn_ratelimited("Called split_huge_page for huge zero page\n");
 -		return -EBUSY;
--	}
--
++	ret = folio_check_splittable(folio, new_order, split_type);
++	if (ret) {
++		VM_WARN_ONCE(ret == -EINVAL, "Tried to split an unsplittable folio");
++		return ret;
+ 	}
+ 
 -	if (folio_test_writeback(folio))
 -		return -EBUSY;
-+	ret = folio_check_splittable(folio, new_order, split_type,
-+				     /* warn = */ true);
-+	if (ret)
-+		return ret;
- 
+-
  	if (is_anon) {
  		/*
+ 		 * The caller does not necessarily hold an mmap_lock that would
 _
