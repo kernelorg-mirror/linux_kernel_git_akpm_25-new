@@ -1,6 +1,6 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm: introduce VMA flags bitmap type
-Date: Fri, 14 Nov 2025 13:26:11 +0000
+Date: Tue, 25 Nov 2025 10:01:02 +0000
 
 It is useful to transition to using a bitmap for VMA flags so we can avoid
 running out of flags, especially for 32-bit kernels which are constrained
@@ -40,6 +40,15 @@ vma->flags.
 
 We update vma_flag_[test, set]_atomic() to account for the change also.
 
+We adapt vm_flags_reset_once() to only clear those bits above the first
+system word providing write-once semantics to the first system word (which
+it is presumed the caller requires - and in all current use cases this is
+so).
+
+As we currently only specify that the VMA flags bitmap size is equal to
+BITS_PER_LONG number of bits, this is a noop, but is defensive in
+preparation for a future change that increases this.
+
 We additionally update the VMA userland test declarations to implement the
 same changes there.
 
@@ -51,10 +60,12 @@ Once we introduce flag helpers we can improve this more.
 
 No functional change intended.
 
-Link: https://lkml.kernel.org/r/195625e7d1a8ff9156cb9bb294eb128b6a4e9294.1763126447.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/bab179d7b153ac12f221b7d65caac2759282cfe9.1764064557.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
+Acked-by: Alice Ryhl <aliceryhl@google.com>	[rust]
 Cc: Alex Gaynor <alex.gaynor@gmail.com>
-Cc: Alice Ryhl <aliceryhl@google.com>
 Cc: Alistair Popple <apopple@nvidia.com>
 Cc: Andreas Hindborg <a.hindborg@kernel.org>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
@@ -85,7 +96,6 @@ Cc: Juri Lelli <juri.lelli@redhat.com>
 Cc: Kairui Song <kasong@tencent.com>
 Cc: Kees Cook <kees@kernel.org>
 Cc: Kemeng Shi <shikemeng@huaweicloud.com>
-Cc: kernel test robot <lkp@intel.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Leon Romanovsky <leon@kernel.org>
 Cc: Liam Howlett <liam.howlett@oracle.com>
@@ -111,7 +121,6 @@ Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Trevor Gross <tmgross@umich.edu>
 Cc: Valentin Schneider <vschneid@redhat.com>
 Cc: Vincent Guittot <vincent.guittot@linaro.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Wei Xu <weixugc@google.com>
 Cc: xu xin <xu.xin16@zte.com.cn>
 Cc: Yuanchu Xie <yuanchu@google.com>
@@ -119,34 +128,40 @@ Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mm.h               |   18 ++-
- include/linux/mm_types.h         |   64 ++++++++++++
+ include/linux/mm.h               |   24 +++-
+ include/linux/mm_types.h         |   64 +++++++++++-
  rust/kernel/mm/virt.rs           |    2 
- tools/testing/vma/vma_internal.h |  143 ++++++++++++++++++++++++-----
- 4 files changed, 196 insertions(+), 31 deletions(-)
+ tools/testing/vma/vma_internal.h |  150 +++++++++++++++++++++++------
+ 4 files changed, 202 insertions(+), 38 deletions(-)
 
 --- a/include/linux/mm.h~mm-introduce-vma-flags-bitmap-type
 +++ a/include/linux/mm.h
-@@ -910,7 +910,8 @@ static inline void vma_init(struct vm_ar
- static inline void vm_flags_init(struct vm_area_struct *vma,
+@@ -911,7 +911,8 @@ static inline void vm_flags_init(struct
  				 vm_flags_t flags)
  {
+ 	VM_WARN_ON_ONCE(!pgtable_supports_soft_dirty() && (flags & VM_SOFTDIRTY));
 -	ACCESS_PRIVATE(vma, __vm_flags) = flags;
 +	vma_flags_clear_all(&vma->flags);
 +	vma_flags_overwrite_word(&vma->flags, flags);
  }
  
  /*
-@@ -929,21 +930,26 @@ static inline void vm_flags_reset_once(s
+@@ -931,14 +932,25 @@ static inline void vm_flags_reset_once(s
  				       vm_flags_t flags)
  {
  	vma_assert_write_locked(vma);
 -	WRITE_ONCE(ACCESS_PRIVATE(vma, __vm_flags), flags);
 +	/*
-+	 * The user should only be interested in avoiding reordering of
-+	 * assignment to the first word.
++	 * If VMA flags exist beyond the first system word, also clear these. It
++	 * is assumed the write once behaviour is required only for the first
++	 * system word.
 +	 */
-+	vma_flags_clear_all(&vma->flags);
++	if (NUM_VMA_FLAG_BITS > BITS_PER_LONG) {
++		unsigned long *bitmap = ACCESS_PRIVATE(&vma->flags, __vma_flags);
++
++		bitmap_zero(&bitmap[1], NUM_VMA_FLAG_BITS - BITS_PER_LONG);
++	}
++
 +	vma_flags_overwrite_word_once(&vma->flags, flags);
  }
  
@@ -159,15 +174,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static inline void vm_flags_clear(struct vm_area_struct *vma,
- 				  vm_flags_t flags)
+@@ -946,7 +958,7 @@ static inline void vm_flags_clear(struct
  {
+ 	VM_WARN_ON_ONCE(!pgtable_supports_soft_dirty() && (flags & VM_SOFTDIRTY));
  	vma_start_write(vma);
 -	ACCESS_PRIVATE(vma, __vm_flags) &= ~flags;
 +	vma_flags_clear_word(&vma->flags, flags);
  }
  
  /*
-@@ -986,12 +992,14 @@ static inline bool __vma_flag_atomic_val
+@@ -989,12 +1001,14 @@ static inline bool __vma_flag_atomic_val
  static inline void vma_flag_set_atomic(struct vm_area_struct *vma,
  				       vma_flag_t bit)
  {
@@ -185,7 +201,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
 --- a/include/linux/mm_types.h~mm-introduce-vma-flags-bitmap-type
 +++ a/include/linux/mm_types.h
-@@ -824,6 +824,15 @@ struct mmap_action {
+@@ -849,6 +849,15 @@ struct mmap_action {
  };
  
  /*
@@ -201,7 +217,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * Describes a VMA that is about to be mmap()'ed. Drivers may choose to
   * manipulate mutable fields which will cause those fields to be updated in the
   * resultant VMA.
-@@ -840,7 +849,10 @@ struct vm_area_desc {
+@@ -865,7 +874,10 @@ struct vm_area_desc {
  	/* Mutable fields. Populated with initial state. */
  	pgoff_t pgoff;
  	struct file *vm_file;
@@ -213,7 +229,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgprot_t page_prot;
  
  	/* Write-only fields. */
-@@ -885,10 +897,12 @@ struct vm_area_struct {
+@@ -910,10 +922,12 @@ struct vm_area_struct {
  	/*
  	 * Flags, see mm.h.
  	 * To modify use vm_flags_{init|reset|set|clear|mod} functions.
@@ -227,7 +243,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	};
  
  #ifdef CONFIG_PER_VMA_LOCK
-@@ -969,6 +983,52 @@ struct vm_area_struct {
+@@ -994,6 +1008,52 @@ struct vm_area_struct {
  #endif
  } __randomize_layout;
  
@@ -293,7 +309,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
      /// Set the `VM_MIXEDMAP` flag on this vma.
 --- a/tools/testing/vma/vma_internal.h~mm-introduce-vma-flags-bitmap-type
 +++ a/tools/testing/vma/vma_internal.h
-@@ -521,6 +521,15 @@ typedef struct {
+@@ -524,6 +524,15 @@ typedef struct {
  	__private DECLARE_BITMAP(__mm_flags, NUM_MM_FLAG_BITS);
  } mm_flags_t;
  
@@ -309,7 +325,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct mm_struct {
  	struct maple_tree mm_mt;
  	int map_count;			/* number of VMAs */
-@@ -605,7 +614,10 @@ struct vm_area_desc {
+@@ -608,7 +617,10 @@ struct vm_area_desc {
  	/* Mutable fields. Populated with initial state. */
  	pgoff_t pgoff;
  	struct file *vm_file;
@@ -321,7 +337,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgprot_t page_prot;
  
  	/* Write-only fields. */
-@@ -651,7 +663,7 @@ struct vm_area_struct {
+@@ -654,7 +666,7 @@ struct vm_area_struct {
  	 */
  	union {
  		const vm_flags_t vm_flags;
@@ -330,7 +346,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	};
  
  #ifdef CONFIG_PER_VMA_LOCK
-@@ -1365,26 +1377,6 @@ static inline bool may_expand_vm(struct
+@@ -1368,26 +1380,6 @@ static inline bool may_expand_vm(struct
  	return true;
  }
  
@@ -357,7 +373,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline int shmem_zero_setup(struct vm_area_struct *vma)
  {
  	return 0;
-@@ -1541,13 +1533,118 @@ static inline void userfaultfd_unmap_com
+@@ -1544,13 +1536,118 @@ static inline void userfaultfd_unmap_com
  {
  }
  
@@ -477,4 +493,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Denies creating a writable executable mapping or gaining executable permissions.
   *
+@@ -1763,11 +1860,4 @@ static inline int do_munmap(struct mm_st
+ 	return 0;
+ }
+ 
+-static inline void vm_flags_reset(struct vm_area_struct *vma, vm_flags_t flags)
+-{
+-	vm_flags_t *dst = (vm_flags_t *)(&vma->vm_flags);
+-
+-	*dst = flags;
+-}
+-
+ #endif	/* __MM_VMA_INTERNAL_H */
 _
