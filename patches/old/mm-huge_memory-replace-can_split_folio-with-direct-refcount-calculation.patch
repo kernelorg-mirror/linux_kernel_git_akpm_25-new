@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/huge_memory: replace can_split_folio() with direct refcount calculation
-Date: Tue, 25 Nov 2025 22:50:06 -0500
+Date: Wed, 26 Nov 2025 16:06:16 -0500
 
 can_split_folio() is just a refcount comparison, making sure only the
 split caller holds an extra pin.  Open code it with
@@ -11,11 +11,12 @@ by folio_ref_unfreeze(), since they are returning the same values when a
 folio is frozen and folio_cache_ref_count() does not have unnecessary
 folio_mapcount() in its implementation.
 
-Link: https://lkml.kernel.org/r/20251126035008.1919461-3-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20251126210618.1971206-3-ziy@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
+Suggested-by: David Hildenbrand (Red Hat) <david@kernel.org>
 Reviewed-by: Wei Yang <richard.weiyang@gmail.com>
-Acked-by: Balbir Singh <balbirs@nvidia.com>
 Acked-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Cc: Balbir Singh <balbirs@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Dev Jain <dev.jain@arm.com>
@@ -30,9 +31,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/huge_mm.h |    1 
- mm/huge_memory.c        |   48 +++++++++++++++-----------------------
+ mm/huge_memory.c        |   52 ++++++++++++++------------------------
  mm/vmscan.c             |    3 +-
- 3 files changed, 21 insertions(+), 31 deletions(-)
+ 3 files changed, 22 insertions(+), 34 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-huge_memory-replace-can_split_folio-with-direct-refcount-calculation
 +++ a/include/linux/huge_mm.h
@@ -91,7 +92,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  {
  	struct folio *end_folio = folio_next(folio);
  	struct folio *new_folio, *next;
-@@ -3782,7 +3773,7 @@ static int __folio_freeze_and_split_unma
+@@ -3782,10 +3773,9 @@ static int __folio_freeze_and_split_unma
  	VM_WARN_ON_ONCE(!mapping && end);
  	/* Prevent deferred_split_scan() touching ->_refcount */
  	ds_queue = folio_split_queue_lock(folio);
@@ -99,26 +100,32 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	if (folio_ref_freeze(folio, folio_cache_ref_count(folio) + 1)) {
  		struct swap_cluster_info *ci = NULL;
  		struct lruvec *lruvec;
- 		int expected_refs;
-@@ -3853,7 +3844,7 @@ static int __folio_freeze_and_split_unma
+-		int expected_refs;
+ 
+ 		if (old_order > 1) {
+ 			if (!list_empty(&folio->_deferred_list)) {
+@@ -3853,8 +3843,8 @@ static int __folio_freeze_and_split_unma
  
  			zone_device_private_split_cb(folio, new_folio);
  
 -			expected_refs = folio_expected_ref_count(new_folio) + 1;
-+			expected_refs = folio_cache_ref_count(new_folio) + 1;
- 			folio_ref_unfreeze(new_folio, expected_refs);
+-			folio_ref_unfreeze(new_folio, expected_refs);
++			folio_ref_unfreeze(new_folio,
++					   folio_cache_ref_count(new_folio) + 1);
  
  			if (do_lru)
-@@ -3897,7 +3888,7 @@ static int __folio_freeze_and_split_unma
+ 				lru_add_split_folio(folio, new_folio, lruvec, list);
+@@ -3897,8 +3887,7 @@ static int __folio_freeze_and_split_unma
  		 * Otherwise, a parallel folio_try_get() can grab @folio
  		 * and its caller can see stale page cache entries.
  		 */
 -		expected_refs = folio_expected_ref_count(folio) + 1;
-+		expected_refs = folio_cache_ref_count(folio) + 1;
- 		folio_ref_unfreeze(folio, expected_refs);
+-		folio_ref_unfreeze(folio, expected_refs);
++		folio_ref_unfreeze(folio, folio_cache_ref_count(folio) + 1);
  
  		if (do_lru)
-@@ -3947,7 +3938,7 @@ static int __folio_split(struct folio *f
+ 			unlock_page_lruvec(lruvec);
+@@ -3947,7 +3936,7 @@ static int __folio_split(struct folio *f
  	struct folio *new_folio, *next;
  	int nr_shmem_dropped = 0;
  	int remap_flags = 0;
@@ -127,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	pgoff_t end = 0;
  
  	VM_WARN_ON_ONCE_FOLIO(!folio_test_locked(folio), folio);
-@@ -4028,7 +4019,7 @@ static int __folio_split(struct folio *f
+@@ -4028,7 +4017,7 @@ static int __folio_split(struct folio *f
  	 * Racy check if we can split the page, before unmap_folio() will
  	 * split PMDs
  	 */
@@ -136,7 +143,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		ret = -EAGAIN;
  		goto out_unlock;
  	}
-@@ -4051,8 +4042,7 @@ static int __folio_split(struct folio *f
+@@ -4051,8 +4040,7 @@ static int __folio_split(struct folio *f
  	}
  
  	ret = __folio_freeze_and_split_unmapped(folio, new_order, split_at, &xas, mapping,
@@ -146,7 +153,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  fail:
  	if (mapping)
  		xas_unlock(&xas);
-@@ -4126,20 +4116,20 @@ out:
+@@ -4126,20 +4114,20 @@ out:
   */
  int folio_split_unmapped(struct folio *folio, unsigned int new_order)
  {
@@ -170,7 +177,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	local_irq_enable();
  	return ret;
  }
-@@ -4632,7 +4622,7 @@ static int split_huge_pages_pid(int pid,
+@@ -4632,7 +4620,7 @@ static int split_huge_pages_pid(int pid,
  		 * can be split or not. So skip the check here.
  		 */
  		if (!folio_test_private(folio) &&
