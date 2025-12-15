@@ -1,0 +1,109 @@
+From: Shivank Garg <shivankg@amd.com>
+Subject: mm/khugepaged: retry with sync writeback for MADV_COLLAPSE
+Date: Mon, 15 Dec 2025 08:46:19 +0000
+
+When MADV_COLLAPSE is called on file-backed mappings (e.g., executable
+text sections), the pages may still be dirty from recent writes. 
+collapse_file() will trigger async writeback and fail with
+SCAN_PAGE_DIRTY_OR_WRITEBACK (-EAGAIN).
+
+MADV_COLLAPSE is a synchronous operation where userspace expects immediate
+results.  If the collapse fails due to dirty pages, perform synchronous
+writeback on the specific range and retry once.
+
+This avoids spurious failures for freshly written executables while
+avoiding unnecessary synchronous I/O for mappings that are already clean.
+
+Link: https://lkml.kernel.org/r/20251215084615.5283-7-shivankg@amd.com
+Signed-off-by: Shivank Garg <shivankg@amd.com>
+Reported-by: Branden Moore <Branden.Moore@amd.com>
+Closes: https://lore.kernel.org/all/4e26fe5e-7374-467c-a333-9dd48f85d7cc@amd.com
+Fixes: 34488399fa08 ("mm/madvise: add file and shmem support to MADV_COLLAPSE")
+Suggested-by: David Hildenbrand <david@kernel.org>
+Tested-by: Lance Yang <lance.yang@linux.dev>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Nico Pache <npache@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: wang lian <lianux.mm@gmail.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/khugepaged.c |   40 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 40 insertions(+)
+
+--- a/mm/khugepaged.c~mm-khugepaged-retry-with-sync-writeback-for-madv_collapse
++++ a/mm/khugepaged.c
+@@ -22,6 +22,7 @@
+ #include <linux/dax.h>
+ #include <linux/ksm.h>
+ #include <linux/pgalloc.h>
++#include <linux/backing-dev.h>
+ 
+ #include <asm/tlb.h>
+ #include "internal.h"
+@@ -2787,9 +2788,11 @@ int madvise_collapse(struct vm_area_stru
+ 	hend = end & HPAGE_PMD_MASK;
+ 
+ 	for (addr = hstart; addr < hend; addr += HPAGE_PMD_SIZE) {
++		bool retried = false;
+ 		int result = SCAN_FAIL;
+ 
+ 		if (!mmap_locked) {
++retry:
+ 			cond_resched();
+ 			mmap_read_lock(mm);
+ 			mmap_locked = true;
+@@ -2819,6 +2822,43 @@ int madvise_collapse(struct vm_area_stru
+ 		if (!mmap_locked)
+ 			*lock_dropped = true;
+ 
++		/*
++		 * If the file-backed VMA has dirty pages, the scan triggers
++		 * async writeback and returns SCAN_PAGE_DIRTY_OR_WRITEBACK.
++		 * Since MADV_COLLAPSE is sync, we force sync writeback and
++		 * retry once.
++		 */
++		if (result == SCAN_PAGE_DIRTY_OR_WRITEBACK && !retried) {
++			/*
++			 * File scan drops the lock. We must re-acquire it to
++			 * safely inspect the VMA and hold the file reference.
++			 */
++			if (!mmap_locked) {
++				cond_resched();
++				mmap_read_lock(mm);
++				mmap_locked = true;
++				result = hugepage_vma_revalidate(mm, addr, false, &vma, cc);
++				if (result != SCAN_SUCCEED)
++					goto handle_result;
++			}
++
++			if (!vma_is_anonymous(vma) && vma->vm_file &&
++			    mapping_can_writeback(vma->vm_file->f_mapping)) {
++				struct file *file = get_file(vma->vm_file);
++				pgoff_t pgoff = linear_page_index(vma, addr);
++				loff_t lstart = (loff_t)pgoff << PAGE_SHIFT;
++				loff_t lend = lstart + HPAGE_PMD_SIZE - 1;
++
++				mmap_read_unlock(mm);
++				mmap_locked = false;
++				*lock_dropped = true;
++				filemap_write_and_wait_range(file->f_mapping, lstart, lend);
++				fput(file);
++				retried = true;
++				goto retry;
++			}
++		}
++
+ handle_result:
+ 		switch (result) {
+ 		case SCAN_SUCCEED:
+_
