@@ -1,0 +1,79 @@
+From: Ankur Arora <ankur.a.arora@oracle.com>
+Subject: mm, folio_zero_user: support clearing page ranges
+Date: Mon, 15 Dec 2025 12:49:21 -0800
+
+Clear contiguous page ranges in folio_zero_user() instead of clearing a
+single page at a time.  Exposing larger ranges enables extent based
+processor optimizations.
+
+However, because the underlying clearing primitives do not, or might not
+be able to check to call cond_resched() to check if preemption is
+required, limit the worst case preemption latency by doing the clearing in
+no more than PROCESS_PAGES_NON_PREEMPT_BATCH units.
+
+For architectures that define clear_pages(), we assume that the clearing
+is fast and define PROCESS_PAGES_NON_PREEMPT_BATCH as 8MB worth of pages. 
+This should be large enough to allow the processor to optimize the
+operation and yet small enough that we see reasonable preemption latency
+for when this optimization is not possible (ex.  slow microarchitectures,
+memory bandwidth saturation.)
+
+Architectures that don't define clear_pages() will continue to use the
+base value (single page).  And, preemptible models don't need invocations
+of cond_resched() so don't care about the batch size.
+
+The resultant performance depends on the kinds of optimizations available
+to the CPU for the region size being cleared.  Two classes of
+optimizations:
+
+  - clearing iteration costs are amortized over a range larger
+    than a single page.
+  - cacheline allocation elision (seen on AMD Zen models).
+
+Testing a demand fault workload shows an improved baseline from the first
+optimization and a larger improvement when the region being cleared is
+large enough for the second optimization.
+
+AMD Milan (EPYC 7J13, boost=0, region=64GB on the local NUMA node):
+
+  $ perf bench mem mmap -p $pg-sz -f demand -s 64GB -l 5
+
+                    page-at-a-time     contiguous clearing      change
+
+                  (GB/s  +- %stdev)     (GB/s  +- %stdev)
+
+   pg-sz=2MB       12.92  +- 2.55%        17.03  +-  0.70%       + 31.8%	preempt=*
+
+   pg-sz=1GB       17.14  +- 2.27%        18.04  +-  1.05%       +  5.2%	preempt=none|voluntary
+   pg-sz=1GB       17.26  +- 1.24%        42.17  +-  4.21% [#]   +144.3%	preempt=full|lazy
+
+ [#] Notice that we perform much better with preempt=full|lazy. As
+  mentioned above, preemptible models not needing explicit invocations
+  of cond_resched() allow clearing of the full extent (1GB) as a
+  single unit.
+  In comparison the maximum extent used for preempt=none|voluntary is
+  PROCESS_PAGES_NON_PREEMPT_BATCH (8MB).
+
+  The larger extent allows the processor to elide cacheline
+  allocation (on Milan the threshold is LLC-size=32MB.)
+
+Also as mentioned earlier, the baseline improvement is not specific to AMD
+Zen platforms.  Intel Icelakex (pg-sz=2MB|1GB) sees a similar improvement
+as the Milan pg-sz=2MB workload above (~30%).
+
+Link: https://lkml.kernel.org/r/20251215204922.475324-8-ankur.a.arora@oracle.com
+Signed-off-by: Ankur Arora <ankur.a.arora@oracle.com>
+Reviewed-by: Raghavendra K T <raghavendra.kt@amd.com>
+Tested-by: Raghavendra K T <raghavendra.kt@amd.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Betkov <bp@alien8.de>
+Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Konrad Rzessutek Wilk <konrad.wilk@oracle.com>
+Cc: Lance Yang <ioworker0@gmail.com>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleinxer <tglx@linutronix.de>
