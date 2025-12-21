@@ -1,0 +1,98 @@
+From: Jane Chu <jane.chu@oracle.com>
+Subject: mm/memory-failure: teach kill_accessing_process to accept hugetlb tail page pfn
+Date: Thu, 18 Dec 2025 23:28:19 -0700
+
+When a hugetlb folio is being poisoned again, try_memory_failure_hugetlb()
+passed head pfn to kill_accessing_process(), that is not right.
+The precise pfn of the poisoned page should be used in order to
+determine the precise vaddr as the SIGBUS payload.
+
+This issue has already been taken care of in the normal path, that is,
+hwpoison_user_mappings(), see [1][2].  Further more, for [3] to work
+correctly in the hugetlb repoisoning case, it's essential to inform
+VM the precise poisoned page, not the head page.
+
+[1] https://lkml.kernel.org/r/20231218135837.3310403-1-willy@infradead.org
+[2] https://lkml.kernel.org/r/20250224211445.2663312-1-jane.chu@oracle.com
+[3] https://lore.kernel.org/lkml/20251116013223.1557158-1-jiaqiyan@google.com/
+
+Link: https://lkml.kernel.org/r/20251219062819.2499399-1-jane.chu@oracle.com
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Jane Chu <jane.chu@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory-failure.c |   22 ++++++++++++----------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+--- a/mm/memory-failure.c~mm-memory-failure-teach-kill_accessing_process-to-accept-hugetlb-tail-page-pfn
++++ a/mm/memory-failure.c
+@@ -689,9 +689,11 @@ static void set_to_kill(struct to_kill *
+ }
+ 
+ static int check_hwpoisoned_entry(pte_t pte, unsigned long addr, short shift,
+-				unsigned long poisoned_pfn, struct to_kill *tk)
++				unsigned long poisoned_pfn, struct to_kill *tk,
++				int pte_nr)
+ {
+ 	unsigned long pfn = 0;
++	unsigned long hwpoison_vaddr;
+ 
+ 	if (pte_present(pte)) {
+ 		pfn = pte_pfn(pte);
+@@ -702,10 +704,11 @@ static int check_hwpoisoned_entry(pte_t
+ 			pfn = softleaf_to_pfn(entry);
+ 	}
+ 
+-	if (!pfn || pfn != poisoned_pfn)
++	if (!pfn || (pfn > poisoned_pfn || (pfn + pte_nr - 1) < poisoned_pfn))
+ 		return 0;
+ 
+-	set_to_kill(tk, addr, shift);
++	hwpoison_vaddr = addr + ((poisoned_pfn - pfn) << PAGE_SHIFT);
++	set_to_kill(tk, hwpoison_vaddr, shift);
+ 	return 1;
+ }
+ 
+@@ -757,7 +760,7 @@ static int hwpoison_pte_range(pmd_t *pmd
+ 
+ 	for (; addr != end; ptep++, addr += PAGE_SIZE) {
+ 		ret = check_hwpoisoned_entry(ptep_get(ptep), addr, PAGE_SHIFT,
+-					     hwp->pfn, &hwp->tk);
++					     hwp->pfn, &hwp->tk, 1);
+ 		if (ret == 1)
+ 			break;
+ 	}
+@@ -780,8 +783,8 @@ static int hwpoison_hugetlb_range(pte_t
+ 
+ 	ptl = huge_pte_lock(h, walk->mm, ptep);
+ 	pte = huge_ptep_get(walk->mm, addr, ptep);
+-	ret = check_hwpoisoned_entry(pte, addr, huge_page_shift(h),
+-					hwp->pfn, &hwp->tk);
++	ret = check_hwpoisoned_entry(pte, addr, huge_page_shift(h), hwp->pfn,
++				&hwp->tk, pages_per_huge_page(h));
+ 	spin_unlock(ptl);
+ 	return ret;
+ }
+@@ -2033,10 +2036,8 @@ retry:
+ 		*hugetlb = 0;
+ 		return 0;
+ 	} else if (res == -EHWPOISON) {
+-		if (flags & MF_ACTION_REQUIRED) {
+-			folio = page_folio(p);
+-			res = kill_accessing_process(current, folio_pfn(folio), flags);
+-		}
++		if (flags & MF_ACTION_REQUIRED)
++			res = kill_accessing_process(current, pfn, flags);
+ 		action_result(pfn, MF_MSG_ALREADY_POISONED, MF_FAILED);
+ 		return res;
+ 	} else if (res == -EBUSY) {
+@@ -2047,6 +2048,7 @@ retry:
+ 		return action_result(pfn, MF_MSG_GET_HWPOISON, MF_IGNORED);
+ 	}
+ 
++
+ 	folio = page_folio(p);
+ 	folio_lock(folio);
+ 
+_
