@@ -1,0 +1,114 @@
+From: Mikulas Patocka <mpatocka@redhat.com>
+Subject: AMDGPU: fix failure with periodic signal
+Date: Fri, 7 Nov 2025 18:48:01 +0100 (CET)
+
+If a process sets up a timer that periodically sends a signal in short
+intervals and if it uses OpenCL on AMDGPU at the same time, we get random
+errors.  Sometimes, probing the OpenCL device fails (strace shows that
+open("/dev/kfd") failed with -EINTR).  Sometimes we get the message
+"amdgpu: init_user_pages: Failed to register MMU notifier: -4" in the
+syslog.
+
+The bug can be reproduced with this program:
+http://www.jikos.cz/~mikulas/testcases/opencl/opencl-bug-small.c
+
+The root cause for these failures is in the function mm_take_all_locks. 
+This function fails with -EINTR if there is pending signal.  The -EINTR is
+propagated up the call stack to userspace and userspace fails if it gets
+this error.
+
+There is the following call chain: kfd_open -> kfd_create_process ->
+create_process -> mmu_notifier_get -> mmu_notifier_get_locked ->
+__mmu_notifier_register -> mm_take_all_locks -> "return -EINTR"
+
+If the failure happens in init_user_pages, there is the following call
+chain: init_user_pages -> amdgpu_hmm_register ->
+mmu_interval_notifier_insert -> mmu_notifier_register ->
+__mmu_notifier_register -> mm_take_all_locks -> "return -EINTR"
+
+In order to fix these failures, this commit changes
+signal_pending(current) to fatal_signal_pending(current) in
+mm_take_all_locks, so that it is interrupted only if the signal is
+actually killing the process.
+
+Also, this commit skips pr_err in init_user_pages if the process is being
+killed - in this situation, there was no error and so we don't want to
+report it in the syslog.
+
+I'm submitting this patch for the stable kernels, because this bug may
+cause random failures in any OpenCL code.
+
+Link: https://lkml.kernel.org/r/6f16b618-26fc-3031-abe8-65c2090262e7@redhat.com
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Cc: Alexander Deucher <alexander.deucher@amd.com>
+Cc: Christan König <christian.koenig@amd.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c |    9 +++++++--
+ mm/vma.c                                         |    8 ++++----
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c~fix-amdgpu-failure-with-periodic-signal
++++ a/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd_gpuvm.c
+@@ -1070,8 +1070,13 @@ static int init_user_pages(struct kgd_me
+ 
+ 	ret = amdgpu_hmm_register(bo, user_addr);
+ 	if (ret) {
+-		pr_err("%s: Failed to register MMU notifier: %d\n",
+-		       __func__, ret);
++		/*
++		 * If we got EINTR because the process was killed, don't report
++		 * it, because no error happened.
++		 */
++		if (!(fatal_signal_pending(current) && ret == -EINTR))
++			pr_err("%s: Failed to register MMU notifier: %d\n",
++			       __func__, ret);
+ 		goto out;
+ 	}
+ 
+--- a/mm/vma.c~fix-amdgpu-failure-with-periodic-signal
++++ a/mm/vma.c
+@@ -2166,14 +2166,14 @@ int mm_take_all_locks(struct mm_struct *
+ 	 * is reached.
+ 	 */
+ 	for_each_vma(vmi, vma) {
+-		if (signal_pending(current))
++		if (fatal_signal_pending(current))
+ 			goto out_unlock;
+ 		vma_start_write(vma);
+ 	}
+ 
+ 	vma_iter_init(&vmi, mm, 0);
+ 	for_each_vma(vmi, vma) {
+-		if (signal_pending(current))
++		if (fatal_signal_pending(current))
+ 			goto out_unlock;
+ 		if (vma->vm_file && vma->vm_file->f_mapping &&
+ 				is_vm_hugetlb_page(vma))
+@@ -2182,7 +2182,7 @@ int mm_take_all_locks(struct mm_struct *
+ 
+ 	vma_iter_init(&vmi, mm, 0);
+ 	for_each_vma(vmi, vma) {
+-		if (signal_pending(current))
++		if (fatal_signal_pending(current))
+ 			goto out_unlock;
+ 		if (vma->vm_file && vma->vm_file->f_mapping &&
+ 				!is_vm_hugetlb_page(vma))
+@@ -2191,7 +2191,7 @@ int mm_take_all_locks(struct mm_struct *
+ 
+ 	vma_iter_init(&vmi, mm, 0);
+ 	for_each_vma(vmi, vma) {
+-		if (signal_pending(current))
++		if (fatal_signal_pending(current))
+ 			goto out_unlock;
+ 		if (vma->anon_vma)
+ 			list_for_each_entry(avc, &vma->anon_vma_chain, same_vma)
+_
