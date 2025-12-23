@@ -1,0 +1,101 @@
+From: Jiayuan Chen <jiayuan.chen@shopee.com>
+Subject: mm/vmscan: mitigate spurious kswapd_failures reset from direct reclaim
+Date: Mon, 22 Dec 2025 20:20:21 +0800
+
+When kswapd fails to reclaim memory, kswapd_failures is incremented.  Once
+it reaches MAX_RECLAIM_RETRIES, kswapd stops running to avoid futile
+reclaim attempts.  However, any successful direct reclaim unconditionally
+resets kswapd_failures to 0, which can cause problems.
+
+We observed an issue in production on a multi-NUMA system where a process
+allocated large amounts of anonymous pages on a single NUMA node, causing
+its watermark to drop below high and evicting most file pages:
+
+$ numastat -m
+Per-node system memory usage (in MBs):
+                          Node 0          Node 1           Total
+                 --------------- --------------- ---------------
+MemTotal               128222.19       127983.91       256206.11
+MemFree                  1414.48         1432.80         2847.29
+MemUsed                126807.71       126551.11       252358.82
+SwapCached                  0.00            0.00            0.00
+Active                  29017.91        25554.57        54572.48
+Inactive                92749.06        95377.00       188126.06
+Active(anon)            28998.96        23356.47        52355.43
+Inactive(anon)          92685.27        87466.11       180151.39
+Active(file)               18.95         2198.10         2217.05
+Inactive(file)             63.79         7910.89         7974.68
+
+With swap disabled, only file pages can be reclaimed.  When kswapd is
+woken (e.g., via wake_all_kswapds()), it runs continuously but cannot
+raise free memory above the high watermark since reclaimable file pages
+are insufficient.  Normally, kswapd would eventually stop after
+kswapd_failures reaches MAX_RECLAIM_RETRIES.
+
+However, pods on this machine have memory.high set in their cgroup. 
+Business processes continuously trigger the high limit, causing frequent
+direct reclaim that keeps resetting kswapd_failures to 0.  This prevents
+kswapd from ever stopping.
+
+The result is that kswapd runs endlessly, repeatedly evicting the few
+remaining file pages which are actually hot.  These pages constantly
+refault, generating sustained heavy IO READ pressure.
+
+Fix this by only resetting kswapd_failures from direct reclaim when the
+node is actually balanced.  This prevents direct reclaim from keeping
+kswapd alive when the node cannot be balanced through reclaim alone.
+
+Link: https://lkml.kernel.org/r/20251222122022.254268-1-jiayuan.chen@linux.dev
+Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: "David Hildenbrand (Red Hat)" <david@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vmscan.c |   13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+--- a/mm/vmscan.c~mm-vmscan-mitigate-spurious-kswapd_failures-reset-from-direct-reclaim
++++ a/mm/vmscan.c
+@@ -2648,6 +2648,15 @@ static bool can_age_anon_pages(struct lr
+ 			  lruvec_memcg(lruvec));
+ }
+ 
++static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx);
++static inline void reset_kswapd_failures(struct pglist_data *pgdat,
++					 struct scan_control *sc)
++{
++	if (!current_is_kswapd() &&
++	    pgdat_balanced(pgdat, sc->order, sc->reclaim_idx))
++		atomic_set(&pgdat->kswapd_failures, 0);
++}
++
+ #ifdef CONFIG_LRU_GEN
+ 
+ #ifdef CONFIG_LRU_GEN_ENABLED
+@@ -5065,7 +5074,7 @@ static void lru_gen_shrink_node(struct p
+ 	blk_finish_plug(&plug);
+ done:
+ 	if (sc->nr_reclaimed > reclaimed)
+-		atomic_set(&pgdat->kswapd_failures, 0);
++		reset_kswapd_failures(pgdat, sc);
+ }
+ 
+ /******************************************************************************
+@@ -6139,7 +6148,7 @@ again:
+ 	 * successful direct reclaim run will revive a dormant kswapd.
+ 	 */
+ 	if (reclaimable)
+-		atomic_set(&pgdat->kswapd_failures, 0);
++		reset_kswapd_failures(pgdat, sc);
+ 	else if (sc->cache_trim_mode)
+ 		sc->cache_trim_mode_failed = 1;
+ }
+_
