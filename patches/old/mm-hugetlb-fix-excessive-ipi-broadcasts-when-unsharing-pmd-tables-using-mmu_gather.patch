@@ -1,6 +1,6 @@
 From: "David Hildenbrand (Red Hat)" <david@kernel.org>
 Subject: mm/hugetlb: fix excessive IPI broadcasts when unsharing PMD tables using mmu_gather
-Date: Fri, 5 Dec 2025 22:35:58 +0100
+Date: Fri, 12 Dec 2025 08:10:19 +0100
 
 As reported, ever since commit 1013af4f585f ("mm/hugetlb: fix
 huge_pmd_unshare() vs GUP-fast race") we can end up in some situations
@@ -100,24 +100,26 @@ There are two fairly tricky things:
 
 Further note that the ptdesc_pmd_pts_dec() in huge_pmd_share() is not a
 concern, as we are holding the i_mmap_lock the whole time, preventing
-concurrent unsharing. That ptdesc_pmd_pts_dec() usage will be removed
+concurrent unsharing.  That ptdesc_pmd_pts_dec() usage will be removed
 separately as a cleanup later.
 
-There are plenty more cleanups to be had, but they have to wait until
-this is fixed.
+There are plenty more cleanups to be had, but they have to wait until this
+is fixed.
 
-Link: https://lkml.kernel.org/r/20251205213558.2980480-5-david@kernel.org
+Link: https://lkml.kernel.org/r/20251212071019.471146-5-david@kernel.org
 Fixes: 1013af4f585f ("mm/hugetlb: fix huge_pmd_unshare() vs GUP-fast race")
 Signed-off-by: David Hildenbrand (Red Hat) <david@kernel.org>
 Reported-by: Uschakow, Stanislav" <suschako@amazon.de>
 Closes: https://lore.kernel.org/all/4d3878531c76479d9f8ca9789dc6485d@amazon.de/
 Tested-by: Laurence Oberman <loberman@redhat.com>
+Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: "Aneesh Kumar K.V" <aneesh.kumar@kernel.org>
 Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Harry Yoo <harry.yoo@oracle.com>
 Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Liu Shixin <liushixin2@huawei.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Nadav Amit <nadav.amit@gmail.com>
 Cc: Nicholas Piggin <npiggin@gmail.com>
@@ -127,40 +129,42 @@ Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
 Cc: Rik van Riel <riel@surriel.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
-Cc: Lance Yang <lance.yang@linux.dev>
 Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/asm-generic/tlb.h |   69 ++++++++++++++++++++
+ include/asm-generic/tlb.h |   74 +++++++++++++++++++++-
  include/linux/hugetlb.h   |   19 +++--
  mm/hugetlb.c              |  121 ++++++++++++++++++++----------------
- mm/mmu_gather.c           |    6 +
+ mm/mmu_gather.c           |    7 ++
  mm/mprotect.c             |    2 
  mm/rmap.c                 |   25 +++++--
- 6 files changed, 173 insertions(+), 69 deletions(-)
+ 6 files changed, 179 insertions(+), 69 deletions(-)
 
 --- a/include/asm-generic/tlb.h~mm-hugetlb-fix-excessive-ipi-broadcasts-when-unsharing-pmd-tables-using-mmu_gather
 +++ a/include/asm-generic/tlb.h
-@@ -364,6 +364,17 @@ struct mmu_gather {
+@@ -364,6 +364,20 @@ struct mmu_gather {
  	unsigned int		vma_huge : 1;
  	unsigned int		vma_pfn  : 1;
  
 +	/*
-+	 * Did we unshare (unmap) any shared page tables?
++	 * Did we unshare (unmap) any shared page tables? For now only
++	 * used for hugetlb PMD table sharing.
 +	 */
 +	unsigned int		unshared_tables : 1;
 +
 +	/*
 +	 * Did we unshare any page tables such that they are now exclusive
-+	 * and could get reused+modified by the new owner?
++	 * and could get reused+modified by the new owner? When setting this
++	 * flag, "unshared_tables" will be set as well. For now only used
++	 * for hugetlb PMD table sharing.
 +	 */
 +	unsigned int		fully_unshared_tables : 1;
 +
  	unsigned int		batch_count;
  
  #ifndef CONFIG_MMU_GATHER_NO_GATHER
-@@ -400,6 +411,7 @@ static inline void __tlb_reset_range(str
+@@ -400,6 +414,7 @@ static inline void __tlb_reset_range(str
  	tlb->cleared_pmds = 0;
  	tlb->cleared_puds = 0;
  	tlb->cleared_p4ds = 0;
@@ -168,7 +172,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/*
  	 * Do not reset mmu_gather::vma_* fields here, we do not
  	 * call into tlb_start_vma() again to set them if there is an
-@@ -484,7 +496,7 @@ static inline void tlb_flush_mmu_tlbonly
+@@ -484,7 +499,7 @@ static inline void tlb_flush_mmu_tlbonly
  	 * these bits.
  	 */
  	if (!(tlb->freed_tables || tlb->cleared_ptes || tlb->cleared_pmds ||
@@ -177,7 +181,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		return;
  
  	tlb_flush(tlb);
-@@ -773,6 +785,61 @@ static inline bool huge_pmd_needs_flush(
+@@ -773,6 +788,63 @@ static inline bool huge_pmd_needs_flush(
  }
  #endif
  
@@ -209,10 +213,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/*
 +	 * As soon as the caller drops locks to allow for reuse of
 +	 * previously-shared tables, these tables could get modified and
-+	 * even reused outside of hugetlb context. So flush the TLB now.
++	 * even reused outside of hugetlb context, so we have to make sure that
++	 * any page table walkers (incl. TLB, GUP-fast) are aware of that
++	 * change.
 +	 *
-+	 * Note that we cannot defer the flush to a later point even if we are
-+	 * not the last sharer of the page table.
++	 * Even if we are not fully unsharing a PMD table, we must
++	 * flush the TLB for the unsharer now.
 +	 */
 +	if (tlb->unshared_tables)
 +		tlb_flush_mmu_tlbonly(tlb);
@@ -495,7 +501,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * @vma: the vma covering the pmd table.
 + *
 + * Perform necessary TLB flushes or IPI broadcasts to synchronize PMD table
-+ * unsharing with concurrent page table walkers (TLB, GUP-fast, etc.).
++ * unsharing with concurrent page table walkers.
 + *
 + * This function must be called after a sequence of huge_pmd_unshare()
 + * calls while still holding the i_mmap_rwsem.
@@ -573,7 +579,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
 --- a/mm/mmu_gather.c~mm-hugetlb-fix-excessive-ipi-broadcasts-when-unsharing-pmd-tables-using-mmu_gather
 +++ a/mm/mmu_gather.c
-@@ -469,6 +469,12 @@ void tlb_gather_mmu_fullmm(struct mmu_ga
+@@ -426,6 +426,7 @@ static void __tlb_gather_mmu(struct mmu_
+ #endif
+ 	tlb->vma_pfn = 0;
+ 
++	tlb->fully_unshared_tables = 0;
+ 	__tlb_reset_range(tlb);
+ 	inc_tlb_flush_pending(tlb->mm);
+ }
+@@ -469,6 +470,12 @@ void tlb_gather_mmu_fullmm(struct mmu_ga
  void tlb_finish_mmu(struct mmu_gather *tlb)
  {
  	/*
