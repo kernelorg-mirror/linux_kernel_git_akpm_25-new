@@ -1,0 +1,148 @@
+From: "David Hildenbrand (Red Hat)" <david@kernel.org>
+Subject: mm/hugetlb: fix excessive IPI broadcasts when unsharing PMD tables using mmu_gather
+Date: Tue, 23 Dec 2025 22:40:37 +0100
+
+As reported, ever since commit 1013af4f585f ("mm/hugetlb: fix
+huge_pmd_unshare() vs GUP-fast race") we can end up in some situations
+where we perform so many IPI broadcasts when unsharing hugetlb PMD page
+tables that it severely regresses some workloads.
+
+In particular, when we fork()+exit(), or when we munmap() a large
+area backed by many shared PMD tables, we perform one IPI broadcast per
+unshared PMD table.
+
+There are two optimizations to be had:
+
+(1) When we process (unshare) multiple such PMD tables, such as during
+    exit(), it is sufficient to send a single IPI broadcast (as long as
+    we respect locking rules) instead of one per PMD table.
+
+    Locking prevents that any of these PMD tables could get reused before
+    we drop the lock.
+
+(2) When we are not the last sharer (> 2 users including us), there is
+    no need to send the IPI broadcast. The shared PMD tables cannot
+    become exclusive (fully unshared) before an IPI will be broadcasted
+    by the last sharer.
+
+    Concurrent GUP-fast could walk into a PMD table just before we
+    unshared it. It could then succeed in grabbing a page from the
+    shared page table even after munmap() etc succeeded (and supressed
+    an IPI). But there is not difference compared to GUP-fast just
+    sleeping for a while after grabbing the page and re-enabling IRQs.
+
+    Most importantly, GUP-fast will never walk into page tables that are
+    no-longer shared, because the last sharer will issue an IPI
+    broadcast.
+
+    (if ever required, checking whether the PUD changed in GUP-fast
+     after grabbing the page like we do in the PTE case could handle
+     this)
+
+So let's rework PMD sharing TLB flushing + IPI sync to use the mmu_gather
+infrastructure so we can implement these optimizations and demystify the
+code at least a bit. Extend the mmu_gather infrastructure to be able to
+deal with our special hugetlb PMD table sharing implementation.
+
+To make initialization of the mmu_gather easier when working on a single
+VMA (in particular, when dealing with hugetlb), provide
+tlb_gather_mmu_vma().
+
+We'll consolidate the handling for (full) unsharing of PMD tables in
+tlb_unshare_pmd_ptdesc() and tlb_flush_unshared_tables(), and track
+in "struct mmu_gather" whether we had (full) unsharing of PMD tables.
+
+Because locking is very special (concurrent unsharing+reuse must be
+prevented), we disallow deferring flushing to tlb_finish_mmu() and instead
+require an explicit earlier call to tlb_flush_unshared_tables().
+
+>From hugetlb code, we call huge_pmd_unshare_flush() where we make sure
+that the expected lock protecting us from concurrent unsharing+reuse is
+still held.
+
+Check with a VM_WARN_ON_ONCE() in tlb_finish_mmu() that
+tlb_flush_unshared_tables() was properly called earlier.
+
+Document it all properly.
+
+Notes about tlb_remove_table_sync_one() interaction with unsharing:
+
+There are two fairly tricky things:
+
+(1) tlb_remove_table_sync_one() is a NOP on architectures without
+    CONFIG_MMU_GATHER_RCU_TABLE_FREE.
+
+    Here, the assumption is that the previous TLB flush would send an
+    IPI to all relevant CPUs. Careful: some architectures like x86 only
+    send IPIs to all relevant CPUs when tlb->freed_tables is set.
+
+    The relevant architectures should be selecting
+    MMU_GATHER_RCU_TABLE_FREE, but x86 might not do that in stable
+    kernels and it might have been problematic before this patch.
+
+    Also, the arch flushing behavior (independent of IPIs) is different
+    when tlb->freed_tables is set. Do we have to enlighten them to also
+    take care of tlb->unshared_tables? So far we didn't care, so
+    hopefully we are fine. Of course, we could be setting
+    tlb->freed_tables as well, but that might then unnecessarily flush
+    too much, because the semantics of tlb->freed_tables are a bit
+    fuzzy.
+
+    This patch changes nothing in this regard.
+
+(2) tlb_remove_table_sync_one() is not a NOP on architectures with
+    CONFIG_MMU_GATHER_RCU_TABLE_FREE that actually don't need a sync.
+
+    Take x86 as an example: in the common case (!pv, !X86_FEATURE_INVLPGB)
+    we still issue IPIs during TLB flushes and don't actually need the
+    second tlb_remove_table_sync_one().
+
+    This optimized can be implemented on top of this, by checking e.g., in
+    tlb_remove_table_sync_one() whether we really need IPIs. But as
+    described in (1), it really must honor tlb->freed_tables then to
+    send IPIs to all relevant CPUs.
+
+Notes on TLB flushing changes:
+
+(1) Flushing for non-shared PMD tables
+
+    We're converting from flush_hugetlb_tlb_range() to
+    tlb_remove_huge_tlb_entry(). Given that we properly initialize the
+    MMU gather in tlb_gather_mmu_vma() to be hugetlb aware, similar to
+    __unmap_hugepage_range(), that should be fine.
+
+(2) Flushing for shared PMD tables
+
+    We're converting from various things (flush_hugetlb_tlb_range(),
+    tlb_flush_pmd_range(), flush_tlb_range()) to tlb_flush_pmd_range().
+
+    tlb_flush_pmd_range() achieves the same that
+    tlb_remove_huge_tlb_entry() would achieve in these scenarios.
+    Note that tlb_remove_huge_tlb_entry() also calls
+    __tlb_remove_tlb_entry(), however that is only implemented on
+    powerpc, which does not support PMD table sharing.
+
+    Similar to (1), tlb_gather_mmu_vma() should make sure that TLB
+    flushing keeps on working as expected.
+
+Further, note that the ptdesc_pmd_pts_dec() in huge_pmd_share() is not a
+concern, as we are holding the i_mmap_lock the whole time, preventing
+concurrent unsharing. That ptdesc_pmd_pts_dec() usage will be removed
+separately as a cleanup later.
+
+There are plenty more cleanups to be had, but they have to wait until
+this is fixed.
+
+Link: https://lkml.kernel.org/r/20251223214037.580860-5-david@kernel.org
+Fixes: 1013af4f585f ("mm/hugetlb: fix huge_pmd_unshare() vs GUP-fast race")
+Signed-off-by: David Hildenbrand (Red Hat) <david@kernel.org>
+Reported-by: Uschakow, Stanislav" <suschako@amazon.de>
+Closes: https://lore.kernel.org/all/4d3878531c76479d9f8ca9789dc6485d@amazon.de/
+Tested-by: Laurence Oberman <loberman@redhat.com>
+Cc: Harry Yoo <harry.yoo@oracle.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liu Shixin <liushixin2@huawei.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: <stable@vger.kernel.org>
