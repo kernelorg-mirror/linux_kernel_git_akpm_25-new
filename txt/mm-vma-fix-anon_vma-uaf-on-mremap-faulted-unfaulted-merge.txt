@@ -1,0 +1,167 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: fix anon_vma UAF on mremap() faulted, unfaulted merge
+Date: Fri, 2 Jan 2026 20:55:20 +0000
+
+Commit 879bca0a2c4f ("mm/vma: fix incorrectly disallowed anonymous VMA
+merges") introduced the ability to merge previously unavailable VMA merge
+scenarios.
+
+The key piece of logic introduced was the ability to merge a faulted VMA
+immediately next to an unfaulted VMA, which relies upon dup_anon_vma() to
+correctly handle anon_vma state.
+
+In the case of the merge of an existing VMA (that is changing properties
+of a VMA and then merging if those properties are shared by adjacent
+VMAs), dup_anon_vma() is invoked correctly.
+
+However in the case of the merge of a new VMA, a corner case peculiar to
+mremap() was missed.
+
+The issue is that vma_expand() only performs dup_anon_vma() if the target
+(the VMA that will ultimately become the merged VMA): is not the next VMA,
+i.e.  the one that appears after the range in which the new VMA is to be
+established.
+
+A key insight here is that in all other cases other than mremap(), a new
+VMA merge either expands an existing VMA, meaning that the target VMA will
+be that VMA, or would have anon_vma be NULL.
+
+Specifically:
+
+* __mmap_region() - no anon_vma in place, initial mapping.
+* do_brk_flags() - expanding an existing VMA.
+* vma_merge_extend() - expanding an existing VMA.
+* relocate_vma_down() - no anon_vma in place, initial mapping.
+
+In addition, we are in the unique situation of needing to duplicate
+anon_vma state from a VMA that is neither the previous or next VMA being
+merged with.
+
+To account for this, introduce a new field in struct vma_merge_struct
+specifically for the mremap() case, and update vma_expand() to explicitly
+check for this case and invoke dup_anon_vma() to ensure anon_vma state is
+correctly propagated.
+
+This issue can be observed most directly by invoked mremap() to move
+around a VMA and cause this kind of merge with the MREMAP_DONTUNMAP flag
+specified.
+
+This will result in unlink_anon_vmas() being called after failing to
+duplicate anon_vma state to the target VMA, which results in the anon_vma
+itself being freed with folios still possessing dangling pointers to the
+anon_vma and thus a use-after-free bug.
+
+This bug was discovered via a syzbot report, which this patch resolves.
+
+The following program reproduces the issue (and is fixed by this patch):
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+#define RESERVED_PGS	(100)
+#define VMA_A_PGS	(10)
+#define VMA_B_PGS	(10)
+#define NUM_ITERS	(1000)
+
+static void trigger_bug(void)
+{
+	unsigned long page_size = sysconf(_SC_PAGE_SIZE);
+	char *reserved, *ptr_a, *ptr_b;
+
+	/*
+	 * The goal here is to achieve:
+	 *
+	 * mremap() with MREMAP_DONTUNMAP such that A and B merge:
+	 *
+	 *      |-------------------------|
+	 *      |                         |
+	 *      |    |-----------|   |---------|
+	 *      v    | unfaulted |   | faulted |
+	 *           |-----------|   |---------|
+	 *                 B              A
+	 *
+	 * Then unmap VMA A to trigger the bug.
+	 */
+
+	/* Reserve a region of memory to operate in. */
+	reserved = mmap(NULL, RESERVED_PGS * page_size, PROT_NONE,
+			MAP_PRIVATE | MAP_ANON, -1, 0);
+	if (reserved == MAP_FAILED) {
+		perror("mmap reserved");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Map VMA A into place. */
+	ptr_a = mmap(&reserved[page_size], VMA_A_PGS * page_size,
+		     PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+	if (ptr_a == MAP_FAILED) {
+		perror("mmap VMA A");
+		exit(EXIT_FAILURE);
+	}
+	/* Fault it in. */
+	ptr_a[0] = 'x';
+
+	/*
+	 * Now move it out of the way so we can place VMA B in position,
+	 * unfaulted.
+	 */
+	ptr_a = mremap(ptr_a, VMA_A_PGS * page_size, VMA_A_PGS * page_size,
+		       MREMAP_FIXED | MREMAP_MAYMOVE, &reserved[50 * page_size]);
+	if (ptr_a == MAP_FAILED) {
+		perror("mremap VMA A out of the way");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Map VMA B into place. */
+	ptr_b = mmap(&reserved[page_size + VMA_A_PGS * page_size],
+		     VMA_B_PGS * page_size, PROT_READ | PROT_WRITE,
+		     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
+	if (ptr_b == MAP_FAILED) {
+		perror("mmap VMA B");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Now move VMA A into position w/MREMAP_DONTUNMAP + free anon_vma. */
+	ptr_a = mremap(ptr_a, VMA_A_PGS * page_size, VMA_A_PGS * page_size,
+		       MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
+		       &reserved[page_size]);
+	if (ptr_a == MAP_FAILED) {
+		perror("mremap VMA A with MREMAP_DONTUNMAP");
+		exit(EXIT_FAILURE);
+	}
+
+	/* Finally, unmap VMA A which should trigger the bug. */
+	munmap(ptr_a, VMA_A_PGS * page_size);
+
+	/* Cleanup in case bug didn't trigger sufficiently visibly... */
+	munmap(reserved, RESERVED_PGS * page_size);
+}
+
+int main(void)
+{
+	int i;
+
+	for (i = 0; i < NUM_ITERS; i++)
+		trigger_bug();
+
+	return EXIT_SUCCESS;
+}
+
+Link: https://lkml.kernel.org/r/20260102205520.986725-1-lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Fixes: 879bca0a2c4f ("mm/vma: fix incorrectly disallowed anonymous VMA merges")
+Reported-by: syzbot+b165fc2e11771c66d8ba@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/694a2745.050a0220.19928e.0017.GAE@google.com/
+Cc: David Hildenbrand (Red Hat) <david@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jeongjun Park <aha310510@gmail.com>
+Cc: levi.yun <yeoreum.yun@arm.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: <stable@vger.kernel.org>
