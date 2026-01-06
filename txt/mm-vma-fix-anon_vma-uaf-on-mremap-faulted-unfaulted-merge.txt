@@ -1,6 +1,76 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/vma: fix anon_vma UAF on mremap() faulted, unfaulted merge
-Date: Fri, 2 Jan 2026 20:55:20 +0000
+Date: Mon, 5 Jan 2026 20:11:47 +0000
+
+Patch series "mm/vma: fix anon_vma UAF on mremap() faulted, unfaulted
+merge", v2.
+
+Commit 879bca0a2c4f ("mm/vma: fix incorrectly disallowed anonymous VMA
+merges") introduced the ability to merge previously unavailable VMA merge
+scenarios.
+
+However, it is handling merges incorrectly when it comes to mremap() of a
+faulted VMA adjacent to an unfaulted VMA.  The issues arise in three
+cases:
+
+1. Previous VMA unfaulted:
+
+              copied -----|
+                          v
+	|-----------|.............|
+	| unfaulted |(faulted VMA)|
+	|-----------|.............|
+	     prev
+
+2. Next VMA unfaulted:
+
+              copied -----|
+                          v
+	            |.............|-----------|
+	            |(faulted VMA)| unfaulted |
+                    |.............|-----------|
+		                      next
+
+3. Both adjacent VMAs unfaulted:
+
+              copied -----|
+                          v
+	|-----------|.............|-----------|
+	| unfaulted |(faulted VMA)| unfaulted |
+	|-----------|.............|-----------|
+	     prev                      next
+
+This series fixes each of these cases, and introduces self tests to assert
+that the issues are corrected.
+
+I also test a further case which was already handled, to assert that my
+changes continues to correctly handle it:
+
+4. prev unfaulted, next faulted:
+
+              copied -----|
+                          v
+	|-----------|.............|-----------|
+	| unfaulted |(faulted VMA)|  faulted  |
+	|-----------|.............|-----------|
+	     prev                      next
+
+This bug was discovered via a syzbot report, linked to in the first patch
+in the series, I confirmed that this series fixes the bug.
+
+I also discovered that we are failing to check that the faulted VMA was
+not forked when merging a copied VMA in cases 1-3 above, an issue this
+series also addresses.
+
+I also added self tests to assert that this is resolved (and confirmed
+that the tests failed prior to this).
+
+I also cleaned up vma_expand() as part of this work, renamed
+vma_had_uncowed_parents() to vma_is_fork_child() as the previous name was
+unduly confusing, and simplified the comments around this function.
+
+
+This patch (of 4):
 
 Commit 879bca0a2c4f ("mm/vma: fix incorrectly disallowed anonymous VMA
 merges") introduced the ability to merge previously unavailable VMA merge
@@ -37,10 +107,77 @@ In addition, we are in the unique situation of needing to duplicate
 anon_vma state from a VMA that is neither the previous or next VMA being
 merged with.
 
-To account for this, introduce a new field in struct vma_merge_struct
-specifically for the mremap() case, and update vma_expand() to explicitly
-check for this case and invoke dup_anon_vma() to ensure anon_vma state is
-correctly propagated.
+dup_anon_vma() deals exclusively with the target=unfaulted, src=faulted
+case.  This leaves four possibilities, in each case where the copied VMA
+is faulted:
+
+1. Previous VMA unfaulted:
+
+              copied -----|
+                          v
+	|-----------|.............|
+	| unfaulted |(faulted VMA)|
+	|-----------|.............|
+	     prev
+
+target = prev, expand prev to cover.
+
+2. Next VMA unfaulted:
+
+              copied -----|
+                          v
+	            |.............|-----------|
+	            |(faulted VMA)| unfaulted |
+                    |.............|-----------|
+		                      next
+
+target = next, expand next to cover.
+
+3. Both adjacent VMAs unfaulted:
+
+              copied -----|
+                          v
+	|-----------|.............|-----------|
+	| unfaulted |(faulted VMA)| unfaulted |
+	|-----------|.............|-----------|
+	     prev                      next
+
+target = prev, expand prev to cover.
+
+4. prev unfaulted, next faulted:
+
+              copied -----|
+                          v
+	|-----------|.............|-----------|
+	| unfaulted |(faulted VMA)|  faulted  |
+	|-----------|.............|-----------|
+	     prev                      next
+
+target = prev, expand prev to cover.  Essentially equivalent to 3, but
+with additional requirement that next's anon_vma is the same as the copied
+VMA's.  This is covered by the existing logic.
+
+To account for this very explicitly, we introduce
+vma_merge_copied_range(), which sets a newly introduced vmg->copied_from
+field, then invokes vma_merge_new_range() which handles the rest of the
+logic.
+
+We then update the key vma_expand() function to clean up the logic and
+make what's going on clearer, making the 'remove next' case less special,
+before invoking dup_anon_vma() unconditionally should we be copying from a
+VMA.
+
+Note that in case 3, the if (remove_next) ...  branch will be a no-op, as
+next=src in this instance and src is unfaulted.
+
+In case 4, it won't be, but since in this instance next=src and it is
+faulted, this will have required tgt=faulted, src=faulted to be
+compatible, meaning that next->anon_vma == vmg->copied_from->anon_vma, and
+thus a single dup_anon_vma() of next suffices to copy anon_vma state for
+the copied-from VMA also.
+
+If we are copying from a VMA in a successful merge we must _always_
+propagate anon_vma state.
 
 This issue can be observed most directly by invoked mremap() to move
 around a VMA and cause this kind of merge with the MREMAP_DONTUNMAP flag
@@ -53,105 +190,13 @@ anon_vma and thus a use-after-free bug.
 
 This bug was discovered via a syzbot report, which this patch resolves.
 
-The following program reproduces the issue (and is fixed by this patch):
+We further make a change to update the mergeable anon_vma check to assert
+the copied-from anon_vma did not have CoW parents, as otherwise
+dup_anon_vma() might incorrectly propagate CoW ancestors from the next VMA
+in case 4 despite the anon_vma's being identical for both VMAs.
 
-#define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/mman.h>
-
-#define RESERVED_PGS	(100)
-#define VMA_A_PGS	(10)
-#define VMA_B_PGS	(10)
-#define NUM_ITERS	(1000)
-
-static void trigger_bug(void)
-{
-	unsigned long page_size = sysconf(_SC_PAGE_SIZE);
-	char *reserved, *ptr_a, *ptr_b;
-
-	/*
-	 * The goal here is to achieve:
-	 *
-	 * mremap() with MREMAP_DONTUNMAP such that A and B merge:
-	 *
-	 *      |-------------------------|
-	 *      |                         |
-	 *      |    |-----------|   |---------|
-	 *      v    | unfaulted |   | faulted |
-	 *           |-----------|   |---------|
-	 *                 B              A
-	 *
-	 * Then unmap VMA A to trigger the bug.
-	 */
-
-	/* Reserve a region of memory to operate in. */
-	reserved = mmap(NULL, RESERVED_PGS * page_size, PROT_NONE,
-			MAP_PRIVATE | MAP_ANON, -1, 0);
-	if (reserved == MAP_FAILED) {
-		perror("mmap reserved");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Map VMA A into place. */
-	ptr_a = mmap(&reserved[page_size], VMA_A_PGS * page_size,
-		     PROT_READ | PROT_WRITE,
-		     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-	if (ptr_a == MAP_FAILED) {
-		perror("mmap VMA A");
-		exit(EXIT_FAILURE);
-	}
-	/* Fault it in. */
-	ptr_a[0] = 'x';
-
-	/*
-	 * Now move it out of the way so we can place VMA B in position,
-	 * unfaulted.
-	 */
-	ptr_a = mremap(ptr_a, VMA_A_PGS * page_size, VMA_A_PGS * page_size,
-		       MREMAP_FIXED | MREMAP_MAYMOVE, &reserved[50 * page_size]);
-	if (ptr_a == MAP_FAILED) {
-		perror("mremap VMA A out of the way");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Map VMA B into place. */
-	ptr_b = mmap(&reserved[page_size + VMA_A_PGS * page_size],
-		     VMA_B_PGS * page_size, PROT_READ | PROT_WRITE,
-		     MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
-	if (ptr_b == MAP_FAILED) {
-		perror("mmap VMA B");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Now move VMA A into position w/MREMAP_DONTUNMAP + free anon_vma. */
-	ptr_a = mremap(ptr_a, VMA_A_PGS * page_size, VMA_A_PGS * page_size,
-		       MREMAP_FIXED | MREMAP_MAYMOVE | MREMAP_DONTUNMAP,
-		       &reserved[page_size]);
-	if (ptr_a == MAP_FAILED) {
-		perror("mremap VMA A with MREMAP_DONTUNMAP");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Finally, unmap VMA A which should trigger the bug. */
-	munmap(ptr_a, VMA_A_PGS * page_size);
-
-	/* Cleanup in case bug didn't trigger sufficiently visibly... */
-	munmap(reserved, RESERVED_PGS * page_size);
-}
-
-int main(void)
-{
-	int i;
-
-	for (i = 0; i < NUM_ITERS; i++)
-		trigger_bug();
-
-	return EXIT_SUCCESS;
-}
-
-Link: https://lkml.kernel.org/r/20260102205520.986725-1-lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/cover.1767638272.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/b7930ad2b1503a657e29fe928eb33061d7eadf5b.1767638272.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Fixes: 879bca0a2c4f ("mm/vma: fix incorrectly disallowed anonymous VMA merges")
 Reported-by: syzbot+b165fc2e11771c66d8ba@syzkaller.appspotmail.com
@@ -159,9 +204,10 @@ Closes: https://lore.kernel.org/all/694a2745.050a0220.19928e.0017.GAE@google.com
 Cc: David Hildenbrand (Red Hat) <david@kernel.org>
 Cc: Jann Horn <jannh@google.com>
 Cc: Jeongjun Park <aha310510@gmail.com>
-Cc: levi.yun <yeoreum.yun@arm.com>
+Cc: Yeoreum Yun <yeoreum.yun@arm.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
 Cc: Rik van Riel <riel@surriel.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Pedro Falcato <pfalcato@suse.de>
 Cc: <stable@vger.kernel.org>
