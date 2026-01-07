@@ -1,0 +1,135 @@
+From: Kevin Brodsky <kevin.brodsky@arm.com>
+Subject: selftests/mm: introduce helper to read every page in range
+Date: Wed, 7 Jan 2026 16:48:39 +0000
+
+FORCE_READ(*addr) ensures that the compiler will emit a load from addr. 
+Several tests need to trigger such a load for every page in the range
+[addr, addr + len), ensuring that every page is faulted in, if it wasn't
+already.
+
+Introduce a new helper force_read_pages_in_range() that does exactly that
+and replace existing loops with a call to it.  Some of those loops have a
+different step size, but reading from every page is appropriate in all
+cases.
+
+Link: https://lkml.kernel.org/r/20260107164842.3289559-6-kevin.brodsky@arm.com
+Signed-off-by: Kevin Brodsky <kevin.brodsky@arm.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Jason Gunthorpe <jgg@nvidia.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Usama Anjum <Usama.Anjum@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Yunsheng Lin <linyunsheng@huawei.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ tools/testing/selftests/mm/hugetlb-madvise.c      |    9 ------
+ tools/testing/selftests/mm/pfnmap.c               |   16 ++++--------
+ tools/testing/selftests/mm/split_huge_page_test.c |    6 ----
+ tools/testing/selftests/mm/vm_util.h              |    6 ++++
+ 4 files changed, 14 insertions(+), 23 deletions(-)
+
+--- a/tools/testing/selftests/mm/hugetlb-madvise.c~selftests-mm-introduce-helper-to-read-every-page-in-range
++++ a/tools/testing/selftests/mm/hugetlb-madvise.c
+@@ -47,14 +47,7 @@ void write_fault_pages(void *addr, unsig
+ 
+ void read_fault_pages(void *addr, unsigned long nr_pages)
+ {
+-	unsigned long i;
+-
+-	for (i = 0; i < nr_pages; i++) {
+-		unsigned long *addr2 =
+-			((unsigned long *)(addr + (i * huge_page_size)));
+-		/* Prevent the compiler from optimizing out the entire loop: */
+-		FORCE_READ(*addr2);
+-	}
++	force_read_pages_in_range(addr, nr_pages * huge_page_size);
+ }
+ 
+ int main(int argc, char **argv)
+--- a/tools/testing/selftests/mm/pfnmap.c~selftests-mm-introduce-helper-to-read-every-page-in-range
++++ a/tools/testing/selftests/mm/pfnmap.c
+@@ -33,20 +33,17 @@ static void signal_handler(int sig)
+ 	siglongjmp(sigjmp_buf_env, -EFAULT);
+ }
+ 
+-static int test_read_access(char *addr, size_t size, size_t pagesize)
++static int test_read_access(char *addr, size_t size)
+ {
+-	size_t offs;
+ 	int ret;
+ 
+ 	if (signal(SIGSEGV, signal_handler) == SIG_ERR)
+ 		return -EINVAL;
+ 
+ 	ret = sigsetjmp(sigjmp_buf_env, 1);
+-	if (!ret) {
+-		for (offs = 0; offs < size; offs += pagesize)
+-			/* Force a read that the compiler cannot optimize out. */
+-			*((volatile char *)(addr + offs));
+-	}
++	if (!ret)
++		force_read_pages_in_range(addr, size);
++
+ 	if (signal(SIGSEGV, SIG_DFL) == SIG_ERR)
+ 		return -EINVAL;
+ 
+@@ -138,7 +135,7 @@ FIXTURE_SETUP(pfnmap)
+ 		SKIP(return, "Invalid file: '%s'. Not pfnmap'ed\n", file);
+ 
+ 	/* ... and want to be able to read from them. */
+-	if (test_read_access(self->addr1, self->size1, self->pagesize))
++	if (test_read_access(self->addr1, self->size1))
+ 		SKIP(return, "Cannot read-access mmap'ed '%s'\n", file);
+ 
+ 	self->size2 = 0;
+@@ -243,8 +240,7 @@ TEST_F(pfnmap, fork)
+ 	ASSERT_GE(pid, 0);
+ 
+ 	if (!pid) {
+-		EXPECT_EQ(test_read_access(self->addr1, self->size1,
+-					   self->pagesize), 0);
++		EXPECT_EQ(test_read_access(self->addr1, self->size1), 0);
+ 		exit(0);
+ 	}
+ 
+--- a/tools/testing/selftests/mm/split_huge_page_test.c~selftests-mm-introduce-helper-to-read-every-page-in-range
++++ a/tools/testing/selftests/mm/split_huge_page_test.c
+@@ -652,11 +652,7 @@ static int create_pagecache_thp_and_fd(c
+ 	}
+ 	madvise(*addr, fd_size, MADV_HUGEPAGE);
+ 
+-	for (size_t i = 0; i < fd_size; i++) {
+-		char *addr2 = *addr + i;
+-
+-		FORCE_READ(*addr2);
+-	}
++	force_read_pages_in_range(*addr, fd_size);
+ 
+ 	if (!check_huge_file(*addr, fd_size / pmd_pagesize, pmd_pagesize)) {
+ 		ksft_print_msg("No large pagecache folio generated, please provide a filesystem supporting large folio\n");
+--- a/tools/testing/selftests/mm/vm_util.h~selftests-mm-introduce-helper-to-read-every-page-in-range
++++ a/tools/testing/selftests/mm/vm_util.h
+@@ -55,6 +55,12 @@ static inline unsigned int pshift(void)
+ 	return __page_shift;
+ }
+ 
++static inline void force_read_pages_in_range(char *addr, size_t len)
++{
++	for (size_t i = 0; i < len; i += psize())
++		FORCE_READ(addr[i]);
++}
++
+ bool detect_huge_zeropage(void);
+ 
+ /*
+_
