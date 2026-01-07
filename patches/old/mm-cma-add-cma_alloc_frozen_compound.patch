@@ -1,6 +1,6 @@
 From: Kefeng Wang <wangkefeng.wang@huawei.com>
 Subject: mm: cma: add cma_alloc_frozen{_compound}()
-Date: Thu, 23 Oct 2025 19:59:39 +0800
+Date: Tue, 30 Dec 2025 15:24:21 +0800
 
 Introduce cma_alloc_frozen{_compound}() helper to alloc pages without
 incrementing their refcount, then convert hugetlb cma to use the
@@ -9,10 +9,11 @@ cma_{alloc,free}_folio(), also move the cma_validate_zones() into
 mm/internal.h since no outside user.
 
 The set_pages_refcounted() is only called to set non-compound pages after
-above changes, so remove the process about PageHead.
+above changes, so remove the processing about PageHead.
 
-Link: https://lkml.kernel.org/r/20251023115940.3573158-6-wangkefeng.wang@huawei.com
+Link: https://lkml.kernel.org/r/20251230072422.265265-6-wangkefeng.wang@huawei.com
 Signed-off-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
 Cc: Brendan Jackman <jackmanb@google.com>
 Cc: David Hildenbrand <david@redhat.com>
 Cc: Jane Chu <jane.chu@oracle.com>
@@ -22,15 +23,14 @@ Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/cma.h |   26 +++++-----------------
- mm/cma.c            |   48 +++++++++++++++++++++++-------------------
- mm/hugetlb_cma.c    |   24 ++++++++++++---------
- mm/internal.h       |   12 ++++------
- 4 files changed, 52 insertions(+), 58 deletions(-)
+ include/linux/cma.h |   26 ++--------
+ mm/cma.c            |  107 ++++++++++++++++++++++++++++--------------
+ mm/hugetlb_cma.c    |   24 +++++----
+ mm/internal.h       |   10 +--
+ 4 files changed, 97 insertions(+), 70 deletions(-)
 
 --- a/include/linux/cma.h~mm-cma-add-cma_alloc_frozen_compound
 +++ a/include/linux/cma.h
@@ -113,7 +113,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
   * cma_alloc() - allocate pages from contiguous area
   * @cma:   Contiguous memory region for which the allocation is performed.
-@@ -928,23 +942,17 @@ static struct page *__cma_alloc(struct c
+@@ -928,42 +942,26 @@ static struct page *__cma_alloc(struct c
  struct page *cma_alloc(struct cma *cma, unsigned long count,
  		       unsigned int align, bool no_warn)
  {
@@ -136,25 +136,89 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	return page;
  }
  
- static bool __cma_release(struct cma *cma, const struct page *pages,
--			  unsigned long count, bool compound)
-+			  unsigned long count, bool frozen)
+-/**
+- * cma_release() - release allocated pages
+- * @cma:   Contiguous memory region for which the allocation is performed.
+- * @pages: Allocated pages.
+- * @count: Number of allocated pages.
+- *
+- * This function releases memory allocated by cma_alloc().
+- * It returns false when provided pages do not belong to contiguous area and
+- * true otherwise.
+- */
+-bool cma_release(struct cma *cma, const struct page *pages,
+-		 unsigned long count)
++static struct cma_memrange *find_cma_memrange(struct cma *cma,
++		const struct page *pages, unsigned long count)
  {
- 	unsigned long pfn, end;
+-	struct cma_memrange *cmr;
++	struct cma_memrange *cmr = NULL;
+ 	unsigned long pfn, end_pfn;
  	int r;
-@@ -974,8 +982,8 @@ static bool __cma_release(struct cma *cm
- 		return false;
+ 
+ 	pr_debug("%s(page %p, count %lu)\n", __func__, (void *)pages, count);
+ 
+ 	if (!cma || !pages || count > cma->count)
+-		return false;
++		return NULL;
+ 
+ 	pfn = page_to_pfn(pages);
+ 
+@@ -981,27 +979,66 @@ bool cma_release(struct cma *cma, const
+ 	if (r == cma->nranges) {
+ 		pr_debug("%s(page %p, count %lu, no cma range matches the page range)\n",
+ 			 __func__, (void *)pages, count);
+-		return false;
++		return NULL;
  	}
  
--	if (compound)
+-	if (PageHead(pages))
 -		__free_pages((struct page *)pages, compound_order(pages));
-+	if (frozen)
-+		free_contig_frozen_range(pfn, count);
- 	else
- 		free_contig_range(pfn, count);
+-	else
+-		free_contig_range(pfn, count);
++	return cmr;
++}
++
++static void __cma_release_frozen(struct cma *cma, struct cma_memrange *cmr,
++		const struct page *pages, unsigned long count)
++{
++	unsigned long pfn = page_to_pfn(pages);
++
++	pr_debug("%s(page %p, count %lu)\n", __func__, (void *)pages, count);
  
-@@ -1002,12 +1010,10 @@ bool cma_release(struct cma *cma, const
- 	return __cma_release(cma, pages, count, false);
++	free_contig_frozen_range(pfn, count);
+ 	cma_clear_bitmap(cma, cmr, pfn, count);
+ 	cma_sysfs_account_release_pages(cma, count);
+ 	trace_cma_release(cma->name, pfn, pages, count);
++}
++
++/**
++ * cma_release() - release allocated pages
++ * @cma:   Contiguous memory region for which the allocation is performed.
++ * @pages: Allocated pages.
++ * @count: Number of allocated pages.
++ *
++ * This function releases memory allocated by cma_alloc().
++ * It returns false when provided pages do not belong to contiguous area and
++ * true otherwise.
++ */
++bool cma_release(struct cma *cma, const struct page *pages,
++		 unsigned long count)
++{
++	struct cma_memrange *cmr;
++	unsigned long pfn;
++
++	cmr = find_cma_memrange(cma, pages, count);
++	if (!cmr)
++		return false;
++
++	pfn = page_to_pfn(pages);
++	for (; count--; pfn++)
++		VM_WARN_ON(!put_page_testzero(pfn_to_page(pfn)));
++
++	__cma_release_frozen(cma, cmr, pages, count);
+ 
+ 	return true;
  }
  
 -bool cma_free_folio(struct cma *cma, const struct folio *folio)
@@ -162,10 +226,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		unsigned long count)
  {
 -	if (WARN_ON(!folio_test_large(folio)))
--		return false;
--
--	return __cma_release(cma, &folio->page, folio_nr_pages(folio), true);
-+	return __cma_release(cma, pages, count, true);
++	struct cma_memrange *cmr;
++
++	cmr = find_cma_memrange(cma, pages, count);
++	if (!cmr)
+ 		return false;
+ 
+-	return cma_release(cma, &folio->page, folio_nr_pages(folio));
++	__cma_release_frozen(cma, cmr, pages, count);
++
++	return true;
  }
  
  int cma_for_each_area(int (*it)(struct cma *cma, void *data), void *data)
@@ -204,7 +274,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 -			folio = cma_alloc_folio(hugetlb_cma[node], order, gfp_mask);
 -			if (folio)
-+			page = cma_alloc_frozen_compound(hugetlb_cma[nid], order);
++			page = cma_alloc_frozen_compound(hugetlb_cma[node], order);
 +			if (page)
  				break;
  		}
@@ -223,12 +293,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/internal.h~mm-cma-add-cma_alloc_frozen_compound
 +++ a/mm/internal.h
-@@ -515,13 +515,6 @@ static inline void set_page_refcounted(s
- 
- static inline void set_pages_refcounted(struct page *page, unsigned long nr_pages)
+@@ -517,11 +517,6 @@ static inline void set_pages_refcounted(
  {
--	unsigned long pfn = page_to_pfn(page);
--
+ 	unsigned long pfn = page_to_pfn(page);
+ 
 -	if (PageHead(page)) {
 -		set_page_refcounted(page);
 -		return;
@@ -237,7 +305,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	for (; nr_pages--; pfn++)
  		set_page_refcounted(pfn_to_page(pfn));
  }
-@@ -952,9 +945,14 @@ void init_cma_reserved_pageblock(struct
+@@ -949,9 +944,14 @@ void init_cma_reserved_pageblock(struct
  struct cma;
  
  #ifdef CONFIG_CMA
