@@ -1,0 +1,141 @@
+From: Bing Jiao <bingjiao@google.com>
+Subject: mm/vmscan: select the closest preferred node in demote_folio_list()
+Date: Thu, 8 Jan 2026 03:32:47 +0000
+
+The preferred demotion node (migration_target_control.nid) should be the
+one closest to the source node to minimize migration latency.  Currently,
+a discrepancy exists where demote_folio_list() randomly selects an allowed
+node if the preferred node from next_demotion_node() is not set in
+mems_allowed.
+
+To address it, update next_demotion_node() to return preferred nodes,
+allowing the caller to select the preferred one.  Also update
+demote_folio_list() to traverse the demotion targets hierarchically until
+a preferred node within mems_allowed is found.  It ensures that the
+selected demotion target is consistently the closest available node.
+
+Link: https://lkml.kernel.org/r/20260108033248.2791579-3-bingjiao@google.com
+Signed-off-by: Bing Jiao <bingjiao@google.com>
+Cc: Akinobu Mita <akinobu.mita@gmail.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/memory-tiers.h |    6 +++---
+ mm/memory-tiers.c            |   11 +++++++----
+ mm/vmscan.c                  |   25 ++++++++++++++++++++++---
+ 3 files changed, 32 insertions(+), 10 deletions(-)
+
+--- a/include/linux/memory-tiers.h~mm-vmscan-select-the-closest-preferred-node-in-demote_folio_list
++++ a/include/linux/memory-tiers.h
+@@ -53,11 +53,11 @@ struct memory_dev_type *mt_find_alloc_me
+ 						  struct list_head *memory_types);
+ void mt_put_memory_types(struct list_head *memory_types);
+ #ifdef CONFIG_MIGRATION
+-int next_demotion_node(int node);
++int next_demotion_node(int node, nodemask_t *preferred_nodes);
+ void node_get_allowed_targets(pg_data_t *pgdat, nodemask_t *targets);
+ bool node_is_toptier(int node);
+ #else
+-static inline int next_demotion_node(int node)
++static inline int next_demotion_node(int node, nodemask_t *preferred_nodes)
+ {
+ 	return NUMA_NO_NODE;
+ }
+@@ -101,7 +101,7 @@ static inline void clear_node_memory_typ
+ 
+ }
+ 
+-static inline int next_demotion_node(int node)
++static inline int next_demotion_node(int node, nodemask_t *preferred_nodes)
+ {
+ 	return NUMA_NO_NODE;
+ }
+--- a/mm/memory-tiers.c~mm-vmscan-select-the-closest-preferred-node-in-demote_folio_list
++++ a/mm/memory-tiers.c
+@@ -320,13 +320,14 @@ void node_get_allowed_targets(pg_data_t
+ /**
+  * next_demotion_node() - Get the next node in the demotion path
+  * @node: The starting node to lookup the next node
++ * @preferred_nodes: The pointer to nodemask of all preferred nodes to return
+  *
+  * Return: node id for next memory node in the demotion path hierarchy
+- * from @node; NUMA_NO_NODE if @node is terminal.  This does not keep
+- * @node online or guarantee that it *continues* to be the next demotion
+- * target.
++ * from @node; NUMA_NO_NODE if @node is terminal. Also returns all preferred
++ * nodes in @preferred_nodes. This does not keep @node online or guarantee
++ * that it *continues* to be the next demotion target.
+  */
+-int next_demotion_node(int node)
++int next_demotion_node(int node, nodemask_t *preferred_nodes)
+ {
+ 	struct demotion_nodes *nd;
+ 	int target;
+@@ -357,6 +358,8 @@ int next_demotion_node(int node)
+ 	 * target node randomly seems better until now.
+ 	 */
+ 	target = node_random(&nd->preferred);
++	if (preferred_nodes)
++		nodes_copy(*preferred_nodes, nd->preferred);
+ 	rcu_read_unlock();
+ 
+ 	return target;
+--- a/mm/vmscan.c~mm-vmscan-select-the-closest-preferred-node-in-demote_folio_list
++++ a/mm/vmscan.c
+@@ -1023,9 +1023,10 @@ static unsigned int demote_folio_list(st
+ 				      struct pglist_data *pgdat,
+ 				      struct mem_cgroup *memcg)
+ {
+-	int target_nid = next_demotion_node(pgdat->node_id);
++	int target_nid;
+ 	unsigned int nr_succeeded;
+ 	nodemask_t allowed_mask;
++	nodemask_t preferred;
+ 
+ 	struct migration_target_control mtc = {
+ 		/*
+@@ -1051,8 +1052,26 @@ static unsigned int demote_folio_list(st
+ 	if (nodes_empty(allowed_mask))
+ 		return 0;
+ 
+-	if (!node_isset(target_nid, allowed_mask))
+-		target_nid = node_random(&allowed_mask);
++	target_nid = next_demotion_node(pgdat->node_id, &preferred);
++	while (target_nid != NUMA_NO_NODE &&
++	       !node_isset(target_nid, allowed_mask)) {
++		/* Filter out preferred nodes that are not in allowed. */
++		nodes_and(preferred, preferred, allowed_mask);
++		if (!nodes_empty(preferred)) {
++			/* Randomly select one node from preferred. */
++			target_nid = node_random(&preferred);
++			break;
++		}
++		/*
++		 * Preferred nodes in the lower tier are not set in allowed.
++		 * Recursively get preferred from the next lower tier.
++		 */
++		target_nid = next_demotion_node(target_nid, &preferred);
++	}
++
++	if (target_nid == NUMA_NO_NODE)
++		/* Nodes are gone (e.g., hot-unplugged). */
++		return 0;
+ 	mtc.nid = target_nid;
+ 
+ 	/* Demotion ignores all cpuset and mempolicy settings */
+_
