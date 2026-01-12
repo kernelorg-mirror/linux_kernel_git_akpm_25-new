@@ -1,9 +1,9 @@
 From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Subject: lib: introduce hierarchical per-cpu counters
-Date: Sat, 13 Dec 2025 13:56:06 -0500
+Date: Wed, 24 Dec 2025 12:46:36 -0500
 
 Patch series "mm: Fix OOM killer inaccuracy on large many-core systems",
-v10.
+v11.
 
 Introduce hierarchical per-cpu counters and use them for RSS tracking to
 fix the per-mm RSS tracking which has become too inaccurate for OOM killer
@@ -37,20 +37,6 @@ which lead to picking wrong tasks as OOM kill target:
 The approach proposed here is to replace this by the hierarchical per-cpu
 counters, which bounds the inaccuracy based on the system topology with
 O(N*logN).
-
-Notable change for v10: The new patch 3/3 changes the implementation of
-the oom killer task selection to a 2-pass algorithm, where the first pass
-uses the fast approximation provided by the hierarchical percpu counters,
-and the second pass does a precise sum for all tasks which have badness
-values within the range of the approximation accuracy.
-
-I've done moderate testing of this series on a 256-core VM with 128GB RAM.
-Figuring out whether this indeed helps solve issues with real-life
-workloads will require broader feedback from the community.
-
-The one request I did not have time to fulfill yet is to port the tests
-from the librseq feature branch implementation (userspace) to the kernel
-selftests.
 
 
 This patch (of 3):
@@ -99,9 +85,9 @@ which evolves with O(n*log(n)) as the number of CPUs increases.
 For a N-way tree, the maximum inaccuracy can be pre-calculated
 based on the the N-arity of each level and the batch size.
 
-Link: https://lkml.kernel.org/r/20251213185608.3418096-1-mathieu.desnoyers@efficios.com
-Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
-Link: https://lkml.kernel.org/r/20251213185608.3418096-2-mathieu.desnoyers@efficios.com
+Link: https://lkml.kernel.org/r/20251224174638.650551-1-mathieu.desnoyers@efficios.com
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ [1]
+Link: https://lkml.kernel.org/r/20251224174638.650551-2-mathieu.desnoyers@efficios.com
 Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
@@ -134,20 +120,38 @@ Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/percpu_counter_tree.h |  242 ++++++++
+ include/linux/mm_types.h            |    6 
+ include/linux/percpu_counter_tree.h |  293 ++++++++++
  init/main.c                         |    2 
  lib/Makefile                        |    1 
  lib/percpu_counter_tree.c           |  705 ++++++++++++++++++++++++++
- 4 files changed, 950 insertions(+)
+ 5 files changed, 1004 insertions(+), 3 deletions(-)
 
+--- a/include/linux/mm_types.h~lib-introduce-hierarchical-per-cpu-counters
++++ a/include/linux/mm_types.h
+@@ -1366,9 +1366,9 @@ static inline void __mm_flags_set_mask_b
+ 			 MT_FLAGS_USE_RCU)
+ extern struct mm_struct init_mm;
+ 
+-#define MM_STRUCT_FLEXIBLE_ARRAY_INIT				\
+-{								\
+-	[0 ... sizeof(cpumask_t) + MM_CID_STATIC_SIZE - 1] = 0	\
++#define MM_STRUCT_FLEXIBLE_ARRAY_INIT									\
++{													\
++	[0 ... sizeof(cpumask_t) + MM_CID_STATIC_SIZE + PERCPU_COUNTER_TREE_ITEMS_STATIC_SIZE - 1] = 0	\
+ }
+ 
+ /* Pointer magic because the dynamic array size confuses some compilers. */
 diff --git a/include/linux/percpu_counter_tree.h a/include/linux/percpu_counter_tree.h
 new file mode 100644
 --- /dev/null
 +++ a/include/linux/percpu_counter_tree.h
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,293 @@
 +/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 +/* SPDX-FileCopyrightText: 2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com> */
 +
@@ -160,6 +164,52 @@ new file mode 100644
 +
 +#ifdef CONFIG_SMP
 +
++#if NR_CPUS == (1U << 0)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	0
++#elif NR_CPUS <= (1U << 1)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	1
++#elif NR_CPUS <= (1U << 2)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	3
++#elif NR_CPUS <= (1U << 3)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	7
++#elif NR_CPUS <= (1U << 4)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	7
++#elif NR_CPUS <= (1U << 5)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	11
++#elif NR_CPUS <= (1U << 6)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	21
++#elif NR_CPUS <= (1U << 7)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	21
++#elif NR_CPUS <= (1U << 8)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	37
++#elif NR_CPUS <= (1U << 9)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	73
++#elif NR_CPUS <= (1U << 10)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	149
++#elif NR_CPUS <= (1U << 11)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	293
++#elif NR_CPUS <= (1U << 12)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	585
++#elif NR_CPUS <= (1U << 13)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	1173
++#elif NR_CPUS <= (1U << 14)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	2341
++#elif NR_CPUS <= (1U << 15)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	4681
++#elif NR_CPUS <= (1U << 16)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	4681
++#elif NR_CPUS <= (1U << 17)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	8777
++#elif NR_CPUS <= (1U << 18)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	17481
++#elif NR_CPUS <= (1U << 19)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	34953
++#elif NR_CPUS <= (1U << 20)
++# define PERCPU_COUNTER_TREE_STATIC_NR_ITEMS	69905
++#else
++# error "Unsupported number of CPUs."
++#endif
++
 +struct percpu_counter_tree_level_item {
 +	atomic_t count;			/*
 +					 * Count the number of carry fort this tree item.
@@ -167,6 +217,9 @@ new file mode 100644
 +					 * carry accounted for at this tree level.
 +					 */
 +} ____cacheline_aligned_in_smp;
++
++#define PERCPU_COUNTER_TREE_ITEMS_STATIC_SIZE	\
++	(PERCPU_COUNTER_TREE_STATIC_NR_ITEMS * sizeof(struct percpu_counter_tree_level_item))
 +
 +struct percpu_counter_tree {
 +	/* Fast-path fields. */
@@ -241,6 +294,8 @@ new file mode 100644
 +}
 +
 +#else	/* !CONFIG_SMP */
++
++#define PERCPU_COUNTER_TREE_ITEMS_STATIC_SIZE	0
 +
 +struct percpu_counter_tree_level_item;
 +
@@ -400,7 +455,7 @@ new file mode 100644
  #include <net/net_namespace.h>
  
  #include <asm/io.h>
-@@ -1063,6 +1064,7 @@ void start_kernel(void)
+@@ -1064,6 +1065,7 @@ void start_kernel(void)
  	vfs_caches_init_early();
  	sort_main_extable();
  	trap_init();

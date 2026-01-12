@@ -1,0 +1,116 @@
+From: Maciej Wieczor-Retman <maciej.wieczor-retman@intel.com>
+Subject: mm/execmem: untag addresses in EXECMEM_ROX related pointer arithmetic
+Date: Mon, 12 Jan 2026 17:27:54 +0000
+
+ARCH_HAS_EXECMEM_ROX was re-enabled in x86 at Linux 6.14 release. 
+vm_reset_perms() calculates range's start and end addresses using min()
+and max() functions.  To do that it compares pointers but, with KASAN
+software tags mode enabled, some are tagged - addr variable is, while
+start and end variables aren't.  This can cause the wrong address to be
+chosen and result in various errors in different places.
+
+Reset tags in the address used as function argument in min(), max().
+
+execmem_cache_add() adds tagged pointers to a maple tree structure, which
+then are incorrectly compared when walking the tree.  That results in
+different pointers being returned later and page permission violation
+errors panicking the kernel.
+
+Reset tag of the address range inserted into the maple tree inside
+execmem_vmalloc() which then gets propagated to execmem_cache_add().
+
+Link: https://lkml.kernel.org/r/09f5b8d31aaf87cf2ba30a29c56524fdd4958bcc.1768233085.git.m.wieczorretman@pm.me
+Signed-off-by: Maciej Wieczor-Retman <maciej.wieczor-retman@intel.com>
+Acked-by: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Andy Lutomirski <luto@kernel.org>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Ard Biesheuvel <ardb@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Bill Wendling <morbo@google.com>
+Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Breno Leitao <leitao@debian.org>
+Cc: Brian Gerst <brgerst@gmail.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Dmitriy Vyukov <dvyukov@google.com>
+Cc: Guilherme Giacomo Simoes <trintaeoitogc@gmail.com>
+Cc: "H. Peter Anvin" <hpa@zytor.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jan Kiszka <jan.kiszka@siemens.com>
+Cc: Jeremy Linton <jeremy.linton@arm.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Josh Poimboeuf <jpoimboe@kernel.org>
+Cc: Justin Stitt <justinstitt@google.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Kieran Bingham <kbingham@kernel.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Marc Rutland <mark.rutland@arm.com>
+Cc: Marc Zyngier <maz@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mostafa Saleh <smostafa@google.com>
+Cc: Nathan Chancellor <nathan@kernel.org>
+Cc: Omar Sandoval <osandov@fb.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sami Tolvanen <samitolvanen@google.com>
+Cc: Samuel Holland <samuel.holland@sifive.com>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Gleixner <tglx@kernel.org>
+Cc: Thomas Huth <thuth@redhat.com>
+Cc: Thomas Lendacky <thomas.lendacky@amd.com>
+Cc: "Uladzislau Rezki (Sony)" <urezki@gmail.com>
+Cc: Uros Bizjak <ubizjak@gmail.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yeoreum Yun <yeoreum.yun@arm.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/execmem.c |    9 ++++++++-
+ mm/vmalloc.c |    7 ++++++-
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+--- a/mm/execmem.c~mm-execmem-untag-addresses-in-execmem_rox-related-pointer-arithmetic
++++ a/mm/execmem.c
+@@ -59,7 +59,14 @@ static void *execmem_vmalloc(struct exec
+ 		return NULL;
+ 	}
+ 
+-	return p;
++	/*
++	 * Resetting the tag here is necessary to avoid the tagged address
++	 * ending up in the maple tree structure. There it's linear address
++	 * can be incorrectly compared with other addresses which can result in
++	 * a wrong address being picked down the line and for example a page
++	 * permission violation error panicking the kernel.
++	 */
++	return kasan_reset_tag(p);
+ }
+ 
+ struct vm_struct *execmem_vmap(size_t size)
+--- a/mm/vmalloc.c~mm-execmem-untag-addresses-in-execmem_rox-related-pointer-arithmetic
++++ a/mm/vmalloc.c
+@@ -3359,7 +3359,12 @@ static void vm_reset_perms(struct vm_str
+ 	 * the vm_unmap_aliases() flush includes the direct map.
+ 	 */
+ 	for (i = 0; i < area->nr_pages; i += 1U << page_order) {
+-		unsigned long addr = (unsigned long)page_address(area->pages[i]);
++		/*
++		 * Addresses' tag needs resetting so it can be properly used in
++		 * the min() and max() below. Otherwise the start or end values
++		 * might be favoured.
++		 */
++		unsigned long addr = (unsigned long)kasan_reset_tag(page_address(area->pages[i]));
+ 
+ 		if (addr) {
+ 			unsigned long page_size;
+_

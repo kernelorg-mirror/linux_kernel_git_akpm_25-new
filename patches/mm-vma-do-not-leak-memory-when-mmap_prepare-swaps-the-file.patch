@@ -1,0 +1,82 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: do not leak memory when .mmap_prepare swaps the file
+Date: Mon, 12 Jan 2026 15:51:43 +0000
+
+The current implementation of mmap() is set up such that a struct file
+object is obtained for the input fd in ksys_mmap_pgoff() via fget(), and
+its reference count decremented at the end of the function via.  fput().
+
+If a merge can be achieved, we are fine to simply decrement the refcount
+on the file.  Otherwise, in __mmap_new_file_vma(), we increment the
+reference count on the file via get_file() such that the fput() in
+ksys_mmap_pgoff() does not free the now-referenced file object.
+
+The introduction of the f_op->mmap_prepare hook changes things, as it
+becomes possible for a driver to replace the file object right at the
+beginning of the mmap operation.
+
+The current implementation is buggy if this happens because it
+unconditionally calls get_file() on the mapping's file whether or not it
+was replaced (and thus whether or not its reference count will be
+decremented at the end of ksys_mmap_pgoff()).
+
+This results in a memory leak, and was exposed in commit ab04945f91bc
+("mm: update mem char driver to use mmap_prepare").
+
+This patch solves the problem by explicitly tracking whether we actually
+need to call get_file() on the file or not, and only doing so if required.
+
+Link: https://lkml.kernel.org/r/20260112155143.661284-1-lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Fixes: ab04945f91bc ("mm: update mem char driver to use mmap_prepare")
+Reported-by: syzbot+bf5de69ebb4bdf86f59f@syzkaller.appspotmail.com
+Closes: https://lore.kernel.org/all/6964a92b.050a0220.eaf7.008a.GAE@google.com/
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/vma.c |   11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+--- a/mm/vma.c~mm-vma-do-not-leak-memory-when-mmap_prepare-swaps-the-file
++++ a/mm/vma.c
+@@ -37,6 +37,8 @@ struct mmap_state {
+ 	bool check_ksm_early :1;
+ 	/* If we map new, hold the file rmap lock on mapping. */
+ 	bool hold_file_rmap_lock :1;
++	/* If .mmap_prepare changed the file, we don't need to pin. */
++	bool file_doesnt_need_get :1;
+ };
+ 
+ #define MMAP_STATE(name, mm_, vmi_, addr_, len_, pgoff_, vm_flags_, file_) \
+@@ -2450,7 +2452,9 @@ static int __mmap_new_file_vma(struct mm
+ 	struct vma_iterator *vmi = map->vmi;
+ 	int error;
+ 
+-	vma->vm_file = get_file(map->file);
++	vma->vm_file = map->file;
++	if (!map->file_doesnt_need_get)
++		get_file(map->file);
+ 
+ 	if (!map->file->f_op->mmap)
+ 		return 0;
+@@ -2638,7 +2642,10 @@ static int call_mmap_prepare(struct mmap
+ 
+ 	/* Update fields permitted to be changed. */
+ 	map->pgoff = desc->pgoff;
+-	map->file = desc->vm_file;
++	if (desc->vm_file != map->file) {
++		map->file_doesnt_need_get = true;
++		map->file = desc->vm_file;
++	}
+ 	map->vm_flags = desc->vm_flags;
+ 	map->page_prot = desc->page_prot;
+ 	/* User-defined fields. */
+_
