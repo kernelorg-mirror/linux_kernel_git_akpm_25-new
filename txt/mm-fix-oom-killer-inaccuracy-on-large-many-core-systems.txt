@@ -1,0 +1,146 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Subject: mm: fix OOM killer inaccuracy on large many-core systems
+Date: Mon, 12 Jan 2026 15:00:55 -0500
+
+Use hierarchical per-cpu counters for rss tracking to fix the per-mm RSS
+tracking which has become too inaccurate for OOM killer purposes on large
+many-core systems.
+
+The following rss tracking issues were noted by Sweet Tea Dorminy [1],
+which lead to picking wrong tasks as OOM kill target:
+
+  Recently, several internal services had an RSS usage regression as part of a
+  kernel upgrade. Previously, they were on a pre-6.2 kernel and were able to
+  read RSS statistics in a backup watchdog process to monitor and decide if
+  they'd overrun their memory budget. Now, however, a representative service
+  with five threads, expected to use about a hundred MB of memory, on a 250-cpu
+  machine had memory usage tens of megabytes different from the expected amount
+  -- this constituted a significant percentage of inaccuracy, causing the
+  watchdog to act.
+
+  This was a result of commit f1a7941243c1 ("mm: convert mm's rss stats
+  into percpu_counter") [1].  Previously, the memory error was bounded by
+  64*nr_threads pages, a very livable megabyte. Now, however, as a result of
+  scheduler decisions moving the threads around the CPUs, the memory error could
+  be as large as a gigabyte.
+
+  This is a really tremendous inaccuracy for any few-threaded program on a
+  large machine and impedes monitoring significantly. These stat counters are
+  also used to make OOM killing decisions, so this additional inaccuracy could
+  make a big difference in OOM situations -- either resulting in the wrong
+  process being killed, or in less memory being returned from an OOM-kill than
+  expected.
+
+Here is a (possibly incomplete) list of the prior approaches that were
+used or proposed, along with their downside:
+
+1) Per-thread rss tracking: large error on many-thread processes.
+
+2) Per-CPU counters: up to 12% slower for short-lived processes and 9%
+   increased system time in make test workloads [1]. Moreover, the
+   inaccuracy increases with O(n^2) with the number of CPUs.
+
+3) Per-NUMA-node counters: requires atomics on fast-path (overhead),
+   error is high with systems that have lots of NUMA nodes (32 times
+   the number of NUMA nodes).
+
+The approach proposed here is to replace this by the hierarchical
+per-cpu counters, which bounds the inaccuracy based on the system
+topology with O(N*logN).
+
+commit 82241a83cd15 ("mm: fix the inaccurate memory statistics issue for
+users") introduced get_mm_counter_sum() for precise /proc memory status
+queries.  Implement it with percpu_counter_tree_precise_sum() since it
+is not a fast path and precision is preferred over speed.
+
+* Testing results:
+
+Test hardware: 2 sockets AMD EPYC 9654 96-Core Processor (384 logical CPUs total)
+
+Methodology:
+
+Comparing the current upstream implementation with the hierarchical
+counters is done by keeping both implementations wired up in parallel,
+and running a single-process, single-threaded program which hops
+randomly across CPUs in the system, calling mmap(2) and munmap(2) on
+random CPUs, keeping track of an array of allocated mappings, randomly
+choosing entries to either map or unmap.
+
+get_mm_counter() is instrumented to compare the upstream counter
+approximation to the precise value, and print the delta when going over
+a given threshold. The delta of the hierarchical counter approximation
+to the precise value is also printed for comparison.
+
+After a few minutes running this test, the upstream implementation
+counter approximation reaches a 1GB delta from the
+precise value, compared to 80MB delta with the hierarchical counter.
+The hierarchical counter provides a guaranteed maximum approximation
+inaccuracy of 192MB on that hardware topology.
+
+* Fast path implementation comparison
+
+The new inline percpu_counter_tree_add() uses a this_cpu_add_return()
+for the fast path (under a certain allocation size threshold).  Above
+that, it calls a slow path which "trickles up" the carry to upper level
+counters with atomic_add_return.
+
+In comparison, the upstream counters implementation calls
+percpu_counter_add_batch which uses this_cpu_try_cmpxchg() on the fast
+path, and does a raw_spin_lock_irqsave above a certain threshold.
+
+The hierarchical implementation is therefore expected to have less
+contention on mid-sized allocations than the upstream counters because
+the atomic counters tracking those bits are only shared across nearby
+CPUs. In comparison, the upstream counters immediately use a global
+spinlock when reaching the threshold.
+
+* Benchmarks
+
+Using will-it-scale page_fault1 benchmarks to compare the upstream
+counters to the hierarchical counters. This is done with hyperthreading
+disabled. The speedup is within the standard deviation of the upstream
+runs, so the overhead is not significant.
+
+                                          upstream   hierarchical    speedup
+page_fault1_processes -s 100 -t 1           614783         615558      +0.1%
+page_fault1_threads -s 100 -t 1             612788         612447      -0.1%
+page_fault1_processes -s 100 -t 96        37994977       37932035      -0.2%
+page_fault1_threads -s 100 -t 96           2484130        2504860      +0.8%
+page_fault1_processes -s 100 -t 192       71262917       71118830      -0.2%
+page_fault1_threads -s 100 -t 192          2446437        2469296      +0.1%
+
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
+Link: https://lore.kernel.org/lkml/20250704150226.47980-1-mathieu.desnoyers@efficios.com/
+Link: https://lkml.kernel.org/r/20260112200056.1250404-3-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: "Paul E. McKenney" <paulmck@kernel.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Martin Liu <liumartin@google.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Christan König <christian.koenig@amd.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Sweet Tea Dorminy <sweettea-kernel@dorminy.me>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: "Liam R . Howlett" <liam.howlett@oracle.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
