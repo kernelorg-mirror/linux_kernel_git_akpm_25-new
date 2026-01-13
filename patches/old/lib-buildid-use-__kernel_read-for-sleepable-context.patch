@@ -1,6 +1,9 @@
 From: Shakeel Butt <shakeel.butt@linux.dev>
 Subject: lib/buildid: use __kernel_read() for sleepable context
-Date: Thu, 18 Dec 2025 12:55:05 -0800
+Date: Mon, 22 Dec 2025 12:58:59 -0800
+
+Prevent a "BUG: unable to handle kernel NULL pointer dereference in
+filemap_read_folio".
 
 For the sleepable context, convert freader to use __kernel_read() instead
 of direct page cache access via read_cache_folio().  This simplifies the
@@ -20,11 +23,15 @@ non-sleepable contexts.  In addition, I would like to replace the
 secretmem check with a more generic approach and will add fstest for the
 buildid code.
 
-Link: https://lkml.kernel.org/r/20251218205505.2415840-1-shakeel.butt@linux.dev
+Link: https://lkml.kernel.org/r/20251222205859.3968077-1-shakeel.butt@linux.dev
 Fixes: ad41251c290d ("lib/buildid: implement sleepable build_id_parse() API")
-Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>Reported-by: syzbot+09b7d050e4806540153d@syzkaller.appspotmail.com
+Reported-by: syzbot+09b7d050e4806540153d@syzkaller.appspotmail.com
 Closes: https://syzkaller.appspot.com/bug?extid=09b7d050e4806540153d
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
 Reviewed-by: Christoph Hellwig <hch@lst.de>
+Tested-by: Jinchao Wang <wangjinchao600@gmail.com>
+  Link: https://lkml.kernel.org/r/aUteBPWPYzVWIZFH@ndev
+Reviewed-by: Christian Brauner <brauner@kernel.org>
 Cc: Alexei Starovoitov <ast@kernel.org>
 Cc: Andrii Nakryiko <andrii@kernel.org>
 Cc: Daniel Borkman <daniel@iogearbox.net>
@@ -34,8 +41,8 @@ Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- lib/buildid.c |   47 +++++++++++++++++++++++++++++++++++------------
- 1 file changed, 35 insertions(+), 12 deletions(-)
+ lib/buildid.c |   32 ++++++++++++++++++++------------
+ 1 file changed, 20 insertions(+), 12 deletions(-)
 
 --- a/lib/buildid.c~lib-buildid-use-__kernel_read-for-sleepable-context
 +++ a/lib/buildid.c
@@ -47,37 +54,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/secretmem.h>
  
  #define BUILD_ID 3
-@@ -37,6 +38,29 @@ static void freader_put_folio(struct fre
- 	r->folio = NULL;
- }
- 
-+/*
-+ * Data is read directly into r->buf. Returns pointer to the buffer
-+ * on success, NULL on failure with r->err set.
-+ */
-+static const void *freader_fetch_sync(struct freader *r, loff_t file_off, size_t sz)
-+{
-+	ssize_t ret;
-+	loff_t pos = file_off;
-+	char *buf = r->buf;
-+
-+	do {
-+		ret = __kernel_read(r->file, buf, sz, &pos);
-+		if (ret <= 0) {
-+			r->err = ret ?: -EIO;
-+			return NULL;
-+		}
-+		buf += ret;
-+		sz -= ret;
-+	} while (sz > 0);
-+
-+	return r->buf;
-+}
-+
- static int freader_get_folio(struct freader *r, loff_t file_off)
- {
- 	/* check if we can just reuse current folio */
-@@ -46,20 +70,9 @@ static int freader_get_folio(struct frea
+@@ -46,20 +47,9 @@ static int freader_get_folio(struct frea
  
  	freader_put_folio(r);
  
@@ -99,7 +76,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	if (IS_ERR(r->folio) || !folio_test_uptodate(r->folio)) {
  		if (!IS_ERR(r->folio))
  			folio_put(r->folio);
-@@ -97,6 +110,16 @@ const void *freader_fetch(struct freader
+@@ -97,6 +87,24 @@ const void *freader_fetch(struct freader
  		return r->data + file_off;
  	}
  
@@ -110,8 +87,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	}
 +
 +	/* use __kernel_read() for sleepable context */
-+	if (r->may_fault)
-+		return freader_fetch_sync(r, file_off, sz);
++	if (r->may_fault) {
++		ssize_t ret;
++
++		ret = __kernel_read(r->file, r->buf, sz, &file_off);
++		if (ret != sz) {
++			r->err = (ret < 0) ? ret : -EIO;
++			return NULL;
++		}
++		return r->buf;
++	}
 +
  	/* fetch or reuse folio for given file offset */
  	r->err = freader_get_folio(r, file_off);
