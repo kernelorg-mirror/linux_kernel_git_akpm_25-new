@@ -1,9 +1,9 @@
 From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Subject: lib: introduce hierarchical per-cpu counters
-Date: Wed, 24 Dec 2025 12:46:36 -0500
+Date: Mon, 12 Jan 2026 15:00:54 -0500
 
 Patch series "mm: Fix OOM killer inaccuracy on large many-core systems",
-v11.
+v14.
 
 Introduce hierarchical per-cpu counters and use them for RSS tracking to
 fix the per-mm RSS tracking which has become too inaccurate for OOM killer
@@ -34,9 +34,9 @@ which lead to picking wrong tasks as OOM kill target:
   process being killed, or in less memory being returned from an OOM-kill than
   expected.
 
-The approach proposed here is to replace this by the hierarchical per-cpu
-counters, which bounds the inaccuracy based on the system topology with
-O(N*logN).
+The approach proposed here is to replace this by the hierarchical
+per-cpu counters, which bounds the inaccuracy based on the system
+topology with O(N*logN).
 
 
 This patch (of 3):
@@ -85,9 +85,9 @@ which evolves with O(n*log(n)) as the number of CPUs increases.
 For a N-way tree, the maximum inaccuracy can be pre-calculated
 based on the the N-arity of each level and the batch size.
 
-Link: https://lkml.kernel.org/r/20251224174638.650551-1-mathieu.desnoyers@efficios.com
-Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ [1]
-Link: https://lkml.kernel.org/r/20251224174638.650551-2-mathieu.desnoyers@efficios.com
+Link: https://lkml.kernel.org/r/20260112200056.1250404-1-mathieu.desnoyers@efficios.com
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
+Link: https://lkml.kernel.org/r/20260112200056.1250404-2-mathieu.desnoyers@efficios.com
 Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
@@ -98,7 +98,6 @@ Cc: Tejun Heo <tj@kernel.org>
 Cc: Christoph Lameter <cl@linux.com>
 Cc: Martin Liu <liumartin@google.com>
 Cc: David Rientjes <rientjes@google.com>
-Cc: Christan König <christian.koenig@amd.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Michal Hocko <mhocko@suse.com>
@@ -120,17 +119,16 @@ Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
-Cc: Mark Brown <broonie@kernel.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Christan König <christian.koenig@amd.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/mm_types.h            |    6 
- include/linux/percpu_counter_tree.h |  293 ++++++++++
+ include/linux/percpu_counter_tree.h |  344 ++++++++++++
  init/main.c                         |    2 
  lib/Makefile                        |    1 
- lib/percpu_counter_tree.c           |  705 ++++++++++++++++++++++++++
- 5 files changed, 1004 insertions(+), 3 deletions(-)
+ lib/percpu_counter_tree.c           |  702 ++++++++++++++++++++++++++
+ 5 files changed, 1052 insertions(+), 3 deletions(-)
 
 --- a/include/linux/mm_types.h~lib-introduce-hierarchical-per-cpu-counters
 +++ a/include/linux/mm_types.h
@@ -151,7 +149,7 @@ diff --git a/include/linux/percpu_counter_tree.h a/include/linux/percpu_counter_
 new file mode 100644
 --- /dev/null
 +++ a/include/linux/percpu_counter_tree.h
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,344 @@
 +/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 +/* SPDX-FileCopyrightText: 2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com> */
 +
@@ -211,8 +209,8 @@ new file mode 100644
 +#endif
 +
 +struct percpu_counter_tree_level_item {
-+	atomic_t count;			/*
-+					 * Count the number of carry fort this tree item.
++	atomic_long_t count;		/*
++					 * Count the number of carry for this tree item.
 +					 * The carry counter is kept at the order of the
 +					 * carry accounted for at this tree level.
 +					 */
@@ -223,17 +221,17 @@ new file mode 100644
 +
 +struct percpu_counter_tree {
 +	/* Fast-path fields. */
-+	unsigned int __percpu *level0;	/* Pointer to per-CPU split counters (tree level 0). */
-+	unsigned int level0_bit_mask;	/* Bit mask to apply to detect carry propagation from tree level 0. */
++	unsigned long __percpu *level0;	/* Pointer to per-CPU split counters (tree level 0). */
++	unsigned long level0_bit_mask;	/* Bit mask to apply to detect carry propagation from tree level 0. */
 +	union {
-+		unsigned int *i;	/* Approximate sum for single-CPU topology. */
-+		atomic_t *a;		/* Approximate sum for SMP topology.  */
++		unsigned long *i;	/* Approximate sum for single-CPU topology. */
++		atomic_long_t *a;	/* Approximate sum for SMP topology.  */
 +	} approx_sum;
-+	int bias;			/* Bias to apply to counter precise and approximate values. */
++	long bias;			/* Bias to apply to counter precise and approximate values. */
 +
 +	/* Slow-path fields. */
 +	struct percpu_counter_tree_level_item *items;	/* Array of tree items for levels 1 to N. */
-+	unsigned int batch_size;	/*
++	unsigned long batch_size;	/*
 +					 * The batch size is the increment step at level 0 which
 +					 * triggers a carry propagation. The batch size is required
 +					 * to be greater than 1, and a power of 2.
@@ -248,27 +246,27 @@ new file mode 100644
 +	 * compared to the "over" accuracy range.
 +	 */
 +	struct {
-+		unsigned int under;
-+		unsigned int over;
++		unsigned long under;
++		unsigned long over;
 +	} approx_accuracy_range;
 +};
 +
 +size_t percpu_counter_tree_items_size(void);
 +int percpu_counter_tree_init_many(struct percpu_counter_tree *counters, struct percpu_counter_tree_level_item *items,
-+				  unsigned int nr_counters, unsigned int batch_size, gfp_t gfp_flags);
++				  unsigned int nr_counters, unsigned long batch_size, gfp_t gfp_flags);
 +int percpu_counter_tree_init(struct percpu_counter_tree *counter, struct percpu_counter_tree_level_item *items,
-+			     unsigned int batch_size, gfp_t gfp_flags);
++			     unsigned long batch_size, gfp_t gfp_flags);
 +void percpu_counter_tree_destroy_many(struct percpu_counter_tree *counter, unsigned int nr_counters);
 +void percpu_counter_tree_destroy(struct percpu_counter_tree *counter);
-+void percpu_counter_tree_add(struct percpu_counter_tree *counter, int inc);
-+int percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter);
++void percpu_counter_tree_add(struct percpu_counter_tree *counter, long inc);
++long percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter);
 +int percpu_counter_tree_approximate_compare(struct percpu_counter_tree *a, struct percpu_counter_tree *b);
-+int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, int v);
++int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, long v);
 +int percpu_counter_tree_precise_compare(struct percpu_counter_tree *a, struct percpu_counter_tree *b);
-+int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, int v);
-+void percpu_counter_tree_set(struct percpu_counter_tree *counter, int v);
++int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, long v);
++void percpu_counter_tree_set(struct percpu_counter_tree *counter, long v);
 +void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
-+						    unsigned int *under, unsigned int *over);
++						    unsigned long *under, unsigned long *over);
 +int percpu_counter_tree_subsystem_init(void);
 +
 +/**
@@ -282,15 +280,15 @@ new file mode 100644
 + * Return: The current approximate counter sum.
 + */
 +static inline
-+int percpu_counter_tree_approximate_sum(struct percpu_counter_tree *counter)
++long percpu_counter_tree_approximate_sum(struct percpu_counter_tree *counter)
 +{
-+	unsigned int v;
++	unsigned long v;
 +
 +	if (!counter->level0_bit_mask)
 +		v = READ_ONCE(*counter->approx_sum.i);
 +	else
-+		v = atomic_read(counter->approx_sum.a);
-+	return (int) (v + (unsigned int)READ_ONCE(counter->bias));
++		v = atomic_long_read(counter->approx_sum.a);
++	return (long) (v + (unsigned long)READ_ONCE(counter->bias));
 +}
 +
 +#else	/* !CONFIG_SMP */
@@ -300,7 +298,7 @@ new file mode 100644
 +struct percpu_counter_tree_level_item;
 +
 +struct percpu_counter_tree {
-+	atomic_t count;
++	atomic_long_t count;
 +};
 +
 +static inline
@@ -311,16 +309,16 @@ new file mode 100644
 +
 +static inline
 +int percpu_counter_tree_init_many(struct percpu_counter_tree *counters, struct percpu_counter_tree_level_item *items,
-+				  unsigned int nr_counters, unsigned int batch_size, gfp_t gfp_flags)
++				  unsigned int nr_counters, unsigned long batch_size, gfp_t gfp_flags)
 +{
 +	for (unsigned int i = 0; i < nr_counters; i++)
-+		atomic_set(&counters[i].count, 0);
++		atomic_long_set(&counters[i].count, 0);
 +	return 0;
 +}
 +
 +static inline
 +int percpu_counter_tree_init(struct percpu_counter_tree *counter, struct percpu_counter_tree_level_item *items,
-+			     unsigned int batch_size, gfp_t gfp_flags)
++			     unsigned long batch_size, gfp_t gfp_flags)
 +{
 +	return percpu_counter_tree_init_many(counter, items, 1, batch_size, gfp_flags);
 +}
@@ -336,16 +334,16 @@ new file mode 100644
 +}
 +
 +static inline
-+int percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter)
++long percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter)
 +{
-+	return atomic_read(&counter->count);
++	return atomic_long_read(&counter->count);
 +}
 +
 +static inline
 +int percpu_counter_tree_precise_compare(struct percpu_counter_tree *a, struct percpu_counter_tree *b)
 +{
-+	int count_a = percpu_counter_tree_precise_sum(a),
-+	    count_b = percpu_counter_tree_precise_sum(b);
++	long count_a = percpu_counter_tree_precise_sum(a),
++	     count_b = percpu_counter_tree_precise_sum(b);
 +
 +	if (count_a == count_b)
 +		return 0;
@@ -355,9 +353,9 @@ new file mode 100644
 +}
 +
 +static inline
-+int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, int v)
++int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, long v)
 +{
-+	int count = percpu_counter_tree_precise_sum(counter);
++	long count = percpu_counter_tree_precise_sum(counter);
 +
 +	if (count == v)
 +		return 0;
@@ -373,33 +371,33 @@ new file mode 100644
 +}
 +
 +static inline
-+int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, int v)
++int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, long v)
 +{
 +	return percpu_counter_tree_precise_compare_value(counter, v);
 +}
 +
 +static inline
-+void percpu_counter_tree_set(struct percpu_counter_tree *counter, int v)
++void percpu_counter_tree_set(struct percpu_counter_tree *counter, long v)
 +{
-+	atomic_set(&counter->count, v);
++	atomic_long_set(&counter->count, v);
 +}
 +
 +static inline
 +void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
-+						    unsigned int *under, unsigned int *over)
++						    unsigned long *under, unsigned long *over)
 +{
 +	*under = 0;
 +	*over = 0;
 +}
 +
 +static inline
-+void percpu_counter_tree_add(struct percpu_counter_tree *counter, int inc)
++void percpu_counter_tree_add(struct percpu_counter_tree *counter, long inc)
 +{
-+	atomic_add(inc, &counter->count);
++	atomic_long_add(inc, &counter->count);
 +}
 +
 +static inline
-+int percpu_counter_tree_approximate_sum(struct percpu_counter_tree *counter)
++long percpu_counter_tree_approximate_sum(struct percpu_counter_tree *counter)
 +{
 +	return percpu_counter_tree_precise_sum(counter);
 +}
@@ -422,9 +420,9 @@ new file mode 100644
 + * Return: The current positive approximate counter sum.
 + */
 +static inline
-+int percpu_counter_tree_approximate_sum_positive(struct percpu_counter_tree *counter)
++long percpu_counter_tree_approximate_sum_positive(struct percpu_counter_tree *counter)
 +{
-+	int v = percpu_counter_tree_approximate_sum(counter);
++	long v = percpu_counter_tree_approximate_sum(counter);
 +	return v > 0 ? v : 0;
 +}
 +
@@ -438,10 +436,61 @@ new file mode 100644
 + * Return: The current positive precise counter sum.
 + */
 +static inline
-+int percpu_counter_tree_precise_sum_positive(struct percpu_counter_tree *counter)
++long percpu_counter_tree_precise_sum_positive(struct percpu_counter_tree *counter)
 +{
-+	int v = percpu_counter_tree_precise_sum(counter);
++	long v = percpu_counter_tree_precise_sum(counter);
 +	return v > 0 ? v : 0;
++}
++
++/**
++ * percpu_counter_tree_approximate_min_max_range() - Return the approximation min and max precise values.
++ * @approx_sum: Approximated sum.
++ * @under: Tree accuracy range (under).
++ * @over: Tree accuracy range (over).
++ * @precise_min: Minimum possible value for precise sum (output).
++ * @precise_max: Maximum possible value for precise sum (output).
++ *
++ * Calculate the minimum and maximum precise values for a given
++ * approximation and (under, over) accuracy range.
++ *
++ * The range of the approximation as a function of the precise sum is expressed as:
++ *
++ *   approx_sum >= precise_sum - approx_accuracy_range.under
++ *   approx_sum <= precise_sum + approx_accuracy_range.over
++ *
++ * Therefore, the range of the precise sum as a function of the approximation is expressed as:
++ *
++ *   precise_sum <= approx_sum + approx_accuracy_range.under
++ *   precise_sum >= approx_sum - approx_accuracy_range.over
++ */
++static inline
++void percpu_counter_tree_approximate_min_max_range(long approx_sum, unsigned long under, unsigned long over,
++						   long *precise_min, long *precise_max)
++{
++	*precise_min = approx_sum - over;
++	*precise_max = approx_sum + under;
++}
++
++/**
++ * percpu_counter_tree_approximate_min_max() - Return the tree approximation, min and max possible precise values.
++ * @counter: The counter to sum.
++ * @approx_sum: Approximate sum (output).
++ * @precise_min: Minimum possible value for precise sum (output).
++ * @precise_max: Maximum possible value for precise sum (output).
++ *
++ * Return the approximate sum, minimum and maximum precise values for
++ * a counter.
++ */
++static inline
++void percpu_counter_tree_approximate_min_max(struct percpu_counter_tree *counter,
++					     long *approx_sum, long *precise_min, long *precise_max)
++{
++	unsigned long under, over;
++	long v = percpu_counter_tree_approximate_sum(counter);
++
++	percpu_counter_tree_approximate_accuracy_range(counter, &under, &over);
++	percpu_counter_tree_approximate_min_max_range(v, under, over, precise_min, precise_max);
++	*approx_sum = v;
 +}
 +
 +#endif  /* _PERCPU_COUNTER_TREE_H */
@@ -477,7 +526,7 @@ diff --git a/lib/percpu_counter_tree.c a/lib/percpu_counter_tree.c
 new file mode 100644
 --- /dev/null
 +++ a/lib/percpu_counter_tree.c
-@@ -0,0 +1,705 @@
+@@ -0,0 +1,702 @@
 +// SPDX-License-Identifier: GPL-2.0+ OR MIT
 +// SPDX-FileCopyrightText: 2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 +
@@ -494,7 +543,7 @@ new file mode 100644
 + * reaching the batch size thresholds.
 + *
 + * Counters at levels 0, 1, 2 can be kept on a single byte ([-128 .. +127] range),
-+ * although it may be relevant to keep them on 32-bit counters for
++ * although it may be relevant to keep them on 64-bit counters for
 + * simplicity. (complexity vs memory footprint tradeoff)
 + *
 + * Counter at level 3 can be kept on a 32-bit counter.
@@ -549,7 +598,7 @@ new file mode 100644
 + * Level 2:      1 bit        (v & ~((1UL << 6) - 1))        0 .. +127
 + * Level 3:     25 bits       (v & ~((1UL << 7) - 1))        0 .. 2^32-1
 + *
-+ * Note: Use a full 32-bit per-cpu counter at level 0 to allow precise sum.
++ * Note: Use a full 64-bit per-cpu counter at level 0 to allow precise sum.
 + *
 + * Note: Use cacheline aligned counters at levels above 0 to prevent false sharing.
 + *       If memory footprint is an issue, a specialized allocator could be used
@@ -578,7 +627,7 @@ new file mode 100644
 + *         if (!inc)
 + *                 return;
 + *
-+ *         res = atomic_add_return(counter @ Level 1, inc);
++ *         res = atomic_long_add_return(counter @ Level 1, inc);
 + *         orig = res - inc;
 + *         if (inc < 0) {
 + *                 inc = -(-inc & ~0b00111111);  // Clear used bits
@@ -594,7 +643,7 @@ new file mode 100644
 + *         if (!inc)
 + *                 return;
 + *
-+ *         res = atomic_add_return(counter @ Level 2, inc);
++ *         res = atomic_long_add_return(counter @ Level 2, inc);
 + *         orig = res - inc;
 + *         if (inc < 0) {
 + *                 inc = -(-inc & ~0b01111111);  // Clear used bits
@@ -610,7 +659,7 @@ new file mode 100644
 + *         if (!inc)
 + *                 return;
 + *
-+ *         atomic_add(counter @ Level 3, inc);
++ *         atomic_long_add(counter @ Level 3, inc);
 + */
 +
 +#include <linux/percpu_counter_tree.h>
@@ -668,13 +717,13 @@ new file mode 100644
 +};
 +
 +static const struct counter_config *counter_config;	/* Hierarchical counter configuration for the hardware topology. */
-+static unsigned int nr_cpus_order,			/* Order of nr_cpu_ids. */
-+		    accuracy_multiplier;		/* Calculate accuracy for a given batch size (multiplication factor). */
++static unsigned int nr_cpus_order;			/* Order of nr_cpu_ids. */
++static unsigned long accuracy_multiplier;		/* Calculate accuracy for a given batch size (multiplication factor). */
 +
 +static
 +int __percpu_counter_tree_init(struct percpu_counter_tree *counter,
-+			       unsigned int batch_size, gfp_t gfp_flags,
-+			       unsigned int __percpu *level0,
++			       unsigned long batch_size, gfp_t gfp_flags,
++			       unsigned long __percpu *level0,
 +			       struct percpu_counter_tree_level_item *items)
 +{
 +	/* Batch size must be greater than 1, and a power of 2. */
@@ -722,23 +771,20 @@ new file mode 100644
 + * * %-ENOMEM:		- Out of memory
 + */
 +int percpu_counter_tree_init_many(struct percpu_counter_tree *counters, struct percpu_counter_tree_level_item *items,
-+				  unsigned int nr_counters, unsigned int batch_size, gfp_t gfp_flags)
++				  unsigned int nr_counters, unsigned long batch_size, gfp_t gfp_flags)
 +{
 +	void __percpu *level0, *level0_iter;
-+	size_t counter_size, items_size = 0;
++	size_t counter_size = sizeof(*counters->level0),
++	       items_size = percpu_counter_tree_items_size();
 +	void *items_iter;
 +	unsigned int i;
 +	int ret;
 +
-+	counter_size = ALIGN(sizeof(*counters), __alignof__(*counters));
++	memset(items, 0, items_size * nr_counters);
 +	level0 = __alloc_percpu_gfp(nr_counters * counter_size,
-+				    __alignof__(*counters), gfp_flags);
++				    __alignof__(*counters->level0), gfp_flags);
 +	if (!level0)
 +		return -ENOMEM;
-+	if (nr_cpus_order) {
-+		items_size = percpu_counter_tree_items_size();
-+		memset(items, 0, items_size * nr_counters);
-+	}
 +	level0_iter = level0;
 +	items_iter = items;
 +	for (i = 0; i < nr_counters; i++) {
@@ -746,8 +792,7 @@ new file mode 100644
 +		if (ret)
 +			goto free_level0;
 +		level0_iter += counter_size;
-+		if (nr_cpus_order)
-+			items_iter += items_size;
++		items_iter += items_size;
 +	}
 +	return 0;
 +
@@ -776,7 +821,7 @@ new file mode 100644
 + * * %-ENOMEM:		- Out of memory
 + */
 +int percpu_counter_tree_init(struct percpu_counter_tree *counter, struct percpu_counter_tree_level_item *items,
-+			     unsigned int batch_size, gfp_t gfp_flags)
++			     unsigned long batch_size, gfp_t gfp_flags)
 +{
 +	return percpu_counter_tree_init_many(counter, items, 1, batch_size, gfp_flags);
 +}
@@ -806,7 +851,7 @@ new file mode 100644
 +}
 +
 +static
-+int percpu_counter_tree_carry(int orig, int res, int inc, unsigned int bit_mask)
++long percpu_counter_tree_carry(long orig, long res, long inc, unsigned long bit_mask)
 +{
 +	if (inc < 0) {
 +		inc = -(-inc & ~(bit_mask - 1));
@@ -844,10 +889,11 @@ new file mode 100644
 + * cpu number is only used to favor cache locality.
 + */
 +static
-+void percpu_counter_tree_add_slowpath(struct percpu_counter_tree *counter, int inc)
++void percpu_counter_tree_add_slowpath(struct percpu_counter_tree *counter, long inc)
 +{
 +	unsigned int level_items, nr_levels = counter_config->nr_levels,
-+		     level, n_arity_order, bit_mask;
++		     level, n_arity_order;
++	unsigned long bit_mask;
 +	struct percpu_counter_tree_level_item *item = counter->items;
 +	unsigned int cpu = raw_smp_processor_id();
 +
@@ -858,10 +904,10 @@ new file mode 100644
 +	level_items = 1U << (nr_cpus_order - n_arity_order);
 +
 +	for (level = 1; level < nr_levels; level++) {
-+		atomic_t *count = &item[cpu & (level_items - 1)].count;
-+		unsigned int orig, res;
++		atomic_long_t *count = &item[cpu & (level_items - 1)].count;
++		unsigned long orig, res;
 +
-+		res = atomic_add_return_relaxed(inc, count);
++		res = atomic_long_add_return_relaxed(inc, count);
 +		orig = res - inc;
 +		inc = percpu_counter_tree_carry(orig, res, inc, bit_mask);
 +		if (likely(!inc))
@@ -871,7 +917,7 @@ new file mode 100644
 +		level_items >>= n_arity_order;
 +		bit_mask <<= n_arity_order;
 +	}
-+	atomic_add(inc, counter->approx_sum.a);
++	atomic_long_add(inc, counter->approx_sum.a);
 +}
 +
 +/**
@@ -883,9 +929,9 @@ new file mode 100644
 + * typically increment per-CPU counters as long as there is no carry
 + * greater or equal to the counter tree batch size.
 + */
-+void percpu_counter_tree_add(struct percpu_counter_tree *counter, int inc)
++void percpu_counter_tree_add(struct percpu_counter_tree *counter, long inc)
 +{
-+	unsigned int bit_mask = counter->level0_bit_mask, orig, res;
++	unsigned long bit_mask = counter->level0_bit_mask, orig, res;
 +
 +	res = this_cpu_add_return(*counter->level0, inc);
 +	orig = res - inc;
@@ -897,14 +943,14 @@ new file mode 100644
 +
 +
 +static
-+int percpu_counter_tree_precise_sum_unbiased(struct percpu_counter_tree *counter)
++long percpu_counter_tree_precise_sum_unbiased(struct percpu_counter_tree *counter)
 +{
-+	unsigned int sum = 0;
++	unsigned long sum = 0;
 +	int cpu;
 +
 +	for_each_possible_cpu(cpu)
 +		sum += *per_cpu_ptr(counter->level0, cpu);
-+	return (int) sum;
++	return (long) sum;
 +}
 +
 +/**
@@ -917,13 +963,13 @@ new file mode 100644
 + *
 + * Return: The current precise counter sum.
 + */
-+int percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter)
++long percpu_counter_tree_precise_sum(struct percpu_counter_tree *counter)
 +{
 +	return percpu_counter_tree_precise_sum_unbiased(counter) + READ_ONCE(counter->bias);
 +}
 +
 +static
-+int compare_delta(int delta, unsigned int accuracy_neg, unsigned int accuracy_pos)
++int compare_delta(long delta, unsigned long accuracy_neg, unsigned long accuracy_pos)
 +{
 +	if (delta >= 0) {
 +		if (delta <= accuracy_pos)
@@ -979,7 +1025,7 @@ new file mode 100644
 + * * %-1	- The value @v is less than the counter.
 + * * %1		- The value @v is greater than the counter.
 + */
-+int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, int v)
++int percpu_counter_tree_approximate_compare_value(struct percpu_counter_tree *counter, long v)
 +{
 +	return compare_delta(v - percpu_counter_tree_approximate_sum(counter),
 +			     counter->approx_accuracy_range.under,
@@ -1004,10 +1050,10 @@ new file mode 100644
 + */
 +int percpu_counter_tree_precise_compare(struct percpu_counter_tree *a, struct percpu_counter_tree *b)
 +{
-+	int count_a = percpu_counter_tree_approximate_sum(a),
-+	    count_b = percpu_counter_tree_approximate_sum(b);
-+	unsigned int accuracy_a, accuracy_b;
-+	int delta = count_a - count_b;
++	long count_a = percpu_counter_tree_approximate_sum(a),
++	     count_b = percpu_counter_tree_approximate_sum(b);
++	unsigned long accuracy_a, accuracy_b;
++	long delta = count_a - count_b;
 +	int res;
 +
 +	res = compare_delta(delta,
@@ -1070,9 +1116,9 @@ new file mode 100644
 + * * %-1	- The value @v is less than the counter.
 + * * %1		- The value @v is greater than the counter.
 + */
-+int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, int v)
++int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, long v)
 +{
-+	int count = percpu_counter_tree_approximate_sum(counter);
++	long count = percpu_counter_tree_approximate_sum(counter);
 +	int res;
 +
 +	res = compare_delta(v - count,
@@ -1092,7 +1138,7 @@ new file mode 100644
 +}
 +
 +static
-+void percpu_counter_tree_set_bias(struct percpu_counter_tree *counter, int bias)
++void percpu_counter_tree_set_bias(struct percpu_counter_tree *counter, long bias)
 +{
 +	WRITE_ONCE(counter->bias, bias);
 +}
@@ -1107,7 +1153,7 @@ new file mode 100644
 + * counter sum to a given value, the counter sum approximation can
 + * return any value within the accuracy range around that value.
 + */
-+void percpu_counter_tree_set(struct percpu_counter_tree *counter, int v)
++void percpu_counter_tree_set(struct percpu_counter_tree *counter, long v)
 +{
 +	percpu_counter_tree_set_bias(counter,
 +				     v - percpu_counter_tree_precise_sum_unbiased(counter));
@@ -1131,7 +1177,7 @@ new file mode 100644
 + * * percpu_counter_tree_precise_compare_value().
 + */
 +void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
-+						    unsigned int *under, unsigned int *over)
++						    unsigned long *under, unsigned long *over)
 +{
 +	*under = counter->approx_accuracy_range.under;
 +	*over = counter->approx_accuracy_range.over;
@@ -1157,7 +1203,7 @@ new file mode 100644
 +{
 +	unsigned int nr_levels = counter_config->nr_levels, level;
 +	unsigned int level_items = 1U << nr_cpus_order;
-+	unsigned int batch_size = 1;
++	unsigned long batch_size = 1;
 +
 +	for (level = 0; level < nr_levels; level++) {
 +		unsigned int n_arity_order = counter_config->n_arity_order[level];
