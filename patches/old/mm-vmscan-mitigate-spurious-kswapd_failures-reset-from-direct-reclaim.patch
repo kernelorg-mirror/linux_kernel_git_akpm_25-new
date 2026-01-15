@@ -1,6 +1,6 @@
 From: Jiayuan Chen <jiayuan.chen@shopee.com>
 Subject: mm/vmscan: mitigate spurious kswapd_failures reset from direct reclaim
-Date: Mon, 22 Dec 2025 20:20:21 +0800
+Date: Fri, 26 Dec 2025 16:00:42 +0800
 
 When kswapd fails to reclaim memory, kswapd_failures is incremented.  Once
 it reaches MAX_RECLAIM_RETRIES, kswapd stops running to avoid futile
@@ -32,38 +32,36 @@ raise free memory above the high watermark since reclaimable file pages
 are insufficient.  Normally, kswapd would eventually stop after
 kswapd_failures reaches MAX_RECLAIM_RETRIES.
 
-However, pods on this machine have memory.high set in their cgroup. 
+However, containers on this machine have memory.high set in their cgroup. 
 Business processes continuously trigger the high limit, causing frequent
 direct reclaim that keeps resetting kswapd_failures to 0.  This prevents
 kswapd from ever stopping.
 
-The result is that kswapd runs endlessly, repeatedly evicting the few
-remaining file pages which are actually hot.  These pages constantly
-refault, generating sustained heavy IO READ pressure.
+The key insight is that direct reclaim triggered by cgroup memory.high
+performs aggressive scanning to throttle the allocating process.  With
+sufficiently aggressive scanning, even hot pages will eventually be
+reclaimed, making direct reclaim "successful" at freeing some memory. 
+However, this success does not mean the node has reached a balanced state
+- the freed memory may still be insufficient to bring free pages above the
+high watermark.  Unconditionally resetting kswapd_failures in this case
+keeps kswapd alive indefinitely.
 
-This is a multi-NUMA system where the memory pressure is not global but
-node-local.  The key observation is:
+The result is that kswapd runs endlessly.  Unlike direct reclaim which
+only reclaims from the allocating cgroup, kswapd scans the entire node's
+memory.  This causes hot file pages from all workloads on the node to be
+evicted, not just those from the cgroup triggering memory.high.  These
+pages constantly refault, generating sustained heavy IO READ pressure
+across the entire system.
 
-Node 0: Under memory pressure, most memory is anonymous (unreclaimable without swap)
-Node 1: Has plenty of reclaimable memory (~60GB file cache out of 125GB total)
+Fix this by only resetting kswapd_failures when the node is actually
+balanced.  This allows both kswapd and direct reclaim to clear
+kswapd_failures upon successful reclaim, but only when the reclaim
+actually resolves the memory pressure (i.e., the node becomes balanced).
 
-Node 0's kswapd runs continuously but cannot reclaim anything
-Direct reclaim succeeds by reclaiming from Node 1
-Direct reclaim resets kswapd_failures, preventing Node 0's kswapd from stopping
-The few file pages on Node 0 are hot and keep refaulting, causing heavy I/O
-
-From a per-node perspective, Node 0 is truly out of reclaimable memory
-and its kswapd should stop.  But the global direct reclaim success
-(from Node 1) incorrectly keeps Node 0's kswapd alive.
-
-Fix this by only resetting kswapd_failures from direct reclaim when the
-node is actually balanced.  This prevents direct reclaim from keeping
-kswapd alive when the node cannot be balanced through reclaim alone.
-
-Link: https://lkml.kernel.org/r/20251222122022.254268-1-jiayuan.chen@linux.dev
+Link: https://lkml.kernel.org/r/20251226080042.291657-1-jiayuan.chen@linux.dev
 Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
-Cc: "David Hildenbrand (Red Hat)" <david@kernel.org>
+Cc: David Hildenbrand (Red Hat) <david@kernel.org>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Michal Hocko <mhocko@kernel.org>
@@ -74,28 +72,33 @@ Cc: Yuanchu Xie <yuanchu@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vmscan.c |   13 +++++++++++--
- 1 file changed, 11 insertions(+), 2 deletions(-)
+ mm/vmscan.c |   18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
 
 --- a/mm/vmscan.c~mm-vmscan-mitigate-spurious-kswapd_failures-reset-from-direct-reclaim
 +++ a/mm/vmscan.c
-@@ -2648,6 +2648,15 @@ static bool can_age_anon_pages(struct lr
+@@ -2648,6 +2648,20 @@ static bool can_age_anon_pages(struct lr
  			  lruvec_memcg(lruvec));
  }
  
++/*
++ * Reset kswapd_failures only when the node is balanced. Without this
++ * check, successful direct reclaim (e.g., from cgroup memory.high
++ * throttling) can keep resetting kswapd_failures even when the node
++ * cannot be balanced, causing kswapd to run endlessly.
++ */
 +static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx);
 +static inline void reset_kswapd_failures(struct pglist_data *pgdat,
 +					 struct scan_control *sc)
 +{
-+	if (!current_is_kswapd() &&
-+	    pgdat_balanced(pgdat, sc->order, sc->reclaim_idx))
++	if (pgdat_balanced(pgdat, sc->order, sc->reclaim_idx))
 +		atomic_set(&pgdat->kswapd_failures, 0);
 +}
 +
  #ifdef CONFIG_LRU_GEN
  
  #ifdef CONFIG_LRU_GEN_ENABLED
-@@ -5065,7 +5074,7 @@ static void lru_gen_shrink_node(struct p
+@@ -5065,7 +5079,7 @@ static void lru_gen_shrink_node(struct p
  	blk_finish_plug(&plug);
  done:
  	if (sc->nr_reclaimed > reclaimed)
@@ -104,7 +107,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /******************************************************************************
-@@ -6139,7 +6148,7 @@ again:
+@@ -6139,7 +6153,7 @@ again:
  	 * successful direct reclaim run will revive a dormant kswapd.
  	 */
  	if (reclaimable)
