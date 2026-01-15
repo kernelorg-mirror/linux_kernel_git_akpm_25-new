@@ -1,0 +1,244 @@
+From: Pnina Feder <pnina.feder@mobileye.com>
+Subject: panic: add panic_force_cpu= parameter to redirect panic to a specific CPU
+Date: Thu, 15 Jan 2026 15:05:52 +0200
+
+Some platforms require panic handling to execute on a specific CPU for
+crash dump to work reliably.  This can be due to firmware limitations,
+interrupt routing constraints, or platform-specific requirements where
+only a single CPU is able to safely enter the crash kernel.
+
+Add the panic_force_cpu= kernel command-line parameter to redirect panic
+execution to a designated CPU.  When the parameter is provided, the CPU
+that initially triggers panic forwards the panic context to the target CPU
+via IPI, which then proceeds with the normal panic and kexec flow.
+
+The IPI delivery is implemented as a weak function
+(panic_smp_redirect_cpu) so architectures with NMI support can override it
+for more reliable delivery.
+
+If the specified CPU is invalid, offline, or a panic is already in
+progress on another CPU, the redirection is skipped and panic continues on
+the current CPU.
+
+Link: https://lkml.kernel.org/r/20260115130552.3761679-1-pnina.feder@mobileye.com
+Signed-off-by: Pnina Feder <pnina.feder@mobileye.com>
+Cc: Baoquan He <bhe@redhat.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ Documentation/admin-guide/kernel-parameters.txt |   15 +
+ include/linux/smp.h                             |    1 
+ kernel/panic.c                                  |  139 +++++++++++++-
+ 3 files changed, 154 insertions(+), 1 deletion(-)
+
+--- a/Documentation/admin-guide/kernel-parameters.txt~panic-add-panic_force_cpu=-parameter-to-redirect-panic-to-a-specific-cpu
++++ a/Documentation/admin-guide/kernel-parameters.txt
+@@ -4788,6 +4788,21 @@ Kernel parameters
+ 	panic_on_warn=1	panic() instead of WARN().  Useful to cause kdump
+ 			on a WARN().
+ 
++	panic_force_cpu=
++			[KNL,SMP] Force panic handling to execute on a specific CPU.
++			Format: <cpu number>
++			Some platforms require panic handling to occur on a
++			specific CPU for the crash kernel to function correctly.
++			This can be due to firmware limitations, interrupt routing
++			constraints, or platform-specific requirements where only
++			a particular CPU can safely enter the crash kernel.
++			When set, panic() will redirect execution to the specified
++			CPU before proceeding with the normal panic and kexec flow.
++			If the target CPU is offline or unavailable, panic proceeds
++			on the current CPU.
++			This option should only be used for systems with the above
++			constraints as it might cause the panic operation to be less reliable.
++
+ 	panic_print=	Bitmask for printing system info when panic happens.
+ 			User can chose combination of the following bits:
+ 			bit 0: print all tasks info
+--- a/include/linux/smp.h~panic-add-panic_force_cpu=-parameter-to-redirect-panic-to-a-specific-cpu
++++ a/include/linux/smp.h
+@@ -62,6 +62,7 @@ int smp_call_function_single_async(int c
+ void __noreturn panic_smp_self_stop(void);
+ void __noreturn nmi_panic_self_stop(struct pt_regs *regs);
+ void crash_smp_send_stop(void);
++int panic_smp_redirect_cpu(int target_cpu, void *msg);
+ 
+ /*
+  * Call a function on all processors
+--- a/kernel/panic.c~panic-add-panic_force_cpu=-parameter-to-redirect-panic-to-a-specific-cpu
++++ a/kernel/panic.c
+@@ -74,6 +74,8 @@ EXPORT_SYMBOL_GPL(panic_timeout);
+ 
+ unsigned long panic_print;
+ 
++static int panic_force_cpu = -1;
++
+ ATOMIC_NOTIFIER_HEAD(panic_notifier_list);
+ 
+ EXPORT_SYMBOL(panic_notifier_list);
+@@ -300,6 +302,128 @@ void __weak crash_smp_send_stop(void)
+ }
+ 
+ atomic_t panic_cpu = ATOMIC_INIT(PANIC_CPU_INVALID);
++atomic_t panic_redirect_cpu = ATOMIC_INIT(PANIC_CPU_INVALID);
++
++#if defined(CONFIG_SMP) && defined(CONFIG_CRASH_DUMP)
++static int __init panic_force_cpu_setup(char *str)
++{
++	int cpu;
++
++	if (!str)
++		return -EINVAL;
++
++	if (kstrtoint(str, 0, &cpu) || cpu < 0) {
++		pr_warn("panic_force_cpu: invalid value '%s'\n", str);
++		return -EINVAL;
++	}
++
++	panic_force_cpu = cpu;
++	return 0;
++}
++early_param("panic_force_cpu", panic_force_cpu_setup);
++
++static void do_panic_on_target_cpu(void *info)
++{
++	panic("%s", (char *)info);
++}
++
++/**
++ * panic_smp_redirect_cpu - Redirect panic to target CPU
++ * @target_cpu: CPU that should handle the panic
++ * @msg: formatted panic message
++ *
++ * Default implementation uses IPI. Architectures with NMI support
++ * can override this for more reliable delivery.
++ *
++ * Return: 0 on success, negative errno on failure
++ */
++int __weak panic_smp_redirect_cpu(int target_cpu, void *msg)
++{
++	static call_single_data_t panic_csd;
++
++	panic_csd.func = do_panic_on_target_cpu;
++	panic_csd.info = msg;
++
++	return smp_call_function_single_async(target_cpu, &panic_csd);
++}
++
++/**
++ * panic_try_force_cpu - Redirect panic to a specific CPU for crash kernel
++ * @buf: buffer to format the panic message into
++ * @buf_size: size of the buffer
++ * @fmt: panic message format string
++ * @args: arguments for format string
++ *
++ * Some platforms require panic handling to occur on a specific CPU
++ * for the crash kernel to function correctly. This function redirects
++ * panic handling to the CPU specified via the panic_force_cpu= boot parameter.
++ *
++ * Returns false if panic should proceed on current CPU.
++ * Returns true if panic was redirected.
++ */
++__printf(3, 0)
++static bool panic_try_force_cpu(char *buf, int buf_size, const char *fmt, va_list args)
++{
++	int this_cpu = raw_smp_processor_id();
++	int old_cpu = PANIC_CPU_INVALID;
++
++	/* Feature not enabled via boot parameter */
++	if (panic_force_cpu < 0)
++		return false;
++
++	/* Already on target CPU - proceed normally */
++	if (this_cpu == panic_force_cpu)
++		return false;
++
++	/* Target CPU is offline, can't redirect */
++	if (!cpu_online(panic_force_cpu))
++		return false;
++
++	/* Another panic already in progress */
++	if (panic_in_progress()) {
++		return false;
++	}
++
++	/*
++	 * Only one CPU can do the redirect. Use atomic cmpxchg to ensure
++	 * we don't race with another CPU also trying to redirect.
++	 */
++	if (!atomic_try_cmpxchg(&panic_redirect_cpu, &old_cpu, this_cpu))
++		return false;
++
++	vsnprintf(buf, buf_size, fmt, args);
++
++	console_verbose();
++	bust_spinlocks(1);
++
++	pr_emerg("panic: Redirecting from CPU %d to CPU %d for crash kernel.\n",
++		 this_cpu, panic_force_cpu);
++
++	/* Dump original CPU before redirecting */
++	if (!test_taint(TAINT_DIE) &&
++	    oops_in_progress <= 1 &&
++	    IS_ENABLED(CONFIG_DEBUG_BUGVERBOSE)) {
++		dump_stack();
++	}
++
++	printk_legacy_allow_panic_sync();
++	console_flush_on_panic(CONSOLE_FLUSH_PENDING);
++
++	if (panic_smp_redirect_cpu(panic_force_cpu, buf) != 0) {
++		atomic_set(&panic_redirect_cpu, PANIC_CPU_INVALID);
++		return false;
++	}
++
++	/* IPI/NMI sent, this CPU should stop */
++	return true;
++}
++#else
++__printf(3, 0)
++static inline bool panic_try_force_cpu(char *buf, int buf_size, const char *fmt, va_list args)
++{
++	return false;
++}
++#endif /* CONFIG_SMP && CONFIG_CRASH_DUMP */
+ 
+ bool panic_try_start(void)
+ {
+@@ -452,6 +576,15 @@ void vpanic(const char *fmt, va_list arg
+ 	local_irq_disable();
+ 	preempt_disable_notrace();
+ 
++	/* Redirect panic to target CPU if configured via panic_force_cpu=. */
++	if (panic_try_force_cpu(buf, sizeof(buf), fmt, args)) {
++		/*
++		 * Mark ourselves offline so panic_other_cpus_shutdown() won't wait
++		 * for us on architectures that check num_online_cpus().
++		 */
++		set_cpu_online(smp_processor_id(), false);
++		panic_smp_self_stop();
++	}
+ 	/*
+ 	 * It's possible to come here directly from a panic-assertion and
+ 	 * not have preempt disabled. Some functions called from here want
+@@ -484,7 +617,11 @@ void vpanic(const char *fmt, va_list arg
+ 	/*
+ 	 * Avoid nested stack-dumping if a panic occurs during oops processing
+ 	 */
+-	if (test_taint(TAINT_DIE) || oops_in_progress > 1) {
++	if (atomic_read(&panic_redirect_cpu) != PANIC_CPU_INVALID &&
++	    panic_force_cpu == raw_smp_processor_id()) {
++		pr_emerg("panic: Redirected from CPU %d, skipping stack dump.\n",
++			 atomic_read(&panic_redirect_cpu));
++	} else if (test_taint(TAINT_DIE) || oops_in_progress > 1) {
+ 		panic_this_cpu_backtrace_printed = true;
+ 	} else if (IS_ENABLED(CONFIG_DEBUG_BUGVERBOSE)) {
+ 		dump_stack();
+_
