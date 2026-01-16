@@ -1,0 +1,141 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: add vma_is_*_locked() helpers
+Date: Fri, 16 Jan 2026 13:36:46 +0000
+
+Add vma_is_read_locked(), vma_is_write_locked() and vma_is_locked()
+helpers and utilise them in vma_assert_locked() and
+vma_assert_write_locked().
+
+We need to test mmap lock state to correctly test vma write lock state, so
+add mmap_is_locked() and mmap_is_write_locked() so we can explicitly
+provide means by which to check mmap_lock state also.
+
+These functions will intentionally not be defined if CONFIG_PER_VMA_LOCK
+is not set, as they would not make any sense in a context where VMA locks
+do not exist.
+
+We are careful in invoking __is_vma_write_locked() - this function asserts
+the mmap write lock, so we check that this lock is held before invoking
+the function so vma_is_write_locked() can be used in situations where we
+don't want an assert failure.
+
+While we're here, we also update __is_vma_write_locked() to accept a const
+vm_area_struct pointer so we can consistently have const VMA parameters
+for these helpers.
+
+As part of this change we also move mmap_lock_is_contended() up in
+include/linux/mmap_lock.h so we group predicates based on mmap lock state
+together.
+
+This lays the groundwork for a subsequent change that allows for asserting
+that either the mmap lock or VMA lock is held.
+
+Link: https://lkml.kernel.org/r/07122584007a6efbaa47d115030ac27947df700a.1768569863.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Suggested-by: Suren Baghdasaryan <surenb@google.com>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmap_lock.h |   50 +++++++++++++++++++++++++++---------
+ 1 file changed, 38 insertions(+), 12 deletions(-)
+
+--- a/include/linux/mmap_lock.h~mm-vma-add-vma_is__locked-helpers
++++ a/include/linux/mmap_lock.h
+@@ -66,6 +66,22 @@ static inline void __mmap_lock_trace_rel
+ 
+ #endif /* CONFIG_TRACING */
+ 
++
++static inline bool mmap_lock_is_contended(struct mm_struct *mm)
++{
++	return rwsem_is_contended(&mm->mmap_lock);
++}
++
++static inline bool mmap_is_locked(const struct mm_struct *mm)
++{
++	return rwsem_is_locked(&mm->mmap_lock);
++}
++
++static inline bool mmap_is_write_locked(const struct mm_struct *mm)
++{
++	return rwsem_is_write_locked(&mm->mmap_lock);
++}
++
+ static inline void mmap_assert_locked(const struct mm_struct *mm)
+ {
+ 	rwsem_assert_held(&mm->mmap_lock);
+@@ -183,7 +199,8 @@ static inline void vma_end_read(struct v
+ }
+ 
+ /* WARNING! Can only be used if mmap_lock is expected to be write-locked */
+-static inline bool __is_vma_write_locked(struct vm_area_struct *vma, unsigned int *mm_lock_seq)
++static inline bool __is_vma_write_locked(const struct vm_area_struct *vma,
++		unsigned int *mm_lock_seq)
+ {
+ 	mmap_assert_write_locked(vma->vm_mm);
+ 
+@@ -236,19 +253,33 @@ int vma_start_write_killable(struct vm_a
+ 	return __vma_start_write(vma, mm_lock_seq, TASK_KILLABLE);
+ }
+ 
+-static inline void vma_assert_write_locked(struct vm_area_struct *vma)
++static inline bool vma_is_read_locked(const struct vm_area_struct *vma)
++{
++	return refcount_read(&vma->vm_refcnt) > 1;
++}
++
++static inline bool vma_is_write_locked(struct vm_area_struct *vma)
+ {
+ 	unsigned int mm_lock_seq;
+ 
+-	VM_BUG_ON_VMA(!__is_vma_write_locked(vma, &mm_lock_seq), vma);
++	/* __is_vma_write_locked() requires the mmap write lock. */
++	return mmap_is_write_locked(vma->vm_mm) &&
++		__is_vma_write_locked(vma, &mm_lock_seq);
+ }
+ 
+-static inline void vma_assert_locked(struct vm_area_struct *vma)
++static inline bool vma_is_locked(struct vm_area_struct *vma)
+ {
+-	unsigned int mm_lock_seq;
++	return vma_is_read_locked(vma) || vma_is_write_locked(vma);
++}
++
++static inline void vma_assert_write_locked(struct vm_area_struct *vma)
++{
++	VM_BUG_ON_VMA(!vma_is_write_locked(vma), vma);
++}
+ 
+-	VM_BUG_ON_VMA(refcount_read(&vma->vm_refcnt) <= 1 &&
+-		      !__is_vma_write_locked(vma, &mm_lock_seq), vma);
++static inline void vma_assert_locked(struct vm_area_struct *vma)
++{
++	VM_BUG_ON_VMA(!vma_is_locked(vma), vma);
+ }
+ 
+ static inline bool vma_is_attached(struct vm_area_struct *vma)
+@@ -432,9 +463,4 @@ static inline void mmap_read_unlock_non_
+ 	up_read_non_owner(&mm->mmap_lock);
+ }
+ 
+-static inline int mmap_lock_is_contended(struct mm_struct *mm)
+-{
+-	return rwsem_is_contended(&mm->mmap_lock);
+-}
+-
+ #endif /* _LINUX_MMAP_LOCK_H */
+_
