@@ -1,14 +1,14 @@
 From: "David Hildenbrand (Red Hat)" <david@kernel.org>
 Subject: mm/hugetlb: fix excessive IPI broadcasts when unsharing PMD tables using mmu_gather
-Date: Fri, 12 Dec 2025 08:10:19 +0100
+Date: Tue, 23 Dec 2025 22:40:37 +0100
 
 As reported, ever since commit 1013af4f585f ("mm/hugetlb: fix
 huge_pmd_unshare() vs GUP-fast race") we can end up in some situations
 where we perform so many IPI broadcasts when unsharing hugetlb PMD page
 tables that it severely regresses some workloads.
 
-In particular, when we fork()+exit(), or when we munmap() a large area
-backed by many shared PMD tables, we perform one IPI broadcast per
+In particular, when we fork()+exit(), or when we munmap() a large
+area backed by many shared PMD tables, we perform one IPI broadcast per
 unshared PMD table.
 
 There are two optimizations to be had:
@@ -17,7 +17,7 @@ There are two optimizations to be had:
     exit(), it is sufficient to send a single IPI broadcast (as long as
     we respect locking rules) instead of one per PMD table.
 
-    Locking prevents that any of these PMD tables could get reuse before
+    Locking prevents that any of these PMD tables could get reused before
     we drop the lock.
 
 (2) When we are not the last sharer (> 2 users including us), there is
@@ -41,12 +41,16 @@ There are two optimizations to be had:
 
 So let's rework PMD sharing TLB flushing + IPI sync to use the mmu_gather
 infrastructure so we can implement these optimizations and demystify the
-code at least a bit.  Extend the mmu_gather infrastructure to be able to
+code at least a bit. Extend the mmu_gather infrastructure to be able to
 deal with our special hugetlb PMD table sharing implementation.
 
+To make initialization of the mmu_gather easier when working on a single
+VMA (in particular, when dealing with hugetlb), provide
+tlb_gather_mmu_vma().
+
 We'll consolidate the handling for (full) unsharing of PMD tables in
-tlb_unshare_pmd_ptdesc() and tlb_flush_unshared_tables(), and track in
-"struct mmu_gather" whether we had (full) unsharing of PMD tables.
+tlb_unshare_pmd_ptdesc() and tlb_flush_unshared_tables(), and track
+in "struct mmu_gather" whether we had (full) unsharing of PMD tables.
 
 Because locking is very special (concurrent unsharing+reuse must be
 prevented), we disallow deferring flushing to tlb_finish_mmu() and instead
@@ -98,35 +102,49 @@ There are two fairly tricky things:
     described in (1), it really must honor tlb->freed_tables then to
     send IPIs to all relevant CPUs.
 
-Further note that the ptdesc_pmd_pts_dec() in huge_pmd_share() is not a
+Notes on TLB flushing changes:
+
+(1) Flushing for non-shared PMD tables
+
+    We're converting from flush_hugetlb_tlb_range() to
+    tlb_remove_huge_tlb_entry(). Given that we properly initialize the
+    MMU gather in tlb_gather_mmu_vma() to be hugetlb aware, similar to
+    __unmap_hugepage_range(), that should be fine.
+
+(2) Flushing for shared PMD tables
+
+    We're converting from various things (flush_hugetlb_tlb_range(),
+    tlb_flush_pmd_range(), flush_tlb_range()) to tlb_flush_pmd_range().
+
+    tlb_flush_pmd_range() achieves the same that
+    tlb_remove_huge_tlb_entry() would achieve in these scenarios.
+    Note that tlb_remove_huge_tlb_entry() also calls
+    __tlb_remove_tlb_entry(), however that is only implemented on
+    powerpc, which does not support PMD table sharing.
+
+    Similar to (1), tlb_gather_mmu_vma() should make sure that TLB
+    flushing keeps on working as expected.
+
+Further, note that the ptdesc_pmd_pts_dec() in huge_pmd_share() is not a
 concern, as we are holding the i_mmap_lock the whole time, preventing
-concurrent unsharing.  That ptdesc_pmd_pts_dec() usage will be removed
+concurrent unsharing. That ptdesc_pmd_pts_dec() usage will be removed
 separately as a cleanup later.
 
-There are plenty more cleanups to be had, but they have to wait until this
-is fixed.
+There are plenty more cleanups to be had, but they have to wait until
+this is fixed.
 
-Link: https://lkml.kernel.org/r/20251212071019.471146-5-david@kernel.org
+[david@kernel.org: fix kerneldoc]
+  Link: https://lkml.kernel.org/r/f223dd74-331c-412d-93fc-69e360a5006c@kernel.org
+Link: https://lkml.kernel.org/r/20251223214037.580860-5-david@kernel.org
 Fixes: 1013af4f585f ("mm/hugetlb: fix huge_pmd_unshare() vs GUP-fast race")
 Signed-off-by: David Hildenbrand (Red Hat) <david@kernel.org>
 Reported-by: Uschakow, Stanislav" <suschako@amazon.de>
 Closes: https://lore.kernel.org/all/4d3878531c76479d9f8ca9789dc6485d@amazon.de/
 Tested-by: Laurence Oberman <loberman@redhat.com>
+Acked-by: Harry Yoo <harry.yoo@oracle.com>
 Reviewed-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: "Aneesh Kumar K.V" <aneesh.kumar@kernel.org>
-Cc: Arnd Bergmann <arnd@arndb.de>
-Cc: Harry Yoo <harry.yoo@oracle.com>
-Cc: Jann Horn <jannh@google.com>
 Cc: Lance Yang <lance.yang@linux.dev>
-Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Liu Shixin <liushixin2@huawei.com>
-Cc: Muchun Song <muchun.song@linux.dev>
-Cc: Nadav Amit <nadav.amit@gmail.com>
-Cc: Nicholas Piggin <npiggin@gmail.com>
 Cc: Oscar Salvador <osalvador@suse.de>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
 Cc: Rik van Riel <riel@surriel.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Will Deacon <will@kernel.org>
 Cc: <stable@vger.kernel.org>
