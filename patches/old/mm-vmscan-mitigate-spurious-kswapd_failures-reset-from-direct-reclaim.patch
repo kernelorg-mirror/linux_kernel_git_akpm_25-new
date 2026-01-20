@@ -1,6 +1,56 @@
 From: Jiayuan Chen <jiayuan.chen@shopee.com>
 Subject: mm/vmscan: mitigate spurious kswapd_failures reset from direct reclaim
-Date: Fri, 26 Dec 2025 16:00:42 +0800
+Date: Wed, 14 Jan 2026 15:40:35 +0800
+
+Patch series "mm/vmscan: mitigate spurious kswapd_failures reset and add
+tracepoints", v3.
+
+== Problem ==
+
+We observed an issue in production on a multi-NUMA system where kswapd
+runs endlessly, causing sustained heavy IO READ pressure across the entire
+system.
+
+The root cause is that direct reclaim triggered by cgroup memory.high
+keeps resetting kswapd_failures to 0, even when the node cannot be
+balanced.  This prevents kswapd from ever stopping after reaching
+MAX_RECLAIM_RETRIES.
+
+bash
+bpftrace -e '
+ #include <linux/mmzone.h>
+ #include <linux/shrinker.h>
+kprobe:balance_pgdat {
+	$pgdat = (struct pglist_data *)arg0;
+	if ($pgdat->kswapd_failures > 0) {
+		printf("[node %d] [%lu] kswapd end, kswapd_failures %d\n",
+                       $pgdat->node_id, jiffies, $pgdat->kswapd_failures);
+	}
+}
+tracepoint:vmscan:mm_vmscan_direct_reclaim_end {
+	printf("[cpu %d] [%ul] reset kswapd_failures %d \n", cpu, jiffies,
+               args.nr_reclaimed)
+}
+'
+
+The trace results showed that when kswapd_failures reaches 15, continuous
+direct reclaim keeps resetting it to 0.  This was accompanied by a flood
+of kswapd_failures log entries, and shortly after, we observed massive
+refaults occurring.
+
+== Solution ==
+
+Patch 1 fixes the issue by only resetting kswapd_failures when the node
+is actually balanced. This introduces pgdat_try_reset_kswapd_failures()
+as a wrapper that checks pgdat_balanced() before resetting.
+
+Patch 2 extends the wrapper to track why kswapd_failures was reset,
+adding tracepoints for better observability:
+  - mm_vmscan_reset_kswapd_failures: traces each reset with reason
+  - mm_vmscan_kswapd_reclaim_fail: traces each kswapd reclaim failure
+
+
+This patch (of 2):
 
 When kswapd fails to reclaim memory, kswapd_failures is incremented.  Once
 it reaches MAX_RECLAIM_RETRIES, kswapd stops running to avoid futile
@@ -58,29 +108,45 @@ balanced.  This allows both kswapd and direct reclaim to clear
 kswapd_failures upon successful reclaim, but only when the reclaim
 actually resolves the memory pressure (i.e., the node becomes balanced).
 
-Link: https://lkml.kernel.org/r/20251226080042.291657-1-jiayuan.chen@linux.dev
+Link: https://lkml.kernel.org/r/20260114074049.229935-1-jiayuan.chen@linux.dev
+Link: https://lkml.kernel.org/r/20260114074049.229935-2-jiayuan.chen@linux.dev
 Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
+Signed-off-by: Jiayuan Chen <jiayuan.chen@linux.dev>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
-Cc: David Hildenbrand (Red Hat) <david@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: David Hildenbrand <david@kernel.org>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Qi Zheng <zhengqi.arch@bytedance.com>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Wei Xu <weixugc@google.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vmscan.c |   18 ++++++++++++++++--
- 1 file changed, 16 insertions(+), 2 deletions(-)
+ mm/vmscan.c |   23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
 
 --- a/mm/vmscan.c~mm-vmscan-mitigate-spurious-kswapd_failures-reset-from-direct-reclaim
 +++ a/mm/vmscan.c
-@@ -2648,6 +2648,20 @@ static bool can_age_anon_pages(struct lr
+@@ -2647,6 +2647,25 @@ static bool can_age_anon_pages(struct lr
  			  lruvec_memcg(lruvec));
  }
  
++static void pgdat_reset_kswapd_failures(pg_data_t *pgdat)
++{
++	atomic_set(&pgdat->kswapd_failures, 0);
++}
++
 +/*
 + * Reset kswapd_failures only when the node is balanced. Without this
 + * check, successful direct reclaim (e.g., from cgroup memory.high
@@ -88,31 +154,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * cannot be balanced, causing kswapd to run endlessly.
 + */
 +static bool pgdat_balanced(pg_data_t *pgdat, int order, int highest_zoneidx);
-+static inline void reset_kswapd_failures(struct pglist_data *pgdat,
-+					 struct scan_control *sc)
++static inline void pgdat_try_reset_kswapd_failures(struct pglist_data *pgdat,
++						   struct scan_control *sc)
 +{
 +	if (pgdat_balanced(pgdat, sc->order, sc->reclaim_idx))
-+		atomic_set(&pgdat->kswapd_failures, 0);
++		pgdat_reset_kswapd_failures(pgdat);
 +}
 +
  #ifdef CONFIG_LRU_GEN
  
  #ifdef CONFIG_LRU_GEN_ENABLED
-@@ -5065,7 +5079,7 @@ static void lru_gen_shrink_node(struct p
+@@ -5064,7 +5083,7 @@ static void lru_gen_shrink_node(struct p
  	blk_finish_plug(&plug);
  done:
  	if (sc->nr_reclaimed > reclaimed)
 -		atomic_set(&pgdat->kswapd_failures, 0);
-+		reset_kswapd_failures(pgdat, sc);
++		pgdat_try_reset_kswapd_failures(pgdat, sc);
  }
  
  /******************************************************************************
-@@ -6139,7 +6153,7 @@ again:
+@@ -6131,7 +6150,7 @@ again:
  	 * successful direct reclaim run will revive a dormant kswapd.
  	 */
  	if (reclaimable)
 -		atomic_set(&pgdat->kswapd_failures, 0);
-+		reset_kswapd_failures(pgdat, sc);
++		pgdat_try_reset_kswapd_failures(pgdat, sc);
  	else if (sc->cache_trim_mode)
  		sc->cache_trim_mode_failed = 1;
  }
