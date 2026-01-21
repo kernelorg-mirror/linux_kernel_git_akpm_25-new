@@ -1,37 +1,6 @@
 From: Pasha Tatashin <pasha.tatashin@soleen.com>
-Subject: liveupdate: luo_flb: introduce File-Lifecycle-Bound global state
-Date: Tue, 25 Nov 2025 17:50:05 -0500
-
-Patch series "Live Update: File-Lifecycle-Bound (FLB) State", v8.
-
-This series adds support for FLB state to the Live Update Orchestrator.
-
-This functionality was originally part of the main LUO series [1] but has
-been split out to serve as a stable dependency for upcoming device
-preservation series.
-
-What is FLB?
-============
-FLB allows global kernel state (like IOMMU domains or HugeTLB state) to be
-preserved once, shared across multiple file descriptors, and restored when
-needed.  It uses reference counting tied to the lifecycle of preserved
-files (e.g., VFIO fds) to ensure the global state is valid as long as any
-file depends on it.
-
-Why separate?
-=============
-This patch does not have current user user, but multiple streams depend on
-it:
-
-1. VFIO LU preservation (ETA: Tomorrow)
-2. IOMMU LU preservation (ETA: One week)
-3. HugeTLB LUO preservation (ETA: A couple weeks)
-
-Merging this into linux-next allows these dependent series to be developed
-against the same API.
-
-
-This patch (of 2):
+Subject: liveupdate: luo_flb: Introduce File-Lifecycle-Bound global state
+Date: Thu, 18 Dec 2025 10:57:51 -0500
 
 Introduce a mechanism for managing global kernel state whose lifecycle is
 tied to the preservation of one or more files.  This is necessary for
@@ -73,8 +42,9 @@ This framework provides the necessary infrastructure for more complex
 subsystems like IOMMU, VFIO, and KVM to integrate with the Live Update
 Orchestrator.
 
-Link: https://lkml.kernel.org/r/20251125225006.3722394-2-pasha.tatashin@soleen.com
+Link: https://lkml.kernel.org/r/20251218155752.3045808-5-pasha.tatashin@soleen.com
 Signed-off-by: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Alexander Graf <graf@amazon.com>
 Cc: David Gow <davidgow@google.com>
 Cc: David Matlack <dmatlack@google.com>
 Cc: David Rientjes <rientjes@google.com>
@@ -84,9 +54,19 @@ Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Petr Mladek <pmladek@suse.com>
 Cc: Pratyush Yadav <pratyush@kernel.org>
 Cc: Samiullah Khawaja <skhawaja@google.com>
+Cc: Tamir Duberstein <tamird@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ Documentation/core-api/liveupdate.rst |   11 
+ include/linux/kho/abi/luo.h           |   76 ++
+ include/linux/liveupdate.h            |  147 +++++
+ kernel/liveupdate/Makefile            |    1 
+ kernel/liveupdate/luo_core.c          |    7 
+ kernel/liveupdate/luo_file.c          |   24 
+ kernel/liveupdate/luo_flb.c           |  654 ++++++++++++++++++++++++
+ kernel/liveupdate/luo_internal.h      |    7 
+ 8 files changed, 924 insertions(+), 3 deletions(-)
 
 --- a/Documentation/core-api/liveupdate.rst~liveupdate-luo_flb-introduce-file-lifecycle-bound-global-state
 +++ a/Documentation/core-api/liveupdate.rst
@@ -242,7 +222,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct file;
  
  /**
-@@ -99,6 +102,114 @@ struct liveupdate_file_handler {
+@@ -99,6 +102,118 @@ struct liveupdate_file_handler {
  	 * registered file handlers.
  	 */
  	struct list_head __private list;
@@ -301,20 +281,24 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
 +/*
 + * struct luo_flb_private_state - Private FLB state structures.
-+ * @count: The number of preserved files currently depending on this FLB.
-+ *         This is used to trigger the preserve/unpreserve/finish ops on the
-+ *         first/last file.
-+ * @data:  The opaque u64 handle returned by .preserve() or passed to
-+ *         .retrieve().
-+ * @obj:   The live kernel object returned by .preserve() or .retrieve().
-+ * @lock:  A mutex that protects all fields within this structure, providing
-+ *         the synchronization service for the FLB's ops.
++ * @count:     The number of preserved files currently depending on this FLB.
++ *             This is used to trigger the preserve/unpreserve/finish ops on the
++ *             first/last file.
++ * @data:      The opaque u64 handle returned by .preserve() or passed to
++ *             .retrieve().
++ * @obj:       The live kernel object returned by .preserve() or .retrieve().
++ * @lock:      A mutex that protects all fields within this structure, providing
++ *             the synchronization service for the FLB's ops.
++ * @finished:  True once the FLB's finish() callback has run.
++ * @retrieved: True once the FLB's retrieve() callback has run.
 + */
 +struct luo_flb_private_state {
 +	long count;
 +	u64 data;
 +	void *obj;
 +	struct mutex lock;
++	bool finished;
++	bool retrieved;
 +};
 +
 +/*
@@ -357,7 +341,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  };
  
  #ifdef CONFIG_LIVEUPDATE
-@@ -112,6 +223,14 @@ int liveupdate_reboot(void);
+@@ -112,6 +227,14 @@ int liveupdate_reboot(void);
  int liveupdate_register_file_handler(struct liveupdate_file_handler *fh);
  int liveupdate_unregister_file_handler(struct liveupdate_file_handler *fh);
  
@@ -372,7 +356,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #else /* CONFIG_LIVEUPDATE */
  
  static inline bool liveupdate_enabled(void)
-@@ -133,6 +252,30 @@ static inline int liveupdate_unregister_
+@@ -133,6 +256,30 @@ static inline int liveupdate_unregister_
  {
  	return -EOPNOTSUPP;
  }
@@ -435,7 +419,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		pr_err("kho_finalize failed %d\n", err);
 --- a/kernel/liveupdate/luo_file.c~liveupdate-luo_flb-introduce-file-lifecycle-bound-global-state
 +++ a/kernel/liveupdate/luo_file.c
-@@ -284,10 +284,14 @@ int luo_preserve_file(struct luo_file_se
+@@ -285,10 +285,14 @@ int luo_preserve_file(struct luo_file_se
  	if (err)
  		goto err_free_files_mem;
  
@@ -451,7 +435,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	luo_file->file = file;
-@@ -311,6 +315,8 @@ int luo_preserve_file(struct luo_file_se
+@@ -312,6 +316,8 @@ int luo_preserve_file(struct luo_file_se
  
  err_kfree:
  	kfree(luo_file);
@@ -460,7 +444,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  err_free_files_mem:
  	luo_free_files_mem(file_set);
  err_fput:
-@@ -352,6 +358,7 @@ void luo_file_unpreserve_files(struct lu
+@@ -353,6 +359,7 @@ void luo_file_unpreserve_files(struct lu
  		args.serialized_data = luo_file->serialized_data;
  		args.private_data = luo_file->private_data;
  		luo_file->fh->ops->unpreserve(&args);
@@ -468,7 +452,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		list_del(&luo_file->list);
  		file_set->count--;
-@@ -629,6 +636,7 @@ static void luo_file_finish_one(struct l
+@@ -630,6 +637,7 @@ static void luo_file_finish_one(struct l
  	args.retrieved = luo_file->retrieved;
  
  	luo_file->fh->ops->finish(&args);
@@ -476,7 +460,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /**
-@@ -850,6 +858,7 @@ int liveupdate_register_file_handler(str
+@@ -851,6 +859,7 @@ int liveupdate_register_file_handler(str
  		goto err_resume;
  	}
  
@@ -484,7 +468,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	INIT_LIST_HEAD(&ACCESS_PRIVATE(fh, list));
  	list_add_tail(&ACCESS_PRIVATE(fh, list), &luo_file_handler_list);
  	luo_session_resume();
-@@ -870,23 +879,34 @@ err_resume:
+@@ -871,23 +880,34 @@ err_resume:
   *
   * It ensures safe removal by checking that:
   * No live update session is currently in progress.
@@ -524,7 +508,7 @@ diff --git a/kernel/liveupdate/luo_flb.c a/kernel/liveupdate/luo_flb.c
 new file mode 100644
 --- /dev/null
 +++ a/kernel/liveupdate/luo_flb.c
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,654 @@
 +// SPDX-License-Identifier: GPL-2.0
 +
 +/*
@@ -572,7 +556,7 @@ new file mode 100644
 +#include <linux/kexec_handover.h>
 +#include <linux/kho/abi/luo.h>
 +#include <linux/libfdt.h>
-+#include <linux/list.h>
++#include <linux/list_private.h>
 +#include <linux/liveupdate.h>
 +#include <linux/module.h>
 +#include <linux/mutex.h>
@@ -682,7 +666,10 @@ new file mode 100644
 +
 +	guard(mutex)(&private->incoming.lock);
 +
-+	if (private->incoming.obj)
++	if (private->incoming.finished)
++		return -ENODATA;
++
++	if (private->incoming.retrieved)
 +		return 0;
 +
 +	if (!fh->active)
@@ -708,9 +695,7 @@ new file mode 100644
 +		return err;
 +
 +	private->incoming.obj = args.obj;
-+
-+	if (WARN_ON_ONCE(!private->incoming.obj))
-+		return -EIO;
++	private->incoming.retrieved = true;
 +
 +	return 0;
 +}
@@ -726,7 +711,7 @@ new file mode 100644
 +	if (!count) {
 +		struct liveupdate_flb_op_args args = {0};
 +
-+		if (!private->incoming.obj) {
++		if (!private->incoming.retrieved) {
 +			int err = luo_flb_retrieve_one(flb);
 +
 +			if (WARN_ON(err))
@@ -740,6 +725,7 @@ new file mode 100644
 +
 +			private->incoming.data = 0;
 +			private->incoming.obj = NULL;
++			private->incoming.finished = true;
 +		}
 +	}
 +}
@@ -903,7 +889,7 @@ new file mode 100644
 +		}
 +
 +		/* Check that compatible string is unique in global list */
-+		luo_list_for_each_private(gflb, &luo_flb_global.list, private.list) {
++		list_private_for_each_entry(gflb, &luo_flb_global.list, private.list) {
 +			if (!strcmp(gflb->compatible, flb->compatible))
 +				goto err_resume;
 +		}
@@ -1060,10 +1046,6 @@ new file mode 100644
 +	if (!liveupdate_enabled())
 +		return -EOPNOTSUPP;
 +
-+	/* Sanity check that object exists */
-+	if (WARN_ON_ONCE(!private->outgoing.obj))
-+		return -ENOENT;
-+
 +	guard(mutex)(&private->outgoing.lock);
 +	*objp = private->outgoing.obj;
 +
@@ -1167,7 +1149,7 @@ new file mode 100644
 +	struct liveupdate_flb *gflb;
 +	int i = 0;
 +
-+	luo_list_for_each_private(gflb, &luo_flb_global.list, private.list) {
++	list_private_for_each_entry(gflb, &luo_flb_global.list, private.list) {
 +		struct luo_flb_private *private = luo_flb_get_private(gflb);
 +
 +		if (private->outgoing.count > 0) {
@@ -1183,7 +1165,7 @@ new file mode 100644
 +}
 --- a/kernel/liveupdate/luo_internal.h~liveupdate-luo_flb-introduce-file-lifecycle-bound-global-state
 +++ a/kernel/liveupdate/luo_internal.h
-@@ -107,4 +107,11 @@ int luo_file_deserialize(struct luo_file
+@@ -100,4 +100,11 @@ int luo_file_deserialize(struct luo_file
  void luo_file_set_init(struct luo_file_set *file_set);
  void luo_file_set_destroy(struct luo_file_set *file_set);
  

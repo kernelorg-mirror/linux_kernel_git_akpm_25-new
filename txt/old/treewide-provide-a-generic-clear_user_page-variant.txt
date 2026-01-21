@@ -1,66 +1,63 @@
 From: David Hildenbrand <david@redhat.com>
 Subject: treewide: provide a generic clear_user_page() variant
-Date: Mon, 15 Dec 2025 12:49:15 -0800
+Date: Tue, 6 Jan 2026 23:20:02 -0800
 
-Patch series "mm: folio_zero_user: clear contiguous pages", v10.
+Patch series "mm: folio_zero_user: clear page ranges", v11.
 
 This series adds clearing of contiguous page ranges for hugepages.
 
-The series improves on the current page-at-a-time approach in two ways:
+The series improves on the current discontiguous clearing approach in two
+ways:
 
- - amortizes the per-page setup cost over a larger extent
- - when using string instructions, exposes the real region size
-   to the processor.
+  - clear pages in a contiguous fashion.
+  - use batched clearing via clear_pages() wherever exposed.
 
-A processor could use knowledge of the full extent to optimize the
-clearing better than if it sees only a single page sized extent at a time.
-AMD Zen uarchs, as an example, elide cacheline allocation for regions
-larger than LLC-size.
+The first is useful because it allows us to make much better use of
+hardware prefetchers.
+
+The second, enables advertising the real extent to the processor.  Where
+specific instructions support it (ex.  string instructions on x86; "mops"
+on arm64 etc), a processor can optimize based on this because, instead of
+seeing a sequence of 8-byte stores, or a sequence of 4KB pages, it sees a
+larger unit being operated on.
+
+For instance, AMD Zen uarchs (for extents larger than LLC-size) switch to
+a mode where they start eliding cacheline allocation.  This is helpful not
+just because it results in higher bandwidth, but also because now the
+cache is not evicting useful cachelines and replacing them with zeroes.
 
 Demand faulting a 64GB region shows performance improvement:
 
  $ perf bench mem mmap -p $pg-sz -f demand -s 64GB -l 5
 
-                       baseline              +series             change
+                       baseline              +series
+                   (GBps +- %stdev)      (GBps +- %stdev)
 
-                  (GB/s  +- %stdev)     (GB/s  +- %stdev)
+   pg-sz=2MB       11.76 +- 1.10%        25.34 +- 1.18% [*]   +115.47%  	preempt=*
 
-   pg-sz=2MB       12.92  +- 2.55%        17.03  +-  0.70%       + 31.8%	preempt=*
+   pg-sz=1GB       24.85 +- 2.41%        39.22 +- 2.32%       + 57.82%  	preempt=none|voluntary
+   pg-sz=1GB         (similar)           52.73 +- 0.20% [#]   +112.19%  	preempt=full|lazy
 
-   pg-sz=1GB       17.14  +- 2.27%        18.04  +-  1.05%       +  5.2%	preempt=none|voluntary
-   pg-sz=1GB       17.26  +- 1.24%        42.17  +-  4.21% [#]   +144.3%	preempt=full|lazy
+ [*] This improvement is because switching to sequential clearing
+  allows the hardware prefetchers to do a much better job.
 
- [#] Notice that we perform much better with preempt=full|lazy. That's
-  because preemptible models don't need explicit invocations of
-  cond_resched() to ensure reasonable preemption latency, which,
-  allows us to clear the full extent (1GB) in a single unit.
-  In comparison the maximum extent used for preempt=none|voluntary is
-  PROCESS_PAGES_NON_PREEMPT_BATCH (8MB).
+ [#] For pg-sz=1GB a large part of the improvement is because of the
+  cacheline elision mentioned above. preempt=full|lazy improves upon
+  that because, not needing explicit invocations of cond_resched() to
+  ensure reasonable preemption latency, it can clear the full extent
+  as a single unit. In comparison the maximum extent used for
+  preempt=none|voluntary is PROCESS_PAGES_NON_PREEMPT_BATCH (32MB).
 
-  The larger extent allows the processor to elide cacheline
-  allocation (on Milan the threshold is LLC-size=32MB.) 
+  When provided the full extent the processor forgoes allocating
+  cachelines on this path almost entirely.
 
   (The hope is that eventually, in the fullness of time, the lazy
-  preemption model will be able to do the same job that none or
-  voluntary models are used for, allowing cond_resched() to go away.)
+   preemption model will be able to do the same job that none or
+   voluntary models are used for, allowing us to do away with
+   cond_resched().)
 
-The anon-w-seq test in the vm-scalability benchmark, however, does show
-worse performance with utime increasing by ~9%:
-
-                         stime                  utime
-
-  baseline         1654.63 ( +- 3.84% )     811.00 ( +- 3.84% )
-  +series          1630.32 ( +- 2.73% )     886.37 ( +- 5.19% )
-
-In part this is because anon-w-seq runs with 384 processes zeroing
-anonymously mapped memory which they then access sequentially.  As such
-this is a likely uncommon pattern where the memory bandwidth is saturated
-while we are also cache limited because the workload accesses the entire
-region.
-
-Raghavendra also tested previous version of the series on AMD Genoa also
-sees improvement [1] with preempt=lazy.  (The pg-sz=2MB improvement is
-much higher on Genoa than I see on Milan):
+Raghavendra also tested previous version of the series on AMD Genoa and
+sees similar improvement [1] with preempt=lazy.
 
   $ perf bench mem map -p $page-size -f populate -s 64GB -l 10
 
@@ -75,8 +72,7 @@ Let's drop all variants that effectively map to clear_page() and provide
 it in a generic variant instead.
 
 We'll use the macro clear_user_page to indicate whether an architecture
-provides it's own variant.  Maybe at some point these should be CONFIG_
-options.
+provides it's own variant.
 
 Also, clear_user_page() is only called from the generic variant of
 clear_user_highpage(), so define it only if the architecture does not
@@ -88,20 +84,29 @@ clear_page_asm(), so we can just get rid of the custom clear_user_page()
 implementation.  There is a clear_user_page_asm() function on parisc, that
 seems to be unused.  Not sure what's up with that.
 
-Link: https://lkml.kernel.org/r/20251215204922.475324-1-ankur.a.arora@oracle.com
-Link: https://lkml.kernel.org/r/20251215204922.475324-2-ankur.a.arora@oracle.com
+Link: https://lkml.kernel.org/r/20260107072009.1615991-1-ankur.a.arora@oracle.com
+Link: https://lkml.kernel.org/r/20260107072009.1615991-2-ankur.a.arora@oracle.com
 Signed-off-by: David Hildenbrand <david@redhat.com>
 Co-developed-by: Ankur Arora <ankur.a.arora@oracle.com>
 Signed-off-by: Ankur Arora <ankur.a.arora@oracle.com>
 Cc: Andy Lutomirski <luto@kernel.org>
-Cc: Borislav Betkov <bp@alien8.de>
+Cc: Ankur Arora <ankur.a.arora@oracle.com>
+Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
 Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Cc: David Hildenbrand <david@kernel.org>
 Cc: "H. Peter Anvin" <hpa@zytor.com>
 Cc: Ingo Molnar <mingo@redhat.com>
 Cc: Konrad Rzessutek Wilk <konrad.wilk@oracle.com>
 Cc: Lance Yang <ioworker0@gmail.com>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Li Zhe <lizhe.67@bytedance.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Peter Zijlstra <peterz@infradead.org>
 Cc: Raghavendra K T <raghavendra.kt@amd.com>
-Cc: Thomas Gleinxer <tglx@linutronix.de>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Vlastimil Babka <vbabka@suse.cz>
