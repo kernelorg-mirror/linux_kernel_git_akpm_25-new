@@ -1,0 +1,145 @@
+From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Subject: mm/vma: add+use vma lockdep acquire/release defines
+Date: Thu, 22 Jan 2026 13:01:56 +0000
+
+The code is littered with inscrutable and duplicative lockdep
+incantations, replace these with defines which explain what is going on
+and add commentary to explain what we're doing.
+
+If lockdep is disabled these become no-ops.  We must use defines so
+_RET_IP_ remains meaningful.
+
+These are self-documenting and aid readability of the code.
+
+Additionally, instead of using the confusing rwsem_*() form for something
+that is emphatically not an rwsem, we instead explicitly use
+lock_[acquired, release]_shared/exclusive() lockdep invocations since we
+are doing something rather custom here and these make more sense to use.
+
+No functional change intended.
+
+Link: https://lkml.kernel.org/r/4703b7320796908b9a0827c3d42d74d11b703714.1769086312.git.lorenzo.stoakes@oracle.com
+Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Boqun Feng <boqun.feng@gmail.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Waiman Long <longman@redhat.com>
+Cc: Will Deacon <will@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/mmap_lock.h |   35 ++++++++++++++++++++++++++++++++---
+ mm/mmap_lock.c            |   10 +++++-----
+ 2 files changed, 37 insertions(+), 8 deletions(-)
+
+--- a/include/linux/mmap_lock.h~mm-vma-adduse-vma-lockdep-acquire-release-defines
++++ a/include/linux/mmap_lock.h
+@@ -78,6 +78,36 @@ static inline void mmap_assert_write_loc
+ 
+ #ifdef CONFIG_PER_VMA_LOCK
+ 
++/*
++ * VMA locks do not behave like most ordinary locks found in the kernel, so we
++ * cannot quite have full lockdep tracking in the way we would ideally prefer.
++ *
++ * Read locks act as shared locks which exclude an exclusive lock being
++ * taken. We therefore mark these accordingly on read lock acquire/release.
++ *
++ * Write locks are acquired exclusively per-VMA, but released in a shared
++ * fashion, that is upon vma_end_write_all(), we update the mmap's seqcount such
++ * that write lock is de-acquired.
++ *
++ * We therefore cannot track write locks per-VMA, nor do we try. Mitigating this
++ * is the fact that, of course, we do lockdep-track the mmap lock rwsem.
++ *
++ * We do, however, want to indicate that during either acquisition of a VMA
++ * write lock or detachment of a VMA that we require the lock held be exclusive,
++ * so we utilise lockdep to do so.
++ */
++#define __vma_lockdep_acquire_read(vma) \
++	lock_acquire_shared(&vma->vmlock_dep_map, 0, 1, NULL, _RET_IP_)
++#define __vma_lockdep_release_read(vma) \
++	lock_release(&vma->vmlock_dep_map, _RET_IP_)
++#define __vma_lockdep_acquire_exclusive(vma) \
++	lock_acquire_exclusive(&vma->vmlock_dep_map, 0, 0, NULL, _RET_IP_)
++#define __vma_lockdep_release_exclusive(vma) \
++	lock_release(&vma->vmlock_dep_map, _RET_IP_)
++/* Only meaningful if CONFIG_LOCK_STAT is defined. */
++#define __vma_lockdep_stat_mark_acquired(vma) \
++	lock_acquired(&vma->vmlock_dep_map, _RET_IP_)
++
+ static inline void mm_lock_seqcount_init(struct mm_struct *mm)
+ {
+ 	seqcount_init(&mm->mm_lock_seq);
+@@ -176,8 +206,7 @@ static inline void vma_refcount_put(stru
+ 	int refcnt;
+ 	bool detached;
+ 
+-	rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
+-
++	__vma_lockdep_release_read(vma);
+ 	detached = __vma_refcount_put(vma, &refcnt);
+ 	/*
+ 	 * __vma_enter_locked() may be sleeping waiting for readers to drop
+@@ -203,7 +232,7 @@ static inline bool vma_start_read_locked
+ 							      VM_REFCNT_LIMIT)))
+ 		return false;
+ 
+-	rwsem_acquire_read(&vma->vmlock_dep_map, 0, 1, _RET_IP_);
++	__vma_lockdep_acquire_read(vma);
+ 	return true;
+ }
+ 
+--- a/mm/mmap_lock.c~mm-vma-adduse-vma-lockdep-acquire-release-defines
++++ a/mm/mmap_lock.c
+@@ -72,7 +72,7 @@ static inline int __vma_enter_locked(str
+ 	if (!refcount_add_not_zero(VM_REFCNT_EXCLUDE_READERS_FLAG, &vma->vm_refcnt))
+ 		return 0;
+ 
+-	rwsem_acquire(&vma->vmlock_dep_map, 0, 0, _RET_IP_);
++	__vma_lockdep_acquire_exclusive(vma);
+ 	err = rcuwait_wait_event(&vma->vm_mm->vma_writer_wait,
+ 		   refcount_read(&vma->vm_refcnt) == tgt_refcnt,
+ 		   state);
+@@ -85,10 +85,10 @@ static inline int __vma_enter_locked(str
+ 			WARN_ON_ONCE(!detaching);
+ 			err = 0;
+ 		}
+-		rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
++		__vma_lockdep_release_exclusive(vma);
+ 		return err;
+ 	}
+-	lock_acquired(&vma->vmlock_dep_map, _RET_IP_);
++	__vma_lockdep_stat_mark_acquired(vma);
+ 
+ 	return 1;
+ }
+@@ -97,7 +97,7 @@ static inline void __vma_exit_locked(str
+ {
+ 	*detached = refcount_sub_and_test(VM_REFCNT_EXCLUDE_READERS_FLAG,
+ 					  &vma->vm_refcnt);
+-	rwsem_release(&vma->vmlock_dep_map, _RET_IP_);
++	__vma_lockdep_release_exclusive(vma);
+ }
+ 
+ int __vma_start_write(struct vm_area_struct *vma, unsigned int mm_lock_seq,
+@@ -199,7 +199,7 @@ static inline struct vm_area_struct *vma
+ 		goto err;
+ 	}
+ 
+-	rwsem_acquire_read(&vma->vmlock_dep_map, 0, 1, _RET_IP_);
++	__vma_lockdep_acquire_read(vma);
+ 
+ 	if (unlikely(vma->vm_mm != mm))
+ 		goto err_unstable;
+_
