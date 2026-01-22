@@ -1,0 +1,114 @@
+From: Qiliang Yuan <realwujing@gmail.com>
+Subject: watchdog/hardlockup: fix UAF in perf event cleanup due to migration race
+Date: Thu, 22 Jan 2026 00:24:42 -0500
+
+During the early initialization of the hardlockup detector, the
+hardlockup_detector_perf_init() function probes for PMU hardware
+availability.  It originally used hardlockup_detector_event_create(),
+which interacts with the per-cpu 'watchdog_ev' variable.
+
+If the initializing task migrates to another CPU during this probe phase,
+two issues arise:
+1. The 'watchdog_ev' pointer on the original CPU is set but not cleared,
+   leaving a stale pointer to a freed perf event.
+2. The 'watchdog_ev' pointer on the new CPU might be incorrectly cleared.
+
+This race condition was observed in console logs (captured by adding debug printks):
+
+[23.038376] hardlockup_detector_perf_init 313 cur_cpu=2
+...
+[23.076385] hardlockup_detector_event_create 203 cpu(cur)=2 set watchdog_ev
+...
+[23.095788] perf_event_release_kernel 4623 cur_cpu=2
+...
+[23.116963] lockup_detector_reconfigure 577 cur_cpu=3
+
+The log shows the task started on CPU 2, set watchdog_ev on CPU 2,
+released the event on CPU 2, but then migrated to CPU 3 before the cleanup
+logic (which would clear watchdog_ev) could run.  This left watchdog_ev on
+CPU 2 pointing to a freed event.
+
+Later, when the watchdog is enabled/disabled on CPU 2, this stale pointer
+leads to a Use-After-Free (UAF) in perf_event_disable(), as detected by KASAN:
+[26.539140] ==================================================================
+[26.540732] BUG: KASAN: use-after-free in perf_event_ctx_lock_nested.isra.72+0x6b/0x140
+[26.542442] Read of size 8 at addr ff110006b360d718 by task kworker/2:1/94
+[26.543954]
+[26.544744] CPU: 2 PID: 94 Comm: kworker/2:1 Not tainted 4.19.90-debugkasan #11
+[26.546505] Hardware name: GoStack Foundation OpenStack Nova, BIOS 1.16.3-3.ctl3 04/01/2014
+[26.548256] Workqueue: events smp_call_on_cpu_callback
+[26.549267] Call Trace:
+[26.549936]  dump_stack+0x8b/0xbb
+[26.550731]  print_address_description+0x6a/0x270
+[26.551688]  kasan_report+0x179/0x2c0
+[26.552519]  ? perf_event_ctx_lock_nested.isra.72+0x6b/0x140
+[26.553654]  ? watchdog_disable+0x80/0x80
+[26.553657]  perf_event_ctx_lock_nested.isra.72+0x6b/0x140
+[26.556951]  ? dump_stack+0xa0/0xbb
+[26.564006]  ? watchdog_disable+0x80/0x80
+[26.564886]  perf_event_disable+0xa/0x30
+[26.565746]  hardlockup_detector_perf_disable+0x1b/0x60
+[26.566776]  watchdog_disable+0x51/0x80
+[26.567624]  softlockup_stop_fn+0x11/0x20
+[26.568499]  smp_call_on_cpu_callback+0x5b/0xb0
+[26.569443]  process_one_work+0x389/0x770
+[26.570311]  worker_thread+0x57/0x5a0
+[26.571124]  ? process_one_work+0x770/0x770
+[26.572031]  kthread+0x1ae/0x1d0
+[26.572810]  ? kthread_create_worker_on_cpu+0xc0/0xc0
+[26.573821]  ret_from_fork+0x1f/0x40
+[26.574638]
+[26.575178] Allocated by task 1:
+[26.575990]  kasan_kmalloc+0xa0/0xd0
+[26.576814]  kmem_cache_alloc_trace+0xf3/0x1e0
+[26.577732]  perf_event_alloc.part.89+0xb5/0x12b0
+[26.578700]  perf_event_create_kernel_counter+0x1e/0x1d0
+[26.579728]  hardlockup_detector_event_create+0x4e/0xc0
+[26.580744]  hardlockup_detector_perf_init+0x2f/0x60
+[26.581746]  lockup_detector_init+0x85/0xdc
+[26.582645]  kernel_init_freeable+0x34d/0x40e
+[26.583568]  kernel_init+0xf/0x130
+[26.584428]  ret_from_fork+0x1f/0x40
+[26.584429]
+[26.584430] Freed by task 0:
+[26.584433]  __kasan_slab_free+0x130/0x180
+[26.584436]  kfree+0x90/0x1a0
+[26.589641]  rcu_process_callbacks+0x2cb/0x6e0
+[26.590935]  __do_softirq+0x119/0x3a2
+[26.591965]
+[26.592630] The buggy address belongs to the object at ff110006b360d500
+[26.592630]  which belongs to the cache kmalloc-2048 of size 2048
+[26.592633] The buggy address is located 536 bytes inside of
+[26.592633]  2048-byte region [ff110006b360d500, ff110006b360dd00)
+[26.592634] The buggy address belongs to the page:
+[26.592637] page:ffd400001acd8200 count:1 mapcount:0 mapping:ff11000107c0e800 index:0x0 compound_mapcount: 0
+[26.600959] flags: 0x17ffffc0010200(slab|head)
+[26.601891] raw: 0017ffffc0010200 dead000000000100 dead000000000200 ff11000107c0e800
+[26.603541] raw: 0000000000000000 00000000800f000f 00000001ffffffff 0000000000000000
+[26.605546] page dumped because: kasan: bad access detected
+[26.606788]
+[26.607351] Memory state around the buggy address:
+[26.608556]  ff110006b360d600: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[26.610565]  ff110006b360d680: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[26.610567] >ff110006b360d700: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[26.610568]                             ^
+[26.610570]  ff110006b360d780: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[26.610573]  ff110006b360d800: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+[26.618955] ==================================================================
+
+Fix this by making the probe logic stateless.  Use a local variable for
+the perf event and avoid accessing the per-cpu 'watchdog_ev' during
+initialization.  This ensures that the probe event is always properly
+released regardless of task migration, and no stale global state is left
+behind.
+
+Link: https://lkml.kernel.org/r/20260122052442.667394-1-realwujing@gmail.com
+Signed-off-by: Shouxin Sun <sunshx@chinatelecom.cn>
+Signed-off-by: Junnan Zhang <zhangjn11@chinatelecom.cn>
+Signed-off-by: Qiliang Yuan <realwujing@gmail.com>
+Signed-off-by: Qiliang Yuan <yuanql9@chinatelecom.cn>
+Cc: Song Liu <song@kernel.org>
+Cc: Douglas Anderson <dianders@chromium.org>
+Cc: Jinchao Wang <wangjinchao600@gmail.com>
+Cc: Wang Jinchao <wangjinchao600@gmail.com>
+Cc: <stable@vger.kernel.org>
