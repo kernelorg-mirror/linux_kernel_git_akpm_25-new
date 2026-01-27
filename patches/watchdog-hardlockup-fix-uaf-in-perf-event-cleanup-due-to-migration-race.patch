@@ -2,43 +2,35 @@ From: Qiliang Yuan <realwujing@gmail.com>
 Subject: watchdog/hardlockup: fix UAF in perf event cleanup due to migration race
 Date: Sat, 24 Jan 2026 02:08:14 -0500
 
-Original analysis on Linux 4.19 showed a race condition in the hardlockup
-detector's initialization phase.  Specifically, during the early probe
-phase, hardlockup_detector_perf_init() (renamed to
-watchdog_hardlockup_probe() in newer kernels via commit d9b3629ade8e)
-interacted with the per-cpu 'watchdog_ev' variable.
+The hardlockup detector's probe path (watchdog_hardlockup_probe()) can
+be executed in a non-pinned context, such as during the asynchronous
+retry mechanism (lockup_detector_delay_init) which runs in a standard
+unbound workqueue.
 
-If the initializing task migrates to another CPU during this probe phase,
-two issues arise:
-1. The 'watchdog_ev' pointer on the original CPU is set but not cleared,
-   leaving a stale pointer to a freed perf event.
-2. The 'watchdog_ev' pointer on the new CPU might be incorrectly cleared.
+In this context, the existing implementation of
+hardlockup_detector_event_create() suffers from a race condition due to
+potential task migration. It relies on is_percpu_thread() to ensure
+CPU-locality, but worker threads in a global workqueue do not carry the
+PF_PERCPU_THREAD flag, causing the WARN_ON() to trigger and violating
+the assumption of stable per-cpu access.
 
-Note: Although the logs below reference hardlockup_detector_perf_init(),
-the same logic persists in the current watchdog_hardlockup_probe()
-implementation.
+If the task migrates during the probe:
+1. It might set 'watchdog_ev' on one CPU but fail to clear it if the
+   subsequent migration causes the cleanup logic to run on a different CPU.
+2. This leaves a stale pointer to a freed perf_event in the original
+   CPU's 'watchdog_ev' variable, leading to a use-after-free (UAF) when
+   the watchdog is later enabled or reconfigured.
 
-This race condition was observed in console logs:
-[23.038376] hardlockup_detector_perf_init 313 cur_cpu=2
-...
-[23.076385] hardlockup_detector_event_create 203 cpu(cur)=2 set watchdog_ev
-...
-[23.095788] perf_event_release_kernel 4623 cur_cpu=2
-...
-[23.116963] lockup_detector_reconfigure 577 cur_cpu=3
+While this issue was prominently observed in downstream kernels (like
+openEuler 4.19) where initialization timings are shifted to a post-SMP
+phase, it represents a latent bug in the mainline asynchronous
+initialization path.
 
-The log shows the task started on CPU 2, set watchdog_ev on CPU 2,
-released the event on CPU 2, but then migrated to CPU 3 before the cleanup
-logic could run.  This left watchdog_ev on CPU 2 pointing to a freed
-event, resulting in a UAF when later accessed:
-
-[26.540732] BUG: KASAN: use-after-free in perf_event_ctx_lock_nested.isra.72+0x6b/0x140
-[26.542442] Read of size 8 at addr ff110006b360d718 by task kworker/2:1/94
-
-Fix this by refactoring hardlockup_detector_event_create() to return the
-created perf event instead of directly assigning it to the per-cpu
-variable.  In the probe function, use an arbitrary CPU but ensure it
-remains online via cpu_hotplug_disable() during the check.
+Refactor hardlockup_detector_event_create() to be stateless by returning
+the created perf_event pointer instead of directly modifying the per-cpu
+'watchdog_ev' variable. This allows the probe logic to safely manage
+the temporary event. Use cpu_hotplug_disable() during the probe to ensure
+the target CPU remains valid throughout the check.
 
 Link: https://lkml.kernel.org/r/20260124070814.806828-1-realwujing@gmail.com
 Fixes: 930d8f8dbab9 ("watchdog/perf: adapt the watchdog_perf interface for async model")
