@@ -1,72 +1,132 @@
 From: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Subject: mm/vma: introduce helper struct + thread through exclusive lock fns
-Date: Thu, 22 Jan 2026 13:01:59 +0000
+Date: Fri, 23 Jan 2026 20:12:17 +0000
 
-It is confusing to have __vma_enter_exclusive_locked() return 0, 1 or an
+It is confusing to have __vma_start_exclude_readers() return 0, 1 or an
 error (but only when waiting for readers in TASK_KILLABLE state), and
-having the return value be stored in a stack variable called 'locked' is
-further confusion.
+having the return value be stored in a stack variable called 'locked'
+is further confusion.
 
-More generally, we are doing a lock of rather finnicky things during the
+More generally, we are doing a lot of rather finnicky things during the
 acquisition of a state in which readers are excluded and moving out of
-this state, including tracking whether we are detached or not or whether
-an error occurred.
+this state, including tracking whether we are detached or not or
+whether an error occurred.
 
-We are implementing logic in __vma_enter_exclusive_locked() that
+We are implementing logic in __vma_start_exclude_readers() that
 effectively acts as if 'if one caller calls us do X, if another then do
 Y', which is very confusing from a control flow perspective.
 
-Introducing the shared helper object state helps us avoid this, as we can
-now handle the 'an error arose but we're detached' condition correctly in
-both callers - a warning if not detaching, and treating the situation as
-if no error arose in the case of a VMA detaching.
+Introducing the shared helper object state helps us avoid this, as we
+can now handle the 'an error arose but we're detached' condition
+correctly in both callers - a warning if not detaching, and treating
+the situation as if no error arose in the case of a VMA detaching.
 
-This also acts to help document what's going on and allows us to add some
-more logical debug asserts.
+This also acts to help document what's going on and allows us to add
+some more logical debug asserts.
 
 Also update vma_mark_detached() to add a guard clause for the likely
 'already detached' state (given we hold the mmap write lock), and add a
 comment about ephemeral VMA read lock reference count increments to
 clarify why we are entering/exiting an exclusive locked state here.
 
+Finally, separate vma_mark_detached() into its fast-path component and
+make it inline, then place the slow path for excluding readers in
+mmap_lock.c.
+
 No functional change intended.
 
-Link: https://lkml.kernel.org/r/4f95671feac6b6d4cea3c53426c875f3fd8a8855.1769086312.git.lorenzo.stoakes@oracle.com
+[akpm@linux-foundation.org: fix function naming in comments, add comment per Vlastimil per Lorenzo]
+  Link: https://lkml.kernel.org/r/7d3084d596c84da10dd374130a5055deba6439c0.1769198904.git.lorenzo.stoakes@oracle.com
+Link: https://lkml.kernel.org/r/7d3084d596c84da10dd374130a5055deba6439c0.1769198904.git.lorenzo.stoakes@oracle.com
 Signed-off-by: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Reviewed-by: Suren Baghdasaryan <surenb@google.com>
 Cc: Boqun Feng <boqun.feng@gmail.com>
-Cc: David Hildenbrand <david@kernel.org>
-Cc: Ingo Molnar <mingo@redhat.com>
-Cc: Jann Horn <jannh@google.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mike Rapoport <rppt@kernel.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
-Cc: Steven Rostedt <rostedt@goodmis.org>
-Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Waiman Long <longman@redhat.com>
-Cc: Will Deacon <will@kernel.org>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/mmap_lock.c |  150 +++++++++++++++++++++++++++++------------------
- 1 file changed, 94 insertions(+), 56 deletions(-)
+ include/linux/mm_types.h  |   14 +--
+ include/linux/mmap_lock.h |   23 +++++
+ mm/mmap_lock.c            |  158 +++++++++++++++++++-----------------
+ 3 files changed, 115 insertions(+), 80 deletions(-)
 
+--- a/include/linux/mmap_lock.h~mm-vma-introduce-helper-struct-thread-through-exclusive-lock-fns
++++ a/include/linux/mmap_lock.h
+@@ -358,7 +358,28 @@ static inline void vma_mark_attached(str
+ 	refcount_set_release(&vma->vm_refcnt, 1);
+ }
+ 
+-void vma_mark_detached(struct vm_area_struct *vma);
++void __vma_exclude_readers_for_detach(struct vm_area_struct *vma);
++
++static inline void vma_mark_detached(struct vm_area_struct *vma)
++{
++	vma_assert_write_locked(vma);
++	vma_assert_attached(vma);
++
++	/*
++	 * The VMA still being attached (refcnt > 0) - is unlikely, because the
++	 * vma has been already write-locked and readers can increment vm_refcnt
++	 * only temporarily before they check vm_lock_seq, realize the vma is
++	 * locked and drop back the vm_refcnt. That is a narrow window for
++	 * observing a raised vm_refcnt.
++	 *
++	 * See the comment describing the vm_area_struct->vm_refcnt field for
++	 * details of possible refcnt values.
++	 */
++	if (likely(!__vma_refcount_put_return(vma)))
++		return;
++
++	__vma_exclude_readers_for_detach(vma);
++}
+ 
+ struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
+ 					  unsigned long address);
+--- a/include/linux/mm_types.h~mm-vma-introduce-helper-struct-thread-through-exclusive-lock-fns
++++ a/include/linux/mm_types.h
+@@ -1011,15 +1011,15 @@ struct vm_area_struct {
+ 	 * decrementing it again.
+ 	 *
+ 	 * VM_REFCNT_EXCLUDE_READERS_FLAG - Detached, pending
+-	 * __vma_exit_locked() completion which will decrement the reference
+-	 * count to zero. IMPORTANT - at this stage no further readers can
+-	 * increment the reference count. It can only be reduced.
++	 * __vma_end_exclude_readers() completion which will decrement the
++	 * reference count to zero. IMPORTANT - at this stage no further readers
++	 * can increment the reference count. It can only be reduced.
+ 	 *
+ 	 * VM_REFCNT_EXCLUDE_READERS_FLAG + 1 - A thread is either write-locking
+-	 * an attached VMA and has yet to invoke __vma_exit_locked(), OR a
+-	 * thread is detaching a VMA and is waiting on a single spurious reader
+-	 * in order to decrement the reference count. IMPORTANT - as above, no
+-	 * further readers can increment the reference count.
++	 * an attached VMA and has yet to invoke __vma_end_exclude_readers(),
++	 * OR a thread is detaching a VMA and is waiting on a single spurious
++	 * reader in order to decrement the reference count. IMPORTANT - as
++	 * above, no further readers can increment the reference count.
+ 	 *
+ 	 * > VM_REFCNT_EXCLUDE_READERS_FLAG + 1 - A thread is either
+ 	 * write-locking or detaching a VMA is waiting on readers to
 --- a/mm/mmap_lock.c~mm-vma-introduce-helper-struct-thread-through-exclusive-lock-fns
 +++ a/mm/mmap_lock.c
-@@ -46,20 +46,40 @@ EXPORT_SYMBOL(__mmap_lock_do_trace_relea
+@@ -46,20 +46,38 @@ EXPORT_SYMBOL(__mmap_lock_do_trace_relea
  #ifdef CONFIG_MMU
  #ifdef CONFIG_PER_VMA_LOCK
  
-+/* State shared across __vma_[enter, exit]_exclusive_locked(). */
++/* State shared across __vma_[start, end]_exclude_readers. */
 +struct vma_exclude_readers_state {
 +	/* Input parameters. */
 +	struct vm_area_struct *vma;
 +	int state; /* TASK_KILLABLE or TASK_UNINTERRUPTIBLE. */
 +	bool detaching;
 +
++	/* Output parameters. */
 +	bool detached;
 +	bool exclusive; /* Are we exclusively locked? */
 +};
@@ -74,20 +134,19 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /*
   * Now that all readers have been evicted, mark the VMA as being out of the
   * 'exclude readers' state.
-  *
-  * Returns true if the VMA is now detached, otherwise false.
+- *
+- * Returns true if the VMA is now detached, otherwise false.
   */
--static bool __must_check __vma_exit_exclusive_locked(struct vm_area_struct *vma)
-+static void __vma_exit_exclusive_locked(struct vma_exclude_readers_state *ves)
+-static bool __must_check __vma_end_exclude_readers(struct vm_area_struct *vma)
++static void __vma_end_exclude_readers(struct vma_exclude_readers_state *ves)
  {
 -	bool detached;
 +	struct vm_area_struct *vma = ves->vma;
++
++	VM_WARN_ON_ONCE(ves->detached);
  
 -	detached = refcount_sub_and_test(VM_REFCNT_EXCLUDE_READERS_FLAG,
 -					 &vma->vm_refcnt);
-+	VM_WARN_ON_ONCE(ves->detached);
-+	VM_WARN_ON_ONCE(!ves->exclusive);
-+
 +	ves->detached = refcount_sub_and_test(VM_REFCNT_EXCLUDE_READERS_FLAG,
 +					      &vma->vm_refcnt);
  	__vma_lockdep_release_exclusive(vma);
@@ -102,7 +161,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  /*
-@@ -69,30 +89,31 @@ static bool __must_check __vma_exit_excl
+@@ -69,32 +87,29 @@ static bool __must_check __vma_end_exclu
   * Note that this function pairs with vma_refcount_put() which will wake up this
   * thread when it detects that the last reader has released its lock.
   *
@@ -110,11 +169,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 - * wish the thread to sleep uninterruptibly or TASK_KILLABLE if a fatal signal
 - * is permitted to kill it.
 - *
-- * The function will return 0 immediately if the VMA is detached, and 1 once the
-- * VMA has evicted all readers, leaving the VMA exclusively locked.
+- * The function will return 0 immediately if the VMA is detached, or wait for
+- * readers and return 1 once they have all exited, leaving the VMA exclusively
+- * locked.
 - *
 - * If the function returns 1, the caller is required to invoke
-- * __vma_exit_exclusive_locked() once the exclusive state is no longer required.
+- * __vma_end_exclude_readers() once the exclusive state is no longer required.
 - *
 - * If state is set to something other than TASK_UNINTERRUPTIBLE, the function
 - * may also return -EINTR to indicate a fatal signal was received while waiting.
@@ -122,21 +182,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * where we wish the thread to sleep uninterruptibly or TASK_KILLABLE if a fatal
 + * signal is permitted to kill it.
 + *
-+ * The function sets the ves->locked parameter to true if an exclusive lock was
-+ * acquired, or false if the VMA was detached or an error arose on wait.
++ * The function sets the ves->exclusive parameter to true if readers were
++ * excluded, or false if the VMA was detached or an error arose on wait.
 + *
 + * If the function indicates an exclusive lock was acquired via ves->exclusive
-+ * (or equivalently, returning 0 with !ves->detached), the caller is required to
-+ * invoke __vma_exit_exclusive_locked() once the exclusive state is no longer
-+ * required.
++ * the caller is required to invoke __vma_end_exclude_readers() once the
++ * exclusive state is no longer required.
 + *
 + * If ves->state is set to something other than TASK_UNINTERRUPTIBLE, the
 + * function may also return -EINTR to indicate a fatal signal was received while
-+ * waiting.
++ * waiting.  Otherwise, the function returns 0.
   */
--static int __vma_enter_exclusive_locked(struct vm_area_struct *vma,
+-static int __vma_start_exclude_readers(struct vm_area_struct *vma,
 -		bool detaching, int state)
-+static int __vma_enter_exclusive_locked(struct vma_exclude_readers_state *ves)
++static int __vma_start_exclude_readers(struct vma_exclude_readers_state *ves)
  {
 -	int err;
 -	unsigned int tgt_refcnt = VM_REFCNT_EXCLUDE_READERS_FLAG;
@@ -145,16 +204,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	int err = 0;
  
  	mmap_assert_write_locked(vma->vm_mm);
--
+ 
 -	/* Additional refcnt if the vma is attached. */
 -	if (!detaching)
 -		tgt_refcnt++;
-+	VM_WARN_ON_ONCE(ves->detached);
-+	VM_WARN_ON_ONCE(ves->exclusive);
- 
+-
  	/*
  	 * If vma is detached then only vma_mark_attached() can raise the
-@@ -101,37 +122,39 @@ static int __vma_enter_exclusive_locked(
+ 	 * vm_refcnt. mmap_write_lock prevents racing with vma_mark_attached().
+@@ -102,37 +117,39 @@ static int __vma_start_exclude_readers(s
  	 * See the comment describing the vm_area_struct->vm_refcnt field for
  	 * details of possible refcnt values.
  	 */
@@ -170,7 +228,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		   state);
 +		   ves->state);
  	if (err) {
--		if (__vma_exit_exclusive_locked(vma)) {
+-		if (__vma_end_exclude_readers(vma)) {
 -			/*
 -			 * The wait failed, but the last reader went away
 -			 * as well. Tell the caller the VMA is detached.
@@ -178,7 +236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			WARN_ON_ONCE(!detaching);
 -			err = 0;
 -		}
-+		__vma_exit_exclusive_locked(ves);
++		__vma_end_exclude_readers(ves);
  		return err;
  	}
 -	__vma_lockdep_stat_mark_acquired(vma);
@@ -199,10 +257,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		.state = state,
 +	};
  
--	locked = __vma_enter_exclusive_locked(vma, false, state);
+-	locked = __vma_start_exclude_readers(vma, false, state);
 -	if (locked < 0)
 -		return locked;
-+	err = __vma_enter_exclusive_locked(&ves);
++	err = __vma_start_exclude_readers(&ves);
 +	if (err) {
 +		WARN_ON_ONCE(ves.detached);
 +		return err;
@@ -210,26 +268,30 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * We should use WRITE_ONCE() here because we can have concurrent reads
-@@ -141,9 +164,11 @@ int __vma_start_write(struct vm_area_str
+@@ -142,45 +159,42 @@ int __vma_start_write(struct vm_area_str
  	 */
  	WRITE_ONCE(vma->vm_lock_seq, mm_lock_seq);
  
--	/* vma should remain attached. */
--	if (locked)
--		WARN_ON_ONCE(__vma_exit_exclusive_locked(vma));
-+	if (!ves.detached) {
-+		__vma_exit_exclusive_locked(&ves);
+-	if (locked) {
+-		bool detached = __vma_end_exclude_readers(vma);
+-
+-		/* The VMA should remain attached. */
+-		WARN_ON_ONCE(detached);
++	if (ves.exclusive) {
++		__vma_end_exclude_readers(&ves);
 +		/* VMA should remain attached. */
 +		WARN_ON_ONCE(ves.detached);
-+	}
+ 	}
  
  	return 0;
  }
-@@ -151,7 +176,12 @@ EXPORT_SYMBOL_GPL(__vma_start_write);
+ EXPORT_SYMBOL_GPL(__vma_start_write);
  
- void vma_mark_detached(struct vm_area_struct *vma)
+-void vma_mark_detached(struct vm_area_struct *vma)
++void __vma_exclude_readers_for_detach(struct vm_area_struct *vma)
  {
--	bool detached;
+-	vma_assert_write_locked(vma);
+-	vma_assert_attached(vma);
 +	struct vma_exclude_readers_state ves = {
 +		.vma = vma,
 +		.state = TASK_UNINTERRUPTIBLE,
@@ -237,40 +299,40 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	};
 +	int err;
  
- 	vma_assert_write_locked(vma);
- 	vma_assert_attached(vma);
-@@ -160,18 +190,26 @@ void vma_mark_detached(struct vm_area_st
- 	 * See the comment describing the vm_area_struct->vm_refcnt field for
- 	 * details of possible refcnt values.
- 	 */
--	detached = __vma_refcount_put(vma, NULL);
--	if (unlikely(!detached)) {
--		/* Wait until vma is detached with no readers. */
--		if (__vma_enter_exclusive_locked(vma, true, TASK_UNINTERRUPTIBLE)) {
--			/*
--			 * Once this is complete, no readers can increment the
--			 * reference count, and the VMA is marked detached.
--			 */
--			detached = __vma_exit_exclusive_locked(vma);
--			WARN_ON_ONCE(!detached);
--		}
-+	if (likely(__vma_refcount_put(vma, NULL)))
-+		return;
-+
-+	/*
+ 	/*
+-	 * This condition - that the VMA is still attached (refcnt > 0) - is
+-	 * unlikely, because the vma has been already write-locked and readers
+-	 * can increment vm_refcnt only temporarily before they check
+-	 * vm_lock_seq, realize the vma is locked and drop back the
+-	 * vm_refcnt. That is a narrow window for observing a raised vm_refcnt.
+-	 *
+-	 * See the comment describing the vm_area_struct->vm_refcnt field for
+-	 * details of possible refcnt values.
 +	 * Wait until the VMA is detached with no readers. Since we hold the VMA
 +	 * write lock, the only read locks that might be present are those from
 +	 * threads trying to acquire the read lock and incrementing the
 +	 * reference count before realising the write lock is held and
 +	 * decrementing it.
-+	 */
-+	err = __vma_enter_exclusive_locked(&ves);
-+	if (!err && !ves.detached) {
+ 	 */
+-	if (unlikely(__vma_refcount_put_return(vma))) {
+-		/* Wait until vma is detached with no readers. */
+-		if (__vma_start_exclude_readers(vma, true, TASK_UNINTERRUPTIBLE)) {
+-			bool detached;
+-
+-			/*
+-			 * Once this is complete, no readers can increment the
+-			 * reference count, and the VMA is marked detached.
+-			 */
+-			detached = __vma_end_exclude_readers(vma);
+-			WARN_ON_ONCE(!detached);
+-		}
++	err = __vma_start_exclude_readers(&ves);
++	if (!err && ves.exclusive) {
 +		/*
 +		 * Once this is complete, no readers can increment the
 +		 * reference count, and the VMA is marked detached.
 +		 */
-+		__vma_exit_exclusive_locked(&ves);
++		__vma_end_exclude_readers(&ves);
  	}
 +	/* If an error arose but we were detached anyway, we don't care. */
 +	WARN_ON_ONCE(!ves.detached);

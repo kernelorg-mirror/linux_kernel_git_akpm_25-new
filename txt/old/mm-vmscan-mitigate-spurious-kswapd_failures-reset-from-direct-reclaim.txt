@@ -1,53 +1,89 @@
 From: Jiayuan Chen <jiayuan.chen@shopee.com>
 Subject: mm/vmscan: mitigate spurious kswapd_failures reset from direct reclaim
-Date: Wed, 14 Jan 2026 15:40:35 +0800
+Date: Tue, 20 Jan 2026 10:43:48 +0800
 
-Patch series "mm/vmscan: mitigate spurious kswapd_failures reset and add
-tracepoints", v3.
+Patch series "mm/vmscan: add tracepoint and reason for kswapd_failures
+reset", v4.
 
-== Problem ==
+Currently, kswapd_failures is reset in multiple places (kswapd,
+direct reclaim, PCP freeing, memory-tiers), but there's no way to
+trace when and why it was reset, making it difficult to debug
+memory reclaim issues.
 
-We observed an issue in production on a multi-NUMA system where kswapd
-runs endlessly, causing sustained heavy IO READ pressure across the entire
-system.
+This patch:
 
-The root cause is that direct reclaim triggered by cgroup memory.high
-keeps resetting kswapd_failures to 0, even when the node cannot be
-balanced.  This prevents kswapd from ever stopping after reaching
-MAX_RECLAIM_RETRIES.
+1. Introduce kswapd_clear_hopeless() as a wrapper function to
+   centralize kswapd_failures reset logic.
 
-bash
-bpftrace -e '
- #include <linux/mmzone.h>
- #include <linux/shrinker.h>
-kprobe:balance_pgdat {
-	$pgdat = (struct pglist_data *)arg0;
-	if ($pgdat->kswapd_failures > 0) {
-		printf("[node %d] [%lu] kswapd end, kswapd_failures %d\n",
-                       $pgdat->node_id, jiffies, $pgdat->kswapd_failures);
-	}
-}
-tracepoint:vmscan:mm_vmscan_direct_reclaim_end {
-	printf("[cpu %d] [%ul] reset kswapd_failures %d \n", cpu, jiffies,
-               args.nr_reclaimed)
-}
-'
+2. Introduce kswapd_test_hopeless() to encapsulate hopeless node
+   checks, replacing all open-coded kswapd_failures comparisons.
 
-The trace results showed that when kswapd_failures reaches 15, continuous
-direct reclaim keeps resetting it to 0.  This was accompanied by a flood
-of kswapd_failures log entries, and shortly after, we observed massive
-refaults occurring.
+3. Add kswapd_clear_hopeless_reason enum to distinguish reset sources:
+   - KSWAPD_CLEAR_HOPELESS_KSWAPD: reset from kswapd context
+   - KSWAPD_CLEAR_HOPELESS_DIRECT: reset from direct reclaim
+   - KSWAPD_CLEAR_HOPELESS_PCP: reset from PCP page freeing
+   - KSWAPD_CLEAR_HOPELESS_OTHER: reset from other paths
 
-== Solution ==
+4. Add tracepoints for better observability:
+   - mm_vmscan_kswapd_clear_hopeless: traces each reset with reason
+   - mm_vmscan_kswapd_reclaim_fail: traces each kswapd reclaim failure
 
-Patch 1 fixes the issue by only resetting kswapd_failures when the node
-is actually balanced. This introduces pgdat_try_reset_kswapd_failures()
-as a wrapper that checks pgdat_balanced() before resetting.
+Test results:
 
-Patch 2 extends the wrapper to track why kswapd_failures was reset,
-adding tracepoints for better observability:
-  - mm_vmscan_reset_kswapd_failures: traces each reset with reason
-  - mm_vmscan_kswapd_reclaim_fail: traces each kswapd reclaim failure
+$ trace-cmd record -e vmscan:mm_vmscan_kswapd_clear_hopeless -e vmscan:mm_vmscan_kswapd_reclaim_fail
+$ # generate memory pressure
+$ trace-cmd report
+cpus=4
+ kswapd0-71    [000]    27.216563: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=1
+ kswapd0-71    [000]    27.217169: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=2
+ kswapd0-71    [000]    27.217764: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=3
+ kswapd0-71    [000]    27.218353: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=4
+ kswapd0-71    [000]    27.218993: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=5
+ kswapd0-71    [000]    27.219744: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=6
+ kswapd0-71    [000]    27.220488: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=7
+ kswapd0-71    [000]    27.221206: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=8
+ kswapd0-71    [000]    27.221806: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=9
+ kswapd0-71    [000]    27.222634: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=10
+ kswapd0-71    [000]    27.223286: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=11
+ kswapd0-71    [000]    27.223894: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=12
+ kswapd0-71    [000]    27.224712: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=13
+ kswapd0-71    [000]    27.225424: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=14
+ kswapd0-71    [000]    27.226082: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=15
+ kswapd0-71    [000]    27.226810: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=16
+ kswapd1-72    [002]    27.386869: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=1
+ kswapd1-72    [002]    27.387435: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=2
+ kswapd1-72    [002]    27.388016: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=3
+ kswapd1-72    [002]    27.388586: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=4
+ kswapd1-72    [002]    27.389155: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=5
+ kswapd1-72    [002]    27.389723: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=6
+ kswapd1-72    [002]    27.390292: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=7
+ kswapd1-72    [002]    27.392364: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=8
+ kswapd1-72    [002]    27.392934: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=9
+ kswapd1-72    [002]    27.393504: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=10
+ kswapd1-72    [002]    27.394073: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=11
+ kswapd1-72    [002]    27.394899: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=12
+ kswapd1-72    [002]    27.395472: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=13
+ kswapd1-72    [002]    27.396055: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=14
+ kswapd1-72    [002]    27.396628: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=15
+ kswapd1-72    [002]    27.397199: mm_vmscan_kswapd_reclaim_fail: nid=1 failures=16
+kworker/u18:0-40    [002]    27.410151: mm_vmscan_kswapd_clear_hopeless: nid=0 reason=DIRECT
+ kswapd0-71    [000]    27.439454: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=1
+ kswapd0-71    [000]    27.440048: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=2
+ kswapd0-71    [000]    27.440634: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=3
+ kswapd0-71    [000]    27.441211: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=4
+ kswapd0-71    [000]    27.441787: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=5
+ kswapd0-71    [000]    27.442363: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=6
+ kswapd0-71    [000]    27.443030: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=7
+ kswapd0-71    [000]    27.443725: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=8
+ kswapd0-71    [000]    27.444315: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=9
+ kswapd0-71    [000]    27.444898: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=10
+ kswapd0-71    [000]    27.445476: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=11
+ kswapd0-71    [000]    27.446053: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=12
+ kswapd0-71    [000]    27.446646: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=13
+ kswapd0-71    [000]    27.447230: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=14
+ kswapd0-71    [000]    27.447812: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=15
+ kswapd0-71    [000]    27.448391: mm_vmscan_kswapd_reclaim_fail: nid=0 failures=16
+ ann-423   [003]    28.028285: mm_vmscan_kswapd_clear_hopeless: nid=0 reason=PCP
 
 
 This patch (of 2):
@@ -108,8 +144,8 @@ balanced.  This allows both kswapd and direct reclaim to clear
 kswapd_failures upon successful reclaim, but only when the reclaim
 actually resolves the memory pressure (i.e., the node becomes balanced).
 
-Link: https://lkml.kernel.org/r/20260114074049.229935-1-jiayuan.chen@linux.dev
-Link: https://lkml.kernel.org/r/20260114074049.229935-2-jiayuan.chen@linux.dev
+Link: https://lkml.kernel.org/r/20260120024402.387576-1-jiayuan.chen@linux.dev
+Link: https://lkml.kernel.org/r/20260120024402.387576-2-jiayuan.chen@linux.dev
 Signed-off-by: Jiayuan Chen <jiayuan.chen@shopee.com>
 Signed-off-by: Jiayuan Chen <jiayuan.chen@linux.dev>
 Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
@@ -119,7 +155,7 @@ Cc: David Hildenbrand <david@kernel.org>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
 Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mike Rapoport <rppt@kernel.org>

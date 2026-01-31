@@ -1,10 +1,10 @@
 From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Subject: mm: fix OOM killer inaccuracy on large many-core systems
-Date: Mon, 12 Jan 2026 15:00:55 -0500
+Date: Wed, 14 Jan 2026 09:36:42 -0500
 
-Use hierarchical per-cpu counters for rss tracking to fix the per-mm RSS
-tracking which has become too inaccurate for OOM killer purposes on large
-many-core systems.
+Use the precise, albeit slower, precise RSS counter sums for the OOM
+killer task selection and console dumps.  The approximated value is too
+imprecise on large many-core systems.
 
 The following rss tracking issues were noted by Sweet Tea Dorminy [1],
 which lead to picking wrong tasks as OOM kill target:
@@ -44,75 +44,38 @@ used or proposed, along with their downside:
    error is high with systems that have lots of NUMA nodes (32 times
    the number of NUMA nodes).
 
-The approach proposed here is to replace this by the hierarchical
-per-cpu counters, which bounds the inaccuracy based on the system
-topology with O(N*logN).
-
 commit 82241a83cd15 ("mm: fix the inaccurate memory statistics issue for
-users") introduced get_mm_counter_sum() for precise /proc memory status
-queries.  Implement it with percpu_counter_tree_precise_sum() since it
-is not a fast path and precision is preferred over speed.
+users") introduced get_mm_counter_sum() for precise proc memory status
+queries for some proc files.
 
-* Testing results:
+The simple fix proposed here is to do the precise per-cpu counters sum
+every time a counter value needs to be read.  This applies to the OOM
+killer task selection, oom task console dumps (printk).
 
-Test hardware: 2 sockets AMD EPYC 9654 96-Core Processor (384 logical CPUs total)
+This change increases the latency introduced when the OOM killer executes
+in favor of doing a more precise OOM target task selection.  Effectively,
+the OOM killer iterates on all tasks, for all relevant page types, for
+which the precise sum iterates on all possible CPUs.
 
-Methodology:
+As a reference, here is the execution time of the OOM killer before/after
+the change:
 
-Comparing the current upstream implementation with the hierarchical
-counters is done by keeping both implementations wired up in parallel,
-and running a single-process, single-threaded program which hops
-randomly across CPUs in the system, calling mmap(2) and munmap(2) on
-random CPUs, keeping track of an array of allocated mappings, randomly
-choosing entries to either map or unmap.
+AMD EPYC 9654 96-Core (2 sockets)
+Within a KVM, configured with 256 logical cpus.
 
-get_mm_counter() is instrumented to compare the upstream counter
-approximation to the precise value, and print the delta when going over
-a given threshold. The delta of the hierarchical counter approximation
-to the precise value is also printed for comparison.
+                                  |  before  |  after   |
+----------------------------------|----------|----------|
+nr_processes=40                   |  0.3 ms  |   0.5 ms |
+nr_processes=10000                |  3.0 ms  |  80.0 ms |
 
-After a few minutes running this test, the upstream implementation
-counter approximation reaches a 1GB delta from the
-precise value, compared to 80MB delta with the hierarchical counter.
-The hierarchical counter provides a guaranteed maximum approximation
-inaccuracy of 192MB on that hardware topology.
-
-* Fast path implementation comparison
-
-The new inline percpu_counter_tree_add() uses a this_cpu_add_return()
-for the fast path (under a certain allocation size threshold).  Above
-that, it calls a slow path which "trickles up" the carry to upper level
-counters with atomic_add_return.
-
-In comparison, the upstream counters implementation calls
-percpu_counter_add_batch which uses this_cpu_try_cmpxchg() on the fast
-path, and does a raw_spin_lock_irqsave above a certain threshold.
-
-The hierarchical implementation is therefore expected to have less
-contention on mid-sized allocations than the upstream counters because
-the atomic counters tracking those bits are only shared across nearby
-CPUs. In comparison, the upstream counters immediately use a global
-spinlock when reaching the threshold.
-
-* Benchmarks
-
-Using will-it-scale page_fault1 benchmarks to compare the upstream
-counters to the hierarchical counters. This is done with hyperthreading
-disabled. The speedup is within the standard deviation of the upstream
-runs, so the overhead is not significant.
-
-                                          upstream   hierarchical    speedup
-page_fault1_processes -s 100 -t 1           614783         615558      +0.1%
-page_fault1_threads -s 100 -t 1             612788         612447      -0.1%
-page_fault1_processes -s 100 -t 96        37994977       37932035      -0.2%
-page_fault1_threads -s 100 -t 96           2484130        2504860      +0.8%
-page_fault1_processes -s 100 -t 192       71262917       71118830      -0.2%
-page_fault1_threads -s 100 -t 192          2446437        2469296      +0.1%
-
+Link: https://lkml.kernel.org/r/20260114143642.47333-1-mathieu.desnoyers@efficios.com
+Fixes: f1a7941243c1 ("mm: convert mm's rss stats into percpu_counter")
 Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
-Link: https://lore.kernel.org/lkml/20250704150226.47980-1-mathieu.desnoyers@efficios.com/
-Link: https://lkml.kernel.org/r/20260112200056.1250404-3-mathieu.desnoyers@efficios.com
 Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Suggested-by: Michal Hocko <mhocko@suse.com>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: Vlastimil Babka <vbabka@suse.cz>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
 Cc: Masami Hiramatsu <mhiramat@kernel.org>
@@ -122,7 +85,6 @@ Cc: Tejun Heo <tj@kernel.org>
 Cc: Christoph Lameter <cl@linux.com>
 Cc: Martin Liu <liumartin@google.com>
 Cc: David Rientjes <rientjes@google.com>
-Cc: Christan König <christian.koenig@amd.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Michal Hocko <mhocko@suse.com>
@@ -132,7 +94,6 @@ Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: "Liam R . Howlett" <liam.howlett@oracle.com>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Suren Baghdasaryan <surenb@google.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Wei Yang <richard.weiyang@gmail.com>
 Cc: David Hildenbrand <david@redhat.com>
@@ -142,5 +103,4 @@ Cc: Yu Zhao <yuzhao@google.com>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
