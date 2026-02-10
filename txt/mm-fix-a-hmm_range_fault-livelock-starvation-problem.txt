@@ -1,0 +1,58 @@
+From: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Subject: mm: fix a hmm_range_fault() livelock / starvation problem
+Date: Thu, 5 Feb 2026 12:10:28 +0100
+
+If hmm_range_fault() fails a folio_trylock() in do_swap_page, trying to
+acquire the lock of a device-private folio for migration, to ram, the
+function will spin until it succeeds grabbing the lock.
+
+However, if the process holding the lock is depending on a work item to be
+completed, which is scheduled on the same CPU as the spinning
+hmm_range_fault(), that work item might be starved and we end up in a
+livelock / starvation situation which is never resolved.
+
+This can happen, for example if the process holding the
+device-private folio lock is stuck in
+   migrate_device_unmap()->lru_add_drain_all()
+The lru_add_drain_all() function requires a short work-item
+to be run on all online cpus to complete.
+
+A prerequisite for this to happen is:
+a) Both zone device and system memory folios are considered in
+   migrate_device_unmap(), so that there is a reason to call
+   lru_add_drain_all() for a system memory folio while a
+   folio lock is held on a zone device folio.
+b) The zone device folio has an initial mapcount > 1 which causes
+   at least one migration PTE entry insertion to be deferred to
+   try_to_migrate(), which can happen after the call to
+   lru_add_drain_all().
+c) No or voluntary only preemption.
+
+This all seems pretty unlikely to happen, but indeed is hit by the
+"xe_exec_system_allocator" igt test.
+
+Resolve this by waiting for the folio to be unlocked if the
+folio_trylock() fails in the do_swap_page() function.
+
+Rename the migration_entry_wait_on_locked() function to
+softleaf_entry_wait_unlock() and update its documentation to indicate the
+new use-case.
+
+Future code improvements might consider moving the lru_add_drain_all()
+call in migrate_device_unmap() to be called *after* all pages have
+migration entries inserted.  That would eliminate also b) above.
+
+Link: https://lkml.kernel.org/r/20260205111028.200506-1-thomas.hellstrom@linux.intel.com
+Fixes: 1afaeb8293c9 ("mm/migrate: Trylock device page in do_swap_page")
+Signed-off-by: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Suggested-by: Alistair Popple <apopple@nvidia.com>
+Reviewed-by: John Hubbard <jhubbard@nvidia.com> #v3
+Cc: Ralph Campbell <rcampbell@nvidia.com>
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Jason Gunthorpe <jgg@mellanox.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: <dri-devel@lists.freedesktop.org>
+Cc: <stable@vger.kernel.org>	[6.15+]

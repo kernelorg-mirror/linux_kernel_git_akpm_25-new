@@ -1,9 +1,9 @@
 From: Baolin Wang <baolin.wang@linux.alibaba.com>
 Subject: mm: rmap: support batched checks of the references for large folios
-Date: Tue, 23 Dec 2025 13:48:35 +0800
+Date: Fri, 26 Dec 2025 14:07:55 +0800
 
 Patch series "support batch checking of references and unmapping for large
-folios", v4.
+folios", v5.
 
 Currently, folio_referenced_one() always checks the young flag for each
 PTE sequentially, which is inefficient for large folios.  This
@@ -23,12 +23,6 @@ By supporting batched checking of the young flags, flushing TLB entries,
 and unmapping, I can observed a significant performance improvements in my
 performance tests for file folios reclamation.  Please check the
 performance data in the commit message of each patch.
-
-Patch 1: Add a new generic batched PTE helper that supports batched checks of
-the references for large folios.
-Patch 2 - 3: Preparation patches.
-patch 4: Implement the Arm64 arch-specific clear_flush_young_ptes().
-Patch 5: Support batched unmapping for file large folios.
 
 
 This patch (of 5):
@@ -51,9 +45,15 @@ performance during large folio reclamation.  And it will be overridden by
 the architecture that implements a more efficient batch operation in the
 following patches.
 
-Link: https://lkml.kernel.org/r/cover.1766455377.git.baolin.wang@linux.alibaba.com
-Link: https://lkml.kernel.org/r/e9ff5fa689740f3b6f3ed1c1ec0e3244f20c1f06.1766455378.git.baolin.wang@linux.alibaba.com
+While we are at it, rename ptep_clear_flush_young_notify() to
+clear_flush_young_ptes_notify() to indicate that this is a batch
+operation.
+
+Link: https://lkml.kernel.org/r/cover.1766631066.git.baolin.wang@linux.alibaba.com
+Link: https://lkml.kernel.org/r/18b3eb9c730d16756e5d23c7be22efe2f6219911.1766631066.git.baolin.wang@linux.alibaba.com
 Signed-off-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Reviewed-by: Ryan Roberts <ryan.roberts@arm.com>
+Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
 Cc: David Hildenbrand (Red Hat) <david@kernel.org>
@@ -65,17 +65,16 @@ Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Rik van Riel <riel@surriel.com>
-Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Will Deacon <will@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mmu_notifier.h |    9 ++++----
- include/linux/pgtable.h      |   35 +++++++++++++++++++++++++++++++++
- mm/rmap.c                    |   29 +++++++++++++++++++++++++--
- 3 files changed, 67 insertions(+), 6 deletions(-)
+ include/linux/mmu_notifier.h |    9 +++++----
+ include/linux/pgtable.h      |   31 +++++++++++++++++++++++++++++++
+ mm/rmap.c                    |   31 ++++++++++++++++++++++++++++---
+ 3 files changed, 64 insertions(+), 7 deletions(-)
 
 --- a/include/linux/mmu_notifier.h~mm-rmap-support-batched-checks-of-the-references-for-large-folios
 +++ a/include/linux/mmu_notifier.h
@@ -84,7 +83,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
 -#define ptep_clear_flush_young_notify(__vma, __address, __ptep)		\
-+#define ptep_clear_flush_young_notify(__vma, __address, __ptep, __nr)	\
++#define clear_flush_young_ptes_notify(__vma, __address, __ptep, __nr)	\
  ({									\
  	int __young;							\
  	struct vm_area_struct *___vma = __vma;				\
@@ -105,13 +104,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #define mmu_notifier_range_update_to_read_only(r) false
  
 -#define ptep_clear_flush_young_notify ptep_clear_flush_young
-+#define ptep_clear_flush_young_notify clear_flush_young_ptes
++#define clear_flush_young_ptes_notify clear_flush_young_ptes
  #define pmdp_clear_flush_young_notify pmdp_clear_flush_young
  #define ptep_clear_young_notify ptep_test_and_clear_young
  #define pmdp_clear_young_notify pmdp_test_and_clear_young
 --- a/include/linux/pgtable.h~mm-rmap-support-batched-checks-of-the-references-for-large-folios
 +++ a/include/linux/pgtable.h
-@@ -1087,6 +1087,41 @@ static inline void wrprotect_ptes(struct
+@@ -1068,6 +1068,37 @@ static inline void wrprotect_ptes(struct
  }
  #endif
  
@@ -137,14 +136,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +					 unsigned long addr, pte_t *ptep,
 +					 unsigned int nr)
 +{
-+	int young;
++	int i, young = 0;
 +
-+	young = ptep_clear_flush_young(vma, addr, ptep);
-+	while (--nr) {
-+		ptep++;
-+		addr += PAGE_SIZE;
++	for (i = 0; i < nr; ++i, ++ptep, addr += PAGE_SIZE)
 +		young |= ptep_clear_flush_young(vma, addr, ptep);
-+	}
 +
 +	return young;
 +}
@@ -155,7 +150,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * memory page, it is responsibility of software setting this bit. It brings
 --- a/mm/rmap.c~mm-rmap-support-batched-checks-of-the-references-for-large-folios
 +++ a/mm/rmap.c
-@@ -828,9 +828,11 @@ static bool folio_referenced_one(struct
+@@ -913,9 +913,11 @@ static bool folio_referenced_one(struct
  	struct folio_referenced_arg *pra = arg;
  	DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
  	int ptes = 0, referenced = 0;
@@ -167,10 +162,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		if (vma->vm_flags & VM_LOCKED) {
  			ptes++;
-@@ -875,9 +877,24 @@ static bool folio_referenced_one(struct
+@@ -960,9 +962,24 @@ static bool folio_referenced_one(struct
  			if (lru_gen_look_around(&pvmw))
  				referenced++;
  		} else if (pvmw.pte) {
+-			if (ptep_clear_flush_young_notify(vma, address,
+-						pvmw.pte))
 +			if (folio_test_large(folio)) {
 +				unsigned long end_addr =
 +					pmd_addr_end(address, vma->vm_end);
@@ -183,8 +180,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			}
 +
 +			ptes += nr;
- 			if (ptep_clear_flush_young_notify(vma, address,
--						pvmw.pte))
++			if (clear_flush_young_ptes_notify(vma, address,
 +						pvmw.pte, nr))
  				referenced++;
 +			/* Skip the batched PTEs */
@@ -193,7 +189,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		} else if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
  			if (pmdp_clear_flush_young_notify(vma, address,
  						pvmw.pmd))
-@@ -887,7 +904,15 @@ static bool folio_referenced_one(struct
+@@ -972,7 +989,15 @@ static bool folio_referenced_one(struct
  			WARN_ON_ONCE(1);
  		}
  
