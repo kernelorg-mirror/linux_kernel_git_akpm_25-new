@@ -1,6 +1,6 @@
 From: Wei Yang <richard.weiyang@gmail.com>
 Subject: mm/huge_memory: fix early failure try_to_migrate() when split huge pmd for shared thp
-Date: Wed, 4 Feb 2026 00:42:19 +0000
+Date: Thu, 5 Feb 2026 03:31:13 +0000
 
 Commit 60fbb14396d5 ("mm/huge_memory: adjust try_to_migrate_one() and
 split_huge_pmd_locked()") return false unconditionally after
@@ -20,22 +20,27 @@ above commit, the folio is still a large folio.
 The reason is the above commit return false after split pmd
 unconditionally in the first process and break try_to_migrate().
 
-The tricky thing in above reproduce method is current debugfs interface
-leverage function split_huge_pages_pid(), which will iterate the whole pmd
-range and do folio split on each base page address.  This means it will
-try 512 times, and each time split one pmd from pmd mapped to pte mapped
-thp.  If there are less than 512 shared mapped process, the folio is still
-split successfully at last.  But in real world, we usually try it for
-once.
+On memory pressure or failure, we would try to reclaim unused memory or
+limit bad memory after folio split.  If failed to split it, we will leave
+some more memory unusable than expected.
 
-This patch fixes this by restart page_vma_mapped_walk() after
-split_huge_pmd_locked().  Because split_huge_pmd_locked() may fall back to
-(freeze = false) if folio_try_share_anon_rmap_pmd() fails and the PMD is
-just split instead of split to migration entry.  Restart
-page_vma_mapped_walk() and let try_to_migrate_one() try on each PTE again
-and fail try_to_migrate() early if it fails.
+The tricky thing in the above reproduction method is current debugfs
+interface leverage function split_huge_pages_pid(), which will iterate the
+whole pmd range and do folio split on each base page address.  This means
+it will try 512 times, and each time split one pmd from pmd mapped to pte
+mapped thp.  If there are less than 512 shared mapped process, the folio
+is still split successfully at last.  But in real world, we usually try it
+for once.
 
-Link: https://lkml.kernel.org/r/20260204004219.6524-1-richard.weiyang@gmail.com
+This patch fixes this by restarting page_vma_mapped_walk() after
+split_huge_pmd_locked().  We cannot simply return "true" to fix the
+problem, as that would affect another case:
+split_huge_pmd_locked()->folio_try_share_anon_rmap_pmd() can failed and
+leave the folio mapped through PTEs; we would return "true" from
+try_to_migrate_one() in that case as well.  While that is mostly harmless,
+we could end up walking the rmap, wasting some cycles.
+
+Link: https://lkml.kernel.org/r/20260205033113.30724-1-richard.weiyang@gmail.com
 Fixes: 60fbb14396d5 ("mm/huge_memory: adjust try_to_migrate_one() and split_huge_pmd_locked()")
 Signed-off-by: Wei Yang <richard.weiyang@gmail.com>
 Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -43,32 +48,30 @@ Reviewed-by: Zi Yan <ziy@nvidia.com>
 Tested-by: Lance Yang <lance.yang@linux.dev>
 Reviewed-by: Lance Yang <lance.yang@linux.dev>
 Reviewed-by: Gavin Guo <gavinguo@igalia.com>
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: David Hildenbrand <david@kernel.org>
-Cc: Harry Yoo <harry.yoo@oracle.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: Rik van Riel <riel@surriel.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
+Acked-by: David Hildenbrand (arm) <david@kernel.org>
+Cc: Gavin Guo <gavinguo@igalia.com>
+Cc: "David Hildenbrand (Red Hat)" <david@kernel.org>
 Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Lance Yang <lance.yang@linux.dev>
 Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/rmap.c |   11 ++++++++---
- 1 file changed, 8 insertions(+), 3 deletions(-)
+ mm/rmap.c |   12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
 
 --- a/mm/rmap.c~mm-huge_memory-fix-early-failure-try_to_migrate-when-split-huge-pmd-for-shared-thp
 +++ a/mm/rmap.c
-@@ -2446,11 +2446,16 @@ static bool try_to_migrate_one(struct fo
+@@ -2443,11 +2443,17 @@ static bool try_to_migrate_one(struct fo
  			__maybe_unused pmd_t pmdval;
  
  			if (flags & TTU_SPLIT_HUGE_PMD) {
 +				/*
-+				 * After split_huge_pmd_locked(), restart the
-+				 * walk to detect PageAnonExclusive handling
-+				 * failure in __split_huge_pmd_locked().
++				 * split_huge_pmd_locked() might leave the
++				 * folio mapped through PTEs. Retry the walk
++				 * so we can detect this scenario and properly
++				 * abort the walk.
 +				 */
  				split_huge_pmd_locked(vma, pvmw.address,
  						      pvmw.pmd, true);
