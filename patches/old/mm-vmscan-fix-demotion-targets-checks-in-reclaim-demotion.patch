@@ -1,9 +1,33 @@
 From: Bing Jiao <bingjiao@google.com>
 Subject: mm/vmscan: fix demotion targets checks in reclaim/demotion
-Date: Thu, 8 Jan 2026 03:32:46 +0000
+Date: Wed, 14 Jan 2026 20:53:02 +0000
+
+Patch series "mm/vmscan: fix demotion targets checks in reclaim/demotion",
+v9.
+
+This patch series addresses two issues in demote_folio_list(),
+can_demote(), and next_demotion_node() in reclaim/demotion.
+
+1. demote_folio_list() and can_demote() do not correctly check
+   demotion target against cpuset.mems_effective, which will cause (a)
+   pages to be demoted to not-allowed nodes and (b) pages fail demotion
+   even if the system still has allowed demotion nodes.
+
+   Patch 1 fixes this bug by updating cpuset_node_allowed() and
+   mem_cgroup_node_allowed() to return effective_mems, allowing directly
+   logic-and operation against demotion targets.
+
+2. next_demotion_node() returns a preferred demotion target, but it
+   does not check the node against allowed nodes.
+
+   Patch 2 ensures that next_demotion_node() filters against the allowed
+   node mask and selects the closest demotion target to the source node.
+
+
+This patch (of 2):
 
 Fix two bugs in demote_folio_list() and can_demote() due to incorrect
-demotion target checks in reclaim/demotion.
+demotion target checks against cpuset.mems_effective in reclaim/demotion.
 
 Commit 7d709f49babc ("vmscan,cgroup: apply mems_effective to reclaim")
 introduces the cpuset.mems_effective check and applies it to can_demote().
@@ -23,10 +47,10 @@ visible from userspace because pages can either fail to be demoted
 entirely or are demoted to nodes that are not allowed in multi-tier memory
 systems.
 
-To address these bugs, update cpuset_node_allowed() to return
-effective_mems and mem_cgroup_node_allowed() to filter out nodes that are
-not set in effective_mems.  Also update can_demote() and
-demote_folio_list() accordingly.
+To address these bugs, update cpuset_node_allowed() and
+mem_cgroup_node_allowed() to return effective_mems, allowing directly
+logic-and operation against demotion targets.  Also update can_demote()
+and demote_folio_list() accordingly.
 
 Bug 1 reproduction:
   Assume a system with 4 nodes, where nodes 0-1 are top-tier and
@@ -59,23 +83,26 @@ Bug 2 reproduction:
     # Observation: No pages are demoted before oom.
     stress-ng --oomable --vm 1 --vm-bytes 150% --mbind 0,1,2
 
-Link: https://lkml.kernel.org/r/20260108033248.2791579-2-bingjiao@google.com
+Link: https://lkml.kernel.org/r/20260114205305.2869796-1-bingjiao@google.com
+Link: https://lkml.kernel.org/r/20260114205305.2869796-2-bingjiao@google.com
 Fixes: 7d709f49babc ("vmscan,cgroup: apply mems_effective to reclaim")
 Signed-off-by: Bing Jiao <bingjiao@google.com>
-Cc: Akinobu Mita <akinobu.mita@gmail.com>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: David Hildenbrand <david@kernel.org>
 Cc: Gregory Price <gourry@gourry.net>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Liam Howlett <liam.howlett@oracle.com>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
-Cc: Michal Hocko <mhocko@kernel.org>
-Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Qi Zheng <zhengqi.arch@bytedance.com>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Tejun Heo <tj@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Waiman Long <longman@redhat.com>
 Cc: Wei Xu <weixugc@google.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
@@ -87,8 +114,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  include/linux/memcontrol.h |    6 +--
  kernel/cgroup/cpuset.c     |   54 +++++++++++++++++++++++------------
  mm/memcontrol.c            |   16 +++++++++-
- mm/vmscan.c                |   28 ++++++++++++------
- 5 files changed, 75 insertions(+), 35 deletions(-)
+ mm/vmscan.c                |   34 ++++++++++++++--------
+ 5 files changed, 78 insertions(+), 38 deletions(-)
 
 --- a/include/linux/cpuset.h~mm-vmscan-fix-demotion-targets-checks-in-reclaim-demotion
 +++ a/include/linux/cpuset.h
@@ -138,7 +165,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline void mem_cgroup_show_protected_memory(struct mem_cgroup *memcg)
 --- a/kernel/cgroup/cpuset.c~mm-vmscan-fix-demotion-targets-checks-in-reclaim-demotion
 +++ a/kernel/cgroup/cpuset.c
-@@ -4427,40 +4427,58 @@ bool cpuset_current_node_allowed(int nod
+@@ -4423,40 +4423,58 @@ bool cpuset_current_node_allowed(int nod
  	return allowed;
  }
  
@@ -243,7 +270,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  void mem_cgroup_show_protected_memory(struct mem_cgroup *memcg)
 --- a/mm/vmscan.c~mm-vmscan-fix-demotion-targets-checks-in-reclaim-demotion
 +++ a/mm/vmscan.c
-@@ -344,19 +344,21 @@ static void flush_reclaim_state(struct s
+@@ -343,19 +343,21 @@ static void flush_reclaim_state(struct s
  static bool can_demote(int nid, struct scan_control *sc,
  		       struct mem_cgroup *memcg)
  {
@@ -271,7 +298,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static inline bool can_reclaim_anon_pages(struct mem_cgroup *memcg,
-@@ -1018,7 +1020,8 @@ static struct folio *alloc_demote_folio(
+@@ -1017,9 +1019,10 @@ static struct folio *alloc_demote_folio(
   * Folios which are not demoted are left on @demote_folios.
   */
  static unsigned int demote_folio_list(struct list_head *demote_folios,
@@ -279,9 +306,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				      struct pglist_data *pgdat,
 +				      struct mem_cgroup *memcg)
  {
- 	int target_nid = next_demotion_node(pgdat->node_id);
+-	int target_nid = next_demotion_node(pgdat->node_id);
++	int target_nid;
  	unsigned int nr_succeeded;
-@@ -1032,7 +1035,6 @@ static unsigned int demote_folio_list(st
+ 	nodemask_t allowed_mask;
+ 
+@@ -1031,7 +1034,6 @@ static unsigned int demote_folio_list(st
  		 */
  		.gfp_mask = (GFP_HIGHUSER_MOVABLE & ~__GFP_RECLAIM) |
  			__GFP_NOMEMALLOC | GFP_NOWAIT,
@@ -289,25 +319,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		.nmask = &allowed_mask,
  		.reason = MR_DEMOTION,
  	};
-@@ -1041,9 +1043,17 @@ static unsigned int demote_folio_list(st
+@@ -1039,10 +1041,18 @@ static unsigned int demote_folio_list(st
+ 	if (list_empty(demote_folios))
  		return 0;
  
- 	if (target_nid == NUMA_NO_NODE)
-+		/* No lower-tier nodes or nodes were hot-unplugged. */
- 		return 0;
- 
- 	node_get_allowed_targets(pgdat, &allowed_mask);
+-	if (target_nid == NUMA_NO_NODE)
++	node_get_allowed_targets(pgdat, &allowed_mask);
 +	mem_cgroup_node_filter_allowed(memcg, &allowed_mask);
 +	if (nodes_empty(allowed_mask))
+ 		return 0;
+ 
+-	node_get_allowed_targets(pgdat, &allowed_mask);
++	target_nid = next_demotion_node(pgdat->node_id);
++	if (target_nid == NUMA_NO_NODE)
++		/* No lower-tier nodes or nodes were hot-unplugged. */
 +		return 0;
-+
 +	if (!node_isset(target_nid, allowed_mask))
 +		target_nid = node_random(&allowed_mask);
 +	mtc.nid = target_nid;
  
  	/* Demotion ignores all cpuset and mempolicy settings */
  	migrate_pages(demote_folios, alloc_demote_folio, NULL,
-@@ -1565,7 +1575,7 @@ keep:
+@@ -1564,7 +1574,7 @@ keep:
  	/* 'folio_list' is always empty here */
  
  	/* Migrate folios selected for demotion */
