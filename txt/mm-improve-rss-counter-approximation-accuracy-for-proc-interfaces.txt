@@ -1,0 +1,149 @@
+From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Subject: mm: improve RSS counter approximation accuracy for proc interfaces
+Date: Tue, 17 Feb 2026 11:10:06 -0500
+
+Use hierarchical per-cpu counters for RSS tracking to improve the accuracy
+of per-mm RSS sum approximation on large many-core systems [1].  This
+improves the accuracy of the RSS values returned by proc interfaces.
+
+Here is a (possibly incomplete) list of the prior approaches that were
+used or proposed, along with their downside:
+
+1) Per-thread rss tracking: large error on many-thread processes.
+
+2) Per-CPU counters: up to 12% slower for short-lived processes and 9%
+   increased system time in make test workloads [1]. Moreover, the
+   inaccuracy increases with O(n^2) with the number of CPUs.
+
+3) Per-NUMA-node counters: requires atomics on fast-path (overhead),
+   error is high with systems that have lots of NUMA nodes (32 times
+   the number of NUMA nodes).
+
+4) Use a percise per-cpu counter sum for each counter value query:
+   Requires iteration on each possible CPUs for each sum, which
+   adds overhead on large many-core systems running many processes.
+
+The approach proposed here is to replace the per-cpu counters by the
+hierarchical per-cpu counters, which bounds the inaccuracy based on the
+system topology with O(N*logN).
+
+* Testing results:
+
+Test hardware: 2 sockets AMD EPYC 9654 96-Core Processor (384 logical CPUs total)
+
+Methodology:
+
+Comparing the current upstream implementation with the hierarchical
+counters is done by keeping both implementations wired up in parallel, and
+running a single-process, single-threaded program which hops randomly
+across CPUs in the system, calling mmap(2) and munmap(2) on random CPUs,
+keeping track of an array of allocated mappings, randomly choosing entries
+to either map or unmap.
+
+get_mm_counter() is instrumented to compare the upstream counter
+approximation to the precise value, and print the delta when going over a
+given threshold.  The delta of the hierarchical counter approximation to
+the precise value is also printed for comparison.
+
+After a few minutes running this test, the upstream implementation counter
+approximation reaches a 1GB delta from the precise value, compared to 80MB
+delta with the hierarchical counter.  The hierarchical counter provides a
+guaranteed maximum approximation inaccuracy of 192MB on that hardware
+topology.
+
+* Fast path implementation comparison
+
+The new inline percpu_counter_tree_add() uses a this_cpu_add_return() for
+the fast path (under a certain allocation size threshold).  Above that, it
+calls a slow path which "trickles up" the carry to upper level counters
+with atomic_add_return.
+
+In comparison, the upstream counters implementation calls
+percpu_counter_add_batch which uses this_cpu_try_cmpxchg() on the fast
+path, and does a raw_spin_lock_irqsave above a certain threshold.
+
+The hierarchical implementation is therefore expected to have less
+contention on mid-sized allocations than the upstream counters because the
+atomic counters tracking those bits are only shared across nearby CPUs. 
+In comparison, the upstream counters immediately use a global spinlock
+when reaching the threshold.
+
+* Benchmarks
+
+Using will-it-scale page_fault1 benchmarks to compare the upstream
+counters to the hierarchical counters.  This is done with hyperthreading
+disabled.  The speedup is within the standard deviation of the upstream
+runs, so the overhead is not significant.
+
+                                          upstream   hierarchical    speedup
+page_fault1_processes -s 100 -t 1           614783         615558      +0.1%
+page_fault1_threads -s 100 -t 1             612788         612447      -0.1%
+page_fault1_processes -s 100 -t 96        37994977       37932035      -0.2%
+page_fault1_threads -s 100 -t 96           2484130        2504860      +0.8%
+page_fault1_processes -s 100 -t 192       71262917       71118830      -0.2%
+page_fault1_threads -s 100 -t 192          2446437        2469296      +0.1%
+
+* Memory Use
+
+The most important parts in terms of memory use are the per-cpu counters
+and the tree items which propagate the carry.
+
+In the proposed implementation, the per-cpu counters are allocated within
+per-cpu data structures, so they end up using:
+
+  nr_possible_cpus * sizeof(unsigned long)
+
+This is in addition to the tree items.  The size of those items is defined
+by the per_nr_cpu_order_config table "nr_items" field.  Each item is
+aligned on cacheline size (typically 64 bytes) to minimize false sharing.
+
+Here is the footprint for a few nr_cpu_ids on a 64-bit arch:
+
+nr_cpu_ids   percpu counters (bytes)     nr_items       items size (bytes)     total (bytes)
+    2               16                     1                 64                    80
+    4               32                     3                192                   224
+    8               64                     7                448                   512
+   64               512                   21               1344                  1856
+  128              1024                   21               1344                  2368
+  256              2048                   37               2368                  4416
+  512              4096                   73               4672                  8768
+
+Compared to this, the upstream percpu counters use a 32-bit integer
+per-cpu (4 bytes), and accumulate within a 64-bit global value.
+
+So there is an extra memory footprint added by the current hpcc
+implementation, but if it's an issue we have various options to consider
+to reduce its footprint.
+
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
+Link: https://lkml.kernel.org/r/20260217161006.1105611-4-mathieu.desnoyers@efficios.com
+Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Christan König <christian.koenig@amd.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: David Hildenbrand <david@redhat.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Liam R . Howlett" <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Martin Liu <liumartin@google.com>
+Cc: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Mateusz Guzik <mjguzik@gmail.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: "Paul E. McKenney" <paulmck@kernel.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: SeongJae Park <sj@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
