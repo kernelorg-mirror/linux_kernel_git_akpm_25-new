@@ -1,16 +1,16 @@
 From: "Pratyush Yadav (Google)" <pratyush@kernel.org>
 Subject: liveupdate: luo_file: remember retrieve() status
-Date: Tue, 27 Jan 2026 00:02:53 +0100
+Date: Mon, 16 Feb 2026 14:22:19 +0100
 
 LUO keeps track of successful retrieve attempts on a LUO file.  It does so
-to avoid multiple retrievals of the same file.  Doing so will cause
+to avoid multiple retrievals of the same file.  Multiple retrievals cause
 problems because once the file is retrieved, the serialized data
 structures are likely freed and the file is likely in a very different
 state from what the code expects.
 
-This is kept track of by the retrieved boolean in struct luo_file, and is
-passed to the finish callback so it knows what work was already done and
-what it has left to do.
+The retrieve boolean in struct luo_file keeps track of this, and is passed
+to the finish callback so it knows what work was already done and what it
+has left to do.
 
 All this works well when retrieve succeeds.  When it fails,
 luo_retrieve_file() returns the error immediately, without ever storing
@@ -44,12 +44,12 @@ This is done by changing the bool to an integer.  A value of 0 means
 retrieve was never attempted, a positive value means it succeeded, and a
 negative value means it failed and the error code is the value.
 
-[akpm@linux-foundation.org: fix kerneldoc, per Pasha]
-Link: https://lkml.kernel.org/r/20260126230302.2936817-3-pratyush@kernel.org
+Link: https://lkml.kernel.org/r/20260216132221.987987-1-pratyush@kernel.org
 Fixes: 7c722a7f44e0 ("liveupdate: luo_file: implement file systems callbacks")
 Signed-off-by: Pratyush Yadav (Google) <pratyush@kernel.org>
-Cc: Mike Rapoport <rppt@kernel.org>
+Reviewed-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
@@ -66,7 +66,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * @handler:          The file handler being called.
 - * @retrieved:        The retrieve status for the 'can_finish / finish'
 - *                    operation.
-+ * @retrieve_sts:     The retrieve status for the 'can_finish / finish'
++ * @retrieve_status:  The retrieve status for the 'can_finish / finish'
 + *                    operation. A value of 0 means the retrieve has not been
 + *                    attempted, a positive value means the retrieve was
 + *                    successful, and a negative value means the retrieve failed,
@@ -79,7 +79,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct liveupdate_file_op_args {
  	struct liveupdate_file_handler *handler;
 -	bool retrieved;
-+	bool retrieve_sts;
++	int retrieve_status;
  	struct file *file;
  	u64 serialized_data;
  	void *private_data;
@@ -90,7 +90,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   *                 callback, and must be freed in the handler's .unpreserve()
   *                 callback.
 - * @retrieved:     A flag indicating whether a user/kernel in the new kernel has
-+ * @retrieve_sts:  Status code indicating whether a user/kernel in the new kernel has
++ * @retrieve_status: Status code indicating whether a user/kernel in the new kernel has
   *                 successfully called retrieve() on this file. This prevents
 - *                 multiple retrieval attempts.
 + *                 multiple retrieval attempts. A value of 0 means a retrieve()
@@ -105,37 +105,33 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	u64 serialized_data;
  	void *private_data;
 -	bool retrieved;
-+	int retrieve_sts;
++	int retrieve_status;
  	struct mutex mutex;
  	struct list_head list;
  	u64 token;
-@@ -298,7 +301,7 @@ int luo_preserve_file(struct luo_file_se
+@@ -298,7 +301,6 @@ int luo_preserve_file(struct luo_file_se
  	luo_file->file = file;
  	luo_file->fh = fh;
  	luo_file->token = token;
 -	luo_file->retrieved = false;
-+	luo_file->retrieve_sts = 0;
  	mutex_init(&luo_file->mutex);
  
  	args.handler = fh;
-@@ -577,7 +580,7 @@ int luo_retrieve_file(struct luo_file_se
+@@ -577,7 +579,12 @@ int luo_retrieve_file(struct luo_file_se
  		return -ENOENT;
  
  	guard(mutex)(&luo_file->mutex);
 -	if (luo_file->retrieved) {
-+	if (luo_file->retrieve_sts > 0) {
++	if (luo_file->retrieve_status < 0) {
++		/* Retrieve was attempted and it failed. Return the error code. */
++		return luo_file->retrieve_status;
++	}
++
++	if (luo_file->retrieve_status > 0) {
  		/*
  		 * Someone is asking for this file again, so get a reference
  		 * for them.
-@@ -585,21 +588,27 @@ int luo_retrieve_file(struct luo_file_se
- 		get_file(luo_file->file);
- 		*filep = luo_file->file;
- 		return 0;
-+	} else if (luo_file->retrieve_sts < 0) {
-+		/* Retrieve was attempted and it failed. Return the error code. */
-+		return luo_file->retrieve_sts;
- 	}
- 
+@@ -590,16 +597,19 @@ int luo_retrieve_file(struct luo_file_se
  	args.handler = luo_file->fh;
  	args.serialized_data = luo_file->serialized_data;
  	err = luo_file->fh->ops->retrieve(&args);
@@ -148,7 +144,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		luo_file->retrieved = true;
 +	if (err) {
 +		/* Keep the error code for later use. */
-+		luo_file->retrieve_sts = err;
++		luo_file->retrieve_status = err;
 +		return err;
  	}
  
@@ -157,42 +153,41 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	/* Get reference so we can keep this file in LUO until finish */
 +	get_file(luo_file->file);
 +	*filep = luo_file->file;
-+	luo_file->retrieve_sts = 1;
++	luo_file->retrieve_status = 1;
 +
 +	return 0;
  }
  
  static int luo_file_can_finish_one(struct luo_file_set *file_set,
-@@ -615,7 +624,7 @@ static int luo_file_can_finish_one(struc
+@@ -615,7 +625,7 @@ static int luo_file_can_finish_one(struc
  		args.handler = luo_file->fh;
  		args.file = luo_file->file;
  		args.serialized_data = luo_file->serialized_data;
 -		args.retrieved = luo_file->retrieved;
-+		args.retrieve_sts = luo_file->retrieve_sts;
++		args.retrieve_status = luo_file->retrieve_status;
  		can_finish = luo_file->fh->ops->can_finish(&args);
  	}
  
-@@ -632,7 +641,7 @@ static void luo_file_finish_one(struct l
+@@ -632,7 +642,7 @@ static void luo_file_finish_one(struct l
  	args.handler = luo_file->fh;
  	args.file = luo_file->file;
  	args.serialized_data = luo_file->serialized_data;
 -	args.retrieved = luo_file->retrieved;
-+	args.retrieve_sts = luo_file->retrieve_sts;
++	args.retrieve_status = luo_file->retrieve_status;
  
  	luo_file->fh->ops->finish(&args);
  	luo_flb_file_finish(luo_file->fh);
-@@ -788,7 +797,7 @@ int luo_file_deserialize(struct luo_file
+@@ -788,7 +798,6 @@ int luo_file_deserialize(struct luo_file
  		luo_file->file = NULL;
  		luo_file->serialized_data = file_ser[i].data;
  		luo_file->token = file_ser[i].token;
 -		luo_file->retrieved = false;
-+		luo_file->retrieve_sts = 0;
  		mutex_init(&luo_file->mutex);
  		list_add_tail(&luo_file->list, &file_set->files_list);
  	}
 --- a/mm/memfd_luo.c~liveupdate-luo_file-remember-retrieve-status
 +++ a/mm/memfd_luo.c
-@@ -335,7 +335,12 @@ static void memfd_luo_finish(struct live
+@@ -326,7 +326,12 @@ static void memfd_luo_finish(struct live
  	struct memfd_luo_folio_ser *folios_ser;
  	struct memfd_luo_ser *ser;
  
@@ -202,7 +197,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	 * already cleaned up everything it could. So nothing to do there
 +	 * either. Only need to clean up when retrieve was not called.
 +	 */
-+	if (args->retrieve_sts)
++	if (args->retrieve_status)
  		return;
  
  	ser = phys_to_virt(args->serialized_data);
