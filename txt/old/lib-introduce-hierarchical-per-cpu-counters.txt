@@ -1,42 +1,17 @@
 From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Subject: lib: introduce hierarchical per-cpu counters
-Date: Mon, 12 Jan 2026 15:00:54 -0500
+Date: Tue, 17 Feb 2026 11:10:04 -0500
 
-Patch series "mm: Fix OOM killer inaccuracy on large many-core systems",
-v14.
+Patch series "Improve proc RSS accuracy", v17.
 
-Introduce hierarchical per-cpu counters and use them for RSS tracking to
-fix the per-mm RSS tracking which has become too inaccurate for OOM killer
-purposes on large many-core systems.
+This series introduces the hierarchical tree counter (hpcc) to increase
+accuracy of approximated RSS counters exposed through proc interfaces.
 
-The following rss tracking issues were noted by Sweet Tea Dorminy [1],
-which lead to picking wrong tasks as OOM kill target:
-
-  Recently, several internal services had an RSS usage regression as part of a
-  kernel upgrade. Previously, they were on a pre-6.2 kernel and were able to
-  read RSS statistics in a backup watchdog process to monitor and decide if
-  they'd overrun their memory budget. Now, however, a representative service
-  with five threads, expected to use about a hundred MB of memory, on a 250-cpu
-  machine had memory usage tens of megabytes different from the expected amount
-  -- this constituted a significant percentage of inaccuracy, causing the
-  watchdog to act.
-
-  This was a result of commit f1a7941243c1 ("mm: convert mm's rss stats
-  into percpu_counter") [1].  Previously, the memory error was bounded by
-  64*nr_threads pages, a very livable megabyte. Now, however, as a result of
-  scheduler decisions moving the threads around the CPUs, the memory error could
-  be as large as a gigabyte.
-
-  This is a really tremendous inaccuracy for any few-threaded program on a
-  large machine and impedes monitoring significantly. These stat counters are
-  also used to make OOM killing decisions, so this additional inaccuracy could
-  make a big difference in OOM situations -- either resulting in the wrong
-  process being killed, or in less memory being returned from an OOM-kill than
-  expected.
-
-The approach proposed here is to replace this by the hierarchical
-per-cpu counters, which bounds the inaccuracy based on the system
-topology with O(N*logN).
+With a test program hopping across CPUs doing frequent mmap/munmap
+operations, the upstream implementation approximation reaches a 1GB delta
+from the precise value after a few minutes, compared to a 80MB delta with
+the hierarchical counter.  The hierarchical counter provides a guaranteed
+maximum approximation inaccuracy of 192MB on that hardware topology.
 
 
 This patch (of 3):
@@ -51,16 +26,20 @@ The purpose of this hierarchical split-counter scheme is to:
   scaling to many-core systems.
 - Provide approximate and precise comparison of two counters, and
   between a counter and a value.
+- Provide possible precise sum ranges for a given sum approximation.
 
-It aims at fixing the per-mm RSS tracking which has become too
-inaccurate for OOM killer purposes on large many-core systems [1].
+Its goals are twofold:
+
+- Improve the accuracy of the approximated RSS counter values returned
+  by proc interfaces [1],
+- Reduce the latency of the OOM killer on large many-core systems.
 
 * Design
 
-The hierarchical per-CPU counters propagate a sum approximation through
-a N-way tree. When reaching the batch size, the carry is propagated
-through a binary tree which consists of logN(nr_cpu_ids) levels. The
-batch size for each level is twice the batch size of the prior level.
+The hierarchical per-CPU counters propagate a sum approximation through a
+N-way tree.  When reaching the batch size, the carry is propagated through
+a binary tree which consists of logN(nr_cpu_ids) levels.  The batch size
+for each level is twice the batch size of the prior level.
 
 Example propagation diagram with 8 cpus through a binary tree:
 
@@ -79,15 +58,74 @@ Level 2:  0                   1
 Level 3:  0
 
 For a binary tree, the maximum inaccuracy is bound by:
-   batch_size * log2(nr_cpus) * nr_cpus
+   batch_size * log2(nr_cpu_ids) * nr_cpu_ids
 which evolves with O(n*log(n)) as the number of CPUs increases.
 
 For a N-way tree, the maximum inaccuracy can be pre-calculated
 based on the the N-arity of each level and the batch size.
 
-Link: https://lkml.kernel.org/r/20260112200056.1250404-1-mathieu.desnoyers@efficios.com
-Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
-Link: https://lkml.kernel.org/r/20260112200056.1250404-2-mathieu.desnoyers@efficios.com
+* Memory Use
+
+The most important parts in terms of memory use are the per-cpu counters
+and the tree items which propagate the carry.
+
+In the proposed implementation, the per-cpu counters are allocated
+within per-cpu data structures, so they end up using:
+
+  nr_possible_cpus * sizeof(unsigned long)
+
+This is in addition to the tree items. The size of those items is
+defined by the per_nr_cpu_order_config table "nr_items" field.
+Each item is aligned on cacheline size (typically 64 bytes) to minimize
+false sharing.
+
+Here is the footprint for a few nr_cpu_ids on a 64-bit arch:
+
+nr_cpu_ids  percpu counters (bytes)     nr_items       items size (bytes)     total (bytes)
+    2               16                     1                 64                    80
+    4               32                     3                192                   224
+    8               64                     7                448                   512
+   64               512                   21               1344                  1856
+  128              1024                   21               1344                  2368
+  256              2048                   37               2368                  4416
+  512              4096                   73               4672                  8768
+
+There are of course various trade offs we can make here. We can:
+
+* Increase the n-arity of the intermediate items to shrink the nr_items
+  required for a given nr_cpus. This will increase contention of carry
+  propagation across more cores.
+
+* Remove cacheline alignment of intermediate tree items. This will
+  shrink the memory needed for tree items, but will increase false
+  sharing.
+
+* Represent intermediate tree items on a byte rather than long.
+  This further reduces the memory required for intermediate tree
+  items, but further increases false sharing.
+
+* Represent per-cpu counters on bytes rather than long. This makes
+  the "sum" operation trickier, because it needs to iterate on the
+  intermediate carry propagation nodes as well and synchronize with
+  ongoing "tree add" operations. It further reduces memory use.
+
+* Implement a custom strided allocator for intermediate items carry
+  propagation bytes. This shares cachelines across different tree
+  instances, keeping good locality. This ensures that all accesses
+  from a given location in the machine topology touch the same
+  cacheline for the various tree instances. This adds complexity,
+  but provides compactness as well as minimal false-sharing.
+
+Compared to this, the upstream percpu counters use a 32-bit integer per-cpu
+(4 bytes), and accumulate within a 64-bit global value.
+
+So there is an extra memory footprint added by the current hpcc
+implementation, but if it's an issue we have various options to consider
+to reduce its footprint.
+
+Link: https://lkml.kernel.org/r/20260217161006.1105611-1-mathieu.desnoyers@efficios.com
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ [1]
+Link: https://lkml.kernel.org/r/20260217161006.1105611-2-mathieu.desnoyers@efficios.com
 Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
@@ -98,6 +136,7 @@ Cc: Tejun Heo <tj@kernel.org>
 Cc: Christoph Lameter <cl@linux.com>
 Cc: Martin Liu <liumartin@google.com>
 Cc: David Rientjes <rientjes@google.com>
+Cc: Christan König <christian.koenig@amd.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Michal Hocko <mhocko@suse.com>
@@ -119,4 +158,3 @@ Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
-Cc: Christan König <christian.koenig@amd.com>

@@ -1,42 +1,17 @@
 From: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Subject: lib: introduce hierarchical per-cpu counters
-Date: Mon, 12 Jan 2026 15:00:54 -0500
+Date: Tue, 17 Feb 2026 11:10:04 -0500
 
-Patch series "mm: Fix OOM killer inaccuracy on large many-core systems",
-v14.
+Patch series "Improve proc RSS accuracy", v17.
 
-Introduce hierarchical per-cpu counters and use them for RSS tracking to
-fix the per-mm RSS tracking which has become too inaccurate for OOM killer
-purposes on large many-core systems.
+This series introduces the hierarchical tree counter (hpcc) to increase
+accuracy of approximated RSS counters exposed through proc interfaces.
 
-The following rss tracking issues were noted by Sweet Tea Dorminy [1],
-which lead to picking wrong tasks as OOM kill target:
-
-  Recently, several internal services had an RSS usage regression as part of a
-  kernel upgrade. Previously, they were on a pre-6.2 kernel and were able to
-  read RSS statistics in a backup watchdog process to monitor and decide if
-  they'd overrun their memory budget. Now, however, a representative service
-  with five threads, expected to use about a hundred MB of memory, on a 250-cpu
-  machine had memory usage tens of megabytes different from the expected amount
-  -- this constituted a significant percentage of inaccuracy, causing the
-  watchdog to act.
-
-  This was a result of commit f1a7941243c1 ("mm: convert mm's rss stats
-  into percpu_counter") [1].  Previously, the memory error was bounded by
-  64*nr_threads pages, a very livable megabyte. Now, however, as a result of
-  scheduler decisions moving the threads around the CPUs, the memory error could
-  be as large as a gigabyte.
-
-  This is a really tremendous inaccuracy for any few-threaded program on a
-  large machine and impedes monitoring significantly. These stat counters are
-  also used to make OOM killing decisions, so this additional inaccuracy could
-  make a big difference in OOM situations -- either resulting in the wrong
-  process being killed, or in less memory being returned from an OOM-kill than
-  expected.
-
-The approach proposed here is to replace this by the hierarchical
-per-cpu counters, which bounds the inaccuracy based on the system
-topology with O(N*logN).
+With a test program hopping across CPUs doing frequent mmap/munmap
+operations, the upstream implementation approximation reaches a 1GB delta
+from the precise value after a few minutes, compared to a 80MB delta with
+the hierarchical counter.  The hierarchical counter provides a guaranteed
+maximum approximation inaccuracy of 192MB on that hardware topology.
 
 
 This patch (of 3):
@@ -51,16 +26,20 @@ The purpose of this hierarchical split-counter scheme is to:
   scaling to many-core systems.
 - Provide approximate and precise comparison of two counters, and
   between a counter and a value.
+- Provide possible precise sum ranges for a given sum approximation.
 
-It aims at fixing the per-mm RSS tracking which has become too
-inaccurate for OOM killer purposes on large many-core systems [1].
+Its goals are twofold:
+
+- Improve the accuracy of the approximated RSS counter values returned
+  by proc interfaces [1],
+- Reduce the latency of the OOM killer on large many-core systems.
 
 * Design
 
-The hierarchical per-CPU counters propagate a sum approximation through
-a N-way tree. When reaching the batch size, the carry is propagated
-through a binary tree which consists of logN(nr_cpu_ids) levels. The
-batch size for each level is twice the batch size of the prior level.
+The hierarchical per-CPU counters propagate a sum approximation through a
+N-way tree.  When reaching the batch size, the carry is propagated through
+a binary tree which consists of logN(nr_cpu_ids) levels.  The batch size
+for each level is twice the batch size of the prior level.
 
 Example propagation diagram with 8 cpus through a binary tree:
 
@@ -79,15 +58,74 @@ Level 2:  0                   1
 Level 3:  0
 
 For a binary tree, the maximum inaccuracy is bound by:
-   batch_size * log2(nr_cpus) * nr_cpus
+   batch_size * log2(nr_cpu_ids) * nr_cpu_ids
 which evolves with O(n*log(n)) as the number of CPUs increases.
 
 For a N-way tree, the maximum inaccuracy can be pre-calculated
 based on the the N-arity of each level and the batch size.
 
-Link: https://lkml.kernel.org/r/20260112200056.1250404-1-mathieu.desnoyers@efficios.com
-Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ # [1]
-Link: https://lkml.kernel.org/r/20260112200056.1250404-2-mathieu.desnoyers@efficios.com
+* Memory Use
+
+The most important parts in terms of memory use are the per-cpu counters
+and the tree items which propagate the carry.
+
+In the proposed implementation, the per-cpu counters are allocated
+within per-cpu data structures, so they end up using:
+
+  nr_possible_cpus * sizeof(unsigned long)
+
+This is in addition to the tree items. The size of those items is
+defined by the per_nr_cpu_order_config table "nr_items" field.
+Each item is aligned on cacheline size (typically 64 bytes) to minimize
+false sharing.
+
+Here is the footprint for a few nr_cpu_ids on a 64-bit arch:
+
+nr_cpu_ids  percpu counters (bytes)     nr_items       items size (bytes)     total (bytes)
+    2               16                     1                 64                    80
+    4               32                     3                192                   224
+    8               64                     7                448                   512
+   64               512                   21               1344                  1856
+  128              1024                   21               1344                  2368
+  256              2048                   37               2368                  4416
+  512              4096                   73               4672                  8768
+
+There are of course various trade offs we can make here. We can:
+
+* Increase the n-arity of the intermediate items to shrink the nr_items
+  required for a given nr_cpus. This will increase contention of carry
+  propagation across more cores.
+
+* Remove cacheline alignment of intermediate tree items. This will
+  shrink the memory needed for tree items, but will increase false
+  sharing.
+
+* Represent intermediate tree items on a byte rather than long.
+  This further reduces the memory required for intermediate tree
+  items, but further increases false sharing.
+
+* Represent per-cpu counters on bytes rather than long. This makes
+  the "sum" operation trickier, because it needs to iterate on the
+  intermediate carry propagation nodes as well and synchronize with
+  ongoing "tree add" operations. It further reduces memory use.
+
+* Implement a custom strided allocator for intermediate items carry
+  propagation bytes. This shares cachelines across different tree
+  instances, keeping good locality. This ensures that all accesses
+  from a given location in the machine topology touch the same
+  cacheline for the various tree instances. This adds complexity,
+  but provides compactness as well as minimal false-sharing.
+
+Compared to this, the upstream percpu counters use a 32-bit integer per-cpu
+(4 bytes), and accumulate within a 64-bit global value.
+
+So there is an extra memory footprint added by the current hpcc
+implementation, but if it's an issue we have various options to consider
+to reduce its footprint.
+
+Link: https://lkml.kernel.org/r/20260217161006.1105611-1-mathieu.desnoyers@efficios.com
+Link: https://lore.kernel.org/lkml/20250331223516.7810-2-sweettea-kernel@dorminy.me/ [1]
+Link: https://lkml.kernel.org/r/20260217161006.1105611-2-mathieu.desnoyers@efficios.com
 Signed-off-by: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: "Paul E. McKenney" <paulmck@kernel.org>
 Cc: Steven Rostedt <rostedt@goodmis.org>
@@ -98,6 +136,7 @@ Cc: Tejun Heo <tj@kernel.org>
 Cc: Christoph Lameter <cl@linux.com>
 Cc: Martin Liu <liumartin@google.com>
 Cc: David Rientjes <rientjes@google.com>
+Cc: Christan König <christian.koenig@amd.com>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: SeongJae Park <sj@kernel.org>
 Cc: Michal Hocko <mhocko@suse.com>
@@ -119,20 +158,100 @@ Cc: Mateusz Guzik <mjguzik@gmail.com>
 Cc: Matthew Wilcox <willy@infradead.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Aboorva Devarajan <aboorvad@linux.ibm.com>
-Cc: Christan König <christian.koenig@amd.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mm_types.h            |    6 
- include/linux/percpu_counter_tree.h |  344 ++++++++++++
- init/main.c                         |    2 
- lib/Makefile                        |    1 
- lib/percpu_counter_tree.c           |  702 ++++++++++++++++++++++++++
- 5 files changed, 1052 insertions(+), 3 deletions(-)
+ Documentation/core-api/percpu-counter-tree.rst |   75 +
+ include/linux/mm_types.h                       |    6 
+ include/linux/percpu_counter_tree.h            |  367 +++++++
+ init/main.c                                    |    2 
+ lib/Makefile                                   |    1 
+ lib/percpu_counter_tree.c                      |  690 +++++++++++++++
+ 6 files changed, 1138 insertions(+), 3 deletions(-)
 
+diff --git a/Documentation/core-api/percpu-counter-tree.rst a/Documentation/core-api/percpu-counter-tree.rst
+new file mode 100644
+--- /dev/null
++++ a/Documentation/core-api/percpu-counter-tree.rst
+@@ -0,0 +1,75 @@
++========================================
++The Hierarchical Per-CPU Counters (HPCC)
++========================================
++
++:Author: Mathieu Desnoyers
++
++Introduction
++============
++
++Counters come in many varieties, each with their own trade offs:
++
++ * A global atomic counter provides a fast read access to the current
++   sum, at the expense of cache-line bouncing on updates. This leads to
++   poor performance of frequent updates from various cores on large SMP
++   systems.
++
++ * A per-cpu split counter provides fast updates to per-cpu counters,
++   at the expense of a slower aggregation (sum). The sum operation needs
++   to iterate over all per-cpu counters to calculate the current total.
++
++The hierarchical per-cpu counters attempt to provide the best of both
++worlds (fast updates, and fast sum) by relaxing requirements on the sum
++accuracy. It allows quickly querying an approximated sum value, along
++with the possible min/max ranges of the associated precise sum. The
++exact precise sum can still be calculated with an iteration on all
++per-cpu counter, but the availability of an approximated sum value with
++possible precise sum min/max ranges allows eliminating candidates which
++are certainly outside of a known target range without the overhead of
++precise sums.
++
++Overview
++========
++
++The herarchical per-cpu counters are organized as a tree with the tree
++root at the bottom (last level) and the first level of the tree
++consisting of per-cpu counters.
++
++The intermediate tree levels contain carry propagation counters. When
++reaching a threshold (batch size), the carry is propagated down the
++tree.
++
++This allows reading an approximated value at the root, which has a
++bounded accuracy (minimum/maximum possible precise sum range) determined
++by the tree topology.
++
++Use Cases
++=========
++
++Use cases HPCC is meant to handle invove tracking resources which are
++used across many CPUs to quickly sum as feedback for decision making to
++apply throttling, quota limits, sort tasks, and perform memory or task
++migration decisions. When considering approximated sums within the
++accuracy range of the decision threshold, the user can either:
++
++ * Be conservative and fast: Consider that the sum has reached the
++   limit as soon as the given limit is within the approximation range.
++
++ * Be aggressive and fast: Consider that the sum is over the
++   limit only when the approximation range is over the given limit.
++
++ * Be precise and slow: Do a precise comparison with the limit, which
++   requires a precise sum when the limit is within the approximated
++   range.
++
++One use-case for these hierarchical counters is to implement a two-pass
++algorithm to speed up sorting picking a maximum/minimunm sum value from
++a set. A first pass compares the approximated values, and then a second
++pass only needs the precise sum for counter trees which are within the
++possible precise sum range of the counter tree chosen by the first pass.
++
++Functions and structures
++========================
++
++.. kernel-doc:: include/linux/percpu_counter_tree.h
++.. kernel-doc:: lib/percpu_counter_tree.c
 --- a/include/linux/mm_types.h~lib-introduce-hierarchical-per-cpu-counters
 +++ a/include/linux/mm_types.h
-@@ -1366,9 +1366,9 @@ static inline void __mm_flags_set_mask_b
+@@ -1414,9 +1414,9 @@ static inline void __mm_flags_set_mask_b
  			 MT_FLAGS_USE_RCU)
  extern struct mm_struct init_mm;
  
@@ -149,7 +268,7 @@ diff --git a/include/linux/percpu_counter_tree.h a/include/linux/percpu_counter_
 new file mode 100644
 --- /dev/null
 +++ a/include/linux/percpu_counter_tree.h
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,367 @@
 +/* SPDX-License-Identifier: GPL-2.0+ OR MIT */
 +/* SPDX-FileCopyrightText: 2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com> */
 +
@@ -265,8 +384,6 @@ new file mode 100644
 +int percpu_counter_tree_precise_compare(struct percpu_counter_tree *a, struct percpu_counter_tree *b);
 +int percpu_counter_tree_precise_compare_value(struct percpu_counter_tree *counter, long v);
 +void percpu_counter_tree_set(struct percpu_counter_tree *counter, long v);
-+void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
-+						    unsigned long *under, unsigned long *over);
 +int percpu_counter_tree_subsystem_init(void);
 +
 +/**
@@ -289,6 +406,33 @@ new file mode 100644
 +	else
 +		v = atomic_long_read(counter->approx_sum.a);
 +	return (long) (v + (unsigned long)READ_ONCE(counter->bias));
++}
++
++/**
++ * percpu_counter_tree_approximate_accuracy_range - Query the accuracy range for a counter tree.
++ * @counter: Counter to query.
++ * @under: Pointer to a variable to be incremented of the approximation
++ *         accuracy range below the precise sum.
++ * @over: Pointer to a variable to be incremented of the approximation
++ *        accuracy range above the precise sum.
++ *
++ * Query the accuracy range limits for the counter.
++ * Because of two's complement binary representation, the "under" range is typically
++ * slightly larger than the "over" range.
++ * Those values are derived from the hardware topology and the counter tree batch size.
++ * They are invariant for a given counter tree.
++ * Using this function should not be typically required, see the following functions instead:
++ * * percpu_counter_tree_approximate_compare(),
++ * * percpu_counter_tree_approximate_compare_value(),
++ * * percpu_counter_tree_precise_compare(),
++ * * percpu_counter_tree_precise_compare_value().
++ */
++static inline
++void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
++						    unsigned long *under, unsigned long *over)
++{
++	*under += counter->approx_accuracy_range.under;
++	*over += counter->approx_accuracy_range.over;
 +}
 +
 +#else	/* !CONFIG_SMP */
@@ -386,8 +530,6 @@ new file mode 100644
 +void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
 +						    unsigned long *under, unsigned long *over)
 +{
-+	*under = 0;
-+	*over = 0;
 +}
 +
 +static inline
@@ -485,7 +627,7 @@ new file mode 100644
 +void percpu_counter_tree_approximate_min_max(struct percpu_counter_tree *counter,
 +					     long *approx_sum, long *precise_min, long *precise_max)
 +{
-+	unsigned long under, over;
++	unsigned long under = 0, over = 0;
 +	long v = percpu_counter_tree_approximate_sum(counter);
 +
 +	percpu_counter_tree_approximate_accuracy_range(counter, &under, &over);
@@ -496,15 +638,15 @@ new file mode 100644
 +#endif  /* _PERCPU_COUNTER_TREE_H */
 --- a/init/main.c~lib-introduce-hierarchical-per-cpu-counters
 +++ a/init/main.c
-@@ -104,6 +104,7 @@
- #include <linux/pidfs.h>
+@@ -105,6 +105,7 @@
  #include <linux/ptdump.h>
  #include <linux/time_namespace.h>
+ #include <linux/unaligned.h>
 +#include <linux/percpu_counter_tree.h>
  #include <net/net_namespace.h>
  
  #include <asm/io.h>
-@@ -1064,6 +1065,7 @@ void start_kernel(void)
+@@ -1067,6 +1068,7 @@ void start_kernel(void)
  	vfs_caches_init_early();
  	sort_main_extable();
  	trap_init();
@@ -526,7 +668,7 @@ diff --git a/lib/percpu_counter_tree.c a/lib/percpu_counter_tree.c
 new file mode 100644
 --- /dev/null
 +++ a/lib/percpu_counter_tree.c
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,690 @@
 +// SPDX-License-Identifier: GPL-2.0+ OR MIT
 +// SPDX-FileCopyrightText: 2025 Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 +
@@ -543,10 +685,10 @@ new file mode 100644
 + * reaching the batch size thresholds.
 + *
 + * Counters at levels 0, 1, 2 can be kept on a single byte ([-128 .. +127] range),
-+ * although it may be relevant to keep them on 64-bit counters for
++ * although it may be relevant to keep them on "long" counters for
 + * simplicity. (complexity vs memory footprint tradeoff)
 + *
-+ * Counter at level 3 can be kept on a 32-bit counter.
++ * Counter at level 3 can be kept on a "long" counter.
 + *
 + * Level 0:  0    1    2    3    4    5    6    7
 + *           |   /     |   /     |   /     |   /
@@ -591,6 +733,7 @@ new file mode 100644
 + * Let's define a number of counter bits for each level, e.g.:
 + *
 + * log2(BATCH(level 0)) = log2(32) = 5
++ * Let's assume, for this example, a 32-bit architecture (sizeof(long) == 4).
 + *
 + *               nr_bit        value_mask                      range
 + * Level 0:      5 bits        v                             0 ..  +31
@@ -598,7 +741,7 @@ new file mode 100644
 + * Level 2:      1 bit        (v & ~((1UL << 6) - 1))        0 .. +127
 + * Level 3:     25 bits       (v & ~((1UL << 7) - 1))        0 .. 2^32-1
 + *
-+ * Note: Use a full 64-bit per-cpu counter at level 0 to allow precise sum.
++ * Note: Use a "long" per-cpu counter at level 0 to allow precise sum.
 + *
 + * Note: Use cacheline aligned counters at levels above 0 to prevent false sharing.
 + *       If memory footprint is an issue, a specialized allocator could be used
@@ -904,14 +1047,25 @@ new file mode 100644
 +	level_items = 1U << (nr_cpus_order - n_arity_order);
 +
 +	for (level = 1; level < nr_levels; level++) {
-+		atomic_long_t *count = &item[cpu & (level_items - 1)].count;
-+		unsigned long orig, res;
++		/*
++		 * For the purpose of carry propagation, the
++		 * intermediate level counters only need to keep track
++		 * of the bits relevant for carry propagation. We
++		 * therefore don't care about higher order bits.
++		 * Note that this optimization is unwanted if the
++		 * intended use is to track counters within intermediate
++		 * levels of the topology.
++		 */
++		if (abs(inc) & (bit_mask - 1)) {
++			atomic_long_t *count = &item[cpu & (level_items - 1)].count;
++			unsigned long orig, res;
 +
-+		res = atomic_long_add_return_relaxed(inc, count);
-+		orig = res - inc;
-+		inc = percpu_counter_tree_carry(orig, res, inc, bit_mask);
-+		if (likely(!inc))
-+			return;
++			res = atomic_long_add_return_relaxed(inc, count);
++			orig = res - inc;
++			inc = percpu_counter_tree_carry(orig, res, inc, bit_mask);
++			if (likely(!inc))
++				return;
++		}
 +		item += level_items;
 +		n_arity_order = counter_config->n_arity_order[level];
 +		level_items >>= n_arity_order;
@@ -1157,30 +1311,6 @@ new file mode 100644
 +{
 +	percpu_counter_tree_set_bias(counter,
 +				     v - percpu_counter_tree_precise_sum_unbiased(counter));
-+}
-+
-+/**
-+ * percpu_counter_tree_approximate_accuracy_range - Query the accuracy range for a counter tree.
-+ * @counter: Counter to query.
-+ * @under: Pointer where to store the to the accuracy range below the approximation.
-+ * @over: Pointer where to store the to the accuracy range above the approximation.
-+ *
-+ * Query the accuracy range limits for the counter.
-+ * Because of two's complement binary representation, the "under" range is typically
-+ * slightly larger than the "over" range.
-+ * Those values are derived from the hardware topology and the counter tree batch size.
-+ * They are invariant for a given counter tree.
-+ * Using this function should not be typically required, see the following functions instead:
-+ * * percpu_counter_tree_approximate_compare(),
-+ * * percpu_counter_tree_approximate_compare_value(),
-+ * * percpu_counter_tree_precise_compare(),
-+ * * percpu_counter_tree_precise_compare_value().
-+ */
-+void percpu_counter_tree_approximate_accuracy_range(struct percpu_counter_tree *counter,
-+						    unsigned long *under, unsigned long *over)
-+{
-+	*under = counter->approx_accuracy_range.under;
-+	*over = counter->approx_accuracy_range.over;
 +}
 +
 +/*
