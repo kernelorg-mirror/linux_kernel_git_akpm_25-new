@@ -1,0 +1,108 @@
+From: Leno Hou <lenohou@gmail.com>
+Subject: mm/mglru: fix cgroup OOM during MGLRU state switching
+Date: Sun, 1 Mar 2026 00:10:08 +0800
+
+When the Multi-Gen LRU (MGLRU) state is toggled dynamically, a race
+condition exists between the state switching and the memory reclaim path. 
+This can lead to unexpected cgroup OOM kills, even when plenty of
+reclaimable memory is available.
+
+*** Problem Description ***
+
+The issue arises from a "reclaim vacuum" during the transition:
+
+1. When disabling MGLRU, lru_gen_change_state() sets lrugen->enabled to
+   false before the pages are drained from MGLRU lists back to
+   traditional LRU lists.
+2. Concurrent reclaimers in shrink_lruvec() see lrugen->enabled as false
+   and skip the MGLRU path.
+3. However, these pages might not have reached the traditional LRU lists
+   yet, or the changes are not yet visible to all CPUs due to a lack of
+   synchronization.
+4. get_scan_count() subsequently finds traditional LRU lists empty,
+   concludes there is no reclaimable memory, and triggers an OOM kill.
+
+A similar race can occur during enablement, where the reclaimer sees the
+new state but the MGLRU lists haven't been populated via fill_evictable()
+yet.
+
+*** Solution ***
+
+Introduce a 'draining' state to bridge the gap during transitions:
+
+- Use smp_store_release() and smp_load_acquire() to ensure the visibility
+  of 'enabled' and 'draining' flags across CPUs.
+- Modify shrink_lruvec() to allow a "joint reclaim" period. If an lruvec
+  is in the 'draining' state, the reclaimer will attempt to scan MGLRU
+  lists first, and then fall through to traditional LRU lists instead
+  of returning early. This ensures that folios are visible to at least
+  one reclaim path at any given time.
+
+*** Reproduction ***
+
+The issue was consistently reproduced on v6.1.157 and v6.18.3 using
+a high-pressure memory cgroup (v1) environment.
+
+Reproduction steps:
+1. Create a 16GB memcg and populate it with 10GB file cache (5GB active)
+   and 8GB active anonymous memory.
+2. Toggle MGLRU state while performing new memory allocations to force
+   direct reclaim.
+
+Reproduction script:
+
+#!/bin/bash
+# Fixed reproduction for memcg OOM during MGLRU toggle
+set -euo pipefail
+
+MGLRU_FILE="/sys/kernel/mm/lru_gen/enabled"
+CGROUP_PATH="/sys/fs/cgroup/memory/memcg_oom_test"
+
+# Switch MGLRU dynamically in the background
+switch_mglru() {
+    local orig_val=$(cat "$MGLRU_FILE")
+    if [[ "$orig_val" != "0x0000" ]]; then
+        echo n > "$MGLRU_FILE" &
+    else
+        echo y > "$MGLRU_FILE" &
+    fi
+}
+
+# Setup 16G memcg
+mkdir -p "$CGROUP_PATH"
+echo $((16 * 1024 * 1024 * 1024)) > "$CGROUP_PATH/memory.limit_in_bytes"
+echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+# 1. Build memory pressure (File + Anon)
+dd if=/dev/urandom of=/tmp/test_file bs=1M count=10240
+dd if=/tmp/test_file of=/dev/null bs=1M # Warm up cache
+
+stress-ng --vm 1 --vm-bytes 8G --vm-keep -t 600 &
+sleep 5
+
+# 2. Trigger switch and concurrent allocation
+switch_mglru
+stress-ng --vm 1 --vm-bytes 2G --vm-populate --timeout 5s || echo "OOM Triggered"
+
+# Check OOM counter
+grep oom_kill "$CGROUP_PATH/memory.oom_control"
+
+Link: https://lkml.kernel.org/r/20260228161008.707-1-lenohou@gmail.com
+Signed-off-by: Leno Hou <lenohou@gmail.com>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Barry Song <21cnbao@gmail.com>
+Cc: Jialing Wang <wjl.linux@gmail.com>
+Cc: Yafang Shao <laoar.shao@gmail.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: "Liam R. Howlett" <Liam.Howlett@oracle.com>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Qi Zheng <zhengqi.arch@bytedance.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
