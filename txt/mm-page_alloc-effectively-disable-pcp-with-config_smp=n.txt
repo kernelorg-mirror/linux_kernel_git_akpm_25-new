@@ -1,0 +1,83 @@
+From: Vlastimil Babka <vbabka@kernel.org>
+Subject: mm/page_alloc: effectively disable pcp with CONFIG_SMP=n
+Date: Fri, 27 Feb 2026 18:07:58 +0100
+
+Patch series "mm/page_alloc: pcp locking cleanup".
+
+This is a followup to the hotfix 038a102535eb ("mm/page_alloc: prevent pcp
+corruption with SMP=n"), to simplify the code and deal with the original
+issue properly.  The previous RFC attempt [1] argued for changing the UP
+spinlock implementation, which was discouraged, but thanks to David's
+off-list suggestion, we can achieve the goal without changing the spinlock
+implementation.
+
+The main change in Patch 1 relies on the fact that on UP we don't need the
+pcp lists for scalability, so just make them always bypassed during
+alloc/free by making the pcp trylock an unconditional failure.
+
+The various drain paths that use pcp_spin_lock_maybe_irqsave() continue to
+exist but will never do any work in practice.  In Patch 2 we can again
+remove the irq saving from them that commit 038a102535eb added.
+
+Besides simpler code with all the ugly UP_flags removed, we get less bloat
+with CONFIG_SMP=n for mm/page_alloc.o as a result:
+
+add/remove: 25/28 grow/shrink: 4/5 up/down: 2105/-6665 (-4560)
+Function                                     old     new   delta
+get_page_from_freelist                      5689    7248   +1559
+free_unref_folios                           2006    2324    +318
+make_alloc_exact                             270     286     +16
+__zone_watermark_ok                          306     322     +16
+drain_pages_zone.isra                        119     109     -10
+decay_pcp_high                               181     149     -32
+setup_pcp_cacheinfo                          193     147     -46
+__free_frozen_pages                         1339    1089    -250
+alloc_pages_bulk_noprof                     1054     419    -635
+free_frozen_page_commit                      907       -    -907
+try_to_claim_block                          1975       -   -1975
+__rmqueue_pcplist                           2614       -   -2614
+Total: Before=54624, After=50064, chg -8.35%
+
+
+This patch (of 3):
+
+The page allocator has been using a locking scheme for its percpu page
+caches (pcp) based on spin_trylock() with no _irqsave() part.  The trick
+is that if we interrupt the locked section, we fail the trylock and just
+fallback to the slowpath taking the zone lock.  That's more expensive, but
+rare, so we don't need to pay the irqsave/restore cost all the time in the
+fastpaths.
+
+It's similar to but not exactly local_trylock_t (which is also newer
+anyway) because in some cases we do lock the pcp of a non-local cpu to
+drain it, in a way that's cheaper than using IPI or queue_work_on().
+
+The complication of this scheme has been UP non-debug spinlock
+implementation which assumes spin_trylock() can't fail on UP and has no
+state to track whether it's locked.  It just doesn't anticipate this usage
+scenario.  So to work around that we disable IRQs only on UP, complicating
+the implementation.  Also recently we found years old bug in where we
+didn't disable IRQs in related paths - see 038a102535eb ("mm/page_alloc:
+prevent pcp corruption with SMP=n").
+
+We can avoid this UP complication by realizing that we do not need the pcp
+caching for scalability on UP in the first place.  Removing it completely
+with #ifdefs is not worth the trouble either.  Just make
+pcp_spin_trylock() return NULL unconditionally on CONFIG_SMP=n.  This
+makes the slowpaths unconditional, and we can remove the IRQ save/restore
+handling in pcp_spin_trylock()/unlock() completely.
+
+Link: https://lkml.kernel.org/r/20260227-b4-pcp-locking-cleanup-v1-0-f7e22e603447@kernel.org
+Link: https://lkml.kernel.org/r/20260227-b4-pcp-locking-cleanup-v1-1-f7e22e603447@kernel.org
+Link: https://lore.kernel.org/all/d762c46b-36f0-471a-b5b4-23c8cf5628ae@suse.cz/ [1]
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Suggested-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Mel Gorman <mgorman@techsingularity.net>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
