@@ -1,32 +1,36 @@
 From: Jianyue Wu <wujianyue000@gmail.com>
-Subject: mm, memcg: optimize stat output for 11% sys time reduce
-Date: Thu, 22 Jan 2026 19:42:42 +0800
+Subject: mm, memcg: optimize stat output for 11% sys time reduction
+Date: Fri, 23 Jan 2026 23:01:08 +0800
 
-Replace seq_printf/seq_buf_printf with lightweight helpers to avoid printf
-parsing in memcg stats output.
+Replace seq_buf_printf() calls in memcg stat formatting with a lightweight
+helper function and replace seq_printf() in numa stat output with direct
+seq operations to avoid printf format parsing overhead.
 
 Key changes:
-- Add memcg_seq_put_name_val() for seq_file "name value\n" formatting
-- Add memcg_seq_buf_put_name_val() for seq_buf "name value\n" formatting
-- Update __memory_events_show(), swap_events_show(),
-  memory_stat_format(), memory_numa_stat_show(), and related helpers
-- Introduce local variables to improve readability and reduce line length
+- Add memcg_seq_buf_print_stat() helper that embeds separator and
+  newline directly in the number buffer to reduce function calls
+- Replace seq_buf_printf() in memcg_stat_format() with
+  memcg_seq_buf_print_stat()
+- Replace seq_printf() in memory_numa_stat_show() and
+  memcg_numa_stat_show() with seq_puts() and seq_put_decimal_ull()
+- Update memory_stat_format() and related v1 stats formatting
 
-Performance:
-- 1M reads of memory.stat+memory.numa_stat
+Performance improvement (1M reads of memory.stat + memory.numa_stat):
 - Before: real 0m9.663s, user 0m4.840s, sys 0m4.823s
-- After:  real 0m9.051s, user 0m4.775s, sys 0m4.275s (~11.4% sys drop)
+- After:  real 0m8.909s, user 0m4.661s, sys 0m4.247s
+- Result: ~11% sys time reduction
 
-Tests:
-- Script:
+Test script:
   for ((i=1; i<=1000000; i++)); do
       : > /dev/null < /sys/fs/cgroup/memory.stat
       : > /dev/null < /sys/fs/cgroup/memory.numa_stat
   done
 
-Link: https://lkml.kernel.org/r/20260122114242.72139-1-wujianyue000@gmail.com
+Link: https://lkml.kernel.org/r/20260123150108.43443-2-wujianyue000@gmail.com
 Signed-off-by: Jianyue Wu <wujianyue000@gmail.com>
+Suggested-by: JP Kobryn <inwardvessel@gmail.com>
 Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Tested-by: JP Kobryn <inwardvessel@gmail.com>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
@@ -34,10 +38,10 @@ Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memcontrol-v1.c |  120 ++++++++++++++++++++-----------
- mm/memcontrol-v1.h |    6 +
- mm/memcontrol.c    |  162 ++++++++++++++++++++++++++++++++-----------
- 3 files changed, 205 insertions(+), 83 deletions(-)
+ mm/memcontrol-v1.c |   84 +++++++++++++++++++++++------------------
+ mm/memcontrol-v1.h |    4 +
+ mm/memcontrol.c    |   88 ++++++++++++++++++++++++++++++++++---------
+ 3 files changed, 123 insertions(+), 53 deletions(-)
 
 --- a/mm/memcontrol.c~mm-optimize-stat-output-for-11%-sys-time-reduce
 +++ a/mm/memcontrol.c
@@ -49,7 +53,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #include <linux/export.h>
  #include <linux/list.h>
  #include <linux/mutex.h>
-@@ -1460,9 +1461,70 @@ static bool memcg_accounts_hugetlb(void)
+@@ -1478,6 +1479,53 @@ static bool memcg_accounts_hugetlb(void)
  }
  #endif /* CONFIG_HUGETLB_PAGE */
  
@@ -57,81 +61,64 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +#define MEMCG_DEC_U64_MAX_LEN 20
 +
 +/**
-+ * memcg_seq_put_name_val - Write a name-value pair to a seq_file
-+ * @m: The seq_file to write to
-+ * @name: The name string (not null-terminated required, uses seq_puts)
-+ * @val: The u64 value to write
-+ *
-+ * This helper formats and writes a "name value\n" line to a seq_file,
-+ * commonly used for cgroup statistics output. The value is efficiently
-+ * converted to decimal using seq_put_decimal_ull.
-+ *
-+ * Output format: "<name> <value>\n"
-+ * Example: "anon 1048576\n"
-+ */
-+void memcg_seq_put_name_val(struct seq_file *m, const char *name, u64 val)
-+{
-+	seq_puts(m, name);
-+	/* need a space between name and value */
-+	seq_put_decimal_ull(m, " ", val);
-+	seq_putc(m, '\n');
-+}
-+
-+/**
-+ * memcg_seq_buf_put_name_val - Write a name-value pair to a seq_buf
++ * memcg_seq_buf_print_stat - Write a name-value pair to a seq_buf with newline
 + * @s: The seq_buf to write to
++ * @prefix: Optional prefix string (can be NULL or "")
 + * @name: The name string to write
++ * @sep: Separator character between name and value (typically ' ' or '=')
 + * @val: The u64 value to write
 + *
-+ * This helper formats and writes a "name value\n" line to a seq_buf.
-+ * Unlike memcg_seq_put_name_val which uses seq_file's built-in formatting,
-+ * this function manually converts the value to a string using num_to_str
-+ * and writes it using seq_buf primitives for better performance when
-+ * batching multiple writes to a seq_buf.
++ * This helper efficiently formats and writes "<prefix><name><sep><value>\n"
++ * to a seq_buf. It manually converts the value to a string using num_to_str
++ * and embeds the separator and newline in the buffer to minimize function
++ * calls for better performance.
 + *
-+ * The function checks for overflow at each step and returns early if
-+ * any operation would cause the buffer to overflow.
++ * The function checks for overflow at each step and returns early if any
++ * operation would cause the buffer to overflow.
 + *
-+ * Output format: "<name> <value>\n"
-+ * Example: "file 2097152\n"
++ * Example: memcg_seq_buf_print_stat(s, "total_", "cache", ' ', 1048576)
++ *          Output: "total_cache 1048576\n"
 + */
-+void memcg_seq_buf_put_name_val(struct seq_buf *s, const char *name, u64 val)
++void memcg_seq_buf_print_stat(struct seq_buf *s, const char *prefix,
++			      const char *name, char sep, u64 val)
 +{
-+	char num_buf[MEMCG_DEC_U64_MAX_LEN];
++	char num_buf[MEMCG_DEC_U64_MAX_LEN + 2];  /* +2 for separator and newline */
 +	int num_len;
 +
-+	num_len = num_to_str(num_buf, sizeof(num_buf), val, 0);
++	/* Embed separator at the beginning */
++	num_buf[0] = sep;
++
++	/* Convert number starting at offset 1 */
++	num_len = num_to_str(num_buf + 1, sizeof(num_buf) - 2, val, 0);
 +	if (num_len <= 0)
 +		return;
 +
++	/* Embed newline at the end */
++	num_buf[num_len + 1] = '\n';
++
++	if (prefix && *prefix && seq_buf_puts(s, prefix))
++		return;
 +	if (seq_buf_puts(s, name))
 +		return;
-+	if (seq_buf_putc(s, ' '))
-+		return;
-+	if (seq_buf_putmem(s, num_buf, num_len))
-+		return;
-+	seq_buf_putc(s, '\n');
++	/* Output separator, value, and newline in one call */
++	seq_buf_putmem(s, num_buf, num_len + 2);
 +}
 +
  static void memcg_stat_format(struct mem_cgroup *memcg, struct seq_buf *s)
  {
  	int i;
-+	u64 pgscan, pgsteal;
- 
- 	/*
- 	 * Provide statistics on the state of the memory subsystem as
-@@ -1485,36 +1547,40 @@ static void memcg_stat_format(struct mem
+@@ -1503,26 +1551,26 @@ static void memcg_stat_format(struct mem
  			continue;
  #endif
  		size = memcg_page_state_output(memcg, memory_stats[i].idx);
 -		seq_buf_printf(s, "%s %llu\n", memory_stats[i].name, size);
-+		memcg_seq_buf_put_name_val(s, memory_stats[i].name, size);
++		memcg_seq_buf_print_stat(s, NULL, memory_stats[i].name, ' ', size);
  
  		if (unlikely(memory_stats[i].idx == NR_SLAB_UNRECLAIMABLE_B)) {
  			size += memcg_page_state_output(memcg,
  							NR_SLAB_RECLAIMABLE_B);
 -			seq_buf_printf(s, "slab %llu\n", size);
-+			memcg_seq_buf_put_name_val(s, "slab", size);
++			memcg_seq_buf_print_stat(s, NULL, "slab", ' ', size);
  		}
  	}
  
@@ -146,160 +133,56 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		       memcg_events(memcg, PGSTEAL_DIRECT) +
 -		       memcg_events(memcg, PGSTEAL_PROACTIVE) +
 -		       memcg_events(memcg, PGSTEAL_KHUGEPAGED));
-+	pgscan = memcg_events(memcg, PGSCAN_KSWAPD) +
-+		 memcg_events(memcg, PGSCAN_DIRECT) +
-+		 memcg_events(memcg, PGSCAN_PROACTIVE) +
-+		 memcg_events(memcg, PGSCAN_KHUGEPAGED);
-+	pgsteal = memcg_events(memcg, PGSTEAL_KSWAPD) +
-+		  memcg_events(memcg, PGSTEAL_DIRECT) +
-+		  memcg_events(memcg, PGSTEAL_PROACTIVE) +
-+		  memcg_events(memcg, PGSTEAL_KHUGEPAGED);
-+
-+	memcg_seq_buf_put_name_val(s, "pgscan", pgscan);
-+	memcg_seq_buf_put_name_val(s, "pgsteal", pgsteal);
++	memcg_seq_buf_print_stat(s, NULL, "pgscan", ' ',
++				 memcg_events(memcg, PGSCAN_KSWAPD) +
++				 memcg_events(memcg, PGSCAN_DIRECT) +
++				 memcg_events(memcg, PGSCAN_PROACTIVE) +
++				 memcg_events(memcg, PGSCAN_KHUGEPAGED));
++	memcg_seq_buf_print_stat(s, NULL, "pgsteal", ' ',
++				 memcg_events(memcg, PGSTEAL_KSWAPD) +
++				 memcg_events(memcg, PGSTEAL_DIRECT) +
++				 memcg_events(memcg, PGSTEAL_PROACTIVE) +
++				 memcg_events(memcg, PGSTEAL_KHUGEPAGED));
  
  	for (i = 0; i < ARRAY_SIZE(memcg_vm_event_stat); i++) {
-+		u64 events;
-+
  #ifdef CONFIG_MEMCG_V1
- 		if (memcg_vm_event_stat[i] == PGPGIN ||
+@@ -1530,9 +1578,9 @@ static void memcg_stat_format(struct mem
  		    memcg_vm_event_stat[i] == PGPGOUT)
  			continue;
  #endif
 -		seq_buf_printf(s, "%s %lu\n",
 -			       vm_event_name(memcg_vm_event_stat[i]),
 -			       memcg_events(memcg, memcg_vm_event_stat[i]));
-+		events = memcg_events(memcg, memcg_vm_event_stat[i]);
-+		memcg_seq_buf_put_name_val(s,
-+					   vm_event_name(memcg_vm_event_stat[i]),
-+					   events);
++		memcg_seq_buf_print_stat(s, NULL,
++					 vm_event_name(memcg_vm_event_stat[i]), ' ',
++					 memcg_events(memcg, memcg_vm_event_stat[i]));
  	}
  }
  
-@@ -4187,10 +4253,12 @@ static void mem_cgroup_attach(struct cgr
- 
- static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
- {
--	if (value == PAGE_COUNTER_MAX)
-+	if (value == PAGE_COUNTER_MAX) {
- 		seq_puts(m, "max\n");
--	else
--		seq_printf(m, "%llu\n", (u64)value * PAGE_SIZE);
-+	} else {
-+		seq_put_decimal_ull(m, "", (u64)value * PAGE_SIZE);
-+		seq_putc(m, '\n');
-+	}
- 
- 	return 0;
- }
-@@ -4216,7 +4284,8 @@ static int peak_show(struct seq_file *sf
- 	else
- 		peak = max(fd_peak, READ_ONCE(pc->local_watermark));
- 
--	seq_printf(sf, "%llu\n", peak * PAGE_SIZE);
-+	seq_put_decimal_ull(sf, "", peak * PAGE_SIZE);
-+	seq_putc(sf, '\n');
- 	return 0;
- }
- 
-@@ -4449,16 +4518,24 @@ out:
-  */
- static void __memory_events_show(struct seq_file *m, atomic_long_t *events)
- {
--	seq_printf(m, "low %lu\n", atomic_long_read(&events[MEMCG_LOW]));
--	seq_printf(m, "high %lu\n", atomic_long_read(&events[MEMCG_HIGH]));
--	seq_printf(m, "max %lu\n", atomic_long_read(&events[MEMCG_MAX]));
--	seq_printf(m, "oom %lu\n", atomic_long_read(&events[MEMCG_OOM]));
--	seq_printf(m, "oom_kill %lu\n",
--		   atomic_long_read(&events[MEMCG_OOM_KILL]));
--	seq_printf(m, "oom_group_kill %lu\n",
--		   atomic_long_read(&events[MEMCG_OOM_GROUP_KILL]));
--	seq_printf(m, "sock_throttled %lu\n",
--		   atomic_long_read(&events[MEMCG_SOCK_THROTTLED]));
-+	u64 low, high, max, oom, oom_kill;
-+	u64 oom_group_kill, sock_throttled;
-+
-+	low = atomic_long_read(&events[MEMCG_LOW]);
-+	high = atomic_long_read(&events[MEMCG_HIGH]);
-+	max = atomic_long_read(&events[MEMCG_MAX]);
-+	oom = atomic_long_read(&events[MEMCG_OOM]);
-+	oom_kill = atomic_long_read(&events[MEMCG_OOM_KILL]);
-+	oom_group_kill = atomic_long_read(&events[MEMCG_OOM_GROUP_KILL]);
-+	sock_throttled = atomic_long_read(&events[MEMCG_SOCK_THROTTLED]);
-+
-+	memcg_seq_put_name_val(m, "low", low);
-+	memcg_seq_put_name_val(m, "high", high);
-+	memcg_seq_put_name_val(m, "max", max);
-+	memcg_seq_put_name_val(m, "oom", oom);
-+	memcg_seq_put_name_val(m, "oom_kill", oom_kill);
-+	memcg_seq_put_name_val(m, "oom_group_kill", oom_group_kill);
-+	memcg_seq_put_name_val(m, "sock_throttled", sock_throttled);
- }
- 
- static int memory_events_show(struct seq_file *m, void *v)
-@@ -4513,7 +4590,7 @@ static int memory_numa_stat_show(struct
+@@ -4560,7 +4608,12 @@ static int memory_numa_stat_show(struct
  		if (memory_stats[i].idx >= NR_VM_NODE_STAT_ITEMS)
  			continue;
  
 -		seq_printf(m, "%s", memory_stats[i].name);
++		/*
++		 * Output format: "stat_name N0=value0 N1=value1 ...\n"
++		 * Use seq_puts and seq_put_decimal_ull to avoid printf
++		 * format parsing overhead in this hot path.
++		 */
 +		seq_puts(m, memory_stats[i].name);
  		for_each_node_state(nid, N_MEMORY) {
  			u64 size;
  			struct lruvec *lruvec;
-@@ -4521,7 +4598,10 @@ static int memory_numa_stat_show(struct
+@@ -4568,7 +4621,8 @@ static int memory_numa_stat_show(struct
  			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
  			size = lruvec_page_state_output(lruvec,
  							memory_stats[i].idx);
 -			seq_printf(m, " N%d=%llu", nid, size);
-+
 +			seq_put_decimal_ull(m, " N", nid);
-+			seq_putc(m, '=');
-+			seq_put_decimal_ull(m, "", size);
++			seq_put_decimal_ull(m, "=", size);
  		}
  		seq_putc(m, '\n');
  	}
-@@ -4534,7 +4614,8 @@ static int memory_oom_group_show(struct
- {
- 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
- 
--	seq_printf(m, "%d\n", READ_ONCE(memcg->oom_group));
-+	seq_put_decimal_ll(m, "", READ_ONCE(memcg->oom_group));
-+	seq_putc(m, '\n');
- 
- 	return 0;
- }
-@@ -5341,13 +5422,15 @@ static ssize_t swap_max_write(struct ker
- static int swap_events_show(struct seq_file *m, void *v)
- {
- 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
-+	u64 swap_high, swap_max, swap_fail;
- 
--	seq_printf(m, "high %lu\n",
--		   atomic_long_read(&memcg->memory_events[MEMCG_SWAP_HIGH]));
--	seq_printf(m, "max %lu\n",
--		   atomic_long_read(&memcg->memory_events[MEMCG_SWAP_MAX]));
--	seq_printf(m, "fail %lu\n",
--		   atomic_long_read(&memcg->memory_events[MEMCG_SWAP_FAIL]));
-+	swap_high = atomic_long_read(&memcg->memory_events[MEMCG_SWAP_HIGH]);
-+	swap_max = atomic_long_read(&memcg->memory_events[MEMCG_SWAP_MAX]);
-+	swap_fail = atomic_long_read(&memcg->memory_events[MEMCG_SWAP_FAIL]);
-+
-+	memcg_seq_put_name_val(m, "high", swap_high);
-+	memcg_seq_put_name_val(m, "max", swap_max);
-+	memcg_seq_put_name_val(m, "fail", swap_fail);
- 
- 	return 0;
- }
-@@ -5533,7 +5616,8 @@ static int zswap_writeback_show(struct s
- {
- 	struct mem_cgroup *memcg = mem_cgroup_from_seq(m);
- 
--	seq_printf(m, "%d\n", READ_ONCE(memcg->zswap_writeback));
-+	seq_put_decimal_ll(m, "", READ_ONCE(memcg->zswap_writeback));
-+	seq_putc(m, '\n');
- 	return 0;
- }
- 
 --- a/mm/memcontrol-v1.c~mm-optimize-stat-output-for-11%-sys-time-reduce
 +++ a/mm/memcontrol-v1.c
 @@ -10,7 +10,7 @@
@@ -311,10 +194,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  #include "internal.h"
  #include "swap.h"
-@@ -1817,25 +1817,36 @@ static int memcg_numa_stat_show(struct s
+@@ -1816,26 +1816,39 @@ static int memcg_numa_stat_show(struct s
+ 
  	mem_cgroup_flush_stats(memcg);
  
- 	for (stat = stats; stat < stats + ARRAY_SIZE(stats); stat++) {
++	/*
++	 * Output format: "stat_name=value N0=value0 N1=value1 ...\n"
++	 * Use seq_puts and seq_put_decimal_ull to avoid printf format
++	 * parsing overhead in this hot path.
++	 */
+ 	for (stat = stats; stat < ARRAY_END(stats); stat++) {
 -		seq_printf(m, "%s=%lu", stat->name,
 -			   mem_cgroup_nr_lru_pages(memcg, stat->lru_mask,
 -						   false));
@@ -322,25 +211,22 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			seq_printf(m, " N%d=%lu", nid,
 -				   mem_cgroup_node_nr_lru_pages(memcg, nid,
 -							stat->lru_mask, false));
-+		u64 nr_pages;
-+
 +		seq_puts(m, stat->name);
-+		nr_pages = mem_cgroup_nr_lru_pages(memcg, stat->lru_mask,
-+						   false);
-+		seq_put_decimal_ull(m, "=", nr_pages);
++		seq_put_decimal_ull(m, "=",
++				    mem_cgroup_nr_lru_pages(memcg, stat->lru_mask,
++							    false));
 +		for_each_node_state(nid, N_MEMORY) {
-+			nr_pages = mem_cgroup_node_nr_lru_pages(memcg, nid,
-+								stat->lru_mask,
-+								false);
 +			seq_put_decimal_ull(m, " N", nid);
-+			seq_put_decimal_ull(m, "=", nr_pages);
++			seq_put_decimal_ull(m, "=",
++					    mem_cgroup_node_nr_lru_pages(memcg, nid,
++									 stat->lru_mask,
++									 false));
 +		}
  		seq_putc(m, '\n');
  	}
  
- 	for (stat = stats; stat < stats + ARRAY_SIZE(stats); stat++) {
-+		u64 nr_pages;
- 
+ 	for (stat = stats; stat < ARRAY_END(stats); stat++) {
+-
 -		seq_printf(m, "hierarchical_%s=%lu", stat->name,
 -			   mem_cgroup_nr_lru_pages(memcg, stat->lru_mask,
 -						   true));
@@ -350,60 +236,44 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -							stat->lru_mask, true));
 +		seq_puts(m, "hierarchical_");
 +		seq_puts(m, stat->name);
-+		nr_pages = mem_cgroup_nr_lru_pages(memcg, stat->lru_mask, true);
-+		seq_put_decimal_ull(m, "=", nr_pages);
++		seq_put_decimal_ull(m, "=",
++				    mem_cgroup_nr_lru_pages(memcg, stat->lru_mask,
++							    true));
 +		for_each_node_state(nid, N_MEMORY) {
-+			nr_pages = mem_cgroup_node_nr_lru_pages(memcg, nid,
-+								stat->lru_mask,
-+								true);
 +			seq_put_decimal_ull(m, " N", nid);
-+			seq_put_decimal_ull(m, "=", nr_pages);
++			seq_put_decimal_ull(m, "=",
++					    mem_cgroup_node_nr_lru_pages(memcg, nid,
++									 stat->lru_mask,
++									 true));
 +		}
  		seq_putc(m, '\n');
  	}
  
-@@ -1892,6 +1903,7 @@ void memcg1_stat_format(struct mem_cgrou
- 	unsigned long memory, memsw;
- 	struct mem_cgroup *mi;
- 	unsigned int i;
-+	u64 memory_limit, memsw_limit;
- 
- 	BUILD_BUG_ON(ARRAY_SIZE(memcg1_stat_names) != ARRAY_SIZE(memcg1_stats));
- 
-@@ -1901,17 +1913,24 @@ void memcg1_stat_format(struct mem_cgrou
+@@ -1901,17 +1914,17 @@ void memcg1_stat_format(struct mem_cgrou
  		unsigned long nr;
  
  		nr = memcg_page_state_local_output(memcg, memcg1_stats[i]);
 -		seq_buf_printf(s, "%s %lu\n", memcg1_stat_names[i], nr);
-+		memcg_seq_buf_put_name_val(s, memcg1_stat_names[i], (u64)nr);
++		memcg_seq_buf_print_stat(s, NULL, memcg1_stat_names[i], ' ', (u64)nr);
  	}
  
--	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++)
+ 	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++)
 -		seq_buf_printf(s, "%s %lu\n", vm_event_name(memcg1_events[i]),
 -			       memcg_events_local(memcg, memcg1_events[i]));
-+	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++) {
-+		u64 events;
++		memcg_seq_buf_print_stat(s, NULL, vm_event_name(memcg1_events[i]),
++					 ' ', memcg_events_local(memcg, memcg1_events[i]));
  
--	for (i = 0; i < NR_LRU_LISTS; i++)
+ 	for (i = 0; i < NR_LRU_LISTS; i++)
 -		seq_buf_printf(s, "%s %lu\n", lru_list_name(i),
 -			       memcg_page_state_local(memcg, NR_LRU_BASE + i) *
 -			       PAGE_SIZE);
-+		events = memcg_events_local(memcg, memcg1_events[i]);
-+		memcg_seq_buf_put_name_val(s, vm_event_name(memcg1_events[i]),
-+					   events);
-+	}
-+
-+	for (i = 0; i < NR_LRU_LISTS; i++) {
-+		u64 nr_pages;
-+
-+		nr_pages = memcg_page_state_local(memcg, NR_LRU_BASE + i) *
-+			   PAGE_SIZE;
-+		memcg_seq_buf_put_name_val(s, lru_list_name(i), nr_pages);
-+	}
++		memcg_seq_buf_print_stat(s, NULL, lru_list_name(i), ' ',
++					 memcg_page_state_local(memcg, NR_LRU_BASE + i) *
++					 PAGE_SIZE);
  
  	/* Hierarchical information */
  	memory = memsw = PAGE_COUNTER_MAX;
-@@ -1919,28 +1938,38 @@ void memcg1_stat_format(struct mem_cgrou
+@@ -1919,28 +1932,27 @@ void memcg1_stat_format(struct mem_cgrou
  		memory = min(memory, READ_ONCE(mi->memory.max));
  		memsw = min(memsw, READ_ONCE(mi->memsw.max));
  	}
@@ -411,13 +281,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		       (u64)memory * PAGE_SIZE);
 -	seq_buf_printf(s, "hierarchical_memsw_limit %llu\n",
 -		       (u64)memsw * PAGE_SIZE);
-+	memory_limit = (u64)memory * PAGE_SIZE;
-+	memsw_limit = (u64)memsw * PAGE_SIZE;
-+
-+	memcg_seq_buf_put_name_val(s, "hierarchical_memory_limit",
-+				   memory_limit);
-+	memcg_seq_buf_put_name_val(s, "hierarchical_memsw_limit",
-+				   memsw_limit);
++	memcg_seq_buf_print_stat(s, NULL, "hierarchical_memory_limit", ' ',
++				 (u64)memory * PAGE_SIZE);
++	memcg_seq_buf_print_stat(s, NULL, "hierarchical_memsw_limit", ' ',
++				 (u64)memsw * PAGE_SIZE);
  
  	for (i = 0; i < ARRAY_SIZE(memcg1_stats); i++) {
  		unsigned long nr;
@@ -425,86 +292,54 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		nr = memcg_page_state_output(memcg, memcg1_stats[i]);
 -		seq_buf_printf(s, "total_%s %llu\n", memcg1_stat_names[i],
 -			       (u64)nr);
-+		seq_buf_puts(s, "total_");
-+		memcg_seq_buf_put_name_val(s, memcg1_stat_names[i], (u64)nr);
-+	}
-+
-+	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++) {
-+		u64 events;
-+
-+		events = memcg_events(memcg, memcg1_events[i]);
-+		seq_buf_puts(s, "total_");
-+		memcg_seq_buf_put_name_val(s, vm_event_name(memcg1_events[i]),
-+					   events);
++		memcg_seq_buf_print_stat(s, "total_", memcg1_stat_names[i], ' ',
++					 (u64)nr);
  	}
  
--	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++)
+ 	for (i = 0; i < ARRAY_SIZE(memcg1_events); i++)
 -		seq_buf_printf(s, "total_%s %llu\n",
 -			       vm_event_name(memcg1_events[i]),
 -			       (u64)memcg_events(memcg, memcg1_events[i]));
--
--	for (i = 0; i < NR_LRU_LISTS; i++)
++		memcg_seq_buf_print_stat(s, "total_", vm_event_name(memcg1_events[i]),
++					 ' ', (u64)memcg_events(memcg, memcg1_events[i]));
+ 
+ 	for (i = 0; i < NR_LRU_LISTS; i++)
 -		seq_buf_printf(s, "total_%s %llu\n", lru_list_name(i),
 -			       (u64)memcg_page_state(memcg, NR_LRU_BASE + i) *
 -			       PAGE_SIZE);
-+	for (i = 0; i < NR_LRU_LISTS; i++) {
-+		u64 nr_pages;
-+
-+		nr_pages = memcg_page_state(memcg, NR_LRU_BASE + i) * PAGE_SIZE;
-+		seq_buf_puts(s, "total_");
-+		memcg_seq_buf_put_name_val(s, lru_list_name(i), nr_pages);
-+	}
++		memcg_seq_buf_print_stat(s, "total_", lru_list_name(i), ' ',
++					 (u64)memcg_page_state(memcg, NR_LRU_BASE + i) *
++					 PAGE_SIZE);
  
  #ifdef CONFIG_DEBUG_VM
  	{
-@@ -1955,8 +1984,8 @@ void memcg1_stat_format(struct mem_cgrou
+@@ -1955,8 +1967,8 @@ void memcg1_stat_format(struct mem_cgrou
  			anon_cost += mz->lruvec.anon_cost;
  			file_cost += mz->lruvec.file_cost;
  		}
 -		seq_buf_printf(s, "anon_cost %lu\n", anon_cost);
 -		seq_buf_printf(s, "file_cost %lu\n", file_cost);
-+		memcg_seq_buf_put_name_val(s, "anon_cost", (u64)anon_cost);
-+		memcg_seq_buf_put_name_val(s, "file_cost", (u64)file_cost);
++		memcg_seq_buf_print_stat(s, NULL, "anon_cost", ' ', (u64)anon_cost);
++		memcg_seq_buf_print_stat(s, NULL, "file_cost", ' ', (u64)file_cost);
  	}
  #endif
  }
-@@ -1990,11 +2019,14 @@ static int mem_cgroup_swappiness_write(s
- static int mem_cgroup_oom_control_read(struct seq_file *sf, void *v)
- {
- 	struct mem_cgroup *memcg = mem_cgroup_from_seq(sf);
-+	u64 oom_kill;
-+
-+	memcg_seq_put_name_val(sf, "oom_kill_disable",
-+			       READ_ONCE(memcg->oom_kill_disable));
-+	memcg_seq_put_name_val(sf, "under_oom", (bool)memcg->under_oom);
- 
--	seq_printf(sf, "oom_kill_disable %d\n", READ_ONCE(memcg->oom_kill_disable));
--	seq_printf(sf, "under_oom %d\n", (bool)memcg->under_oom);
--	seq_printf(sf, "oom_kill %lu\n",
--		   atomic_long_read(&memcg->memory_events[MEMCG_OOM_KILL]));
-+	oom_kill = atomic_long_read(&memcg->memory_events[MEMCG_OOM_KILL]);
-+	memcg_seq_put_name_val(sf, "oom_kill", oom_kill);
- 	return 0;
- }
- 
 --- a/mm/memcontrol-v1.h~mm-optimize-stat-output-for-11%-sys-time-reduce
 +++ a/mm/memcontrol-v1.h
-@@ -4,6 +4,9 @@
+@@ -4,6 +4,7 @@
  #define __MM_MEMCONTROL_V1_H
  
  #include <linux/cgroup-defs.h>
 +#include <linux/seq_buf.h>
-+#include <linux/seq_file.h>
-+#include <linux/sprintf.h>
  
  /* Cgroup v1 and v2 common declarations */
  
-@@ -31,6 +34,9 @@ int memory_stat_show(struct seq_file *m,
+@@ -30,6 +31,9 @@ int memory_stat_show(struct seq_file *m,
  void mem_cgroup_private_id_get_many(struct mem_cgroup *memcg, unsigned int n);
  struct mem_cgroup *mem_cgroup_private_id_get_online(struct mem_cgroup *memcg);
  
-+void memcg_seq_put_name_val(struct seq_file *m, const char *name, u64 val);
-+void memcg_seq_buf_put_name_val(struct seq_buf *s, const char *name, u64 val);
++void memcg_seq_buf_print_stat(struct seq_buf *s, const char *prefix,
++			      const char *name, char sep, u64 val);
 +
  /* Cgroup v1-specific declarations */
  #ifdef CONFIG_MEMCG_V1
