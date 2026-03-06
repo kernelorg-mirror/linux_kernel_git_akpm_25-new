@@ -1,6 +1,6 @@
 From: Qi Zheng <zhengqi.arch@bytedance.com>
 Subject: mm: vmscan: prepare for reparenting traditional LRU folios
-Date: Wed, 14 Jan 2026 19:32:52 +0800
+Date: Wed, 25 Feb 2026 15:53:08 +0800
 
 To resolve the dying memcg issue, we need to reparent LRU folios of child
 memcg to its parent memcg.  For traditional LRU list, each lruvec of every
@@ -11,16 +11,17 @@ during the reparenting process.
 This commit implements the specific function, which will be used during
 the reparenting process.
 
-Link: https://lkml.kernel.org/r/3adb367000706f9ef681b34d0a2b0eb34c494c84.1768389889.git.zhengqi.arch@bytedance.com
+Link: https://lkml.kernel.org/r/a92d217a9fc82bd0c401210204a095caaf615b1c.1772005110.git.zhengqi.arch@bytedance.com
 Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
 Reviewed-by: Harry Yoo <harry.yoo@oracle.com>
 Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Acked-by: Muchun Song <muchun.song@linux.dev>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Allen Pais <apais@linux.microsoft.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Baoquan He <bhe@redhat.com>
 Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: Chen Ridong <chenridong@huawei.com>
-Cc: Dave Chinner <david@fromorbit.com>
 Cc: David Hildenbrand <david@kernel.org>
 Cc: Hamza Mahfooz <hamzamahfooz@linux.microsoft.com>
 Cc: Hugh Dickins <hughd@google.com>
@@ -30,37 +31,34 @@ Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Wei Xu <weixugc@google.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mmzone.h |    4 ++++
- include/linux/swap.h   |   19 +++++++++++++++++++
- mm/swap.c              |   37 +++++++++++++++++++++++++++++++++++++
- mm/vmscan.c            |   19 -------------------
- 4 files changed, 60 insertions(+), 19 deletions(-)
+ include/linux/swap.h |   21 +++++++++++++++++++++
+ mm/swap.c            |   33 +++++++++++++++++++++++++++++++++
+ mm/vmscan.c          |   19 -------------------
+ 3 files changed, 54 insertions(+), 19 deletions(-)
 
---- a/include/linux/mmzone.h~mm-vmscan-prepare-for-reparenting-traditional-lru-folios
-+++ a/include/linux/mmzone.h
-@@ -366,6 +366,10 @@ enum lruvec_flags {
- 	LRUVEC_NODE_CONGESTED,
- };
- 
-+#ifdef CONFIG_MEMCG
-+void lru_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent);
-+#endif /* CONFIG_MEMCG */
-+
- #endif /* !__GENERATING_BOUNDS_H */
- 
- /*
 --- a/include/linux/swap.h~mm-vmscan-prepare-for-reparenting-traditional-lru-folios
 +++ a/include/linux/swap.h
-@@ -636,5 +636,24 @@ static inline bool mem_cgroup_swap_full(
+@@ -546,6 +546,8 @@ static inline int mem_cgroup_swappiness(
+ 
+ 	return READ_ONCE(memcg->swappiness);
+ }
++
++void lru_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid);
+ #else
+ static inline int mem_cgroup_swappiness(struct mem_cgroup *mem)
+ {
+@@ -610,5 +612,24 @@ static inline bool mem_cgroup_swap_full(
  }
  #endif
  
@@ -87,7 +85,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #endif /* _LINUX_SWAP_H */
 --- a/mm/swap.c~mm-vmscan-prepare-for-reparenting-traditional-lru-folios
 +++ a/mm/swap.c
-@@ -1090,6 +1090,43 @@ void folio_batch_remove_exceptionals(str
+@@ -1090,6 +1090,39 @@ void folio_batch_remove_exceptionals(str
  	fbatch->nr = j;
  }
  
@@ -109,22 +107,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	}
 +}
 +
-+void lru_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent)
++void lru_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid)
 +{
-+	int nid;
++	enum lru_list lru;
++	struct lruvec *child_lruvec, *parent_lruvec;
 +
-+	for_each_node(nid) {
-+		enum lru_list lru;
-+		struct lruvec *child_lruvec, *parent_lruvec;
++	child_lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
++	parent_lruvec = mem_cgroup_lruvec(parent, NODE_DATA(nid));
++	parent_lruvec->anon_cost += child_lruvec->anon_cost;
++	parent_lruvec->file_cost += child_lruvec->file_cost;
 +
-+		child_lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
-+		parent_lruvec = mem_cgroup_lruvec(parent, NODE_DATA(nid));
-+		parent_lruvec->anon_cost += child_lruvec->anon_cost;
-+		parent_lruvec->file_cost += child_lruvec->file_cost;
-+
-+		for_each_lru(lru)
-+			lruvec_reparent_lru(child_lruvec, parent_lruvec, lru, nid);
-+	}
++	for_each_lru(lru)
++		lruvec_reparent_lru(child_lruvec, parent_lruvec, lru, nid);
 +}
 +#endif
 +

@@ -1,6 +1,6 @@
 From: Qi Zheng <zhengqi.arch@bytedance.com>
 Subject: mm: vmscan: prepare for reparenting MGLRU folios
-Date: Wed, 14 Jan 2026 19:32:53 +0800
+Date: Wed, 25 Feb 2026 15:53:09 +0800
 
 Similar to traditional LRU folios, in order to solve the dying memcg
 problem, we also need to reparenting MGLRU folios to the parent memcg when
@@ -40,15 +40,16 @@ as lru_gen_del_folio()).
 To prepare for the above work, this commit implements the specific
 functions, which will be used during reparenting.
 
-Link: https://lkml.kernel.org/r/92e0728fed3d68855173352416cf8077670610f0.1768389889.git.zhengqi.arch@bytedance.com
-Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Link: https://lkml.kernel.org/r/e75050354cdbc42221a04f7cf133292b61105548.1772005110.git.zhengqi.arch@bytedance.com
 Suggested-by: Harry Yoo <harry.yoo@oracle.com>
 Suggested-by: Imran Khan <imran.f.khan@oracle.com>
+Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Acked-by: Harry Yoo <harry.yoo@oracle.com>
 Cc: Allen Pais <apais@linux.microsoft.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Baoquan He <bhe@redhat.com>
 Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: Chen Ridong <chenridong@huawei.com>
-Cc: Dave Chinner <david@fromorbit.com>
 Cc: David Hildenbrand <david@kernel.org>
 Cc: Hamza Mahfooz <hamzamahfooz@linux.microsoft.com>
 Cc: Hugh Dickins <hughd@google.com>
@@ -58,46 +59,50 @@ Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Michal Koutný <mkoutny@suse.com>
+Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Muchun Song <songmuchun@bytedance.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Usama Arif <usamaarif642@gmail.com>
 Cc: Wei Xu <weixugc@google.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/mmzone.h |   16 ++++
- mm/vmscan.c            |  144 +++++++++++++++++++++++++++++++++++++++
- 2 files changed, 160 insertions(+)
+ include/linux/mmzone.h |   17 ++++
+ mm/vmscan.c            |  142 +++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 159 insertions(+)
 
 --- a/include/linux/mmzone.h~mm-vmscan-prepare-for-reparenting-mglru-folios
 +++ a/include/linux/mmzone.h
-@@ -628,6 +628,9 @@ void lru_gen_online_memcg(struct mem_cgr
+@@ -638,6 +638,9 @@ void lru_gen_online_memcg(struct mem_cgr
  void lru_gen_offline_memcg(struct mem_cgroup *memcg);
  void lru_gen_release_memcg(struct mem_cgroup *memcg);
  void lru_gen_soft_reclaim(struct mem_cgroup *memcg, int nid);
-+void max_lru_gen_memcg(struct mem_cgroup *memcg);
-+bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg);
-+void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent);
++void max_lru_gen_memcg(struct mem_cgroup *memcg, int nid);
++bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg, int nid);
++void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid);
  
  #else /* !CONFIG_LRU_GEN */
  
-@@ -668,6 +671,19 @@ static inline void lru_gen_soft_reclaim(
+@@ -678,6 +681,20 @@ static inline void lru_gen_soft_reclaim(
  {
  }
  
-+static inline void max_lru_gen_memcg(struct mem_cgroup *memcg)
++static inline void max_lru_gen_memcg(struct mem_cgroup *memcg, int nid)
 +{
 +}
 +
-+static inline bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg)
++static inline bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg, int nid)
 +{
 +	return true;
 +}
 +
-+static inline void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent)
++static inline
++void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid)
 +{
 +}
 +
@@ -106,22 +111,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct lruvec {
 --- a/mm/vmscan.c~mm-vmscan-prepare-for-reparenting-mglru-folios
 +++ a/mm/vmscan.c
-@@ -4414,6 +4414,150 @@ void lru_gen_soft_reclaim(struct mem_cgr
+@@ -4408,6 +4408,148 @@ void lru_gen_soft_reclaim(struct mem_cgr
  		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_HEAD);
  }
  
-+bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg)
++bool recheck_lru_gen_max_memcg(struct mem_cgroup *memcg, int nid)
 +{
-+	int nid;
++	struct lruvec *lruvec = get_lruvec(memcg, nid);
++	int type;
 +
-+	for_each_node(nid) {
-+		struct lruvec *lruvec = get_lruvec(memcg, nid);
-+		int type;
-+
-+		for (type = 0; type < ANON_AND_FILE; type++) {
-+			if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
-+				return false;
-+		}
++	for (type = 0; type < ANON_AND_FILE; type++) {
++		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
++			return false;
 +	}
 +
 +	return true;
@@ -161,19 +162,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + * same gen of the parent memcg, so the gens of the parent memcg needed be
 + * incremented to the MAX_NR_GENS before reparenting.
 + */
-+void max_lru_gen_memcg(struct mem_cgroup *memcg)
++void max_lru_gen_memcg(struct mem_cgroup *memcg, int nid)
 +{
-+	int nid;
++	struct lruvec *lruvec = get_lruvec(memcg, nid);
++	int type;
 +
-+	for_each_node(nid) {
-+		struct lruvec *lruvec = get_lruvec(memcg, nid);
-+		int type;
-+
-+		for (type = 0; type < ANON_AND_FILE; type++) {
-+			while (get_nr_gens(lruvec, type) < MAX_NR_GENS) {
-+				try_to_inc_max_seq_nowalk(memcg, lruvec);
-+				cond_resched();
-+			}
++	for (type = 0; type < ANON_AND_FILE; type++) {
++		while (get_nr_gens(lruvec, type) < MAX_NR_GENS) {
++			try_to_inc_max_seq_nowalk(memcg, lruvec);
++			cond_resched();
 +		}
 +	}
 +}
@@ -219,7 +216,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	for (i = 0; i < get_nr_gens(child_lruvec, type); i++) {
 +		int gen = lru_gen_from_seq(child_lrugen->max_seq - i);
 +		long nr_pages = child_lrugen->nr_pages[gen][type][zone];
-+		int dst_lru_active = lru_gen_is_active(parent_lruvec, gen) ? LRU_ACTIVE : 0;
++		int child_lru_active = lru_gen_is_active(child_lruvec, gen) ? LRU_ACTIVE : 0;
++		int parent_lru_active = lru_gen_is_active(parent_lruvec, gen) ? LRU_ACTIVE : 0;
 +
 +		/* Assuming that child pages are colder than parent pages */
 +		list_splice_init(&child_lrugen->folios[gen][type][zone],
@@ -229,27 +227,32 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		WRITE_ONCE(parent_lrugen->nr_pages[gen][type][zone],
 +			   parent_lrugen->nr_pages[gen][type][zone] + nr_pages);
 +
-+		update_lru_size(parent_lruvec, lru + dst_lru_active, zone, nr_pages);
++		if (lru_gen_is_active(child_lruvec, gen) != lru_gen_is_active(parent_lruvec, gen)) {
++			__update_lru_size(child_lruvec, lru + child_lru_active, zone, -nr_pages);
++			__update_lru_size(parent_lruvec, lru + parent_lru_active, zone, nr_pages);
++		}
 +	}
 +}
 +
-+void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent)
++void lru_gen_reparent_memcg(struct mem_cgroup *memcg, struct mem_cgroup *parent, int nid)
 +{
-+	int nid;
++	struct lruvec *child_lruvec, *parent_lruvec;
++	int type, zid;
++	struct zone *zone;
++	enum lru_list lru;
 +
-+	for_each_node(nid) {
-+		struct lruvec *child_lruvec, *parent_lruvec;
-+		int type, zid;
-+		struct zone *zone;
++	child_lruvec = get_lruvec(memcg, nid);
++	parent_lruvec = get_lruvec(parent, nid);
 +
-+		child_lruvec = get_lruvec(memcg, nid);
-+		parent_lruvec = get_lruvec(parent, nid);
++	for_each_managed_zone_pgdat(zone, NODE_DATA(nid), zid, MAX_NR_ZONES - 1)
++		for (type = 0; type < ANON_AND_FILE; type++)
++			__lru_gen_reparent_memcg(child_lruvec, parent_lruvec, zid, type);
 +
++	for_each_lru(lru) {
 +		for_each_managed_zone_pgdat(zone, NODE_DATA(nid), zid, MAX_NR_ZONES - 1) {
-+			for (type = 0; type < ANON_AND_FILE; type++)
-+				__lru_gen_reparent_memcg(child_lruvec, parent_lruvec, zid, type);
-+			mem_cgroup_update_lru_size(parent_lruvec, LRU_UNEVICTABLE, zid,
-+				mem_cgroup_get_zone_lru_size(child_lruvec, LRU_UNEVICTABLE, zid));
++			unsigned long size = mem_cgroup_get_zone_lru_size(child_lruvec, lru, zid);
++
++			mem_cgroup_update_lru_size(parent_lruvec, lru, zid, size);
 +		}
 +	}
 +}
