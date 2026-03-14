@@ -1,0 +1,139 @@
+From: "Kanchana P. Sridhar" <kanchanapsridhar2026@gmail.com>
+Subject: mm: zswap: tie per-CPU acomp_ctx lifetime to the pool
+Date: Fri, 13 Mar 2026 22:16:31 -0700
+
+Patch series "zswap pool per-CPU acomp_ctx simplifications".
+
+This patchset persists the zswap pool's per-CPU acomp_ctx resources to
+last until the pool is destroyed.  It then simplifies the per-CPU
+acomp_ctx mutex locking in zswap_compress()/zswap_decompress().
+
+Further, it consistently uses the same checks for valid
+acomp_ctx->acomp/req in zswap procedures that allocate/deallocate
+acomp_ctx members.
+
+These are independent submissions of patches 23 and 24 from [1], to
+facilitate merging. The Acks are preserved from [1].
+
+
+This patch (of 2):
+
+Currently, per-CPU acomp_ctx are allocated on pool creation and/or CPU
+hotplug, and destroyed on pool destruction or CPU hotunplug.  This
+complicates the lifetime management to save memory while a CPU is
+offlined, which is not very common.
+
+Simplify lifetime management by allocating per-CPU acomp_ctx once on pool
+creation (or CPU hotplug for CPUs onlined later), and keeping them
+allocated until the pool is destroyed.
+
+Refactor cleanup code from zswap_cpu_comp_dead() into acomp_ctx_dealloc()
+to be used elsewhere.
+
+The main benefit of using the CPU hotplug multi state instance startup
+callback to allocate the acomp_ctx resources is that it prevents the cores
+from being offlined until the multi state instance addition call returns.
+
+  From Documentation/core-api/cpu_hotplug.rst:
+
+    "The node list add/remove operations and the callback invocations are
+     serialized against CPU hotplug operations."
+
+Furthermore, zswap_[de]compress() cannot contend with
+zswap_cpu_comp_prepare() because:
+
+  - During pool creation/deletion, the pool is not in the zswap_pools
+    list.
+
+  - During CPU hot[un]plug, the CPU is not yet online, as Yosry pointed
+    out. zswap_cpu_comp_prepare() will be run on a control CPU,
+    since CPUHP_MM_ZSWP_POOL_PREPARE is in the PREPARE section of "enum
+    cpuhp_state".
+
+  In both these cases, any recursions into zswap reclaim from
+  zswap_cpu_comp_prepare() will be handled by the old pool.
+
+The above two observations enable the following simplifications:
+
+ 1) zswap_cpu_comp_prepare():
+
+    a) acomp_ctx mutex locking:
+
+       If the process gets migrated while zswap_cpu_comp_prepare() is
+       running, it will complete on the new CPU. In case of failures, we
+       pass the acomp_ctx pointer obtained at the start of
+       zswap_cpu_comp_prepare() to acomp_ctx_dealloc(), which again, can
+       only undergo migration. There appear to be no contention
+       scenarios that might cause inconsistent values of acomp_ctx's
+       members. Hence, it seems there is no need for
+       mutex_lock(&acomp_ctx->mutex) in zswap_cpu_comp_prepare().
+
+    b) acomp_ctx mutex initialization:
+
+       Since the pool is not yet on zswap_pools list, we don't need to
+       initialize the per-CPU acomp_ctx mutex in
+       zswap_pool_create(). This has been restored to occur in
+       zswap_cpu_comp_prepare().
+
+    c) Subsequent CPU offline-online transitions:
+
+       zswap_cpu_comp_prepare() checks upfront if acomp_ctx->acomp is
+       valid. If so, it returns success. This should handle any CPU
+       hotplug online-offline transitions after pool creation is done.
+
+ 2) CPU offline vis-a-vis zswap ops:
+
+    Let's suppose the process is migrated to another CPU before the
+    current CPU is dysfunctional. If zswap_[de]compress() holds the
+    acomp_ctx->mutex lock of the offlined CPU, that mutex will be
+    released once it completes on the new CPU. Since there is no
+    teardown callback, there is no possibility of UAF.
+
+ 3) Pool creation/deletion and process migration to another CPU:
+
+    During pool creation/deletion, the pool is not in the zswap_pools
+    list. Hence it cannot contend with zswap ops on that CPU. However,
+    the process can get migrated.
+
+    a) Pool creation --> zswap_cpu_comp_prepare()
+                                --> process migrated:
+                                    * Old CPU offline: no-op.
+                                    * zswap_cpu_comp_prepare() continues
+                                      to run on the new CPU to finish
+                                      allocating acomp_ctx resources for
+                                      the offlined CPU.
+
+    b) Pool deletion --> acomp_ctx_dealloc()
+                                --> process migrated:
+                                    * Old CPU offline: no-op.
+                                    * acomp_ctx_dealloc() continues
+                                      to run on the new CPU to finish
+                                      de-allocating acomp_ctx resources
+                                      for the offlined CPU.
+
+ 4) Pool deletion vis-a-vis CPU onlining:
+
+    The call to cpuhp_state_remove_instance() cannot race with
+    zswap_cpu_comp_prepare() because of hotplug synchronization.
+
+The current acomp_ctx_get_cpu_lock()/acomp_ctx_put_unlock() are deleted. 
+Instead, zswap_[de]compress() directly call
+mutex_[un]lock(&acomp_ctx->mutex).
+
+The per-CPU memory cost of not deleting the acomp_ctx resources upon CPU
+offlining, and only deleting them when the pool is destroyed, is 8.28 KB
+on x86_64.  This cost is only paid when a CPU is offlined, until it is
+onlined again.
+
+Link: https://lkml.kernel.org/r/20260314051632.17931-1-kanchanapsridhar2026@gmail.com
+Link: https://lkml.kernel.org/r/20260314051632.17931-2-kanchanapsridhar2026@gmail.com
+Link: https://patchwork.kernel.org/project/linux-mm/list/?series=1046677 [1]
+Co-developed-by: Kanchana P. Sridhar <kanchanapsridhar2026@gmail.com>
+Signed-off-by: Kanchana P. Sridhar <kanchanapsridhar2026@gmail.com>
+Signed-off-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
+Acked-by: Yosry Ahmed <yosry.ahmed@linux.dev>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Herbert Xu <herbert@gondor.apana.org.au>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
