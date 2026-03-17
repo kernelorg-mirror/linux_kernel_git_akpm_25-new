@@ -1,0 +1,169 @@
+From: Michal Clapinski <mclapinski@google.com>
+Subject: kho: make kho_scratch_overlap usable outside debugging
+Date: Tue, 17 Mar 2026 15:15:32 +0100
+
+Patch series "kho: add support for deferred struct page init", v7.
+
+When CONFIG_DEFERRED_STRUCT_PAGE_INIT (hereinafter DEFERRED) is enabled,
+struct page initialization is deferred to parallel kthreads that run later
+in the boot process.
+
+Currently, KHO is incompatible with DEFERRED.  This series fixes that
+incompatibility.
+
+
+This patch (of 3):
+
+Also return false if kho_scratch is NULL.
+
+Link: https://lkml.kernel.org/r/20260317141534.815634-1-mclapinski@google.com
+Link: https://lkml.kernel.org/r/20260317141534.815634-2-mclapinski@google.com
+Signed-off-by: Michal Clapinski <mclapinski@google.com>
+Cc: Alexander Graf <graf@amazon.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Pasha Tatashin <pasha.tatashin@soleen.com>
+Cc: Pratyush Yadav <pratyush@kernel.org>
+Cc: Samiullah Khawaja <skhawaja@google.com>
+Cc: Evangelos Petrongonas <epetron@amazon.de>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ include/linux/kexec_handover.h              |    6 +++
+ kernel/liveupdate/Makefile                  |    1 
+ kernel/liveupdate/kexec_handover.c          |   28 +++++++++++++++---
+ kernel/liveupdate/kexec_handover_debug.c    |   25 ----------------
+ kernel/liveupdate/kexec_handover_internal.h |    7 +++-
+ 5 files changed, 35 insertions(+), 32 deletions(-)
+
+--- a/include/linux/kexec_handover.h~kho-make-kho_scratch_overlap-usable-outside-debugging
++++ a/include/linux/kexec_handover.h
+@@ -35,6 +35,7 @@ void *kho_restore_vmalloc(const struct k
+ int kho_add_subtree(const char *name, void *fdt);
+ void kho_remove_subtree(void *fdt);
+ int kho_retrieve_subtree(const char *name, phys_addr_t *phys);
++bool kho_scratch_overlap(phys_addr_t phys, size_t size);
+ 
+ void kho_memory_init(void);
+ 
+@@ -109,6 +110,11 @@ static inline int kho_retrieve_subtree(c
+ 	return -EOPNOTSUPP;
+ }
+ 
++static inline bool kho_scratch_overlap(phys_addr_t phys, size_t size)
++{
++	return false;
++}
++
+ static inline void kho_memory_init(void) { }
+ 
+ static inline void kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
+--- a/kernel/liveupdate/kexec_handover.c~kho-make-kho_scratch_overlap-usable-outside-debugging
++++ a/kernel/liveupdate/kexec_handover.c
+@@ -820,7 +820,8 @@ int kho_preserve_folio(struct folio *fol
+ 	const unsigned long pfn = folio_pfn(folio);
+ 	const unsigned int order = folio_order(folio);
+ 
+-	if (WARN_ON(kho_scratch_overlap(pfn << PAGE_SHIFT, PAGE_SIZE << order)))
++	if (WARN_ON(kho_scratch_overlap_debug(pfn << PAGE_SHIFT,
++					      PAGE_SIZE << order)))
+ 		return -EINVAL;
+ 
+ 	return kho_radix_add_page(tree, pfn, order);
+@@ -864,10 +865,9 @@ int kho_preserve_pages(struct page *page
+ 	unsigned long failed_pfn = 0;
+ 	int err = 0;
+ 
+-	if (WARN_ON(kho_scratch_overlap(start_pfn << PAGE_SHIFT,
+-					nr_pages << PAGE_SHIFT))) {
++	if (WARN_ON(kho_scratch_overlap_debug(start_pfn << PAGE_SHIFT,
++					      nr_pages << PAGE_SHIFT)))
+ 		return -EINVAL;
+-	}
+ 
+ 	while (pfn < end_pfn) {
+ 		unsigned int order =
+@@ -1327,6 +1327,26 @@ int kho_retrieve_subtree(const char *nam
+ }
+ EXPORT_SYMBOL_GPL(kho_retrieve_subtree);
+ 
++bool kho_scratch_overlap(phys_addr_t phys, size_t size)
++{
++	phys_addr_t scratch_start, scratch_end;
++	unsigned int i;
++
++	if (!kho_scratch)
++		return false;
++
++	for (i = 0; i < kho_scratch_cnt; i++) {
++		scratch_start = kho_scratch[i].addr;
++		scratch_end = kho_scratch[i].addr + kho_scratch[i].size;
++
++		if (phys < scratch_end && (phys + size) > scratch_start)
++			return true;
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(kho_scratch_overlap);
++
+ static int __init kho_mem_retrieve(const void *fdt)
+ {
+ 	struct kho_radix_tree tree;
+diff --git a/kernel/liveupdate/kexec_handover_debug.c a/kernel/liveupdate/kexec_handover_debug.c
+deleted file mode 100644
+--- a/kernel/liveupdate/kexec_handover_debug.c
++++ /dev/null
+@@ -1,25 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * kexec_handover_debug.c - kexec handover optional debug functionality
+- * Copyright (C) 2025 Google LLC, Pasha Tatashin <pasha.tatashin@soleen.com>
+- */
+-
+-#define pr_fmt(fmt) "KHO: " fmt
+-
+-#include "kexec_handover_internal.h"
+-
+-bool kho_scratch_overlap(phys_addr_t phys, size_t size)
+-{
+-	phys_addr_t scratch_start, scratch_end;
+-	unsigned int i;
+-
+-	for (i = 0; i < kho_scratch_cnt; i++) {
+-		scratch_start = kho_scratch[i].addr;
+-		scratch_end = kho_scratch[i].addr + kho_scratch[i].size;
+-
+-		if (phys < scratch_end && (phys + size) > scratch_start)
+-			return true;
+-	}
+-
+-	return false;
+-}
+--- a/kernel/liveupdate/kexec_handover_internal.h~kho-make-kho_scratch_overlap-usable-outside-debugging
++++ a/kernel/liveupdate/kexec_handover_internal.h
+@@ -41,9 +41,12 @@ static inline void kho_debugfs_fdt_remov
+ #endif /* CONFIG_KEXEC_HANDOVER_DEBUGFS */
+ 
+ #ifdef CONFIG_KEXEC_HANDOVER_DEBUG
+-bool kho_scratch_overlap(phys_addr_t phys, size_t size);
++static inline bool kho_scratch_overlap_debug(phys_addr_t phys, size_t size)
++{
++	return kho_scratch_overlap(phys, size);
++}
+ #else
+-static inline bool kho_scratch_overlap(phys_addr_t phys, size_t size)
++static inline bool kho_scratch_overlap_debug(phys_addr_t phys, size_t size)
+ {
+ 	return false;
+ }
+--- a/kernel/liveupdate/Makefile~kho-make-kho_scratch_overlap-usable-outside-debugging
++++ a/kernel/liveupdate/Makefile
+@@ -7,7 +7,6 @@ luo-y :=								\
+ 		luo_session.o
+ 
+ obj-$(CONFIG_KEXEC_HANDOVER)		+= kexec_handover.o
+-obj-$(CONFIG_KEXEC_HANDOVER_DEBUG)	+= kexec_handover_debug.o
+ obj-$(CONFIG_KEXEC_HANDOVER_DEBUGFS)	+= kexec_handover_debugfs.o
+ 
+ obj-$(CONFIG_LIVEUPDATE)		+= luo.o
+_
