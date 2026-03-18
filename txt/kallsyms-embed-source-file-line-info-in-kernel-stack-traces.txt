@@ -1,0 +1,200 @@
+From: Sasha Levin <sashal@kernel.org>
+Subject: kallsyms: embed source file:line info in kernel stack traces
+Date: Wed, 11 Mar 2026 23:06:45 -0400
+
+Patch series "kallsyms: embed source file:line info in kernel stack
+traces", v3.
+
+This series adds CONFIG_KALLSYMS_LINEINFO, which embeds source file:line
+information directly in the kernel image so that stack traces annotate
+every frame with the originating source location - no external tools, no
+debug symbols at runtime, and safe to use in NMI/panic context.
+
+Motivation
+==========
+
+The recent "slowly decommission bugzilla?" thread surfaced a recurring
+problem: when users encounter kernel crashes they see stack traces like
+`func+0x1ec/0x240` but have no way to identify which subsystem or
+maintainer to contact.  Richard Weinberger proposed building a database
+mapping symbols to source files using nm/DWARF.  Linus pointed to
+scripts/decode_stacktrace.sh as the existing solution.  But as the
+discussion progressed, it became clear that decode_stacktrace.sh has
+significant practical barriers that prevent it from being useful in the
+common case.
+
+Problems with scripts/decode_stacktrace.sh
+==========================================
+
+- Requires debug symbols: the script needs vmlinux with DWARF debug
+  info. Many distros don't retain debug symbols for older or security
+  kernels, and even when available, asking users to obtain matching
+  debuginfo packages is a significant hurdle.
+
+- Requires toolchain: users need addr2line and nm installed.
+
+- Version-matching requirement: debug symbols must exactly match the
+  running kernel binary.
+
+What this series does
+=====================
+
+Patch 1: CONFIG_KALLSYMS_LINEINFO
+
+At build time, a host tool (scripts/gen_lineinfo) reads DWARF .debug_line
+from vmlinux, extracts address-to-file:line mappings, and embeds them as
+sorted lookup tables in .rodata.  At runtime, kallsyms_lookup_lineinfo()
+binary-searches the table and __sprint_symbol() appends "(file:line)" to
+each stack frame.  NMI/panic- safe (no locks, no allocations),
+KASLR-compatible.
+
+Patch 2: CONFIG_KALLSYMS_LINEINFO_MODULES
+
+Extends lineinfo to loadable modules.  Each .ko gets a .mod_lineinfo
+section embedded at build time.  The module loader picks it up at load
+time.  Same zero-allocation, NMI-safe lookup.
+
+Patch 3: delta compression
+
+Block-indexed delta-encoding with LEB128 varints, implementing the
+approach suggested by Juergen Gross in the RFC review.  Reduces overhead
+from ~44 MiB to ~11 MiB (~3.7 bytes/entry), addressing the primary size
+concern from the RFC.
+
+Patch 4: KUnit tests
+
+30 KUnit tests covering the lineinfo lookup paths, delta-decode logic,
+boundary conditions, and integration with the backtrace formatting APIs.
+
+Example output
+==============
+
+  [   11.206749]  dump_stack_lvl+0x5d/0x80 (lib/dump_stack.c:94)
+  [   11.207403]  vpanic+0x36e/0x620 (kernel/panic.c:650)
+  [   11.209324]  panic+0xc9/0xd0 (kernel/panic.c:787)
+  [   11.213312]  sysrq_handle_crash+0x1a/0x20 (drivers/tty/sysrq.c:154)
+  [   11.214005]  __handle_sysrq.cold+0x66/0x256 (drivers/tty/sysrq.c:611)
+  [   11.214712]  write_sysrq_trigger+0x65/0x80 (drivers/tty/sysrq.c:1221)
+  [   11.215424]  proc_reg_write+0x1bd/0x3c0 (fs/proc/inode.c:330)
+  [   11.216061]  vfs_write+0x1c6/0xff0 (fs/read_write.c:686)
+  [   11.218848]  ksys_write+0xfa/0x200 (fs/read_write.c:740)
+  [   11.222394]  do_syscall_64+0xf3/0x690 (arch/x86/entry/syscall_64.c:63)
+
+Size impact
+===========
+
+Measured with a Debian kernel config:
+
+- bzImage: +3.6 MiB (14 MiB -> 18 MiB, +26%)
+- Runtime memory: +5.9 MiB (text+data+bss)
+- Code overhead: +5.0 KiB (.text, lookup functions only)
+- Data overhead: +5.9 MiB (.data, lineinfo tables)
+
+Lineinfo data breakdown:
+
+- lineinfo_data (delta-compressed): 5,728 KiB (97%)
+- lineinfo_block_addrs: 99 KiB
+- lineinfo_block_offsets: 99 KiB
+- lineinfo_filenames: 111 KiB
+- lineinfo_file_offsets: 17 KiB
+
+The ~5.9 MiB is after 2.7x delta compression; uncompressed would be ~16
+MiB.  This is a fraction of the cost of shipping full DWARF debug info
+(hundreds of MiB), which distros must store and serve for every kernel
+version.
+
+For distros, maintaining debug symbol repositories is expensive: storage,
+mirrors, and CDN bandwidth for hundreds of MiB per kernel build add up
+quickly.  A ~5.9 MiB increase in the kernel image itself is a modest cost
+that eliminates the need for users to find, download, and version-match
+debuginfo packages just to make a crash report useful.
+
+For developers, the file:line annotations appear immediately in crash
+traces - no post-processing with decode_stacktrace.sh needed.
+
+
+This patch (of 4):
+
+Add CONFIG_KALLSYMS_LINEINFO, which embeds a compact address-to-line
+lookup table in the kernel image so stack traces directly print source
+file and line number information:
+
+  root@localhost:~# echo c > /proc/sysrq-trigger
+  [   11.201987] sysrq: Trigger a crash
+  [   11.202831] Kernel panic - not syncing: sysrq triggered crash
+  [   11.206218] Call Trace:
+  [   11.206501]  <TASK>
+  [   11.206749]  dump_stack_lvl+0x5d/0x80 (lib/dump_stack.c:94)
+  [   11.207403]  vpanic+0x36e/0x620 (kernel/panic.c:650)
+  [   11.208565]  ? __lock_acquire+0x465/0x2240 (kernel/locking/lockdep.c:4674)
+  [   11.209324]  panic+0xc9/0xd0 (kernel/panic.c:787)
+  [   11.211873]  ? find_held_lock+0x2b/0x80 (kernel/locking/lockdep.c:5350)
+  [   11.212597]  ? lock_release+0xd3/0x300 (kernel/locking/lockdep.c:5535)
+  [   11.213312]  sysrq_handle_crash+0x1a/0x20 (drivers/tty/sysrq.c:154)
+  [   11.214005]  __handle_sysrq.cold+0x66/0x256 (drivers/tty/sysrq.c:611)
+  [   11.214712]  write_sysrq_trigger+0x65/0x80 (drivers/tty/sysrq.c:1221)
+  [   11.215424]  proc_reg_write+0x1bd/0x3c0 (fs/proc/inode.c:330)
+  [   11.216061]  vfs_write+0x1c6/0xff0 (fs/read_write.c:686)
+  [   11.218848]  ksys_write+0xfa/0x200 (fs/read_write.c:740)
+  [   11.222394]  do_syscall_64+0xf3/0x690 (arch/x86/entry/syscall_64.c:63)
+  [   11.223942]  entry_SYSCALL_64_after_hwframe+0x77/0x7f (arch/x86/entry/entry_64.S:121)
+
+At build time, a new host tool (scripts/gen_lineinfo) reads DWARF
+.debug_line from vmlinux using libdw (elfutils), extracts all
+address-to-file:line mappings, and generates an assembly file with sorted
+parallel arrays (offsets from _text, file IDs, and line numbers).  These
+are linked into vmlinux as .rodata.
+
+At runtime, kallsyms_lookup_lineinfo() does a binary search on the table
+and __sprint_symbol() appends "(file:line)" to each stack frame.  The
+lookup uses offsets from _text so it works with KASLR, requires no locks
+or allocations, and is safe in any context including panic.
+
+The feature requires CONFIG_DEBUG_INFO (for DWARF data) and
+elfutils (libdw-dev) on the build host.
+
+Memory footprint measured with a 1852-option x86_64 config:
+
+  Table: 4,597,583 entries from 4,841 source files
+    lineinfo_addrs[]     4,597,583 x u32  = 17.5 MiB
+    lineinfo_file_ids[]  4,597,583 x u16  =  8.8 MiB
+    lineinfo_lines[]     4,597,583 x u32  = 17.5 MiB
+    file_offsets + filenames              ~  0.1 MiB
+    Total .rodata increase:              ~ 44.0 MiB
+
+  vmlinux (stripped):  529 MiB -> 573 MiB  (+44 MiB / +8.3%)
+
+Note: this probably won't be something we roll into "production", but
+it might be useful for the average user given the relatively low memory
+footprint, in canary deployments for hyperscalers, or by default for
+folks who run tests/fuzzing/etc.
+
+Disclaimer: this was vibe coded over an afternoon with an AI coding
+assistant.
+
+The .config used for testing is a simple KVM guest configuration for
+local development and testing.
+
+Link: https://lkml.kernel.org/r/20260312030649.674699-1-sashal@kernel.org
+Link: https://lkml.kernel.org/r/20260312030649.674699-2-sashal@kernel.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+Assisted-by: Claude:claude-opus-4-6
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Helge Deller <deller@gmx.de>
+Cc: James Bottomley <james.bottomley@HansenPartnership.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Juegren Gross <jgross@suse.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Cc: Luis Chamberalin <mcgrof@kernel.org>
+Cc: Masahiro Yamada <masahiroy@kernel.org>
+Cc: Nathan Chancellor <nathan@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Petr Mladek <pmladek@suse.com>
+Cc: Petr Pavlu <petr.pavlu@suse.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thorsten Leemhuis <linux@leemhuis.info>
+Cc: David Gow <david@davidgow.net>
