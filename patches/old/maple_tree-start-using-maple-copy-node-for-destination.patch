@@ -1,6 +1,6 @@
 From: "Liam R. Howlett" <Liam.Howlett@oracle.com>
 Subject: maple_tree: start using maple copy node for destination
-Date: Wed, 21 Jan 2026 11:45:14 -0500
+Date: Fri, 30 Jan 2026 15:59:22 -0500
 
 Stop using the maple subtree state and big node in favour of using three
 destinations in the maple copy node.  That is, expand the way leaves were
@@ -32,7 +32,8 @@ ascending the left and right write maple states.
 One test case setup needed to be tweaked so that the targeted node was
 surrounded by full nodes.
 
-Link: https://lkml.kernel.org/r/20260121164526.2093265-18-Liam.Howlett@oracle.com
+[akpm@linux-foundation.org: coding-style cleanups]
+Link: https://lkml.kernel.org/r/20260130205935.2559335-18-Liam.Howlett@oracle.com
 Signed-off-by: Liam R. Howlett <Liam.Howlett@oracle.com>
 Cc: Alice Ryhl <aliceryhl@google.com>
 Cc: Andrew Ballance <andrewjballance@gmail.com>
@@ -41,6 +42,7 @@ Cc: Christian Kujau <lists@nerdbynature.de>
 Cc: Geert Uytterhoeven <geert@linux-m68k.org>
 Cc: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: SeongJae Park <sj@kernel.org>
 Cc: Sidhartha Kumar <sidhartha.kumar@oracle.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
@@ -48,9 +50,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/maple_tree.h       |   14 
- lib/maple_tree.c                 |  622 ++++++++++++++++++++---------
+ lib/maple_tree.c                 |  628 ++++++++++++++++++++---------
  tools/testing/radix-tree/maple.c |    2 
- 3 files changed, 454 insertions(+), 184 deletions(-)
+ 3 files changed, 460 insertions(+), 184 deletions(-)
 
 --- a/include/linux/maple_tree.h~maple_tree-start-using-maple-copy-node-for-destination
 +++ a/include/linux/maple_tree.h
@@ -85,7 +87,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  /**
 --- a/lib/maple_tree.c~maple_tree-start-using-maple-copy-node-for-destination
 +++ a/lib/maple_tree.c
-@@ -1320,6 +1320,21 @@ void wr_mas_setup(struct ma_wr_state *wr
+@@ -353,6 +353,13 @@ static inline struct maple_enode *mt_mk_
+ 			(type << MAPLE_ENODE_TYPE_SHIFT) | MAPLE_ENODE_NULL);
+ }
+ 
++static inline void ma_init_slot(void __rcu **slot, const struct maple_node *mn,
++				const enum maple_type mt)
++{
++	/* WARNING: this is unsafe if the slot is exposed to readers. */
++	RCU_INIT_POINTER(*slot, (void *)mt_mk_node(mn, mt));
++}
++
+ static inline void *mte_mk_root(const struct maple_enode *node)
+ {
+ 	return (void *)((unsigned long)node | MAPLE_ROOT_NODE);
+@@ -1320,6 +1327,21 @@ void wr_mas_setup(struct ma_wr_state *wr
  	wr_mas->r_max = mas_safe_pivot(mas, wr_mas->pivots, mas->offset,
  				       wr_mas->type);
  }
@@ -107,7 +123,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
  		enum maple_type mt, unsigned long min, unsigned long max,
  		unsigned long *pivots, void __rcu **slots)
-@@ -2508,6 +2523,112 @@ static inline void mas_wmb_replace(struc
+@@ -2508,6 +2530,112 @@ static inline void mas_wmb_replace(struc
  }
  
  /*
@@ -220,7 +236,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
   * mast_cp_to_nodes() - Copy data out to nodes.
   * @mast: The maple subtree state
   * @left: The left encoded maple node
-@@ -2684,6 +2805,7 @@ static inline void cp_leaf_init(struct m
+@@ -2684,6 +2812,7 @@ static inline void cp_leaf_init(struct m
  	 * result in buggy code when a compiler reorders the instructions.
  	 */
  
@@ -228,7 +244,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Create entries to insert including split entries to left and right */
  	if (l_wr_mas->r_min < mas->index) {
  		end++;
-@@ -2726,6 +2848,100 @@ static inline void cp_data_calc(struct m
+@@ -2726,6 +2855,100 @@ static inline void cp_data_calc(struct m
  	cp->data += r_wr_mas->mas->end - r_wr_mas->offset_end;
  }
  
@@ -329,7 +345,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline void append_mas_cp(struct maple_copy *cp,
  	struct ma_state *mas, unsigned char start, unsigned char end)
  {
-@@ -2813,38 +3029,153 @@ void multi_src_setup(struct maple_copy *
+@@ -2813,38 +3036,153 @@ void multi_src_setup(struct maple_copy *
  }
  
  static inline
@@ -469,13 +485,13 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * read-side operations that can view them until they are
 +		 * inserted into the tree after an rcu_assign_pointer() call.
 +		 */
-+		RCU_INIT_POINTER(cp->slot[d], mt_mk_node(mn, mt));
++		ma_init_slot(&cp->slot[d], mn, mt);
 +		cp->pivot[d] = slot_max;
 +		if (mt_is_alloc(mas->tree)) {
 +			if (ma_is_leaf(mt)) {
 +				cp->gap[d] = ma_leaf_max_gap(mn, mt, slot_min,
-+					         slot_max, ma_pivots(mn, mt),
-+					         ma_slots(mn, mt));
++						 slot_max, ma_pivots(mn, mt),
++						 ma_slots(mn, mt));
 +			} else {
 +				unsigned long *gaps = ma_gaps(mn, mt);
 +
@@ -511,7 +527,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static void mas_spanning_rebalance_loop(struct ma_state *mas,
-@@ -3000,173 +3331,98 @@ static void mas_spanning_rebalance(struc
+@@ -3000,173 +3338,97 @@ static void mas_spanning_rebalance(struc
  	mas_spanning_rebalance_loop(mas, mast, count);
  }
  
@@ -602,8 +618,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +			 * read-side operations that can view it until it is insert into
 +			 * the tree after an rcu_assign_pointer() call.
 +			 */
-+			RCU_INIT_POINTER(cp->slot[0],
-+					 mt_mk_node(cp->dst[0].node, mt));
++			ma_init_slot(&cp->slot[0], cp->dst[0].node, mt);
 +			cp->height++;
  		}
 +		WARN_ON_ONCE(cp->dst[0].node != mte_to_node(
