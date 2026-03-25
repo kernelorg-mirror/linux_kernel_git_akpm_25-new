@@ -6,8 +6,16 @@ Convert objcg to be per-memcg per-node type, so that when reparent LRU
 folios later, we can hold the lru lock at the node level, thus avoiding
 holding too many lru locks at once.
 
+[zhengqi.arch@bytedance.com: reset pn->orig_objcg to NULL]
+  Link: https://lkml.kernel.org/r/20260309112939.31937-1-qi.zheng@linux.dev
+[akpm@linux-foundation.org: fix comment typo, per Usama.  Reflow comment to 80 cols]
+[devnexen@gmail.com: fix obj_cgroup leak in mem_cgroup_css_online() error path]
+  Link: https://lkml.kernel.org/r/20260322193631.45457-1-devnexen@gmail.com
+[devnexen@gmail.com: add newline, per Qi Zheng]
+  Link: https://lkml.kernel.org/r/20260323063007.7783-1-devnexen@gmail.com
 Link: https://lkml.kernel.org/r/56c04b1c5d54f75ccdc12896df6c1ca35403ecc3.1772711148.git.zhengqi.arch@bytedance.com
 Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Signed-off-by: David Carlier <devnexen@gmail.com>
 Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Allen Pais <apais@linux.microsoft.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
@@ -42,10 +50,10 @@ Cc: Usama Arif <usama.arif@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- include/linux/memcontrol.h |   23 +++++-----
+ include/linux/memcontrol.h |   23 ++++----
  include/linux/sched.h      |    2 
- mm/memcontrol.c            |   79 +++++++++++++++++++++--------------
- 3 files changed, 62 insertions(+), 42 deletions(-)
+ mm/memcontrol.c            |   92 +++++++++++++++++++++++------------
+ 3 files changed, 75 insertions(+), 42 deletions(-)
 
 --- a/include/linux/memcontrol.h~mm-memcontrol-convert-objcg-to-be-per-memcg-per-node-type
 +++ a/include/linux/memcontrol.h
@@ -239,13 +247,15 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	lruvec_init(&pn->lruvec);
  	pn->memcg = memcg;
  
-@@ -3843,10 +3852,12 @@ static void __mem_cgroup_free(struct mem
+@@ -3843,10 +3852,14 @@ static void __mem_cgroup_free(struct mem
  {
  	int node;
  
 -	obj_cgroup_put(memcg->orig_objcg);
 +	for_each_node(node) {
 +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[node];
++		if (!pn)
++			continue;
  
 -	for_each_node(node)
 -		free_mem_cgroup_per_node_info(memcg->nodeinfo[node]);
@@ -255,7 +265,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	memcg1_free_events(memcg);
  	kfree(memcg->vmstats);
  	free_percpu(memcg->vmstats_percpu);
-@@ -3917,7 +3928,6 @@ static struct mem_cgroup *mem_cgroup_all
+@@ -3917,7 +3930,6 @@ static struct mem_cgroup *mem_cgroup_all
  #endif
  	memcg1_memcg_init(memcg);
  	memcg->kmemcg_id = -1;
@@ -263,7 +273,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  #ifdef CONFIG_CGROUP_WRITEBACK
  	INIT_LIST_HEAD(&memcg->cgwb_list);
  	for (i = 0; i < MEMCG_CGWB_FRN_CNT; i++)
-@@ -3994,6 +4004,7 @@ static int mem_cgroup_css_online(struct
+@@ -3994,6 +4006,7 @@ static int mem_cgroup_css_online(struct
  {
  	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
  	struct obj_cgroup *objcg;
@@ -271,7 +281,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	memcg_online_kmem(memcg);
  
-@@ -4005,17 +4016,19 @@ static int mem_cgroup_css_online(struct
+@@ -4005,17 +4018,19 @@ static int mem_cgroup_css_online(struct
  	if (alloc_shrinker_info(memcg))
  		goto offline_kmem;
  
@@ -300,7 +310,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (unlikely(mem_cgroup_is_root(memcg)) && !mem_cgroup_disabled())
  		queue_delayed_work(system_dfl_wq, &stats_flush_dwork,
-@@ -4039,7 +4052,13 @@ static int mem_cgroup_css_online(struct
+@@ -4039,7 +4054,24 @@ static int mem_cgroup_css_online(struct
  	xa_store(&mem_cgroup_private_ids, memcg->id.id, memcg, GFP_KERNEL);
  
  	return 0;
@@ -308,9 +318,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +free_objcg:
 +	for_each_node(nid) {
 +		struct mem_cgroup_per_node *pn = memcg->nodeinfo[nid];
++		objcg = rcu_replace_pointer(pn->objcg, NULL, true);
 +
-+		if (pn && pn->orig_objcg)
++		if (objcg)
++			percpu_ref_kill(&objcg->refcnt);
++
++		if (pn->orig_objcg) {
 +			obj_cgroup_put(pn->orig_objcg);
++			/*
++			 * Reset pn->orig_objcg to NULL to prevent
++			 * obj_cgroup_put() from being called again in
++			 * __mem_cgroup_free().
++			 */
++			pn->orig_objcg = NULL;
++		}
 +	}
  	free_shrinker_info(memcg);
  offline_kmem:
