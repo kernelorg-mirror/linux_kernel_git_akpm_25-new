@@ -12,6 +12,12 @@ backed).  This C port uses shmem directly and use a single process.
 
 Note: the initial rust to C conversion is done by Cursor.
 
+[ziy@nvidia.com: v4]
+  Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
+[ziy@nvidia.com: update .gitignore, per Lorenzo]
+  Link: https://lkml.kernel.org/r/D60C0C65-11E3-4060-9295-B67F90E9D774@nvidia.com
+[ziy@nvidia.com: fix sashiko complains on folio_split_race_test]
+  Link: https://lkml.kernel.org/r/B0985749-939D-4256-B9B9-C54C0734CF72@nvidia.com
 Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
 Link: https://github.com/dfinity/thp-madv-remove-test [2]
 Link: https://lkml.kernel.org/r/20260319190409.294523-1-ziy@nvidia.com
@@ -25,23 +31,24 @@ Cc: Dev Jain <dev.jain@arm.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Lorenzo Stoakes (Oracle) <ljs@kernel.org>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Nico Pache <npache@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ tools/testing/selftests/mm/.gitignore              |    1 
  tools/testing/selftests/mm/Makefile                |    1 
- tools/testing/selftests/mm/folio_split_race_test.c |  292 +++++++++++
+ tools/testing/selftests/mm/folio_split_race_test.c |  304 +++++++++++
  tools/testing/selftests/mm/run_vmtests.sh          |    2 
- 3 files changed, 295 insertions(+)
+ 4 files changed, 308 insertions(+)
 
 diff --git a/tools/testing/selftests/mm/folio_split_race_test.c a/tools/testing/selftests/mm/folio_split_race_test.c
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/folio_split_race_test.c
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,304 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The test creates shmem PMD huge pages, fills all pages with known patterns,
@@ -55,6 +62,7 @@ new file mode 100644
 +
 +#define _GNU_SOURCE
 +#include <errno.h>
++#include <inttypes.h>
 +#include <linux/mman.h>
 +#include <pthread.h>
 +#include <stdatomic.h>
@@ -89,6 +97,7 @@ new file mode 100644
 +	atomic_uint_fast32_t stop;
 +	atomic_size_t reader_failures;
 +	atomic_size_t reader_verified;
++	pthread_barrier_t barrier;
 +};
 +
 +static void fill_page(unsigned char *base, size_t page_idx)
@@ -121,14 +130,14 @@ new file mode 100644
 +		}
 +		if (all_zero) {
 +			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %zu) is ALL ZEROS\n",
++				"CORRUPTED: page %zu (huge page %" PRIu64 ") is ALL ZEROS\n",
 +				page_idx,
 +				(page_idx * page_size) / pmd_pagesize);
 +		} else {
 +			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %zu): expected idx %zu, got %lu\n",
++				"CORRUPTED: page %zu (huge page %" PRIu64 "): expected idx %zu, got %" PRIu64 "\n",
 +				page_idx, (page_idx * page_size) / pmd_pagesize,
-+				page_idx, (unsigned long)got_idx);
++				page_idx, got_idx);
 +		}
 +		return false;
 +	}
@@ -152,6 +161,8 @@ new file mode 100644
 +	atomic_size_t *failures = ra->failures;
 +	atomic_size_t *verified = ra->verified;
 +	size_t page_idx;
++
++	pthread_barrier_wait(&ctl->barrier);
 +
 +	while (atomic_load_explicit(&ctl->stop, memory_order_acquire) == 0) {
 +		for (page_idx = (size_t)tid; page_idx < TOTAL_PAGES;
@@ -221,7 +232,13 @@ new file mode 100644
 +	if (!check_huge_shmem(mmap_base, NR_PMD_PAGE, pmd_pagesize))
 +		ksft_exit_fail_msg("No shmem THP is allocated\n");
 +
++	if (pthread_barrier_init(&ctl.barrier, NULL, NUM_READER_THREADS + 1) != 0)
++		ksft_exit_fail_msg("pthread_barrier_init failed\n");
++
 +	create_readers(threads, args, mmap_base, &ctl);
++
++	/* Wait for all reader threads to be ready before punching holes. */
++	pthread_barrier_wait(&ctl.barrier);
 +
 +	for (i = 0; i < TOTAL_PAGES; i++) {
 +		if (i % PUNCH_INTERVAL != 0)
@@ -233,13 +250,15 @@ new file mode 100644
 +				i, errno);
 +		}
 +
-+		i += PUNCH_SIZE_FACTOR;
++		i += PUNCH_SIZE_FACTOR - 1;
 +	}
 +
 +	atomic_store_explicit(&ctl.stop, 1, memory_order_release);
 +
 +	for (i = 0; i < NUM_READER_THREADS; i++)
 +		pthread_join(threads[i], NULL);
++
++	pthread_barrier_destroy(&ctl.barrier);
 +
 +	reader_failures = atomic_load_explicit(&ctl.reader_failures,
 +					       memory_order_acquire);
@@ -305,8 +324,8 @@ new file mode 100644
 +
 +	ksft_print_msg("folio split race test\n");
 +	ksft_print_msg("===================================================\n");
-+	ksft_print_msg("Shmem size:       %zu MiB\n", FILE_SIZE / 1024 / 1024);
-+	ksft_print_msg("Total pages:     %zu\n", TOTAL_PAGES);
++	ksft_print_msg("Shmem size:       %" PRIu64 " MiB\n", FILE_SIZE / 1024 / 1024);
++	ksft_print_msg("Total pages:     %" PRIu64 "\n", TOTAL_PAGES);
 +	ksft_print_msg("Child readers:   %d\n", NUM_READER_THREADS);
 +	ksft_print_msg("Punching every %dth to %dth page\n", PUNCH_INTERVAL,
 +		       PUNCH_INTERVAL + PUNCH_SIZE_FACTOR);
@@ -355,4 +374,11 @@ new file mode 100644
  CATEGORY="migration" run_test ./migration
  
  CATEGORY="mkdirty" run_test ./mkdirty
+--- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
++++ a/tools/testing/selftests/mm/.gitignore
+@@ -61,3 +61,4 @@ guard-regions
+ merge
+ prctl_thp_disable
+ rmap
++folio_split_race_test
 _
