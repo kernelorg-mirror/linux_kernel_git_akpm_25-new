@@ -1,25 +1,29 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: selftests/mm: add folio_split() and filemap_get_entry() race test
-Date: Fri, 13 Mar 2026 07:40:37 -0400
+Date: Thu, 19 Mar 2026 15:04:08 -0400
 
 The added folio_split_race_test is a modified C port of the race condition
-test from [1].  The test creates shmem huge pages shared by both a parent
-and a child processes, where the parent process punches holes in the shmem
-to cause folio_split() in the kernel and the child process reads the shmem
-in 16 threads to cause filemap_get_entry() in the kernel.
-
+test from [1].  The test creates shmem huge pages, where the main thread
+punches holes in the shmem to cause folio_split() in the kernel and a set
+of 16 threads reads the shmem to cause filemap_get_entry() in the kernel. 
 filemap_get_entry() reads the folio and xarray split by folio_split()
 locklessly.  The original test[2] is written in rust and uses memfd (shmem
-backed).  This C port uses shmem directly.
+backed).  This C port uses shmem directly and use a single process.
 
 Note: the initial rust to C conversion is done by Cursor.
 
+[ziy@nvidia.com: v4]
+  Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
+[ziy@nvidia.com: update .gitignore, per Lorenzo]
+  Link: https://lkml.kernel.org/r/D60C0C65-11E3-4060-9295-B67F90E9D774@nvidia.com
+[ziy@nvidia.com: fix sashiko complains on folio_split_race_test]
+  Link: https://lkml.kernel.org/r/B0985749-939D-4256-B9B9-C54C0734CF72@nvidia.com
 Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
 Link: https://github.com/dfinity/thp-madv-remove-test [2]
-Link: https://lkml.kernel.org/r/20260313114037.3593642-1-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20260319190409.294523-1-ziy@nvidia.com
+Signed-off-by: Bas van Dijk <bas@dfinity.org>
+Signed-off-by: Adam Bratschi-Kaye <adam.bratschikaye@dfinity.org>
 Signed-off-by: Zi Yan <ziy@nvidia.com>
-Cc: Bas van Dijk <bas@dfinity.org>
-Cc: Adam Bratschi-Kaye <adam.bratschikaye@dfinity.org>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: David Hildenbrand <david@kernel.org>
@@ -27,29 +31,29 @@ Cc: Dev Jain <dev.jain@arm.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
+Cc: Lorenzo Stoakes (Oracle) <ljs@kernel.org>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
 Cc: Nico Pache <npache@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ tools/testing/selftests/mm/.gitignore              |    1 
  tools/testing/selftests/mm/Makefile                |    1 
- tools/testing/selftests/mm/folio_split_race_test.c |  380 +++++++++++
+ tools/testing/selftests/mm/folio_split_race_test.c |  304 +++++++++++
  tools/testing/selftests/mm/run_vmtests.sh          |    2 
- 3 files changed, 383 insertions(+)
+ 4 files changed, 308 insertions(+)
 
 diff --git a/tools/testing/selftests/mm/folio_split_race_test.c a/tools/testing/selftests/mm/folio_split_race_test.c
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/folio_split_race_test.c
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,304 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * The parent process creates a shmem and forks. The child creates a THP on the
-+ * mapping, fills all pages with known patterns, and then continuously verifies
-+ * non-punched pages. The parent punches holes via MADV_REMOVE on the shmem
-+ * while the child reads.
++ * The test creates shmem PMD huge pages, fills all pages with known patterns,
++ * then continuously verifies non-punched pages with 16 threads. Meanwhile, the
++ * main thread punches holes via MADV_REMOVE on the shmem.
 + *
 + * It tests the race condition between folio_split() and filemap_get_entry(),
 + * where the hole punches on shmem lead to folio_split() and reading the shmem
@@ -57,8 +61,8 @@ new file mode 100644
 + */
 +
 +#define _GNU_SOURCE
-+#include <assert.h>
 +#include <errno.h>
++#include <inttypes.h>
 +#include <linux/mman.h>
 +#include <pthread.h>
 +#include <stdatomic.h>
@@ -68,8 +72,7 @@ new file mode 100644
 +#include <stdlib.h>
 +#include <string.h>
 +#include <sys/mman.h>
-+#include <sys/stat.h>
-+#include <sys/wait.h>
++#include <signal.h>
 +#include <unistd.h>
 +#include "vm_util.h"
 +#include "kselftest.h"
@@ -89,20 +92,13 @@ new file mode 100644
 +#define FILL_BYTE 0xAF
 +#define NUM_ITERATIONS 100
 +
-+#define CHILD_READY 1
-+#define CHILD_FAILED 2
-+/* Shared control block: MAP_SHARED anonymous so parent and child see same values. */
-+struct SharedCtl {
-+	atomic_uint_fast32_t ready;
++/* Shared control block: control reading threads and record stats */
++struct shared_ctl {
 +	atomic_uint_fast32_t stop;
-+	atomic_size_t child_failures;
-+	atomic_size_t child_verified;
++	atomic_size_t reader_failures;
++	atomic_size_t reader_verified;
++	pthread_barrier_t barrier;
 +};
-+
-+static int get_errno(void)
-+{
-+	return errno;
-+}
 +
 +static void fill_page(unsigned char *base, size_t page_idx)
 +{
@@ -134,14 +130,14 @@ new file mode 100644
 +		}
 +		if (all_zero) {
 +			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %zu) is ALL ZEROS\n",
++				"CORRUPTED: page %zu (huge page %" PRIu64 ") is ALL ZEROS\n",
 +				page_idx,
 +				(page_idx * page_size) / pmd_pagesize);
 +		} else {
 +			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %zu): expected idx %zu, got %lu\n",
++				"CORRUPTED: page %zu (huge page %" PRIu64 "): expected idx %zu, got %" PRIu64 "\n",
 +				page_idx, (page_idx * page_size) / pmd_pagesize,
-+				page_idx, (unsigned long)got_idx);
++				page_idx, got_idx);
 +		}
 +		return false;
 +	}
@@ -150,7 +146,7 @@ new file mode 100644
 +
 +struct reader_arg {
 +	unsigned char *base;
-+	struct SharedCtl *ctl;
++	struct shared_ctl *ctl;
 +	int tid;
 +	atomic_size_t *failures;
 +	atomic_size_t *verified;
@@ -160,17 +156,22 @@ new file mode 100644
 +{
 +	struct reader_arg *ra = (struct reader_arg *)arg;
 +	unsigned char *base = ra->base;
-+	struct SharedCtl *ctl = ra->ctl;
++	struct shared_ctl *ctl = ra->ctl;
 +	int tid = ra->tid;
 +	atomic_size_t *failures = ra->failures;
 +	atomic_size_t *verified = ra->verified;
 +	size_t page_idx;
 +
++	pthread_barrier_wait(&ctl->barrier);
++
 +	while (atomic_load_explicit(&ctl->stop, memory_order_acquire) == 0) {
 +		for (page_idx = (size_t)tid; page_idx < TOTAL_PAGES;
 +		     page_idx += NUM_READER_THREADS) {
-+			if (page_idx % PUNCH_INTERVAL >= 0 &&
-+			    page_idx % PUNCH_INTERVAL < PUNCH_SIZE_FACTOR)
++			/*
++			 * page_idx % PUNCH_INTERVAL is in [0, PUNCH_INTERVAL),
++			 * skip [0, PUNCH_SIZE_FACTOR)
++			 */
++			if (page_idx % PUNCH_INTERVAL < PUNCH_SIZE_FACTOR)
 +				continue;
 +			if (check_page(base, page_idx))
 +				atomic_fetch_add_explicit(verified, 1,
@@ -186,203 +187,132 @@ new file mode 100644
 +	return NULL;
 +}
 +
-+static void child_reader_loop(unsigned char *base, struct SharedCtl *ctl)
++static void create_readers(pthread_t *threads, struct reader_arg *args,
++			   unsigned char *base, struct shared_ctl *ctl)
 +{
-+	pthread_t threads[NUM_READER_THREADS];
-+	struct reader_arg args[NUM_READER_THREADS];
-+	atomic_size_t failures = 0;
-+	atomic_size_t verified = 0;
-+	size_t page_idx;
-+	size_t recheck = 0;
 +	int i;
 +
 +	for (i = 0; i < NUM_READER_THREADS; i++) {
 +		args[i].base = base;
 +		args[i].ctl = ctl;
 +		args[i].tid = i;
-+		args[i].failures = &failures;
-+		args[i].verified = &verified;
++		args[i].failures = &ctl->reader_failures;
++		args[i].verified = &ctl->reader_verified;
 +		if (pthread_create(&threads[i], NULL, reader_thread,
 +				   &args[i]) != 0)
 +			ksft_exit_fail_msg("pthread_create failed\n");
 +	}
-+
-+	for (i = 0; i < NUM_READER_THREADS; i++)
-+		pthread_join(threads[i], NULL);
-+
-+	/* Post-sleep recheck */
-+	usleep(1000); /* 1 ms */
-+
-+	for (page_idx = 0; page_idx < TOTAL_PAGES; page_idx++) {
-+		if (page_idx % PUNCH_INTERVAL >= 0 &&
-+		    page_idx % PUNCH_INTERVAL < PUNCH_SIZE_FACTOR)
-+			continue;
-+		if (!check_page(base, page_idx))
-+			recheck++;
-+	}
-+	if (recheck)
-+		ksft_print_msg("post-sleep failures: %zu\n", recheck);
-+
-+	atomic_store_explicit(&ctl->child_failures,
-+			      atomic_load_explicit(&failures,
-+						   memory_order_relaxed),
-+			      memory_order_release);
-+	atomic_store_explicit(&ctl->child_verified,
-+			      atomic_load_explicit(&verified,
-+						   memory_order_relaxed),
-+			      memory_order_release);
-+}
-+
-+/* Returns number of corrupted pages. */
-+static size_t verify_pages(unsigned char *base, const bool *is_punched)
-+{
-+	size_t failures = 0;
-+	size_t page_idx;
-+	size_t non_punched = 0;
-+
-+	for (page_idx = 0; page_idx < TOTAL_PAGES; page_idx++) {
-+		if (is_punched[page_idx])
-+			continue;
-+		if (!check_page(base, page_idx)) {
-+			failures++;
-+			if (failures >= 100)
-+				return failures;
-+		}
-+		non_punched++;
-+	}
-+	if (failures)
-+		ksft_print_msg("  %zu non-punched pages are corrupted!\n",
-+			failures);
-+	return failures;
 +}
 +
 +/* Run a single iteration. Returns total number of corrupted pages. */
 +static size_t run_iteration(void)
 +{
-+	struct SharedCtl *ctl;
-+	pid_t pid;
-+	unsigned char *parent_base;
-+	bool *is_punched;
++	size_t reader_failures, reader_verified;
++	struct reader_arg args[NUM_READER_THREADS];
++	pthread_t threads[NUM_READER_THREADS];
++	unsigned char *mmap_base;
++	struct shared_ctl ctl;
 +	size_t i;
-+	size_t child_failures, child_verified, parent_failures;
-+	int status;
-+	size_t n_punched = 0;
 +
-+	ctl = (struct SharedCtl *)mmap(NULL, sizeof(struct SharedCtl), PROT_READ | PROT_WRITE,
-+				MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-+	if (ctl == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap ctl failed: %d\n", get_errno());
++	memset(&ctl, 0, sizeof(struct shared_ctl));
 +
-+	memset(ctl, 0, sizeof(struct SharedCtl));
++	mmap_base = mmap(NULL, FILE_SIZE, PROT_READ | PROT_WRITE,
++			 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 +
-+	parent_base = mmap(NULL, FILE_SIZE, PROT_READ | PROT_WRITE,
-+			   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
++	if (mmap_base == MAP_FAILED)
++		ksft_exit_fail_msg("mmap failed: %d\n", errno);
 +
-+	if (parent_base == MAP_FAILED)
-+		ksft_exit_fail_msg("mmap failed: %d\n", get_errno());
++	if (madvise(mmap_base, FILE_SIZE, MADV_HUGEPAGE) != 0)
++		ksft_exit_fail_msg("madvise(MADV_HUGEPAGE) failed: %d\n",
++				   errno);
 +
-+	pid = fork();
-+	if (pid < 0)
-+		ksft_exit_fail_msg("fork failed: %d\n", get_errno());
++	for (i = 0; i < TOTAL_PAGES; i++)
++		fill_page(mmap_base, i);
 +
-+	if (pid == 0) {
-+		/* ---- Child process ---- */
-+		unsigned char *child_base = parent_base;
++	if (!check_huge_shmem(mmap_base, NR_PMD_PAGE, pmd_pagesize))
++		ksft_exit_fail_msg("No shmem THP is allocated\n");
 +
-+		if (madvise(child_base, FILE_SIZE, MADV_HUGEPAGE) != 0)
-+			ksft_exit_fail_msg("madvise(MADV_HUGEPAGE) failed: %d\n",
-+				get_errno());
++	if (pthread_barrier_init(&ctl.barrier, NULL, NUM_READER_THREADS + 1) != 0)
++		ksft_exit_fail_msg("pthread_barrier_init failed\n");
 +
-+		for (i = 0; i < TOTAL_PAGES; i++)
-+			fill_page(child_base, i);
++	create_readers(threads, args, mmap_base, &ctl);
 +
-+		if (!check_huge_shmem(child_base, NR_PMD_PAGE, pmd_pagesize)) {
-+			atomic_store_explicit(&ctl->ready, CHILD_FAILED, memory_order_release);
-+			ksft_print_msg("No shmem THP is allocated\n");
-+			_exit(0);
-+		}
-+
-+		atomic_store_explicit(&ctl->ready, CHILD_READY, memory_order_release);
-+		child_reader_loop(child_base, ctl);
-+
-+		munmap(child_base, FILE_SIZE);
-+		_exit(0);
-+	}
-+
-+	/* ---- Parent process ---- */
-+	while (atomic_load_explicit(&ctl->ready, memory_order_acquire) == 0)
-+		usleep(1000);
-+
-+	if (ctl->ready == CHILD_FAILED)
-+		ksft_exit_fail_msg("Child process error\n");
-+
-+	is_punched = calloc(TOTAL_PAGES, sizeof(bool));
-+	if (!is_punched)
-+		ksft_exit_fail_msg("calloc is_punched failed\n");
++	/* Wait for all reader threads to be ready before punching holes. */
++	pthread_barrier_wait(&ctl.barrier);
 +
 +	for (i = 0; i < TOTAL_PAGES; i++) {
-+		int j;
-+
 +		if (i % PUNCH_INTERVAL != 0)
 +			continue;
-+		if (madvise(parent_base + i * page_size,
++		if (madvise(mmap_base + i * page_size,
 +			    PUNCH_SIZE_FACTOR * page_size, MADV_REMOVE) != 0) {
 +			ksft_exit_fail_msg(
 +				"madvise(MADV_REMOVE) failed on page %zu: %d\n",
-+				i, get_errno());
++				i, errno);
 +		}
-+		for (j = 0; j < PUNCH_SIZE_FACTOR && i + j < TOTAL_PAGES; j++)
-+			is_punched[i + j] = true;
 +
-+		i += PUNCH_SIZE_FACTOR;
-+
-+		n_punched += PUNCH_SIZE_FACTOR;
++		i += PUNCH_SIZE_FACTOR - 1;
 +	}
 +
-+	atomic_store_explicit(&ctl->stop, 1, memory_order_release);
++	atomic_store_explicit(&ctl.stop, 1, memory_order_release);
 +
-+	if (waitpid(pid, &status, 0) != pid)
-+		ksft_exit_fail_msg("waitpid failed\n");
++	for (i = 0; i < NUM_READER_THREADS; i++)
++		pthread_join(threads[i], NULL);
 +
-+	child_failures = atomic_load_explicit(&ctl->child_failures,
-+					      memory_order_acquire);
-+	child_verified = atomic_load_explicit(&ctl->child_verified,
-+					      memory_order_acquire);
-+	if (child_failures)
++	pthread_barrier_destroy(&ctl.barrier);
++
++	reader_failures = atomic_load_explicit(&ctl.reader_failures,
++					       memory_order_acquire);
++	reader_verified = atomic_load_explicit(&ctl.reader_verified,
++					       memory_order_acquire);
++	if (reader_failures)
 +		ksft_print_msg("Child: %zu pages verified, %zu failures\n",
-+			child_verified, child_failures);
++			       reader_verified, reader_failures);
 +
-+	parent_failures = verify_pages(parent_base, is_punched);
-+	if (parent_failures)
-+		ksft_print_msg("Parent verification failures: %zu\n",
-+			parent_failures);
++	munmap(mmap_base, FILE_SIZE);
 +
-+	munmap(parent_base, FILE_SIZE);
-+	munmap(ctl, sizeof(struct SharedCtl));
-+	free(is_punched);
++	return reader_failures;
++}
 +
-+	(void)n_punched;
-+	return child_failures + parent_failures;
++static void thp_cleanup_handler(int signum)
++{
++	thp_restore_settings();
++	/*
++	 * Restore default handler and re-raise the signal to exit.
++	 * This is to ensure the test process exits with the correct
++	 * status code corresponding to the signal.
++	 */
++	signal(signum, SIG_DFL);
++	raise(signum);
++}
++
++static void thp_settings_cleanup(void)
++{
++	thp_restore_settings();
 +}
 +
 +int main(void)
 +{
-+	size_t iter;
-+	size_t failures;
 +	struct thp_settings current_settings;
 +	bool failed = false;
++	size_t failures;
++	size_t iter;
 +
 +	ksft_print_header();
 +
 +	if (!thp_is_enabled())
 +		ksft_exit_skip("Transparent Hugepages not available\n");
 +
-+	if (geteuid() != 0) {
-+		ksft_print_msg("Please run the benchmark as root\n");
-+		ksft_finished();
-+	}
++	if (geteuid() != 0)
++		ksft_exit_skip("Please run the test as root\n");
 +
 +	thp_save_settings();
++	/* make sure thp settings are restored */
++	if (atexit(thp_settings_cleanup) != 0)
++		ksft_exit_fail_msg("atexit failed\n");
++
++	signal(SIGINT, thp_cleanup_handler);
++	signal(SIGTERM, thp_cleanup_handler);
++
 +	thp_read_settings(&current_settings);
 +	current_settings.shmem_enabled = SHMEM_ADVISE;
 +	thp_write_settings(&current_settings);
@@ -393,12 +323,12 @@ new file mode 100644
 +	pmd_pagesize = read_pmd_pagesize();
 +
 +	ksft_print_msg("folio split race test\n");
-+	ksft_print_msg("=======================================================\n");
-+	ksft_print_msg("Shmem size:       %zu MiB\n", FILE_SIZE / 1024 / 1024);
-+	ksft_print_msg("Total pages:     %zu\n", TOTAL_PAGES);
++	ksft_print_msg("===================================================\n");
++	ksft_print_msg("Shmem size:       %" PRIu64 " MiB\n", FILE_SIZE / 1024 / 1024);
++	ksft_print_msg("Total pages:     %" PRIu64 "\n", TOTAL_PAGES);
 +	ksft_print_msg("Child readers:   %d\n", NUM_READER_THREADS);
 +	ksft_print_msg("Punching every %dth to %dth page\n", PUNCH_INTERVAL,
-+	       PUNCH_INTERVAL + PUNCH_SIZE_FACTOR);
++		       PUNCH_INTERVAL + PUNCH_SIZE_FACTOR);
 +	ksft_print_msg("Iterations:      %d\n", NUM_ITERATIONS);
 +
 +	for (iter = 1; iter <= NUM_ITERATIONS; iter++) {
@@ -406,19 +336,18 @@ new file mode 100644
 +		if (failures > 0) {
 +			failed = true;
 +			ksft_print_msg(
-+				"FAILED on iteration %zu: %zu pages corrupted by cross-process MADV_REMOVE!\n",
++				"FAILED on iteration %zu: %zu pages corrupted by MADV_REMOVE!\n",
 +				iter, failures);
 +			break;
 +		}
 +	}
 +
-+	thp_restore_settings();
-+
 +	if (failed) {
 +		ksft_test_result_fail("Test failed\n");
 +		ksft_exit_fail();
 +	} else {
-+		ksft_test_result_pass("All %d iterations passed\n", NUM_ITERATIONS);
++		ksft_test_result_pass("All %d iterations passed\n",
++				      NUM_ITERATIONS);
 +		ksft_exit_pass();
 +	}
 +
@@ -436,7 +365,7 @@ new file mode 100644
  TEST_GEN_FILES += soft-dirty
 --- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
 +++ a/tools/testing/selftests/mm/run_vmtests.sh
-@@ -555,6 +555,8 @@ if [ -n "${MOUNTED_XFS}" ]; then
+@@ -553,6 +553,8 @@ if [ -n "${MOUNTED_XFS}" ]; then
      rm -f ${XFS_IMG}
  fi
  
@@ -445,4 +374,11 @@ new file mode 100644
  CATEGORY="migration" run_test ./migration
  
  CATEGORY="mkdirty" run_test ./mkdirty
+--- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
++++ a/tools/testing/selftests/mm/.gitignore
+@@ -61,3 +61,4 @@ guard-regions
+ merge
+ prctl_thp_disable
+ rmap
++folio_split_race_test
 _
