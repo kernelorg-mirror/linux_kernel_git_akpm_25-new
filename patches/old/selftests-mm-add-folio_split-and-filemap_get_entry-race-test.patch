@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: selftests/mm: add folio_split() and filemap_get_entry() race test
-Date: Thu, 19 Mar 2026 15:04:08 -0400
+Date: Mon, 23 Mar 2026 12:37:17 -0400
 
 The added folio_split_race_test is a modified C port of the race condition
 test from [1].  The test creates shmem huge pages, where the main thread
@@ -12,16 +12,12 @@ backed).  This C port uses shmem directly and use a single process.
 
 Note: the initial rust to C conversion is done by Cursor.
 
-[ziy@nvidia.com: v4]
-  Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
-[ziy@nvidia.com: update .gitignore, per Lorenzo]
-  Link: https://lkml.kernel.org/r/D60C0C65-11E3-4060-9295-B67F90E9D774@nvidia.com
-[ziy@nvidia.com: fix sashiko complains on folio_split_race_test]
-  Link: https://lkml.kernel.org/r/B0985749-939D-4256-B9B9-C54C0734CF72@nvidia.com
 Link: https://lore.kernel.org/all/CAKNNEtw5_kZomhkugedKMPOG-sxs5Q5OLumWJdiWXv+C9Yct0w@mail.gmail.com/ [1]
 Link: https://github.com/dfinity/thp-madv-remove-test [2]
-Link: https://lkml.kernel.org/r/20260319190409.294523-1-ziy@nvidia.com
+Link: https://lkml.kernel.org/r/20260323163717.184107-1-ziy@nvidia.com
+Co-developed-by: Bas van Dijk <bas@dfinity.org>
 Signed-off-by: Bas van Dijk <bas@dfinity.org>
+Co-developed-by: Adam Bratschi-Kaye <adam.bratschikaye@dfinity.org>
 Signed-off-by: Adam Bratschi-Kaye <adam.bratschikaye@dfinity.org>
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
@@ -31,24 +27,29 @@ Cc: Dev Jain <dev.jain@arm.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam Howlett <liam.howlett@oracle.com>
-Cc: Lorenzo Stoakes (Oracle) <ljs@kernel.org>
+Cc: Lorenzo Stoakes <lorenzo.stoakes@oracle.com>
 Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Nico Pache <npache@redhat.com>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  tools/testing/selftests/mm/.gitignore              |    1 
  tools/testing/selftests/mm/Makefile                |    1 
- tools/testing/selftests/mm/folio_split_race_test.c |  304 +++++++++++
+ tools/testing/selftests/mm/folio_split_race_test.c |  297 +++++++++++
  tools/testing/selftests/mm/run_vmtests.sh          |    2 
- 4 files changed, 308 insertions(+)
+ 4 files changed, 301 insertions(+)
 
 diff --git a/tools/testing/selftests/mm/folio_split_race_test.c a/tools/testing/selftests/mm/folio_split_race_test.c
 new file mode 100644
 --- /dev/null
 +++ a/tools/testing/selftests/mm/folio_split_race_test.c
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,297 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * The test creates shmem PMD huge pages, fills all pages with known patterns,
@@ -95,8 +96,8 @@ new file mode 100644
 +/* Shared control block: control reading threads and record stats */
 +struct shared_ctl {
 +	atomic_uint_fast32_t stop;
-+	atomic_size_t reader_failures;
-+	atomic_size_t reader_verified;
++	atomic_uint_fast64_t reader_failures;
++	atomic_uint_fast64_t reader_verified;
 +	pthread_barrier_t barrier;
 +};
 +
@@ -110,7 +111,7 @@ new file mode 100644
 +}
 +
 +/* Returns true if valid, false if corrupted. */
-+static bool check_page(unsigned char *base, size_t page_idx)
++static bool check_page(unsigned char *base, uint64_t page_idx)
 +{
 +	unsigned char *page_ptr = base + page_idx * page_size;
 +	uint64_t expected_idx = (uint64_t)page_idx;
@@ -119,7 +120,7 @@ new file mode 100644
 +	memcpy(&got_idx, page_ptr, 8);
 +
 +	if (got_idx != expected_idx) {
-+		size_t off;
++		uint64_t off;
 +		int all_zero = 1;
 +
 +		for (off = 0; off < page_size; off++) {
@@ -129,15 +130,19 @@ new file mode 100644
 +			}
 +		}
 +		if (all_zero) {
-+			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %" PRIu64 ") is ALL ZEROS\n",
-+				page_idx,
-+				(page_idx * page_size) / pmd_pagesize);
++			ksft_print_msg("CORRUPTED: page %" PRIu64
++				       " (huge page %" PRIu64
++				       ") is ALL ZEROS\n",
++				       page_idx,
++				       (page_idx * page_size) / pmd_pagesize);
 +		} else {
-+			ksft_print_msg(
-+				"CORRUPTED: page %zu (huge page %" PRIu64 "): expected idx %zu, got %" PRIu64 "\n",
-+				page_idx, (page_idx * page_size) / pmd_pagesize,
-+				page_idx, got_idx);
++			ksft_print_msg("CORRUPTED: page %" PRIu64
++				       " (huge page %" PRIu64
++				       "): expected idx %" PRIu64
++				       ", got %" PRIu64 "\n",
++				       page_idx,
++				       (page_idx * page_size) / pmd_pagesize,
++				       page_idx, got_idx);
 +		}
 +		return false;
 +	}
@@ -148,8 +153,8 @@ new file mode 100644
 +	unsigned char *base;
 +	struct shared_ctl *ctl;
 +	int tid;
-+	atomic_size_t *failures;
-+	atomic_size_t *verified;
++	atomic_uint_fast64_t *failures;
++	atomic_uint_fast64_t *verified;
 +};
 +
 +static void *reader_thread(void *arg)
@@ -158,9 +163,9 @@ new file mode 100644
 +	unsigned char *base = ra->base;
 +	struct shared_ctl *ctl = ra->ctl;
 +	int tid = ra->tid;
-+	atomic_size_t *failures = ra->failures;
-+	atomic_size_t *verified = ra->verified;
-+	size_t page_idx;
++	atomic_uint_fast64_t *failures = ra->failures;
++	atomic_uint_fast64_t *verified = ra->verified;
++	uint64_t page_idx;
 +
 +	pthread_barrier_wait(&ctl->barrier);
 +
@@ -205,14 +210,14 @@ new file mode 100644
 +}
 +
 +/* Run a single iteration. Returns total number of corrupted pages. */
-+static size_t run_iteration(void)
++static uint64_t run_iteration(void)
 +{
-+	size_t reader_failures, reader_verified;
++	uint64_t reader_failures, reader_verified;
 +	struct reader_arg args[NUM_READER_THREADS];
 +	pthread_t threads[NUM_READER_THREADS];
 +	unsigned char *mmap_base;
 +	struct shared_ctl ctl;
-+	size_t i;
++	uint64_t i;
 +
 +	memset(&ctl, 0, sizeof(struct shared_ctl));
 +
@@ -246,7 +251,7 @@ new file mode 100644
 +		if (madvise(mmap_base + i * page_size,
 +			    PUNCH_SIZE_FACTOR * page_size, MADV_REMOVE) != 0) {
 +			ksft_exit_fail_msg(
-+				"madvise(MADV_REMOVE) failed on page %zu: %d\n",
++				"madvise(MADV_REMOVE) failed on page %" PRIu64 ": %d\n",
 +				i, errno);
 +		}
 +
@@ -265,7 +270,7 @@ new file mode 100644
 +	reader_verified = atomic_load_explicit(&ctl.reader_verified,
 +					       memory_order_acquire);
 +	if (reader_failures)
-+		ksft_print_msg("Child: %zu pages verified, %zu failures\n",
++		ksft_print_msg("Child: %" PRIu64 " pages verified, %" PRIu64 " failures\n",
 +			       reader_verified, reader_failures);
 +
 +	munmap(mmap_base, FILE_SIZE);
@@ -293,13 +298,15 @@ new file mode 100644
 +int main(void)
 +{
 +	struct thp_settings current_settings;
-+	bool failed = false;
-+	size_t failures;
-+	size_t iter;
++	uint64_t corrupted_pages;
++	uint64_t iter;
 +
 +	ksft_print_header();
 +
-+	if (!thp_is_enabled())
++	page_size = getpagesize();
++	pmd_pagesize = read_pmd_pagesize();
++
++	if (!thp_available() || !pmd_pagesize)
 +		ksft_exit_skip("Transparent Hugepages not available\n");
 +
 +	if (geteuid() != 0)
@@ -319,40 +326,34 @@ new file mode 100644
 +
 +	ksft_set_plan(1);
 +
-+	page_size = getpagesize();
-+	pmd_pagesize = read_pmd_pagesize();
-+
 +	ksft_print_msg("folio split race test\n");
-+	ksft_print_msg("===================================================\n");
-+	ksft_print_msg("Shmem size:       %" PRIu64 " MiB\n", FILE_SIZE / 1024 / 1024);
-+	ksft_print_msg("Total pages:     %" PRIu64 "\n", TOTAL_PAGES);
-+	ksft_print_msg("Child readers:   %d\n", NUM_READER_THREADS);
-+	ksft_print_msg("Punching every %dth to %dth page\n", PUNCH_INTERVAL,
-+		       PUNCH_INTERVAL + PUNCH_SIZE_FACTOR);
-+	ksft_print_msg("Iterations:      %d\n", NUM_ITERATIONS);
 +
-+	for (iter = 1; iter <= NUM_ITERATIONS; iter++) {
-+		failures = run_iteration();
-+		if (failures > 0) {
-+			failed = true;
-+			ksft_print_msg(
-+				"FAILED on iteration %zu: %zu pages corrupted by MADV_REMOVE!\n",
-+				iter, failures);
++	for (iter = 0; iter < NUM_ITERATIONS; iter++) {
++		corrupted_pages = run_iteration();
++		if (corrupted_pages > 0)
 +			break;
-+		}
 +	}
 +
-+	if (failed) {
-+		ksft_test_result_fail("Test failed\n");
-+		ksft_exit_fail();
-+	} else {
++	if (iter < NUM_ITERATIONS)
++		ksft_test_result_fail("FAILED on iteration %" PRIu64
++				      ": %" PRIu64
++				      " pages corrupted by MADV_REMOVE!\n",
++				      iter, corrupted_pages);
++	else
 +		ksft_test_result_pass("All %d iterations passed\n",
 +				      NUM_ITERATIONS);
-+		ksft_exit_pass();
-+	}
++
++	ksft_exit(iter == NUM_ITERATIONS);
 +
 +	return 0;
 +}
+--- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
++++ a/tools/testing/selftests/mm/.gitignore
+@@ -61,3 +61,4 @@ guard-regions
+ merge
+ prctl_thp_disable
+ rmap
++folio_split_race_test
 --- a/tools/testing/selftests/mm/Makefile~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
 +++ a/tools/testing/selftests/mm/Makefile
 @@ -105,6 +105,7 @@ TEST_GEN_FILES += droppable
@@ -365,7 +366,7 @@ new file mode 100644
  TEST_GEN_FILES += soft-dirty
 --- a/tools/testing/selftests/mm/run_vmtests.sh~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
 +++ a/tools/testing/selftests/mm/run_vmtests.sh
-@@ -553,6 +553,8 @@ if [ -n "${MOUNTED_XFS}" ]; then
+@@ -515,6 +515,8 @@ if [ -n "${MOUNTED_XFS}" ]; then
      rm -f ${XFS_IMG}
  fi
  
@@ -374,11 +375,4 @@ new file mode 100644
  CATEGORY="migration" run_test ./migration
  
  CATEGORY="mkdirty" run_test ./mkdirty
---- a/tools/testing/selftests/mm/.gitignore~selftests-mm-add-folio_split-and-filemap_get_entry-race-test
-+++ a/tools/testing/selftests/mm/.gitignore
-@@ -61,3 +61,4 @@ guard-regions
- merge
- prctl_thp_disable
- rmap
-+folio_split_race_test
 _
