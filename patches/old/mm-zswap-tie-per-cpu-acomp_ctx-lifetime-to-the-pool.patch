@@ -1,22 +1,6 @@
 From: "Kanchana P. Sridhar" <kanchanapsridhar2026@gmail.com>
 Subject: mm: zswap: tie per-CPU acomp_ctx lifetime to the pool
-Date: Fri, 13 Mar 2026 22:16:31 -0700
-
-Patch series "zswap pool per-CPU acomp_ctx simplifications".
-
-This patchset persists the zswap pool's per-CPU acomp_ctx resources to
-last until the pool is destroyed.  It then simplifies the per-CPU
-acomp_ctx mutex locking in zswap_compress()/zswap_decompress().
-
-Further, it consistently uses the same checks for valid
-acomp_ctx->acomp/req in zswap procedures that allocate/deallocate
-acomp_ctx members.
-
-These are independent submissions of patches 23 and 24 from [1], to
-facilitate merging. The Acks are preserved from [1].
-
-
-This patch (of 2):
+Date: Mon, 16 Mar 2026 18:48:02 -0700
 
 Currently, per-CPU acomp_ctx are allocated on pool creation and/or CPU
 hotplug, and destroyed on pool destruction or CPU hotunplug.  This
@@ -27,8 +11,8 @@ Simplify lifetime management by allocating per-CPU acomp_ctx once on pool
 creation (or CPU hotplug for CPUs onlined later), and keeping them
 allocated until the pool is destroyed.
 
-Refactor cleanup code from zswap_cpu_comp_dead() into acomp_ctx_dealloc()
-to be used elsewhere.
+Refactor cleanup code from zswap_cpu_comp_dead() into acomp_ctx_free() to
+be used elsewhere.
 
 The main benefit of using the CPU hotplug multi state instance startup
 callback to allocate the acomp_ctx resources is that it prevents the cores
@@ -62,7 +46,7 @@ The above two observations enable the following simplifications:
        If the process gets migrated while zswap_cpu_comp_prepare() is
        running, it will complete on the new CPU. In case of failures, we
        pass the acomp_ctx pointer obtained at the start of
-       zswap_cpu_comp_prepare() to acomp_ctx_dealloc(), which again, can
+       zswap_cpu_comp_prepare() to acomp_ctx_free(), which again, can
        only undergo migration. There appear to be no contention
        scenarios that might cause inconsistent values of acomp_ctx's
        members. Hence, it seems there is no need for
@@ -103,10 +87,10 @@ The above two observations enable the following simplifications:
                                       allocating acomp_ctx resources for
                                       the offlined CPU.
 
-    b) Pool deletion --> acomp_ctx_dealloc()
+    b) Pool deletion --> acomp_ctx_free()
                                 --> process migrated:
                                     * Old CPU offline: no-op.
-                                    * acomp_ctx_dealloc() continues
+                                    * acomp_ctx_free() continues
                                       to run on the new CPU to finish
                                       de-allocating acomp_ctx resources
                                       for the offlined CPU.
@@ -125,48 +109,60 @@ offlining, and only deleting them when the pool is destroyed, is 8.28 KB
 on x86_64.  This cost is only paid when a CPU is offlined, until it is
 onlined again.
 
-Link: https://lkml.kernel.org/r/20260314051632.17931-1-kanchanapsridhar2026@gmail.com
-Link: https://lkml.kernel.org/r/20260314051632.17931-2-kanchanapsridhar2026@gmail.com
-Link: https://patchwork.kernel.org/project/linux-mm/list/?series=1046677 [1]
+Link: https://lkml.kernel.org/r/20260317014802.27591-3-kanchanapsridhar2026@gmail.com
 Co-developed-by: Kanchana P. Sridhar <kanchanapsridhar2026@gmail.com>
 Signed-off-by: Kanchana P. Sridhar <kanchanapsridhar2026@gmail.com>
 Signed-off-by: Kanchana P Sridhar <kanchana.p.sridhar@intel.com>
-Acked-by: Yosry Ahmed <yosry.ahmed@linux.dev>
 Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: Herbert Xu <herbert@gondor.apana.org.au>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Nhat Pham <nphamcs@gmail.com>
 Cc: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Yosry Ahmed <yosry@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/zswap.c |  163 ++++++++++++++++++++-------------------------------
- 1 file changed, 66 insertions(+), 97 deletions(-)
+ mm/zswap.c |  180 ++++++++++++++++++++++-----------------------------
+ 1 file changed, 80 insertions(+), 100 deletions(-)
 
 --- a/mm/zswap.c~mm-zswap-tie-per-cpu-acomp_ctx-lifetime-to-the-pool
 +++ a/mm/zswap.c
-@@ -242,6 +242,20 @@ static inline struct xarray *swap_zswap_
+@@ -242,6 +242,34 @@ static inline struct xarray *swap_zswap_
  **********************************/
  static void __zswap_pool_empty(struct percpu_ref *ref);
  
-+static void acomp_ctx_dealloc(struct crypto_acomp_ctx *acomp_ctx)
++static void acomp_ctx_free(struct crypto_acomp_ctx *acomp_ctx)
 +{
-+	if (IS_ERR_OR_NULL(acomp_ctx))
++	if (!acomp_ctx)
 +		return;
 +
-+	if (!IS_ERR_OR_NULL(acomp_ctx->req))
++	/*
++	 * If there was an error in allocating @acomp_ctx->req, it
++	 * would be set to NULL.
++	 */
++	if (acomp_ctx->req)
 +		acomp_request_free(acomp_ctx->req);
 +
++	acomp_ctx->req = NULL;
++
++	/*
++	 * We have to handle both cases here: an error pointer return from
++	 * crypto_alloc_acomp_node(); and a) NULL initialization by zswap, or
++	 * b) NULL assignment done in a previous call to acomp_ctx_free().
++	 */
 +	if (!IS_ERR_OR_NULL(acomp_ctx->acomp))
 +		crypto_free_acomp(acomp_ctx->acomp);
 +
++	acomp_ctx->acomp = NULL;
++
 +	kfree(acomp_ctx->buffer);
++	acomp_ctx->buffer = NULL;
 +}
 +
  static struct zswap_pool *zswap_pool_create(char *compressor)
  {
  	struct zswap_pool *pool;
-@@ -263,19 +277,27 @@ static struct zswap_pool *zswap_pool_cre
+@@ -263,19 +291,27 @@ static struct zswap_pool *zswap_pool_cre
  
  	strscpy(pool->tfm_name, compressor, sizeof(pool->tfm_name));
  
@@ -199,18 +195,18 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/* being the current pool takes 1 ref; this func expects the
  	 * caller to always add the new pool as the current pool
-@@ -292,6 +314,10 @@ static struct zswap_pool *zswap_pool_cre
+@@ -292,6 +328,10 @@ static struct zswap_pool *zswap_pool_cre
  
  ref_fail:
  	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 +
 +cpuhp_add_fail:
 +	for_each_possible_cpu(cpu)
-+		acomp_ctx_dealloc(per_cpu_ptr(pool->acomp_ctx, cpu));
++		acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
  error:
  	if (pool->acomp_ctx)
  		free_percpu(pool->acomp_ctx);
-@@ -322,9 +348,15 @@ static struct zswap_pool *__zswap_pool_c
+@@ -322,9 +362,15 @@ static struct zswap_pool *__zswap_pool_c
  
  static void zswap_pool_destroy(struct zswap_pool *pool)
  {
@@ -221,12 +217,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	cpuhp_state_remove_instance(CPUHP_MM_ZSWP_POOL_PREPARE, &pool->node);
 +
 +	for_each_possible_cpu(cpu)
-+		acomp_ctx_dealloc(per_cpu_ptr(pool->acomp_ctx, cpu));
++		acomp_ctx_free(per_cpu_ptr(pool->acomp_ctx, cpu));
 +
  	free_percpu(pool->acomp_ctx);
  
  	zs_destroy_pool(pool->zs_pool);
-@@ -738,39 +770,36 @@ static int zswap_cpu_comp_prepare(unsign
+@@ -736,44 +782,41 @@ static int zswap_cpu_comp_prepare(unsign
  {
  	struct zswap_pool *pool = hlist_entry(node, struct zswap_pool, node);
  	struct crypto_acomp_ctx *acomp_ctx = per_cpu_ptr(pool->acomp_ctx, cpu);
@@ -249,12 +245,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return 0;
  	}
  
--	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, cpu_to_node(cpu));
--	if (IS_ERR(acomp)) {
 +	acomp_ctx->buffer = kmalloc_node(PAGE_SIZE, GFP_KERNEL, cpu_to_node(cpu));
 +	if (!acomp_ctx->buffer)
 +		return ret;
 +
+ 	/*
+ 	 * In case of an error, crypto_alloc_acomp_node() returns an
+ 	 * error pointer, never NULL.
+ 	 */
+-	acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, cpu_to_node(cpu));
+-	if (IS_ERR(acomp)) {
 +	acomp_ctx->acomp = crypto_alloc_acomp_node(pool->tfm_name, 0, 0, cpu_to_node(cpu));
 +	if (IS_ERR(acomp_ctx->acomp)) {
  		pr_err("could not alloc crypto acomp %s : %pe\n",
@@ -265,6 +265,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		goto fail;
  	}
  
+ 	/* acomp_request_alloc() returns NULL in case of an error. */
 -	req = acomp_request_alloc(acomp);
 -	if (!req) {
 +	acomp_ctx->req = acomp_request_alloc(acomp_ctx->acomp);
@@ -284,7 +285,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	crypto_init_wait(&acomp_ctx->wait);
  
  	/*
-@@ -778,80 +807,17 @@ static int zswap_cpu_comp_prepare(unsign
+@@ -781,83 +824,17 @@ static int zswap_cpu_comp_prepare(unsign
  	 * crypto_wait_req(); if the backend of acomp is scomp, the callback
  	 * won't be called, crypto_wait_req() will return without blocking.
  	 */
@@ -303,7 +304,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	if (!IS_ERR_OR_NULL(acomp))
 -		crypto_free_acomp(acomp);
 -	kfree(buffer);
-+	acomp_ctx_dealloc(acomp_ctx);
++	acomp_ctx_free(acomp_ctx);
  	return ret;
  }
  
@@ -315,7 +316,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	struct crypto_acomp *acomp;
 -	u8 *buffer;
 -
--	if (IS_ERR_OR_NULL(acomp_ctx))
+-	if (!acomp_ctx)
 -		return 0;
 -
 -	mutex_lock(&acomp_ctx->mutex);
@@ -330,8 +331,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -	/*
 -	 * Do the actual freeing after releasing the mutex to avoid subtle
 -	 * locking dependencies causing deadlocks.
+-	 *
+-	 * If there was an error in allocating @acomp_ctx->req, it
+-	 * would be set to NULL.
 -	 */
--	if (!IS_ERR_OR_NULL(req))
+-	if (req)
 -		acomp_request_free(req);
 -	if (!IS_ERR_OR_NULL(acomp))
 -		crypto_free_acomp(acomp);
@@ -368,7 +372,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static bool zswap_compress(struct page *page, struct zswap_entry *entry,
  			   struct zswap_pool *pool)
  {
-@@ -864,7 +830,9 @@ static bool zswap_compress(struct page *
+@@ -870,7 +847,9 @@ static bool zswap_compress(struct page *
  	u8 *dst;
  	bool mapped = false;
  
@@ -379,7 +383,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	dst = acomp_ctx->buffer;
  	sg_init_table(&input, 1);
  	sg_set_page(&input, page, PAGE_SIZE, 0);
-@@ -930,7 +898,7 @@ unlock:
+@@ -933,7 +912,7 @@ unlock:
  	else if (alloc_ret)
  		zswap_reject_alloc_fail++;
  
@@ -388,7 +392,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	return comp_ret == 0 && alloc_ret == 0;
  }
  
-@@ -942,7 +910,8 @@ static bool zswap_decompress(struct zswa
+@@ -945,7 +924,8 @@ static bool zswap_decompress(struct zswa
  	struct crypto_acomp_ctx *acomp_ctx;
  	int ret = 0, dlen;
  
@@ -398,7 +402,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	zs_obj_read_sg_begin(pool->zs_pool, entry->handle, input, entry->length);
  
  	/* zswap entries of length PAGE_SIZE are not compressed. */
-@@ -966,7 +935,7 @@ static bool zswap_decompress(struct zswa
+@@ -970,7 +950,7 @@ static bool zswap_decompress(struct zswa
  	}
  
  	zs_obj_read_sg_end(pool->zs_pool, entry->handle);
@@ -407,7 +411,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!ret && dlen == PAGE_SIZE)
  		return true;
-@@ -1786,7 +1755,7 @@ static int zswap_setup(void)
+@@ -1790,7 +1770,7 @@ static int zswap_setup(void)
  	ret = cpuhp_setup_state_multi(CPUHP_MM_ZSWP_POOL_PREPARE,
  				      "mm/zswap_pool:prepare",
  				      zswap_cpu_comp_prepare,
