@@ -1,6 +1,6 @@
 From: "Lorenzo Stoakes (Oracle)" <ljs@kernel.org>
 Subject: mm: add vm_ops->mapped hook
-Date: Thu, 19 Mar 2026 18:23:28 +0000
+Date: Fri, 20 Mar 2026 22:39:34 +0000
 
 Previously, when a driver needed to do something like establish a
 reference count, it could do so in the mmap hook in the knowledge that the
@@ -32,31 +32,17 @@ mmap() invocations, add __compat_vma_mapped() and invoke it on vfs_mmap()
 (via compat_vma_mmap()) to ensure that the mapped callback is handled when
 an mmap() caller invokes a nested filesystem's mmap_prepare() callback.
 
-We can now also remove call_action_complete() and invoke
-mmap_action_complete() directly, as we separate out the rmap lock logic.
-
-The rmap lock logic, which was added in order to keep hugetlb working (!)
-to allow for the rmap lock to be held longer, needs to be propagated to the
-error paths on mmap complete and mapped hook error paths.
-
-This is because do_munmap() might otherwise deadlock with the rmap being
-held, so instead we unlock at the point of unmap.
-
-This is fine as any reliance on the rmap being held is irrelevant on error.
-
-While we're here, refactor mmap_action_finish() to avoid a big if (err)
-branch.
-
-We also abstract unmapping of a VMA on mmap action completion into its own
-helper function, unmap_vma_locked().
-
 Update the mmap_prepare documentation to describe the mapped hook and make
 it clear what its intended use is.
 
+The vm_ops->mapped() call is handled by the mmap complete logic to ensure
+the same code paths are handled by both the compatibility and VMA layers.
+
 Additionally, update VMA userland test headers to reflect the change.
 
-Link: https://lkml.kernel.org/r/a97366fa6f22a0ca1340cfd2b0d4df87c80ac80a.1773944114.git.ljs@kernel.org
+Link: https://lkml.kernel.org/r/4c5e98297eb0aae9565c564e1c296a112702f144.1774045440.git.ljs@kernel.org
 Signed-off-by: Lorenzo Stoakes (Oracle) <ljs@kernel.org>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
 Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
 Cc: Alexandre Torgue <alexandre.torgue@foss.st.com>
 Cc: Al Viro <viro@zeniv.linux.org.uk>
@@ -87,19 +73,16 @@ Cc: Ryan Roberts <ryan.roberts@arm.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vignesh Raghavendra <vigneshr@ti.com>
 Cc: Wei Liu <wei.liu@kernel.org>
-Cc: Vlastimil Babka (SUSE) <vbabka@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- Documentation/filesystems/mmap_prepare.rst |   15 ++
+ Documentation/filesystems/mmap_prepare.rst |   15 +++
  include/linux/fs.h                         |    9 +
- include/linux/mm.h                         |   20 ++
- mm/internal.h                              |    8 +
- mm/util.c                                  |  129 ++++++++++++-------
- mm/vma.c                                   |   37 +++--
- tools/testing/vma/include/dup.h            |   27 +++
- tools/testing/vma/include/stubs.h          |    3 
- 8 files changed, 187 insertions(+), 61 deletions(-)
+ include/linux/mm.h                         |   17 +++
+ mm/util.c                                  |   90 +++++++++++++------
+ mm/vma.c                                   |    1 
+ tools/testing/vma/include/dup.h            |   17 +++
+ 6 files changed, 120 insertions(+), 29 deletions(-)
 
 --- a/Documentation/filesystems/mmap_prepare.rst~mm-add-vm_ops-mapped-hook
 +++ a/Documentation/filesystems/mmap_prepare.rst
@@ -151,7 +134,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static inline int vfs_mmap_prepare(struct file *file, struct vm_area_desc *desc)
 --- a/include/linux/mm.h~mm-add-vm_ops-mapped-hook
 +++ a/include/linux/mm.h
-@@ -777,6 +777,23 @@ struct vm_operations_struct {
+@@ -775,6 +775,23 @@ struct vm_operations_struct {
  	 * Context: User context.  May sleep.  Caller holds mmap_lock.
  	 */
  	void (*close)(struct vm_area_struct *vma);
@@ -175,122 +158,78 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Called any time before splitting to check if it's allowed */
  	int (*may_split)(struct vm_area_struct *vma, unsigned long addr);
  	int (*mremap)(struct vm_area_struct *vma);
-@@ -4325,7 +4342,8 @@ static inline void mmap_action_ioremap_f
- 
- int mmap_action_prepare(struct vm_area_desc *desc);
- int mmap_action_complete(struct vm_area_struct *vma,
--			 struct mmap_action *action);
-+			 struct mmap_action *action,
-+			 bool rmap_lock_held);
- 
- /* Look up the first VMA which exactly match the interval vm_start ... vm_end */
- static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
---- a/mm/internal.h~mm-add-vm_ops-mapped-hook
-+++ a/mm/internal.h
-@@ -202,6 +202,14 @@ static inline void vma_close(struct vm_a
- /* unmap_vmas is in mm/memory.c */
- void unmap_vmas(struct mmu_gather *tlb, struct unmap_desc *unmap);
- 
-+static inline void unmap_vma_locked(struct vm_area_struct *vma)
-+{
-+	const size_t len = vma_pages(vma) << PAGE_SHIFT;
-+
-+	mmap_assert_write_locked(vma->vm_mm);
-+	do_munmap(vma->vm_mm, vma->vm_start, len, NULL);
-+}
-+
- #ifdef CONFIG_MMU
- 
- static inline void get_anon_vma(struct anon_vma *anon_vma)
 --- a/mm/util.c~mm-add-vm_ops-mapped-hook
 +++ a/mm/util.c
-@@ -1163,6 +1163,54 @@ void flush_dcache_folio(struct folio *fo
+@@ -1163,33 +1163,7 @@ void flush_dcache_folio(struct folio *fo
  EXPORT_SYMBOL(flush_dcache_folio);
  #endif
  
+-/**
+- * compat_vma_mmap() - Apply the file's .mmap_prepare() hook to an
+- * existing VMA and execute any requested actions.
+- * @file: The file which possesss an f_op->mmap_prepare() hook.
+- * @vma: The VMA to apply the .mmap_prepare() hook to.
+- *
+- * Ordinarily, .mmap_prepare() is invoked directly upon mmap(). However, certain
+- * stacked filesystems invoke a nested mmap hook of an underlying file.
+- *
+- * Until all filesystems are converted to use .mmap_prepare(), we must be
+- * conservative and continue to invoke these stacked filesystems using the
+- * deprecated .mmap() hook.
+- *
+- * However we have a problem if the underlying file system possesses an
+- * .mmap_prepare() hook, as we are in a different context when we invoke the
+- * .mmap() hook, already having a VMA to deal with.
+- *
+- * compat_vma_mmap() is a compatibility function that takes VMA state,
+- * establishes a struct vm_area_desc descriptor, passes to the underlying
+- * .mmap_prepare() hook and applies any changes performed by it.
+- *
+- * Once the conversion of filesystems is complete this function will no longer
+- * be required and will be removed.
+- *
+- * Returns: 0 on success or error.
+- */
+-int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
 +static int __compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
-+{
-+	struct vm_area_desc desc = {
-+		.mm = vma->vm_mm,
-+		.file = file,
-+		.start = vma->vm_start,
-+		.end = vma->vm_end,
-+
-+		.pgoff = vma->vm_pgoff,
-+		.vm_file = vma->vm_file,
-+		.vma_flags = vma->flags,
-+		.page_prot = vma->vm_page_prot,
-+
-+		.action.type = MMAP_NOTHING, /* Default */
-+	};
-+	int err;
-+
-+	err = vfs_mmap_prepare(file, &desc);
-+	if (err)
-+		return err;
-+
-+	err = mmap_action_prepare(&desc);
-+	if (err)
-+		return err;
-+
-+	set_vma_from_desc(vma, &desc);
-+	return mmap_action_complete(vma, &desc.action, /*rmap_lock_held=*/false);
-+}
-+
-+static int __compat_vma_mapped(struct file *file, struct vm_area_struct *vma)
-+{
-+	const struct vm_operations_struct *vm_ops = vma->vm_ops;
-+	void *vm_private_data = vma->vm_private_data;
-+	int err;
-+
-+	if (!vm_ops || !vm_ops->mapped)
-+		return 0;
-+
-+	err = vm_ops->mapped(vma->vm_start, vma->vm_end, vma->vm_pgoff, file,
-+			     &vm_private_data);
-+	if (err)
-+		unmap_vma_locked(vma);
-+	else if (vm_private_data != vma->vm_private_data)
-+		vma->vm_private_data = vm_private_data;
-+
-+	return err;
-+}
-+
- /**
-  * compat_vma_mmap() - Apply the file's .mmap_prepare() hook to an
-  * existing VMA and execute any requested actions.
-@@ -1191,34 +1239,26 @@ EXPORT_SYMBOL(flush_dcache_folio);
-  */
- int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
  {
--	struct vm_area_desc desc = {
--		.mm = vma->vm_mm,
--		.file = file,
--		.start = vma->vm_start,
--		.end = vma->vm_end,
--
--		.pgoff = vma->vm_pgoff,
--		.vm_file = vma->vm_file,
--		.vma_flags = vma->flags,
--		.page_prot = vma->vm_page_prot,
--
--		.action.type = MMAP_NOTHING, /* Default */
--	};
- 	int err;
- 
--	err = vfs_mmap_prepare(file, &desc);
--	if (err)
--		return err;
--
--	err = mmap_action_prepare(&desc);
-+	err = __compat_vma_mmap(file, vma);
- 	if (err)
- 		return err;
- 
--	set_vma_from_desc(vma, &desc);
--	return mmap_action_complete(vma, &desc.action);
-+	return __compat_vma_mapped(file, vma);
+ 	struct vm_area_desc desc = {
+ 		.mm = vma->vm_mm,
+@@ -1221,8 +1195,49 @@ int compat_vma_mmap(struct file *file, s
+ 	set_vma_from_desc(vma, &desc);
+ 	return mmap_action_complete(vma, action);
  }
++
++/**
++ * compat_vma_mmap() - Apply the file's .mmap_prepare() hook to an
++ * existing VMA and execute any requested actions.
++ * @file: The file which possesss an f_op->mmap_prepare() hook.
++ * @vma: The VMA to apply the .mmap_prepare() hook to.
++ *
++ * Ordinarily, .mmap_prepare() is invoked directly upon mmap(). However, certain
++ * stacked filesystems invoke a nested mmap hook of an underlying file.
++ *
++ * Until all filesystems are converted to use .mmap_prepare(), we must be
++ * conservative and continue to invoke these stacked filesystems using the
++ * deprecated .mmap() hook.
++ *
++ * However we have a problem if the underlying file system possesses an
++ * .mmap_prepare() hook, as we are in a different context when we invoke the
++ * .mmap() hook, already having a VMA to deal with.
++ *
++ * compat_vma_mmap() is a compatibility function that takes VMA state,
++ * establishes a struct vm_area_desc descriptor, passes to the underlying
++ * .mmap_prepare() hook and applies any changes performed by it.
++ *
++ * Once the conversion of filesystems is complete this function will no longer
++ * be required and will be removed.
++ *
++ * Returns: 0 on success or error.
++ */
++int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	return __compat_vma_mmap(file, vma);
++}
  EXPORT_SYMBOL(compat_vma_mmap);
  
 +int __vma_check_mmap_hook(struct vm_area_struct *vma)
@@ -306,156 +245,46 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void set_ps_flags(struct page_snapshot *ps, const struct folio *folio,
  			 const struct page *page)
  {
-@@ -1308,32 +1348,31 @@ again:
- }
- 
- static int mmap_action_finish(struct vm_area_struct *vma,
--			      struct mmap_action *action, int err)
-+			      struct mmap_action *action, int err,
-+			      bool rmap_lock_held)
- {
-+	if (rmap_lock_held)
-+		i_mmap_unlock_write(vma->vm_file->f_mapping);
-+
-+	if (!err) {
-+		if (action->success_hook)
-+			return action->success_hook(vma);
-+		return 0;
-+	}
-+
- 	/*
- 	 * If an error occurs, unmap the VMA altogether and return an error. We
- 	 * only clear the newly allocated VMA, since this function is only
- 	 * invoked if we do NOT merge, so we only clean up the VMA we created.
- 	 */
--	if (err) {
--		const size_t len = vma_pages(vma) << PAGE_SHIFT;
--
--		do_munmap(current->mm, vma->vm_start, len, NULL);
--
--		if (action->error_hook) {
--			/* We may want to filter the error. */
--			err = action->error_hook(err);
--
--			/* The caller should not clear the error. */
--			VM_WARN_ON_ONCE(!err);
--		}
--		return err;
-+	unmap_vma_locked(vma);
-+	if (action->error_hook) {
-+		/* We may want to filter the error. */
-+		err = action->error_hook(err);
-+		/* The caller should not clear the error. */
-+		VM_WARN_ON_ONCE(!err);
+@@ -1311,11 +1326,32 @@ again:
  	}
--
--	if (action->success_hook)
--		return action->success_hook(vma);
--
--	return 0;
-+	return err;
  }
  
- #ifdef CONFIG_MMU
-@@ -1364,13 +1403,15 @@ EXPORT_SYMBOL(mmap_action_prepare);
-  * mmap_action_complete - Execute VMA descriptor action.
-  * @vma: The VMA to perform the action upon.
-  * @action: The action to perform.
-+ * @rmap_lock_held: Is the file rmap lock held?
-  *
-  * Similar to mmap_action_prepare().
-  *
-  * Return: 0 on success, or error, at which point the VMA will be unmapped.
-  */
- int mmap_action_complete(struct vm_area_struct *vma,
--			 struct mmap_action *action)
-+			 struct mmap_action *action,
-+			 bool rmap_lock_held)
- 
- {
- 	int err = 0;
-@@ -1388,7 +1429,8 @@ int mmap_action_complete(struct vm_area_
- 		break;
- 	}
- 
--	return mmap_action_finish(vma, action, err);
-+	return mmap_action_finish(vma, action, err,
-+				  rmap_lock_held);
- }
- EXPORT_SYMBOL(mmap_action_complete);
- #else
-@@ -1408,7 +1450,8 @@ int mmap_action_prepare(struct vm_area_d
- EXPORT_SYMBOL(mmap_action_prepare);
- 
- int mmap_action_complete(struct vm_area_struct *vma,
--			 struct mmap_action *action)
-+			 struct mmap_action *action,
-+			 bool rmap_lock_held)
- {
- 	int err = 0;
- 
-@@ -1423,7 +1466,7 @@ int mmap_action_complete(struct vm_area_
- 		break;
- 	}
- 
--	return mmap_action_finish(vma, action, err);
-+	return mmap_action_finish(vma, action, err, rmap_lock_held);
- }
- EXPORT_SYMBOL(mmap_action_complete);
- #endif
---- a/mm/vma.c~mm-add-vm_ops-mapped-hook
-+++ a/mm/vma.c
-@@ -2731,21 +2731,28 @@ static bool can_set_ksm_flags_early(stru
- 	return false;
- }
- 
--static int call_action_complete(struct mmap_state *map,
--				struct mmap_action *action,
--				struct vm_area_struct *vma)
-+static int call_mapped_hook(struct mmap_state *map,
-+			    struct vm_area_struct *vma)
- {
--	int ret;
++static int call_vma_mapped(struct vm_area_struct *vma)
++{
 +	const struct vm_operations_struct *vm_ops = vma->vm_ops;
 +	void *vm_private_data = vma->vm_private_data;
 +	int err;
 +
 +	if (!vm_ops || !vm_ops->mapped)
 +		return 0;
++
 +	err = vm_ops->mapped(vma->vm_start, vma->vm_end, vma->vm_pgoff,
 +			     vma->vm_file, &vm_private_data);
-+	if (err) {
-+		if (map->hold_file_rmap_lock)
-+			i_mmap_unlock_write(vma->vm_file->f_mapping);
- 
--	ret = mmap_action_complete(vma, action);
--
--	/* If we held the file rmap we need to release it. */
--	if (map->hold_file_rmap_lock) {
--		struct file *file = vma->vm_file;
--
--		i_mmap_unlock_write(file->f_mapping);
-+		unmap_vma_locked(vma);
++	if (err)
 +		return err;
- 	}
--	return ret;
-+	/* Update private data if changed. */
++
 +	if (vm_private_data != vma->vm_private_data)
 +		vma->vm_private_data = vm_private_data;
 +	return 0;
- }
++}
++
+ static int mmap_action_finish(struct vm_area_struct *vma,
+ 			      struct mmap_action *action, int err)
+ {
+ 	size_t len;
  
- static unsigned long __mmap_region(struct file *file, unsigned long addr,
-@@ -2799,8 +2806,10 @@ static unsigned long __mmap_region(struc
- 	__mmap_complete(&map, vma);
++	if (!err)
++		err = call_vma_mapped(vma);
+ 	if (!err && action->success_hook)
+ 		err = action->success_hook(vma);
+ 
+--- a/mm/vma.c~mm-add-vm_ops-mapped-hook
++++ a/mm/vma.c
+@@ -2781,7 +2781,6 @@ static unsigned long __mmap_region(struc
  
  	if (have_mmap_prepare && allocated_new) {
--		error = call_action_complete(&map, &desc.action, vma);
+ 		error = mmap_action_complete(vma, &desc.action);
 -
-+		error = mmap_action_complete(vma, &desc.action,
-+					     map.hold_file_rmap_lock);
-+		if (!error)
-+			error = call_mapped_hook(&map, vma);
  		if (error)
  			return error;
  	}
@@ -485,37 +314,4 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	/* Called any time before splitting to check if it's allowed */
  	int (*may_split)(struct vm_area_struct *vma, unsigned long addr);
  	int (*mremap)(struct vm_area_struct *vma);
-@@ -1287,7 +1304,7 @@ static inline int __compat_vma_mmap(cons
- 		return err;
- 
- 	set_vma_from_desc(vma, &desc);
--	return mmap_action_complete(vma, &desc.action);
-+	return mmap_action_complete(vma, &desc.action, /*rmap_lock_held=*/false);
- }
- 
- static inline int compat_vma_mmap(struct file *file,
-@@ -1506,3 +1523,11 @@ static inline pgprot_t vma_get_page_prot
- 
- 	return vm_get_page_prot(vm_flags);
- }
-+
-+static inline void unmap_vma_locked(struct vm_area_struct *vma)
-+{
-+	const size_t len = vma_pages(vma) << PAGE_SHIFT;
-+
-+	mmap_assert_write_locked(vma->vm_mm);
-+	do_munmap(vma->vm_mm, vma->vm_start, len, NULL);
-+}
---- a/tools/testing/vma/include/stubs.h~mm-add-vm_ops-mapped-hook
-+++ a/tools/testing/vma/include/stubs.h
-@@ -87,7 +87,8 @@ static inline int mmap_action_prepare(st
- }
- 
- static inline int mmap_action_complete(struct vm_area_struct *vma,
--				       struct mmap_action *action)
-+				       struct mmap_action *action,
-+				       bool rmap_lock_held)
- {
- 	return 0;
- }
 _

@@ -1,15 +1,46 @@
 From: "Lorenzo Stoakes (Oracle)" <ljs@kernel.org>
 Subject: mm/vma: convert vma_modify_flags[_uffd]() to use vma_flags_t
-Date: Wed, 18 Mar 2026 15:50:33 +0000
+Date: Fri, 20 Mar 2026 19:38:40 +0000
 
 Update the vma_modify_flags() and vma_modify_flags_uffd() functions to
 accept a vma_flags_t parameter rather than a vm_flags_t one, and propagate
 the changes as needed to implement this change.
 
+Also add vma_flags_reset_once() in replacement of vm_flags_reset_once(). We
+still need to be careful here because we need to avoid tearing, so maintain
+the assumption that the first system word set of flags are the only ones
+that require protection from tearing, and retain this functionality.
+
+We can copy the remainder of VMA flags above 64 bits normally. But
+hopefully by the time that happens, we will have replaced the logic that
+requires these WRITE_ONCE()'s with something else.
+
+We also replace instances of vm_flags_reset() with a simple write of VMA
+flags. We are no longer perform a number of checks, most notable of all the
+VMA flags asserts becase:
+
+1. We might be operating on a VMA that is not yet added to the tree.
+
+2. We might be operating on a VMA that is now detached.
+
+3. Really in all but core code, you should be using vma_desc_xxx().
+
+4. Other VMA fields are manipulated with no such checks.
+
+5. It'd be egregious to have to add variants of flag functions just to
+   account for cases such as the above, especially when we don't do so for
+   other VMA fields. Drivers are the problematic cases and why it was
+   especially important (and also for debug as VMA locks were introduced),
+   the mmap_prepare work is solving this generally.
+
+Additionally, we can fairly safely assume by this point the soft dirty
+flags are being set correctly, so it's reasonable to drop this also.
+
 Finally, update the VMA tests to reflect this.
 
-Link: https://lkml.kernel.org/r/98a004bf89227ea9abaef5fef06ea7e584f77bcf.1773846935.git.ljs@kernel.org
+Link: https://lkml.kernel.org/r/51afbb2b8c3681003cc7926647e37335d793836e.1774034900.git.ljs@kernel.org
 Signed-off-by: Lorenzo Stoakes (Oracle) <ljs@kernel.org>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
 Cc: Albert Ou <aou@eecs.berkeley.edu>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
 Cc: Alexandre Ghiti <alex@ghiti.fr>
@@ -48,13 +79,13 @@ Cc: Sven Schnelle <svens@linux.ibm.com>
 Cc: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
 Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vineet Gupta <vgupta@kernel.org>
-Cc: Vlastimil Babka (SUSE) <vbabka@kernel.org>
 Cc: WANG Xuerui <kernel@xen0n.name>
 Cc: Will Deacon <will@kernel.org>
 Cc: xu xin <xu.xin16@zte.com.cn>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
+ include/linux/mm.h              |   22 +++++++----------
  include/linux/userfaultfd_k.h   |    3 ++
  mm/madvise.c                    |   10 ++++---
  mm/mlock.c                      |   38 ++++++++++++++++--------------
@@ -63,9 +94,45 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  mm/userfaultfd.c                |   21 +++++++++++-----
  mm/vma.c                        |   15 ++++++-----
  mm/vma.h                        |   15 +++++------
+ tools/testing/vma/include/dup.h |   22 ++++++++++-------
  tools/testing/vma/tests/merge.c |    3 --
- 9 files changed, 70 insertions(+), 53 deletions(-)
+ 11 files changed, 93 insertions(+), 74 deletions(-)
 
+--- a/include/linux/mm.h~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
++++ a/include/linux/mm.h
+@@ -954,22 +954,20 @@ static inline void vm_flags_reset(struct
+ 	vm_flags_init(vma, flags);
+ }
+ 
+-static inline void vm_flags_reset_once(struct vm_area_struct *vma,
+-				       vm_flags_t flags)
++static inline void vma_flags_reset_once(struct vm_area_struct *vma,
++					vma_flags_t *flags)
+ {
+-	vma_assert_write_locked(vma);
+-	/*
+-	 * If VMA flags exist beyond the first system word, also clear these. It
+-	 * is assumed the write once behaviour is required only for the first
+-	 * system word.
+-	 */
++	const unsigned long word = flags->__vma_flags[0];
++
++	/* It is assumed only the first system word must be written once. */
++	vma_flags_overwrite_word_once(&vma->flags, word);
++	/* The remainder can be copied normally. */
+ 	if (NUM_VMA_FLAG_BITS > BITS_PER_LONG) {
+-		unsigned long *bitmap = vma->flags.__vma_flags;
++		unsigned long *dst = &vma->flags.__vma_flags[1];
++		const unsigned long *src = &flags->__vma_flags[1];
+ 
+-		bitmap_zero(&bitmap[1], NUM_VMA_FLAG_BITS - BITS_PER_LONG);
++		bitmap_copy(dst, src, NUM_VMA_FLAG_BITS - BITS_PER_LONG);
+ 	}
+-
+-	vma_flags_overwrite_word_once(&vma->flags, flags);
+ }
+ 
+ static inline void vm_flags_set(struct vm_area_struct *vma,
 --- a/include/linux/userfaultfd_k.h~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
 +++ a/include/linux/userfaultfd_k.h
 @@ -23,6 +23,9 @@
@@ -145,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		vma_flags_set(new_vma_flags, VMA_IO_BIT);
  	vma_start_write(vma);
 -	vm_flags_reset_once(vma, newflags);
-+	WRITE_ONCE(vma->flags, *new_vma_flags);
++	vma_flags_reset_once(vma, new_vma_flags);
  
  	lru_add_drain();
  	walk_page_range(vma->vm_mm, start, end, &mlock_walk_ops, NULL);
@@ -156,7 +223,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		vm_flags_reset_once(vma, newflags);
 +	if (vma_flags_test(new_vma_flags, VMA_IO_BIT)) {
 +		vma_flags_clear(new_vma_flags, VMA_IO_BIT);
-+		WRITE_ONCE(vma->flags, *new_vma_flags);
++		vma_flags_reset_once(vma, new_vma_flags);
  	}
  }
  
@@ -238,7 +305,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 */
  	vma_start_write(vma);
 -	vm_flags_reset_once(vma, newflags);
-+	WRITE_ONCE(vma->flags, new_vma_flags);
++	vma_flags_reset_once(vma, &new_vma_flags);
  	if (vma_wants_manual_pte_write_upgrade(vma))
  		mm_cp_flags |= MM_CP_TRY_CHANGE_WRITABLE;
  	vma_set_page_prot(vma);
@@ -253,7 +320,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 --- a/mm/mseal.c~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
 +++ a/mm/mseal.c
 @@ -68,14 +68,17 @@ static int mseal_apply(struct mm_struct
- 	for_each_vma_range(vmi, vma, end) {
+ 		const unsigned long curr_start = MAX(vma->vm_start, start);
  		const unsigned long curr_end = MIN(vma->vm_end, end);
  
 -		if (!(vma->vm_flags & VM_SEALED)) {
@@ -276,7 +343,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		prev = vma;
 --- a/mm/userfaultfd.c~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
 +++ a/mm/userfaultfd.c
-@@ -2093,6 +2093,9 @@ struct vm_area_struct *userfaultfd_clear
+@@ -1976,6 +1976,9 @@ struct vm_area_struct *userfaultfd_clear
  {
  	struct vm_area_struct *ret;
  	bool give_up_on_oom = false;
@@ -286,7 +353,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * If we are modifying only and not splitting, just give up on the merge
-@@ -2106,8 +2109,8 @@ struct vm_area_struct *userfaultfd_clear
+@@ -1989,8 +1992,8 @@ struct vm_area_struct *userfaultfd_clear
  		uffd_wp_range(vma, start, end - start, false);
  
  	ret = vma_modify_flags_uffd(vmi, prev, vma, start, end,
@@ -297,7 +364,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * In the vma_merge() successful mprotect-like case 8:
-@@ -2127,10 +2130,11 @@ int userfaultfd_register_range(struct us
+@@ -2010,10 +2013,11 @@ int userfaultfd_register_range(struct us
  			       unsigned long start, unsigned long end,
  			       bool wp_async)
  {
@@ -310,7 +377,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (vma->vm_start < start)
  		prev = vma;
-@@ -2141,23 +2145,26 @@ int userfaultfd_register_range(struct us
+@@ -2024,23 +2028,26 @@ int userfaultfd_register_range(struct us
  		VM_WARN_ON_ONCE(!vma_can_userfault(vma, vm_flags, wp_async));
  		VM_WARN_ON_ONCE(vma->vm_userfaultfd_ctx.ctx &&
  				vma->vm_userfaultfd_ctx.ctx != ctx);
@@ -440,6 +507,38 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		struct vm_userfaultfd_ctx new_ctx, bool give_up_on_oom);
  
  __must_check struct vm_area_struct *vma_merge_new_range(struct vma_merge_struct *vmg);
+--- a/tools/testing/vma/include/dup.h~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
++++ a/tools/testing/vma/include/dup.h
+@@ -871,16 +871,20 @@ static inline void vm_flags_reset(struct
+ 	vm_flags_init(vma, flags);
+ }
+ 
+-static inline void vm_flags_reset_once(struct vm_area_struct *vma,
+-				       vm_flags_t flags)
++static inline void vma_flags_reset_once(struct vm_area_struct *vma,
++					vma_flags_t *flags)
+ {
+-	vma_assert_write_locked(vma);
+-	/*
+-	 * The user should only be interested in avoiding reordering of
+-	 * assignment to the first word.
+-	 */
+-	vma_flags_clear_all(&vma->flags);
+-	vma_flags_overwrite_word_once(&vma->flags, flags);
++	const unsigned long word = flags->__vma_flags[0];
++
++	/* It is assumed only the first system word must be written once. */
++	vma_flags_overwrite_word_once(&vma->flags, word);
++	/* The remainder can be copied normally. */
++	if (NUM_VMA_FLAG_BITS > BITS_PER_LONG) {
++		unsigned long *dst = &vma->flags.__vma_flags[1];
++		const unsigned long *src = &flags->__vma_flags[1];
++
++		bitmap_copy(dst, src, NUM_VMA_FLAG_BITS - BITS_PER_LONG);
++	}
+ }
+ 
+ static inline void vm_flags_set(struct vm_area_struct *vma,
 --- a/tools/testing/vma/tests/merge.c~mm-vma-convert-vma_modify_flags-to-use-vma_flags_t
 +++ a/tools/testing/vma/tests/merge.c
 @@ -132,7 +132,6 @@ static bool test_simple_modify(void)
