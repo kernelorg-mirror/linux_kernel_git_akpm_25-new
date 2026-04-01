@@ -1,6 +1,6 @@
 From: Hao Ge <hao.ge@linux.dev>
 Subject: mm/alloc_tag: clear codetag for pages allocated before page_ext initialization
-Date: Thu, 26 Mar 2026 22:05:54 +0800
+Date: Fri, 27 Mar 2026 16:06:23 +0800
 
 Due to initialization ordering, page_ext is allocated and initialized
 relatively late during boot.  Some pages have already been allocated and
@@ -21,7 +21,9 @@ warning if this limit is exceeded.  When page_ext initialization
 completes, set their codetag to empty to avoid warnings when they are
 freed later.
 
-The following warning is observed when this issue occurs:
+This warning is only observed with CONFIG_MEM_ALLOC_PROFILING_DEBUG=Y
+and mem_profiling_compressed disabled:
+
 [    9.582133] ------------[ cut here ]------------
 [    9.582137] alloc_tag was not set
 [    9.582139] WARNING: ./include/linux/alloc_tag.h:164 at __pgalloc_tag_sub+0x40f/0x550, CPU#5: systemd/1
@@ -82,35 +84,35 @@ The following warning is observed when this issue occurs:
 [    9.582292]  </TASK>
 [    9.582293] ---[ end trace 0000000000000000 ]---
 
-Link: https://lkml.kernel.org/r/20260326140554.191996-1-hao.ge@linux.dev
-Fixes: 93d5440ece3c ("alloc_tag: uninline code gated by mem_alloc_profiling_key in page allocator")
+Link: https://lkml.kernel.org/r/20260327080623.123212-1-hao.ge@linux.dev
+Fixes: dcfe378c81f72 ("lib: introduce support for page allocation tagging")
 Signed-off-by: Hao Ge <hao.ge@linux.dev>
 Suggested-by: Suren Baghdasaryan <surenb@google.com>
-Cc: Brendan Jackman <jackmanb@google.com>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
-Cc: Michal Hocko <mhocko@suse.com>
-Cc: Vlastimil Babka <vbabka@kernel.org>
-Cc: Zi Yan <ziy@nvidia.com>
+Acked-by: Suren Baghdasaryan <surenb@google.com>
+Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/alloc_tag.h   |    2 
  include/linux/pgalloc_tag.h |    2 
- lib/alloc_tag.c             |   92 ++++++++++++++++++++++++++++++++++
- mm/page_alloc.c             |    7 ++
- 4 files changed, 102 insertions(+), 1 deletion(-)
+ lib/alloc_tag.c             |  109 ++++++++++++++++++++++++++++++++++
+ mm/page_alloc.c             |   10 ++-
+ 4 files changed, 121 insertions(+), 2 deletions(-)
 
 --- a/include/linux/alloc_tag.h~mm-alloc_tag-clear-codetag-for-pages-allocated-before-page_ext-initialization
 +++ a/include/linux/alloc_tag.h
-@@ -74,6 +74,8 @@ static inline void set_codetag_empty(uni
- 
- #ifdef CONFIG_MEM_ALLOC_PROFILING
- 
+@@ -163,9 +163,11 @@ static inline void alloc_tag_sub_check(u
+ {
+ 	WARN_ONCE(ref && !ref->ct, "alloc_tag was not set\n");
+ }
 +void alloc_tag_add_early_pfn(unsigned long pfn);
-+
- #define ALLOC_TAG_SECTION_NAME	"alloc_tags"
+ #else
+ static inline void alloc_tag_add_check(union codetag_ref *ref, struct alloc_tag *tag) {}
+ static inline void alloc_tag_sub_check(union codetag_ref *ref) {}
++static inline void alloc_tag_add_early_pfn(unsigned long pfn) {}
+ #endif
  
- struct codetag_bytes {
+ /* Caller should verify both ref and tag to be valid */
 --- a/include/linux/pgalloc_tag.h~mm-alloc_tag-clear-codetag-for-pages-allocated-before-page_ext-initialization
 +++ a/include/linux/pgalloc_tag.h
 @@ -181,7 +181,7 @@ static inline struct alloc_tag *__pgallo
@@ -124,20 +126,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
 --- a/lib/alloc_tag.c~mm-alloc_tag-clear-codetag-for-pages-allocated-before-page_ext-initialization
 +++ a/lib/alloc_tag.c
-@@ -6,6 +6,7 @@
+@@ -6,7 +6,9 @@
  #include <linux/kallsyms.h>
  #include <linux/module.h>
  #include <linux/page_ext.h>
 +#include <linux/pgalloc_tag.h>
  #include <linux/proc_fs.h>
++#include <linux/rcupdate.h>
  #include <linux/seq_buf.h>
  #include <linux/seq_file.h>
-@@ -26,6 +27,96 @@ static bool mem_profiling_support;
- 
- static struct codetag_type *alloc_tag_cttype;
+ #include <linux/string_choices.h>
+@@ -758,8 +760,115 @@ static __init bool need_page_alloc_taggi
+ 	return mem_profiling_support;
+ }
  
 +#ifdef CONFIG_MEM_ALLOC_PROFILING_DEBUG
-+
 +/*
 + * Track page allocations before page_ext is initialized.
 + * Some pages are allocated before page_ext becomes available, leaving
@@ -151,6 +154,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 + *
 + * For simplicity, we fix the size to 8192.
 + * If insufficient, a warning will be triggered to alert the user.
++ *
++ * TODO: Replace fixed-size array with dynamic allocation using
++ * a GFP flag similar to ___GFP_NO_OBJ_EXT to avoid recursion.
 + */
 +#define EARLY_ALLOC_PFN_MAX		8192
 +
@@ -174,21 +180,34 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	early_pfns[old_idx] = pfn;
 +}
 +
-+static void (*alloc_tag_add_early_pfn_ptr)(unsigned long pfn) __refdata =
++typedef void (*alloc_tag_add_func)(unsigned long pfn);
++static alloc_tag_add_func __rcu alloc_tag_add_early_pfn_ptr __refdata =
 +		__alloc_tag_add_early_pfn;
 +
 +void alloc_tag_add_early_pfn(unsigned long pfn)
 +{
++	alloc_tag_add_func alloc_tag_add;
++
 +	if (static_key_enabled(&mem_profiling_compressed))
 +		return;
 +
-+	if (alloc_tag_add_early_pfn_ptr)
-+		alloc_tag_add_early_pfn_ptr(pfn);
++	rcu_read_lock();
++	alloc_tag_add = rcu_dereference(alloc_tag_add_early_pfn_ptr);
++	if (alloc_tag_add)
++		alloc_tag_add(pfn);
++	rcu_read_unlock();
 +}
 +
 +static void __init clear_early_alloc_pfn_tag_refs(void)
 +{
 +	unsigned int i;
++
++	if (static_key_enabled(&mem_profiling_compressed))
++		return;
++
++	rcu_assign_pointer(alloc_tag_add_early_pfn_ptr, NULL);
++	/* Make sure we are not racing with __alloc_tag_add_early_pfn() */
++	synchronize_rcu();
 +
 +	for (i = 0; i < atomic_read(&early_pfn_count); i++) {
 +		unsigned long pfn = early_pfns[i];
@@ -204,6 +223,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +				 * after its page_ext is initialized but before we clear it.
 +				 * In that case, it already has a valid tag set.
 +				 * We should not overwrite that valid tag with CODETAG_EMPTY.
++				 *
++				 * Note: there is still a small race window between checking
++				 * ref.ct and calling set_codetag_empty(). We accept this
++				 * race as it's unlikely and the extra complexity of atomic
++				 * cmpxchg is not worth it for this debug-only code path.
 +				 */
 +				if (ref.ct) {
 +					put_page_tag_ref(handle);
@@ -217,20 +241,11 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		}
 +
 +	}
-+	atomic_set(&early_pfn_count, 0);
-+
-+	alloc_tag_add_early_pfn_ptr = NULL;
 +}
 +#else /* !CONFIG_MEM_ALLOC_PROFILING_DEBUG */
-+inline void alloc_tag_add_early_pfn(unsigned long pfn) {}
 +static inline void __init clear_early_alloc_pfn_tag_refs(void) {}
-+#endif
++#endif /* CONFIG_MEM_ALLOC_PROFILING_DEBUG */
 +
- #ifdef CONFIG_ARCH_MODULE_NEEDS_WEAK_PER_CPU
- DEFINE_PER_CPU(struct alloc_tag_counters, _shared_alloc_tag);
- EXPORT_SYMBOL(_shared_alloc_tag);
-@@ -760,6 +851,7 @@ static __init bool need_page_alloc_taggi
- 
  static __init void init_page_alloc_tagging(void)
  {
 +	clear_early_alloc_pfn_tag_refs();
@@ -239,7 +254,12 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct page_ext_operations page_alloc_tagging_ops = {
 --- a/mm/page_alloc.c~mm-alloc_tag-clear-codetag-for-pages-allocated-before-page_ext-initialization
 +++ a/mm/page_alloc.c
-@@ -1256,6 +1256,13 @@ void __pgalloc_tag_add(struct page *page
+@@ -1252,10 +1252,18 @@ void __pgalloc_tag_add(struct page *page
+ 	union pgtag_ref_handle handle;
+ 	union codetag_ref ref;
+ 
+-	if (get_page_tag_ref(page, &ref, &handle)) {
++	if (likely(get_page_tag_ref(page, &ref, &handle))) {
  		alloc_tag_add(&ref, task->alloc_tag, PAGE_SIZE * nr);
  		update_page_tag_ref(handle, &ref);
  		put_page_tag_ref(handle);
@@ -249,7 +269,8 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		 * clear the tag ref later when page_ext is initialized.
 +		 */
 +		alloc_tag_add_early_pfn(page_to_pfn(page));
-+		alloc_tag_set_inaccurate(current->alloc_tag);
++		if (task->alloc_tag)
++			alloc_tag_set_inaccurate(task->alloc_tag);
  	}
  }
  
