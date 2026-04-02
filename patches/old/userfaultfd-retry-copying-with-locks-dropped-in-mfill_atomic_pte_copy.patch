@@ -1,6 +1,6 @@
 From: "Mike Rapoport (Microsoft)" <rppt@kernel.org>
 Subject: userfaultfd: retry copying with locks dropped in mfill_atomic_pte_copy()
-Date: Fri, 6 Mar 2026 19:18:05 +0200
+Date: Mon, 30 Mar 2026 13:11:06 +0300
 
 Implementation of UFFDIO_COPY for anonymous memory might fail to copy data
 from userspace buffer when the destination VMA is locked (either with
@@ -21,17 +21,16 @@ loop in mfill_atomic() won't retry copiyng outside of mmap_lock.  This is
 removed later when shmem implementation will be updated later and the loop
 in mfill_atomic() will be adjusted.
 
-[avagin@google.com: fix lock leak in mfill_get_vma()]
-  Link: https://lkml.kernel.org/r/20260316173829.1126728-1-avagin@google.com
 [akpm@linux-foundation.org: update mfill_copy_folio_retry()]
   Link: https://lkml.kernel.org/r/20260316173829.1126728-1-avagin@google.com
 Link: https://lkml.kernel.org/r/20260306171815.3160826-6-rppt@kernel.org
+Link: https://lkml.kernel.org/r/20260330101116.1117699-6-rppt@kernel.org
 Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
-Signed-off-by: Andrei Vagin <avagin@google.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: David Hildenbrand <david@kernel.org>
+Cc: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Harry Yoo <harry.yoo@oracle.com>
 Cc: Hugh Dickins <hughd@google.com>
 Cc: James Houghton <jthoughton@google.com>
 Cc: Liam Howlett <liam.howlett@oracle.com>
@@ -50,48 +49,12 @@ Cc: Vlastimil Babka <vbabka@suse.cz>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/userfaultfd.c |   87 ++++++++++++++++++++++++++++++---------------
- 1 file changed, 58 insertions(+), 29 deletions(-)
+ mm/userfaultfd.c |   79 ++++++++++++++++++++++++++++++---------------
+ 1 file changed, 53 insertions(+), 26 deletions(-)
 
 --- a/mm/userfaultfd.c~userfaultfd-retry-copying-with-locks-dropped-in-mfill_atomic_pte_copy
 +++ a/mm/userfaultfd.c
-@@ -159,6 +159,9 @@ static void uffd_mfill_unlock(struct vm_
- 
- static void mfill_put_vma(struct mfill_state *state)
- {
-+	if (!state->vma)
-+		return;
-+
- 	up_read(&state->ctx->map_changing_lock);
- 	uffd_mfill_unlock(state->vma);
- 	state->vma = NULL;
-@@ -185,6 +188,7 @@ static int mfill_get_vma(struct mfill_st
- 	 * request the user to retry later
- 	 */
- 	down_read(&ctx->map_changing_lock);
-+	state->vma = dst_vma;
- 	err = -EAGAIN;
- 	if (atomic_read(&ctx->mmap_changing))
- 		goto out_unlock;
-@@ -207,7 +211,7 @@ static int mfill_get_vma(struct mfill_st
- 		goto out_unlock;
- 
- 	if (is_vm_hugetlb_page(dst_vma))
--		goto out;
-+		return 0;
- 
- 	if (!vma_is_anonymous(dst_vma) && !vma_is_shmem(dst_vma))
- 		goto out_unlock;
-@@ -215,8 +219,6 @@ static int mfill_get_vma(struct mfill_st
- 	    uffd_flags_mode_is(flags, MFILL_ATOMIC_CONTINUE))
- 		goto out_unlock;
- 
--out:
--	state->vma = dst_vma;
- 	return 0;
- 
- out_unlock:
-@@ -403,35 +405,63 @@ static int mfill_copy_folio_locked(struc
+@@ -405,35 +405,63 @@ static int mfill_copy_folio_locked(struc
  	return ret;
  }
  
@@ -176,7 +139,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	/*
-@@ -441,17 +471,16 @@ static int mfill_atomic_pte_copy(struct
+@@ -443,17 +471,16 @@ static int mfill_atomic_pte_copy(struct
  	 */
  	__folio_mark_uptodate(folio);
  
