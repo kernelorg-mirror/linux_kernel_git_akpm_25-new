@@ -1,0 +1,95 @@
+From: Frederick Mayle <fmayle@google.com>
+Subject: mm: limit filemap_fault readahead to VMA boundaries
+Date: Sun, 26 Apr 2026 20:01:47 -0700
+
+When a file mapping covers a strict subset of a file, an access to the
+mapping can trigger readahead of file pages outside the mapped region. 
+Readahead is meant to prefetch pages likely to be accessed soon, but these
+pages aren't accessible via the same means, so it fair to say we don't
+have a good indicator they'll be accessed soon.  Take an ELF file for
+example: an access to the end of a program's read-only segment isn't a
+sign that nearby file contents will be accessed next (they are likely to
+be mapped discontiguously, or not at all).  The pressure from loading
+these pages into the cache can evict more useful pages.
+
+To improve the behavior, make three changes:
+
+* Introduce a new readahead_control field, max_index, as a hard limit on
+  the readahead. The existing file_ra_state->size can't be used as a
+  limit, it is more of a hint and can be increased by various
+  heuristics.
+* Set readahead_control->max_index to the end of the VMA in all of the
+  readahead paths that can be triggered from a fault on a file mapping
+  (both "sync" and "async" readahead).
+* Limit the read-around range start to the VMA's start.
+
+Note that these changes only affect readahead triggered in the context of
+a fault, they do not affect readahead triggered by read syscalls.  If a
+user mixes the two types of accesses, the behavior is expected to be the
+following: if a fault causes readahead and places a PG_readahead marker
+and then a read(2) syscall hits the PG_readahead marker, the resulting
+async readahead *will not* be limited to the VMA end.  Conversely, if a
+read(2) syscall places a PG_readahead marker and then a fault hits the
+marker, the async readahead *will* be limited to the VMA end.
+
+There is an edge case that the above motivation glosses over: A single
+file mapping might be backed by multiple VMAs.  For example, a whole file
+could be mapped RW, then part of the mapping made RO using mprotect.  This
+patch would hurt performance of a sequential faulted read of such a
+mapping, the degree depending on how fragmented the VMAs are.  A usage
+pattern like that is likely rare and already suffering from sub-optimal
+performance because, e.g., the fragmented VMAs limit the fault-around, so
+each VMA boundary in a sequential faulted read would cause a minor fault. 
+Still, this patch would make it worse.  See a previous discussion of this
+topic at [1].
+
+Tested by mapping and reading a small subset of a large file, then using
+the cachestat syscall to verify the number of cached pages didn't exceed
+the mapping size.
+
+In practical scenarios, the effect depends on the specific file and usage.
+Sometimes there is no effect at all, but, for some ELF files in Android,
+we see ~20% fewer pages pulled into the cache.
+
+A comprehensive performance evaluation hasn't been done, but, in addition
+to the anecdontal memory savings mentioned above, a benchmark was run with
+fio 3.38, showing neutral looking results:
+
+    /data/local/tmp/fio --version
+
+    fio --name=mmap_test --ioengine=mmap --rw=read --bs=4k \
+        --offset=1G --size=1G --filesize=3G --numjobs=1 \
+        --filename=testfile.bin
+
+        Before: 4366.6 MiB/s (avg of 3459, 4592, 4613, 4697, 4472)
+        After:  4444.0 MiB/s (avg of 4633, 4655, 4511, 4571, 3850)
+                +1.7%
+
+    Same, with --ioengine=mmap --rw=randread
+
+        Before: 445.6 MiB/s  (avg of 446, 447, 442, 452, 441)
+        After:  447.0 MiB/s  (avg of 447, 446, 446, 451, 445)
+                +0.3%
+
+    Same, with --ioengine=psync --rw=read
+
+        Before: 3086.6 MiB/s (avg of 3122, 3094, 3066, 3094, 3057)
+        After:  3084.6 MiB/s (avg of 3039, 3103, 3103, 3084, 3094)
+                -0.06%
+
+    Same, with --ioengine=psync --rw=randread
+
+        Before: 2226.4 MiB/s (avg of 2256, 2183, 2207, 2265, 2221)
+        After:  2231.4 MiB/s (avg of 2236, 2241, 2236, 2193, 2251)
+                +0.2%
+
+
+Link: https://lore.kernel.org/20260427030148.653228-1-fmayle@google.com
+Link: https://lore.kernel.org/all/ivnv2crd3et76p2nx7oszuqhzzah756oecn5yuykzqfkqzoygw@yvnlkhjjssoz/ [1]
+Signed-off-by: Frederick Mayle <fmayle@google.com>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Kalesh Singh <kaleshsingh@google.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Matthew Wilcox <willy@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
