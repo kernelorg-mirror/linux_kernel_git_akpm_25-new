@@ -1,0 +1,58 @@
+From: Michael Bommarito <michael.bommarito@gmail.com>
+Subject: ocfs2: reject regular files with non-zero i_size and zero i_clusters
+Date: Sun, 17 May 2026 07:10:14 -0400
+
+On a volume mounted WITHOUT OCFS2_FEATURE_INCOMPAT_SPARSE_ALLOC, a regular
+file with non-zero i_size, zero i_clusters, and no OCFS2_INLINE_DATA_FL
+flag is structurally malformed: the extent map declares no allocated
+clusters yet the size header claims the file has content. 
+ocfs2_populate_inode() copies i_size into the in-core inode and dispatches
+to ocfs2_aops; subsequent reads or truncates then operate on an
+inconsistent extent state.
+
+This is the shape an attacker who keeps the rest of the extent list intact
+(to satisfy the inline-data, refcount, chain-list, and per-field
+validators already in this function) would produce when forging only the
+inode header to publish a synthetic file size on a victim node.  It is
+also the shape on-disk corruption of the i_clusters field produces. 
+Reject early in the validator.
+
+The check is restricted to non-sparse volumes (ocfs2_sparse_alloc()
+returns false).  On non-sparse mounts the allocator path always grows
+clusters before i_size: ocfs2_extend_file() takes the !sparse branch into
+ocfs2_extend_no_holes(), which calls ocfs2_extend_allocation() to journal
+new clusters first, and only then ocfs2_simple_size_update() journals the
+larger i_size.  The truncate path likewise lowers i_size in
+ocfs2_orphan_for_truncate() and then frees clusters in
+ocfs2_commit_truncate(), which uses ocfs2_clusters_for_bytes(new_i_size)
+as its new_highest_cpos: when new_i_size > 0 the floor is at least one
+cluster, so the on-disk dinode never legitimately exposes a non-inline
+regular file with i_size > 0 and i_clusters == 0 on a non-sparse volume.
+
+On sparse-alloc volumes the same shape is legitimate: an
+ocfs2_extend_file() call goes through ocfs2_zero_extend() +
+ocfs2_simple_size_update(), which grows i_size on its own without changing
+i_clusters; a freshly truncate -s 1M of a sparse regular file is therefore
+on-disk (i_size = 1048576, i_clusters = 0).  The check therefore opts out
+via ocfs2_sparse_alloc(OCFS2_SB(sb)).
+
+System inodes (OCFS2_SYSTEM_FL) carry their own size and cluster
+invariants validated by the allocator, journal, quota, and truncate-log
+subsystems; skip them here.  The inline-data fast path is filtered
+separately by its own dedicated branch below: its well-formed case is
+exactly i_clusters == 0 with i_size <= id_count.  Symlinks legitimately
+keep i_clusters == 0 with non-zero i_size (fast symlinks), so this check
+is restricted to S_IFREG.
+
+Link: https://lore.kernel.org/20260517111015.3187935-4-michael.bommarito@gmail.com
+Fixes: b657c95c1108 ("ocfs2: Wrap inode block reads in a dedicated function.")
+Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+Assisted-by: Claude:claude-opus-4-7
+Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Changwei Ge <gechangwei@live.cn>
+Cc: Jun Piao <piaojun@huawei.com>
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: <stable@vger.kernel.org>
