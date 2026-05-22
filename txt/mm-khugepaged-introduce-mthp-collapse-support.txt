@@ -1,0 +1,138 @@
+From: Nico Pache <npache@redhat.com>
+Subject: mm/khugepaged: Introduce mTHP collapse support
+Date: Fri, 22 May 2026 09:00:06 -0600
+
+Enable khugepaged to collapse to mTHP orders.  This patch implements the
+main scanning logic using a bitmap to track occupied pages and a stack
+structure that allows us to find optimal collapse sizes.
+
+Previous to this patch, PMD collapse had 3 main phases, a light weight
+scanning phase (mmap_read_lock) that determines a potential PMD collapse,
+an alloc phase (mmap unlocked), then finally heavier collapse phase
+(mmap_write_lock).
+
+To enabled mTHP collapse we make the following changes:
+
+During PMD scan phase, track occupied pages in a bitmap.  When mTHP orders
+are enabled, we remove the restriction of max_ptes_none during the scan
+phase to avoid missing potential mTHP collapse candidates.  Once we have
+scanned the full PMD range and updated the bitmap to track occupied pages,
+we use the bitmap to find the optimal mTHP size.
+
+Implement collapse_scan_bitmap() to perform binary recursion on the bitmap
+and determine the best eligible order for the collapse.  A stack structure
+is used instead of traditional recursion to manage the search.  This also
+prevents a traditional recursive approach when the kernel stack struct is
+limited.  The algorithm recursively splits the bitmap into smaller chunks
+to find the highest order mTHPs that satisfy the collapse criteria.  We
+start by attempting the PMD order, then moved on the consecutively lower
+orders (mTHP collapse).  The stack maintains a pair of variables (offset,
+order), indicating the number of PTEs from the start of the PMD, and the
+order of the potential collapse candidate.
+
+The algorithm for consuming the bitmap works as such:
+    1) push (0, HPAGE_PMD_ORDER) onto the stack
+    2) pop the stack
+    3) check if the number of set bits in that (offset,order) pair
+       statisfy the max_ptes_none threshold for that order
+    4) if yes, attempt collapse
+    5) if no (or collapse fails), push two new stack items representing
+       the left and right halves of the current bitmap range, at the
+       next lower order
+    6) repeat at step (2) until stack is empty.
+
+Below is a diagram representing the algorithm and stack items:
+
+                            offset   mid_offset
+                            |        |
+                            |        |
+                            v        v
+          ____________________________________
+         |          PTE Page Table            |
+         --------------------------------------
+			    <-------><------->
+                             order-1  order-1
+
+mTHP collapses reject regions containing swapped out or shared pages. 
+This is because adding new entries can lead to new none pages, and these
+may lead to constant promotion into a higher order mTHP.  A similar issue
+can occur with "max_ptes_none > HPAGE_PMD_NR/2" due to a collapse
+introducing at least 2x the number of pages, and on a future scan will
+satisfy the promotion condition once again.  This issue is prevented via
+the collapse_max_ptes_none() function which imposes the max_ptes_none
+restrictions above.
+
+We currently only support mTHP collapse for max_ptes_none values of 0 and
+HPAGE_PMD_NR - 1.  resulting in the following behavior:
+
+    - max_ptes_none=0: Never introduce new empty pages during collapse
+    - max_ptes_none=HPAGE_PMD_NR-1: Always try collapse to the highest
+      available mTHP order
+
+Any other max_ptes_none value will emit a warning and default mTHP
+collapse to max_ptes_none=0.  There should be no behavior change for PMD
+collapse.
+
+Once we determine what mTHP sizes fits best in that PMD range a collapse
+is attempted.  A minimum collapse order of 2 is used as this is the lowest
+order supported by anon memory as defined by THP_ORDERS_ALL_ANON.
+
+Currently madv_collapse is not supported and will only attempt PMD
+collapse.
+
+We can also remove the check for is_khugepaged inside the PMD scan as the
+collapse_max_ptes_none() function handles this logic now.
+
+Link: https://lore.kernel.org/20260522150009.121603-12-npache@redhat.com
+Signed-off-by: Nico Pache <npache@redhat.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: "Huang, Ying" <ying.huang@linux.alibaba.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Nanyong Sun <sunnanyong@huawei.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Rafael Aquini <raquini@redhat.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Shivank Garg <shivankg@amd.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Takashi Iwai (SUSE) <tiwai@suse.de>
+Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
+Cc: Usama Arif <usamaarif642@gmail.com>
+Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
+Cc: Vlastimil Babka <vbabka@suse.cz>
+Cc: Wei Yang <richard.weiyang@gmail.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Yang Shi <yang@os.amperecomputing.com>
+Cc: Zach O'Keefe <zokeefe@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
+Cc: Usama Arif <usama.arif@linux.dev>
