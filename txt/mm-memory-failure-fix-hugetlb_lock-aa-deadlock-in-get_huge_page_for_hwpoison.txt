@@ -1,0 +1,54 @@
+From: Wupeng Ma <mawupeng1@huawei.com>
+Subject: mm/memory-failure: fix hugetlb_lock AA deadlock in get_huge_page_for_hwpoison
+Date: Fri, 22 May 2026 09:03:05 +0800
+
+Two concurrent madvise(MADV_HWPOISON) calls on the same hugetlb page can
+trigger a recursive spinlock self-deadlock (AA deadlock) on hugetlb_lock
+when racing with a concurrent unmap:
+
+  thread#0                              thread#1
+  --------                              --------
+  madvise(folio, MADV_HWPOISON)
+    -> poisons the folio successfully
+  madvise(folio, MADV_HWPOISON)         unmap(folio)
+    try_memory_failure_hugetlb
+      get_huge_page_for_hwpoison
+        spin_lock_irq(&hugetlb_lock)    <- held
+        __get_huge_page_for_hwpoison
+          hugetlb_update_hwpoison()
+            -> MF_HUGETLB_FOLIO_PRE_POISONED
+          goto out:
+            folio_put()
+              refcount: 1 -> 0
+              free_huge_folio()
+                spin_lock_irqsave(&hugetlb_lock)
+                  -> AA DEADLOCK!
+
+The out: path in __get_huge_page_for_hwpoison() calls folio_put() to drop
+the GUP reference while the hugetlb_lock is still held by the hugetlb.c
+wrapper get_huge_page_for_hwpoison().  If concurrent unmap has released
+the page table mapping reference, folio_put() drops the folio refcount to
+zero, triggering free_huge_folio() which attempts to re-acquire the
+non-recursive hugetlb_lock.
+
+Fix this by moving hugetlb_lock acquisition from the hugetlb.c wrapper
+into get_huge_page_for_hwpoison().  Place spin_unlock_irq() before the
+folio_put() at the out: label so the folio is always released outside the
+lock.
+
+Link: https://lore.kernel.org/20260522010305.4099834-1-mawupeng1@huawei.com
+Fixes: 405ce051236c ("mm/hwpoison: fix race between hugetlb free/demotion and memory_failure_hugetlb()")
+Signed-off-by: Wupeng Ma <mawupeng1@huawei.com>
+Acked-by: Oscar Salvador (SUSE) <osalvador@kernel.org>
+Acked-by: Muchun Song <muchun.song@linux.dev>
+Reviewed-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Acked-by: Miaohe Lin <linmiaohe@huawei.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Liam Howlett <liam.howlett@oracle.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: <stable@vger.kernel.org>
