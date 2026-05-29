@@ -1,6 +1,6 @@
 From: "JP Kobryn (Meta)" <jp.kobryn@linux.dev>
 Subject: mm/lruvec: preemptively free dead folios during lru_add drain
-Date: Thu, 23 Apr 2026 09:43:07 -0700
+Date: Fri, 24 Apr 2026 22:34:17 -0700
 
 Of all observable lruvec lock contention in our fleet, we find that ~24%
 occurs when dead folios are present in lru_add batches at drain time. 
@@ -12,6 +12,10 @@ Eliminate this overhead by preemptively cleaning up dead folios before
 they make it into the LRU.  Use folio_ref_freeze() to filter folios whose
 only remaining refcount is the batch ref.  When dead folios are found,
 move them off the add batch and onto a temporary batch to be freed.
+
+PG_active may be set on a batched folio as well as PG_unevictable (via
+migration path).  Since filtered folios bypass the normal lru_add()
+cleanup, both flags must be cleared before freeing.
 
 During A/B testing on one of our prod instagram workloads (high-frequency
 short-lived requests), the patch intercepted almost all dead folios before
@@ -38,9 +42,13 @@ No regressions were observed in requests served per second or request tail
 latency (p99).  Both metrics showed directional improvement at higher CPU
 utilization (comparing 85% to 95%).
 
-Link: https://lore.kernel.org/20260423164307.29805-1-jp.kobryn@linux.dev
+Note that tests were performed using classic LRU.
+
+Link: https://lore.kernel.org/20260425053417.351146-1-jp.kobryn@linux.dev
 Signed-off-by: JP Kobryn (Meta) <jp.kobryn@linux.dev>
 Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Michal Hocko <mhocko@suse.com>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: Baoquan He <bhe@redhat.com>
 Cc: Barry Song <baohua@kernel.org>
@@ -48,23 +56,19 @@ Cc: Chris Li <chrisl@kernel.org>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kairui Song <kasong@tencent.com>
 Cc: Kemeng Shi <shikemeng@huaweicloud.com>
-Cc: Michal Hocko <mhocko@suse.com>
 Cc: Nhat Pham <nphamcs@gmail.com>
-Cc: Qi Zheng <qi.zheng@linux.dev>
 Cc: Rik van Riel <riel@surriel.com>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Wei Xu <weixugc@google.com>
-Cc: Youngjun Park <youngjun.park@lge.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/swap.c |   36 +++++++++++++++++++++++++++++++++++-
- 1 file changed, 35 insertions(+), 1 deletion(-)
+ mm/swap.c |   41 ++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 40 insertions(+), 1 deletion(-)
 
 --- a/mm/swap.c~mm-lruvec-preemptively-free-dead-folios-during-lru_add-drain
 +++ a/mm/swap.c
-@@ -160,13 +160,36 @@ static void folio_batch_move_lru(struct
+@@ -160,14 +160,42 @@ static void folio_batch_move_lru(struct
  	int i;
  	struct lruvec *lruvec = NULL;
  	unsigned long flags = 0;
@@ -84,25 +88,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/* block memcg migration while the folio moves between lru */
 -		if (move_fn != lru_add && !folio_test_clear_lru(folio))
 +		if (!is_lru_add && !folio_test_clear_lru(folio))
-+			continue;
-+
+ 			continue;
+ 
 +		/*
 +		 * Filter dead folios by moving them from the add batch to the temp
 +		 * batch for freeing after this loop.
++		 *
++		 * We're bypassing normal cleanup. Clear flags that are not
++		 * applicable to dead folios.
 +		 *
 +		 * Since the folio may be part of a huge page, unqueue from
 +		 * deferred split list to avoid a dangling list entry.
 +		 */
 +		if (is_lru_add && folio_ref_freeze(folio, 1)) {
++			__folio_clear_active(folio);
++			__folio_clear_unevictable(folio);
 +			folio_unqueue_deferred_split(folio);
 +			fbatch->folios[i] = NULL;
 +			folio_batch_add(&free_fbatch, folio);
- 			continue;
++			continue;
 +		}
- 
++
  		folio_lruvec_relock_irqsave(folio, &lruvec, &flags);
  		move_fn(lruvec, folio);
-@@ -176,6 +199,13 @@ static void folio_batch_move_lru(struct
+ 
+@@ -176,6 +204,13 @@ static void folio_batch_move_lru(struct
  
  	if (lruvec)
  		lruvec_unlock_irqrestore(lruvec, flags);
@@ -116,7 +126,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	folios_put(fbatch);
  }
  
-@@ -964,6 +994,10 @@ void folios_put_refs(struct folio_batch
+@@ -964,6 +999,10 @@ void folios_put_refs(struct folio_batch
  		struct folio *folio = folios->folios[i];
  		unsigned int nr_refs = refs ? refs[i] : 1;
  
