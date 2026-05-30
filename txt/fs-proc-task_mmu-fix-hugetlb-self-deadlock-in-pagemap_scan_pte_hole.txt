@@ -1,0 +1,51 @@
+From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Subject: fs/proc/task_mmu: fix hugetlb self-deadlock in pagemap_scan_pte_hole()
+Date: Fri, 29 May 2026 18:23:27 +0100
+
+A PAGEMAP_SCAN ioctl requesting PM_SCAN_WP_MATCHING on a hugetlb VMA hangs
+the calling thread, unkillably, as soon as the scan reaches an unpopulated
+part of the range:
+
+  do_pagemap_scan()
+    walk_page_range()
+      walk_hugetlb_range()
+        hugetlb_vma_lock_read()           # take the vma lock for read ...
+        pagemap_scan_pte_hole()           # ... ->pte_hole() for a hole
+          uffd_wp_range()
+            change_protection()
+              hugetlb_change_protection()
+                hugetlb_vma_lock_write()  # ... and block taking it for write
+
+walk_hugetlb_range() holds the hugetlb vma lock for read across the whole
+walk.  A present entry goes to ->hugetlb_entry(); an unpopulated one goes
+to ->pte_hole(), i.e.  pagemap_scan_pte_hole().  To write-protect the hole
+that handler calls uffd_wp_range(), which on a hugetlb VMA reaches
+hugetlb_change_protection() and takes the same vma lock for write.  The
+thread then blocks in down_write() waiting for the read lock it is itself
+holding.
+
+The populated path avoids this: pagemap_scan_hugetlb_entry()
+write-protects the entry inline under the page-table lock and never enters
+hugetlb_change_protection().
+
+Do the same for holes.  Fault in the page table and install the uffd-wp
+marker directly with make_uffd_wp_huge_pte() under the page-table lock,
+rather than routing through uffd_wp_range().  That is the same sequence
+hugetlb_change_protection() runs for an unpopulated entry, minus the vma
+write lock -- which is safe to skip because PMD sharing is disabled on
+uffd-wp VMAs (hugetlb_unshare_all_pmds() runs at registration), leaving
+nothing for that lock to serialise against.
+
+Link: https://lore.kernel.org/20260529172331.356655-4-kas@kernel.org
+Fixes: 52526ca7fdb9 ("fs/proc/task_mmu: implement IOCTL to get and optionally clear info about PTEs")
+Signed-off-by: Kiryl Shutsemau <kas@kernel.org>
+Reported-by: Sashiko AI review <sashiko-bot@kernel.org>
+Assisted-by: Claude:claude-opus-4-8
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: <stable@vger.kernel.org>
