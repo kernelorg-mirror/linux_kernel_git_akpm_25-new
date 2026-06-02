@@ -1,6 +1,6 @@
 From: Shakeel Butt <shakeel.butt@linux.dev>
 Subject: memcg: multi objcg charge support
-Date: Thu, 21 May 2026 18:19:08 -0700
+Date: Mon, 25 May 2026 20:39:31 -0700
 
 Commit 01b9da291c49 ("mm: memcontrol: convert objcg to be per-memcg
 per-node type") split a memcg's single obj_cgroup into one per NUMA node
@@ -13,7 +13,7 @@ stress-ng.switch.ops_per_sec from this pattern.
 Mirror the multi-slot pattern already used by memcg_stock_pcp: turn
 nr_bytes and cached_objcg into NR_OBJ_STOCK-element arrays, scan all slots
 on consume/refill/account, prefer empty slots when inserting, and evict a
-random slot only when full.  With multiple slots a CPU can hold the
+slot round-robin only when full.  With multiple slots a CPU can hold the
 per-node objcg variants of one memcg plus a few siblings without ever
 forcing a drain.
 
@@ -30,29 +30,29 @@ layout (verified with pahole) is:
 so consume_obj_stock, refill_obj_stock and the slab account path each
 touch exactly one 64-byte cache line on non-debug 64-bit builds.
 
-Link: https://lore.kernel.org/20260522011908.1669332-5-shakeel.butt@linux.dev
-Fixes: 01b9da291c49 ("mm: memcontrol: convert objcg to be per-memcg per-node type")
+Link: https://lore.kernel.org/20260526033931.1760588-5-shakeel.butt@linux.dev
 Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
 Reported-by: kernel test robot <oliver.sang@intel.com>
 Closes: https://lore.kernel.org/oe-lkp/202605121641.b6a60cb0-lkp@intel.com
+Fixes: 01b9da291c49 ("mm: memcontrol: convert objcg to be per-memcg per-node type")
 Tested-by: kernel test robot <oliver.sang@intel.com>
+Reviewed-by: Harry Yoo (Oracle) <harry@kernel.org>
 Cc: Alexandre Ghiti <alex@ghiti.fr>
-Cc: Harry Yoo (Oracle) <harry@kernel.org>
 Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
-Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/memcontrol.c |  188 +++++++++++++++++++++++++++++++++-------------
- 1 file changed, 136 insertions(+), 52 deletions(-)
+ mm/memcontrol.c |  200 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 142 insertions(+), 58 deletions(-)
 
 --- a/mm/memcontrol.c~memcg-multi-objcg-charge-support
 +++ a/mm/memcontrol.c
-@@ -150,14 +150,14 @@ static void obj_cgroup_release(struct pe
+@@ -150,15 +150,15 @@ static void obj_cgroup_release(struct pe
  	 * However, it can be PAGE_SIZE or (x * PAGE_SIZE).
  	 *
  	 * The following sequence can lead to it:
@@ -63,13 +63,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	 * 3) CPU1: a process from another memcg is allocating something,
  	 *          the stock if flushed,
  	 *          objcg->nr_charged_bytes = PAGE_SIZE - 92
- 	 * 5) CPU0: we do release this object,
+-	 * 5) CPU0: we do release this object,
 -	 *          92 bytes are added to stock->nr_bytes
+-	 * 6) CPU0: stock is flushed,
++	 * 4) CPU0: we do release this object,
 +	 *          92 bytes are added to stock->nr_bytes[i]
- 	 * 6) CPU0: stock is flushed,
++	 * 5) CPU0: stock is flushed,
  	 *          92 bytes are added to objcg->nr_charged_bytes
  	 *
-@@ -2018,25 +2018,40 @@ static DEFINE_PER_CPU_ALIGNED(struct mem
+ 	 * In the result, nr_charged_bytes == PAGE_SIZE.
+@@ -2018,34 +2018,49 @@ static DEFINE_PER_CPU_ALIGNED(struct mem
  	.lock = INIT_LOCAL_TRYLOCK(lock),
  };
  
@@ -87,12 +90,26 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  struct obj_stock_pcp {
  	local_trylock_t lock;
 -	struct obj_cgroup *cached_objcg;
--	uint16_t nr_bytes;
 +	int8_t index;
- 	int16_t node_id;
- 	int16_t nr_slab_reclaimable_b;
- 	int16_t nr_slab_unreclaimable_b;
++	int16_t node_id;
++	int16_t nr_slab_reclaimable_b;
++	int16_t nr_slab_unreclaimable_b;
+ #if PAGE_SHIFT > 16
+ 	/*
+ 	 * On rare archs with 256KiB base page size (hexagon and powerpc 44x)
+ 	 * keep nr_bytes to unsigned int as uint16_t cannot represent the full
+-	 * sub-page remainder.
++e patches/memcg-uint16_t-for-nr_bytes-in-obj_stock_pcp.patch	 * sub-page remainder. Such archs are not cacheline optimization target.
+ 	 */
+-	unsigned int nr_bytes;
++	unsigned int nr_bytes[NR_OBJ_STOCK];
+ #else
+-	uint16_t nr_bytes;
 +	uint16_t nr_bytes[NR_OBJ_STOCK];
+ #endif
+-	int16_t node_id;
+-	int16_t nr_slab_reclaimable_b;
+-	int16_t nr_slab_unreclaimable_b;
 +	struct obj_cgroup *cached[NR_OBJ_STOCK];
  
  	struct work_struct work;
@@ -112,7 +129,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  static void drain_obj_stock(struct obj_stock_pcp *stock);
  static bool obj_stock_flush_required(struct obj_stock_pcp *stock,
  				     struct mem_cgroup *root_memcg);
-@@ -3156,12 +3171,13 @@ static void unlock_stock(struct obj_stoc
+@@ -3165,12 +3180,13 @@ static void unlock_stock(struct obj_stoc
  		local_unlock(&obj_stock.lock);
  }
  
@@ -127,7 +144,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	/*
  	 * Though at the moment MAX_NUMNODES <= 1024 in all archs but let's make
-@@ -3170,29 +3186,39 @@ static void __account_obj_stock(struct o
+@@ -3179,29 +3195,39 @@ static void __account_obj_stock(struct o
  	 */
  	BUILD_BUG_ON(MAX_NUMNODES >= S16_MAX);
  
@@ -174,7 +191,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		stock->node_id = pgdat->node_id;
  	}
  
-@@ -3233,10 +3259,16 @@ static bool __consume_obj_stock(struct o
+@@ -3231,10 +3257,16 @@ static bool __consume_obj_stock(struct o
  				struct obj_stock_pcp *stock,
  				unsigned int nr_bytes)
  {
@@ -195,7 +212,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  
  	return false;
-@@ -3257,16 +3289,42 @@ static bool consume_obj_stock(struct obj
+@@ -3255,16 +3287,42 @@ static bool consume_obj_stock(struct obj
  	return ret;
  }
  
@@ -243,7 +260,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		if (nr_pages) {
  			struct mem_cgroup *memcg;
-@@ -3292,46 +3350,43 @@ static void drain_obj_stock(struct obj_s
+@@ -3290,46 +3348,43 @@ static void drain_obj_stock(struct obj_s
  		 * so it might be changed in the future.
  		 */
  		atomic_add(nr_bytes, &old->nr_charged_bytes);
@@ -312,7 +329,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  	}
  	rcu_read_unlock();
  
-@@ -3345,6 +3400,7 @@ static void __refill_obj_stock(struct ob
+@@ -3343,6 +3398,7 @@ static void __refill_obj_stock(struct ob
  {
  	unsigned int nr_pages = 0;
  	unsigned int stock_nr_bytes;
@@ -320,7 +337,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  	if (!stock) {
  		nr_pages = nr_bytes >> PAGE_SHIFT;
-@@ -3353,19 +3409,47 @@ static void __refill_obj_stock(struct ob
+@@ -3351,16 +3407,44 @@ static void __refill_obj_stock(struct ob
  		goto out;
  	}
  
@@ -368,14 +385,10 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +
  	stock_nr_bytes += nr_bytes;
  
--	/* Since stock->nr_bytes is uint16_t, don't refill >= U16_MAX */
-+	/* nr_bytes[] is uint16_t; flush if we would refill >= U16_MAX. */
  	if ((allow_uncharge && (stock_nr_bytes > PAGE_SIZE)) ||
- 	    stock_nr_bytes > U16_MAX) {
+@@ -3368,7 +3452,7 @@ static void __refill_obj_stock(struct ob
  		nr_pages = stock_nr_bytes >> PAGE_SHIFT;
-@@ -3387,7 +3471,7 @@ static void __refill_obj_stock(struct ob
- 			stock_nr_bytes = kept;
- 		}
+ 		stock_nr_bytes &= (PAGE_SIZE - 1);
  	}
 -	stock->nr_bytes = stock_nr_bytes;
 +	stock->nr_bytes[slot] = stock_nr_bytes;
