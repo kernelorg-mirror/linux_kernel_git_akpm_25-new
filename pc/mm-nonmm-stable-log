@@ -1,0 +1,3802 @@
+commit ff6f26c58421614b02694ac9d219ac61d924bc68
+Author: Aleksandr Nogikh <nogikh@google.com>
+Date:   Fri Jun 12 11:50:20 2026 +0000
+
+    ocfs2: fix circular locking dependency in ocfs2_dio_end_io_write
+    
+    A circular locking dependency involves INODE_ALLOC_SYSTEM_INODE,
+    EXTENT_ALLOC_SYSTEM_INODE, and ORPHAN_DIR_SYSTEM_INODE.
+    
+    1. ocfs2_mknod() acquires INODE_ALLOC then EXTENT_ALLOC.
+    
+    2. ocfs2_dio_end_io_write() acquires EXTENT_ALLOC for unwritten
+       extents, then ORPHAN_DIR via ocfs2_del_inode_from_orphan() while still
+       holding EXTENT_ALLOC.
+    
+    3. ocfs2_wipe_inode() acquires ORPHAN_DIR then INODE_ALLOC via
+       ocfs2_remove_inode.
+    
+    Break the cycle in ocfs2_dio_end_io_write() by freeing the allocation
+    contexts (releasing EXTENT_ALLOC) before acquiring ORPHAN_DIR.
+    
+    WARNING: possible circular locking dependency detected
+    ------------------------------------------------------
+    is trying to acquire lock:
+    ffff8881e78b33a0
+    (&ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE]){+.+.}-{4:4}, at:
+    ocfs2_evict_inode+0x1539/0x43b0 fs/ocfs2/inode.c:1299
+    
+    but task is already holding lock:
+    ffff8881e78b4fa0
+    (&ocfs2_sysfile_lock_key[ORPHAN_DIR_SYSTEM_INODE]){+.+.}-{4:4}, at:
+    ocfs2_evict_inode+0xe97/0x43b0 fs/ocfs2/inode.c:1299
+    
+    the existing dependency chain (in reverse order) is:
+    
+    -> #2 (&ocfs2_sysfile_lock_key[ORPHAN_DIR_SYSTEM_INODE]){+.+.}-{4:4}:
+           inode_lock include/linux/fs.h:1029 [inline]
+           ocfs2_del_inode_from_orphan+0x12e/0x7a0 fs/ocfs2/namei.c:2728
+           ocfs2_dio_end_io+0xf9c/0x1370 fs/ocfs2/aops.c:2418
+           dio_complete+0x25b/0x790 fs/direct-io.c:281
+    
+    -> #1 (&ocfs2_sysfile_lock_key[EXTENT_ALLOC_SYSTEM_INODE]){+.+.}-{4:4}:
+           inode_lock include/linux/fs.h:1029 [inline]
+           ocfs2_reserve_suballoc_bits+0x16d/0x4840 fs/ocfs2/suballoc.c:882
+           ocfs2_reserve_new_metadata_blocks+0x415/0x9a0
+           fs/ocfs2/suballoc.c:1078
+           ocfs2_mknod+0x10f3/0x2260 fs/ocfs2/namei.c:351
+    
+    -> #0 (&ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE]){+.+.}-{4:4}:
+           __lock_acquire+0x15a5/0x2cf0 kernel/locking/lockdep.c:5237
+           lock_acquire+0x106/0x350 kernel/locking/lockdep.c:5868
+           down_write+0x96/0x200 kernel/locking/rwsem.c:1625
+           inode_lock include/linux/fs.h:1029 [inline]
+           ocfs2_remove_inode fs/ocfs2/inode.c:733 [inline]
+           ocfs2_wipe_inode fs/ocfs2/inode.c:896 [inline]
+           ocfs2_delete_inode fs/ocfs2/inode.c:1157 [inline]
+           ocfs2_evict_inode+0x1539/0x43b0 fs/ocfs2/inode.c:1299
+    
+    Chain exists of:
+      &ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE] -->
+      &ocfs2_sysfile_lock_key[EXTENT_ALLOC_SYSTEM_INODE] -->
+      &ocfs2_sysfile_lock_key[ORPHAN_DIR_SYSTEM_INODE]
+    
+     Possible unsafe locking scenario:
+    
+           CPU0                    CPU1
+           ----                    ----
+      lock(&ocfs2_sysfile_lock_key[ORPHAN_DIR_SYSTEM_INODE]);
+                                   lock(&ocfs2_sysfile_lock_key[EXTENT_ALLOC_SYSTEM_INODE]);
+                                   lock(&ocfs2_sysfile_lock_key[ORPHAN_DIR_SYSTEM_INODE]);
+      lock(&ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE]);
+    
+     *** DEADLOCK ***
+    
+    Link: https://lore.kernel.org/97c902a6-3bcf-43ea-9b70-f1f136a6c3f2@mail.kernel.org
+    Fixes: d647c5b2fbf8 ("ocfs2: split transactions in dio completion to avoid credit exhaustion")
+    Assisted-by: Gemini:gemini-3.1-pro-preview Gemini:gemini-3-flash-preview syzbot
+    Reported-by: syzbot+b225d4dfce6219600c42@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=b225d4dfce6219600c42
+    Link: https://syzkaller.appspot.com/ai_job?id=0b53ce1e-2972-4192-aa85-8097a702762c
+    Signed-off-by: Aleksandr Nogikh <nogikh@google.com>
+    Reviewed-by: Heming Zhao <heming.zhao@suse.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Joseph Qi <jiangqi903@gmail.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f9ab30c96b0f00c20c6dac93681bdae3a033d229
+Author: Ian Bridges <icb@fastmail.org>
+Date:   Thu Jun 11 09:46:38 2026 -0500
+
+    ocfs2: fix NULL h_transaction deref in ocfs2_assure_trans_credits
+    
+    [BUG]
+    A direct write over unwritten extents can panic the kernel in
+    ocfs2_assure_trans_credits() when the journal aborts during DIO
+    completion. The crash is a general protection fault from a NULL pointer
+    dereference.
+    
+    [CAUSE]
+    ocfs2_dio_end_io_write() loops over a direct write's unwritten extents,
+    marking each written under a single journal handle. If the journal
+    aborts (for example after an I/O error) while the extent tree is being
+    updated, the handle is left aborted with its transaction pointer
+    cleared. The extent merge treats that failure as not critical and
+    reports success, so the loop keeps using the handle.
+    ocfs2_assure_trans_credits() reads the handle's remaining credits
+    without first checking whether the handle is aborted, and that read
+    dereferences the cleared transaction pointer.
+    
+    [FIX]
+    A journal abort is recorded in the handle itself, so callers are
+    expected to test the handle rather than rely on a returned error.
+    Make ocfs2_assure_trans_credits() do that, as the other ocfs2 journal
+    helpers already do, and return -EROFS when the handle is aborted.
+    
+    Link: https://lore.kernel.org/airKTsM1fRVN-Wj7@dev
+    Fixes: be346c1a6eeb ("ocfs2: fix DIO failure due to insufficient transaction credits")
+    Signed-off-by: Ian Bridges <icb@fastmail.org>
+    Reported-by: syzbot+e9c15ff790cea6a0cfae@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=e9c15ff790cea6a0cfae
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c1fff9794a165b6b64ae4ad9b54c00bc94e7daed
+Author: Samuel Moelius <sam.moelius@trailofbits.com>
+Date:   Tue Jun 9 00:54:47 2026 +0000
+
+    lib: interval_tree_test: validate benchmark parameters
+    
+    The interval tree runtime test accepts module parameters that are later
+    used as divisors while generating randomized intervals and while reporting
+    average timings.  For example, max_endpoint=1 makes the generated interval
+    end value zero and the next modulo operation divides by that zero value.
+    
+    Reject non-positive counts and require max_endpoint to provide at least
+    one non-zero generated endpoint before the test allocates state or starts
+    the benchmark.
+    
+    [akpm@linux-foundation.org: include printk.h for pr_warn()]
+    Assisted-by: Codex:gpt-5.5-cyber-preview
+    Signed-off-by: Samuel Moelius <sam.moelius@trailofbits.com>
+    Link: https://lore.kernel.org/20260609005446.1241288.1525a5964698.interval-tree-test-small-max-endpoint-div0@trailofbits.com
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 22920541c35a9f23f219038ba5874c843a7c4419
+Author: Kyle Zeng <kylebot@openai.com>
+Date:   Thu Jun 11 14:35:10 2026 -0700
+
+    ocfs2: avoid moving extents to occupied clusters
+    
+    For non-auto OCFS2_IOC_MOVE_EXT operations, userspace supplies a physical
+    me_goal.  ocfs2_move_extent() initializes new_phys_cpos from that goal and
+    expects ocfs2_probe_alloc_group() to replace it with a free run in the
+    target block group.
+    
+    The probe currently leaves *phys_cpos unchanged if the scan reaches the
+    end of the group without finding a free run.  An occupied goal at the last
+    bit can therefore survive the probe and be passed to
+    __ocfs2_move_extent(), which copies file data into a cluster still owned
+    by another inode before the bitmap is updated.
+    
+    When the probe does find a free run, it also subtracts move_len from the
+    ending bit.  The start of an N-bit run ending at i is i - N + 1, so the
+    current calculation can report the bit immediately before the free run.
+    
+    Clear *phys_cpos before scanning and use the correct free-run start.
+    Callers already treat a zero result as -ENOSPC, so failed probes no longer
+    continue with an occupied caller-controlled goal.
+    
+    Link: https://lore.kernel.org/20260611213510.16956-1-kylebot@openai.com
+    Fixes: e6b5859cccfa ("Ocfs2/move_extents: helper to probe a proper region to move in an alloc group.")
+    Fixes: 236b9254f8d1 ("ocfs2: fix non-auto defrag path not working issue")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Kyle Zeng <kylebot@openai.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 07669b0abe4ce76c716e8437e198e1337cf43d1f
+Author: Shardul Deshpande <iamsharduld@gmail.com>
+Date:   Fri Jun 12 23:46:32 2026 +0530
+
+    treewide: fix transposed "sign" typos and update spelling.txt
+    
+    Several comments transpose the letters in "assigned" and "unsigned",
+    spelling them with "sing" instead of "sign".  Correct all of them.
+    
+    Of these, the misspelling of "assigned" is not yet flagged by checkpatch,
+    so also add it to scripts/spelling.txt.
+    
+    The remaining matches of `grep -ri singed` are RISINGEDGE register and
+    enum names, not typos.
+    
+    Link: https://lore.kernel.org/20260612181633.734458-1-iamsharduld@gmail.com
+    Signed-off-by: Shardul Deshpande <iamsharduld@gmail.com>
+    Suggested-by: Andrew Morton <akpm@linux-foundation.org>
+    Reviewed-by: SeongJae Park <sj@kernel.org>
+    Cc: Joe Perches <joe@perches.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 452a8467be8143747292218212671deeb186d2ae
+Author: Ian Bridges <icb@fastmail.org>
+Date:   Wed Jun 10 19:23:11 2026 -0500
+
+    ocfs2: fix UBSAN array-index-out-of-bounds in ocfs2_sum_rightmost_rec
+    
+    [BUG]
+    On-disk corruption setting l_next_free_rec to 0 in an inode's embedded
+    extent list triggers a UBSAN panic on the next write to that file.
+    
+    [CAUSE]
+    ocfs2_sum_rightmost_rec() computes
+    i = le16_to_cpu(el->l_next_free_rec) - 1
+    and accesses el->l_recs[i] without validating i. When l_next_free_rec
+    is 0, i becomes -1; when l_next_free_rec exceeds l_count, i falls
+    past the end of the array. Either case violates the
+    __counted_by_le(l_count) annotation on l_recs[] and triggers UBSAN.
+    
+    [FIX]
+    Validate the inode's embedded extent list when the inode is read, in
+    ocfs2_validate_inode_block(): l_count must be non-zero and no larger
+    than the inode block can hold, and l_next_free_rec must not exceed
+    l_count. A corrupt list is rejected at read time, before the b-tree
+    code can index l_recs[] out of bounds.
+    
+    Link: https://lore.kernel.org/ain_780qc0P4ypNd@dev
+    Signed-off-by: Ian Bridges <icb@fastmail.org>
+    Reported-by: syzbot+be16e33db01e6644db7a@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=be16e33db01e6644db7a
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 5108f4765637bd0ac5ea2897dc7d537486a09885
+Author: Samuel Moelius <sam.moelius@trailofbits.com>
+Date:   Fri Jun 5 15:52:15 2026 +0000
+
+    fat: reject BPB volumes whose data area starts beyond total sectors
+    
+    fat_fill_super() subtracts sbi->data_start from the BPB total sector count
+    before computing the number of clusters.  A malformed image can declare a
+    total sector count smaller than data_start, causing the subtraction to
+    underflow and the mount code to derive a plausible cluster count from the
+    FAT length instead.
+    
+    Reject such images before the subtraction.  In QEMU, a crafted FAT image
+    with total_sectors=2 and data_start=3 mounted successfully before the fix
+    and reading a file returned bytes stored past the BPB-declared end of the
+    volume.  With this change, the same image is rejected during mount.
+    
+    Assisted-by: Codex:gpt-5.5-cyber-preview
+    Link: https://lore.kernel.org/20260605155216.2126545-1-sam.moelius@trailofbits.com
+    Signed-off-by: Samuel Moelius <sam.moelius@trailofbits.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Christian Brauner <brauner@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c7fdbc2c2f26b9c397eb3aad2fdc54dbd85f68e1
+Author: Guixin Liu <kanie@linux.alibaba.com>
+Date:   Mon Jun 8 13:39:34 2026 +0800
+
+    selftests/uevent: increase __UEVENT_BUFFER_SIZE to avoid ENOBUFS on busy systems
+    
+    The kselftests case uevent.uevent_filtering fails reproducibly on busy
+    systems (e.g.  Intel EMR / AMD servers) with:
+    
+      No buffer space available - Failed to receive uevent
+    
+    The listener binds the NETLINK_KOBJECT_UEVENT socket to all 32 multicast
+    groups (nl_groups = -1) but only sets SO_RCVBUF to 4 KiB
+    (__UEVENT_BUFFER_SIZE = 2048 * 2).  On hosts with many devices, the kernel
+    and userspace daemons (udev/systemd) constantly emit uevents on multiple
+    groups, plus the test itself triggers 10 add events in a row.  The 4 KiB
+    receive buffer overflows before the listener can drain it, recvmsg()
+    returns -ENOBUFS, and the test bails out as failure.
+    
+    Increase __UEVENT_BUFFER_SIZE to 1 MiB so the receive buffer is large
+    enough to absorb the burst of uevents on busy systems.  After this change
+    the test passes consistently across dozens of runs on Intel EMR and AMD
+    platforms.
+    
+    Link: https://lore.kernel.org/20260608053934.4059533-1-kanie@linux.alibaba.com
+    Signed-off-by: Guixin Liu <kanie@linux.alibaba.com>
+    Cc: Christian Brauner <brauner@kernel.org>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Cc: Wei Yang <richard.weiyang@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f2737dc40d2ef3e9f3f9395d61f53f6668306a71
+Author: Samuel Moelius <sam.moelius@trailofbits.com>
+Date:   Fri Jun 5 00:30:37 2026 +0000
+
+    lib/test_firmware: allocate the configured into_buf size
+    
+    The batched into_buf test path allocates TEST_FIRMWARE_BUF_SIZE bytes
+    unconditionally, but then passes test_fw_config->buf_size to
+    request_firmware_into_buf() or request_partial_firmware_into_buf().
+    
+    Userspace can set config_buf_size above TEST_FIRMWARE_BUF_SIZE before
+    triggering a batched request. If the firmware file is large enough, the
+    firmware loader writes past the end of the 1 KiB test buffer.
+    
+    Allocate the buffer with the same size that the test passes to the firmware
+    API so config_buf_size remains the actual buffer size under test.
+    
+    Assisted-by: Codex:gpt-5.5-cyber-preview
+    Link: https://lore.kernel.org/20260605003038.2005840-1-sam.moelius@trailofbits.com
+    Signed-off-by: Samuel Moelius <sam.moelius@trailofbits.com>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Kees Cook <kees@kernel.org>
+    Cc: Luis R. Rodriguez <mcgrof@kernel.org>
+    Cc: Scott Branden <scott.branden@broadcom.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 89009392c80da5da00876c8334ff20028e6e3eb6
+Author: Maxwell Doose <m32285159@gmail.com>
+Date:   Thu Jun 4 22:52:51 2026 -0500
+
+    fs: efs: remove unneeded debug prints
+    
+    The current code uses debug prints conditionally compiled with #ifdef
+    DEBUG.  However, that code, when compiled, causes compiler errors due to
+    incompatible formatters and undefined variables, notably:
+    
+    fs/efs/file.c: In function `efs_get_block':
+    fs/efs/file.c:26:35: error: `block' undeclared (first use in this
+    function); did you mean `iblock'?
+      26 |                         __func__, block, inode->i_blocks, inode->i_size);
+         |                                   ^~~~~
+    
+    and:
+    
+    fs/efs/file.c: In function `efs_bmap':
+    ./include/linux/kern_levels.h:5:25: error: format `%ld' expects
+    argument of type `long int', but argument 4 has type `blkcnt_t' {aka
+    `long long unsigned int'} [-Werror=format=]
+       5 | #define KERN_SOH        "\001"          /* ASCII Start Of Header */
+         |                         ^~~~~~
+    
+    which also extends to the other formatters.  As this part of the code has
+    been dead for just about 14 years now, it has not been modernized to stay
+    compatible with the most recent gcc compilers.  Fix these issues by
+    removing the debug prints.
+    
+    Link: https://lore.kernel.org/20260605035251.89305-2-m32285159@gmail.com
+    Fixes: f403d1dbac6d ("fs/efs: add pr_fmt / use __func__")
+    Signed-off-by: Maxwell Doose <m32285159@gmail.com>
+    Suggested-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Fabian Frederick <fabf@skynet.be>
+    Cc: Christian Brauner <brauner@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 66cbd504306bf354231b1fbe43585b9aaa242d28
+Author: Cryolitia PukNgae <cryolitia@uniontech.com>
+Date:   Fri Jun 5 14:57:04 2026 +0800
+
+    checkpatch: cuppress warnings when Reported-by: is followed by Link:
+    
+    > The tag should be followed by a Closes: tag pointing to the report,
+    > unless the report is not available on the web. The Link: tag can be
+    > used instead of Closes: if the patch fixes a part of the issue(s)
+    > being reported.
+    
+    According to Documentation/process/submitting-patches.rst, Link: is also
+    acceptable to follow a Reported-by:, if the patch fixes a part of the
+    issue(s) being reported.
+    
+    Link: https://lore.kernel.org/20260605-checkpatch-v1-1-8c68ae618513@linux.dev
+    Signed-off-by: Cryolitia PukNgae <cryolitia@uniontech.com>
+    Reviewed-by: Petr Vorel <pvorel@suse.cz>
+    Cc: Andy Whitcroft <apw@canonical.com>
+    Cc: Cheng Nie <niecheng1@uniontech.com>
+    Cc: Dwaipayan Ray <dwaipayanray1@gmail.com>
+    Cc: Joe Perches <joe@perches.com>
+    Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 5ef8a1c7aa7f095b0913aed643df4a6da0d8b275
+Author: Alexander Potapenko <glider@google.com>
+Date:   Fri Jun 5 10:54:23 2026 +0200
+
+    MAINTAINERS: add Alexander as a kcov reviewer
+    
+    Also move Dmitry Vyukov to the bottom of the list.
+    
+    Link: https://lore.kernel.org/20260605085423.1962700-1-glider@google.com
+    Signed-off-by: Alexander Potapenko <glider@google.com>
+    Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Alexander Potapenko <glider@google.com>
+    Cc: Marco Elver <elver@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 0f1f777b309bf9ac90f9ad2a93ae6ab68a1376a1
+Author: Alexander Sverdlin <alex@sverdlin.org>
+Date:   Thu Jun 4 00:58:40 2026 +0200
+
+    mailmap: update Alexander Sverdlin's Email addresses
+    
+    - add kernel.org address
+    - add sverdlin.org address (as primary address)
+    - drop siemens.com address (for accounting purposes only)
+    
+    Link: https://lore.kernel.org/20260603225847.1849399-1-asv@kernel.org
+    Signed-off-by: Alexander Sverdlin <asv@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit aae636b5463d9957fadba71e83e7cfc157416974
+Author: Maxwell Doose <m32285159@gmail.com>
+Date:   Wed Jun 3 09:52:21 2026 -0500
+
+    fs: fat: inode: replace sprintf() with scnprintf()
+    
+    The kernel documentation notes that sprintf() is deprecated and unsafe.
+    Replace it with the more preferred scnprintf() to help with hardening.
+    
+    Link: https://lore.kernel.org/20260603145222.59012-1-m32285159@gmail.com
+    Signed-off-by: Maxwell Doose <m32285159@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 1ec3cca2d8b6b9ff6584ca626d4c8918bbf48d44
+Author: Ian Bridges <icb@fastmail.org>
+Date:   Mon Jun 1 13:44:33 2026 -0500
+
+    ocfs2: fix out-of-bounds write in ocfs2_remove_refcount_extent
+    
+    [BUG]
+    Unlinking a refcounted file whose refcount tree has leaf blocks
+    triggers a fortify panic due to an out-of-bounds write.
+    
+    [CAUSE]
+    When the last leaf block is removed from a refcount tree,
+    ocfs2_remove_refcount_extent() converts the root back to leaf mode
+    with a bulk memset on &rb->rf_records. rf_records sits in an anonymous
+    union with rf_list. rf_list.l_tree_depth aliases rf_records.rl_count,
+    and is 0 for a single-level tree. With rl_count equal to 0, the memset
+    writes past the 16-byte declared size of rf_records, which the fortify
+    checker catches.
+    
+    [FIX]
+    Replace the bulk memset on &rb->rf_records with a correctly-bounded
+    memset on rl_recs[] alone, after setting rl_count to the correct value.
+    
+    Link: https://lore.kernel.org/ah3TESOsEO9j_JLU@dev
+    Fixes: 2f26f58df041 ("ocfs2: annotate flexible array members with __counted_by_le()")
+    Signed-off-by: Ian Bridges <icb@fastmail.org>
+    Reported-by: syzbot+3ef989aae096b30f1663@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=3ef989aae096b30f1663
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 57dcfd9049d497c31151787a0696d59f0a98f8e6
+Author: Joseph Qi <joseph.qi@linux.alibaba.com>
+Date:   Mon Jun 1 20:16:18 2026 +0800
+
+    ocfs2: fix race between ocfs2_control_install_private() and ocfs2_control_release()
+    
+    Move atomic_inc(&ocfs2_control_opened) and the handshake state update
+    inside ocfs2_control_lock to close a race window where
+    ocfs2_control_release() can observe ocfs2_control_opened dropping to zero
+    (resetting ocfs2_control_this_node and running_proto) while
+    ocfs2_control_install_private() is about to bump the counter and mark the
+    connection valid.
+    
+    Link: https://lore.kernel.org/20260601121618.1263346-1-joseph.qi@linux.alibaba.com
+    Fixes: 3cfd4ab6b6b4 ("ocfs2: Add the local node id to the handshake.")
+    Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Reported-by: Ginger <ginger.jzllee@gmail.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 03ad858ce8064861ea580021976dc19b7aabb549
+Author: Zhang Cen <rollkingzzc@gmail.com>
+Date:   Sun May 31 12:47:14 2026 +0800
+
+    ocfs2/dlm: require a ref for locking_state debugfs open
+    
+    debug_lockres_open() copies inode->i_private into struct debug_lockres and
+    debug_lockres_release() later drops that pointer with dlm_put().  That
+    only works if open successfully pins the struct dlm_ctxt.
+    
+    Today open calls dlm_grab(dlm) but ignores its return value.  Once the
+    last domain unregister has removed the context from dlm_domains,
+    dlm_grab() returns NULL, yet open still stores the raw pointer and returns
+    success.  The later release path is outside the debugfs removal barrier,
+    so it can call dlm_put() after dlm_free_ctxt_mem() has freed the context.
+    KASAN reports this as a slab-use-after-free in dlm_put() called from
+    debug_lockres_release().
+    
+    Fail the open when dlm_grab() cannot acquire the reference and unwind the
+    seq_file private state before returning.  That keeps locking_state from
+    handing out a file descriptor whose release path does not own the
+    dlm_ctxt.
+    
+    The buggy scenario involves two paths, with each column showing the order
+    within that path:
+    
+    locking_state debugfs open:          last domain unregister:
+    1. debug_lockres_open() reads        1. dlm_unregister_domain() calls
+       inode->i_private.                    dlm_complete_dlm_shutdown().
+    2. debug_lockres_open() calls        2. shutdown removes the dlm_ctxt from
+       dlm_grab(dlm) and gets NULL.         dlm_domains.
+    3. open still stores the raw dlm     3. final teardown reaches
+       pointer in dl->dl_ctxt and           dlm_free_ctxt_mem() and frees it.
+       returns success.
+    4. debug_lockres_release() later
+       calls dlm_put(dl->dl_ctxt).
+    
+    Validation reproduced this kernel report:
+    KASAN slab-use-after-free in dlm_put+0x82/0x200
+    RIP: 0033:0x7f4d349bc9e0
+    The buggy address belongs to the object at ffff888103a3c000 which belongs
+    to the cache kmalloc-2k of size 2048
+    The buggy address is located 816 bytes inside of freed 2048-byte region
+    [ffff888103a3c000, ffff888103a3c800)
+    Write of size 4
+    Call trace:
+      dump_stack_lvl+0x66/0xa0 (?:?)
+      print_report+0xd0/0x630 (?:?)
+      dlm_put+0x82/0x200 (?:?)
+      srso_alias_return_thunk+0x5/0xfbef5 (?:?)
+      __virt_addr_valid+0x188/0x2f0 (?:?)
+      kasan_report+0xe4/0x120 (?:?)
+      kasan_check_range+0x105/0x1b0 (?:?)
+      debug_lockres_release+0x53/0x80 (fs/ocfs2/dlm/dlmdebug.c:587)
+      dlm_put+0x9/0x200 (?:?)
+      debug_lockres_release+0x5c/0x80 (fs/ocfs2/dlm/dlmdebug.c:587)
+      full_proxy_release+0x67/0x90 (?:?)
+      __fput+0x1df/0x4b0 (?:?)
+      do_raw_spin_lock+0x10f/0x1b0 (?:?)
+      fput_close_sync+0xd2/0x170 (?:?)
+      __x64_sys_close+0x55/0x90 (?:?)
+      do_syscall_64+0x10c/0x640 (arch/x86/entry/syscall_64.c:87)
+      irqentry_exit+0xac/0x6e0 (?:?)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f (?:?)
+    Freed by task stack:
+      kasan_save_stack+0x33/0x60 (?:?)
+      kasan_save_track+0x14/0x30 (?:?)
+      kasan_save_free_info+0x3b/0x60 (?:?)
+      __kasan_slab_free+0x5f/0x80 (?:?)
+      kfree+0x30f/0x580 (?:?)
+      dlm_put+0x1ce/0x200 (?:?)
+      dlm_unregister_domain+0xf6/0xb30 (?:?)
+      o2cb_cluster_disconnect+0x6b/0x90 (?:?)
+      ocfs2_cluster_disconnect+0x41/0x70 (?:?)
+      ocfs2_dlm_shutdown+0x1c4/0x220 (?:?)
+      ocfs2_dismount_volume+0x38a/0x550 (?:?)
+      generic_shutdown_super+0xc3/0x220 (?:?)
+      kill_block_super+0x29/0x60 (?:?)
+      deactivate_locked_super+0x66/0xe0 (?:?)
+      cleanup_mnt+0x13d/0x210 (?:?)
+      task_work_run+0xfa/0x170 (?:?)
+      exit_to_user_mode_loop+0xd6/0x430 (?:?)
+      do_syscall_64+0x3cb/0x640 (arch/x86/entry/syscall_64.c:87)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f (?:?)
+    
+    Link: https://lore.kernel.org/20260531044714.1640172-1-rollkingzzc@gmail.com
+    Fixes: 4e3d24ed1a12 ("ocfs2/dlm: Dumps the lockres' into a debugfs file")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit ca1afd88f5eaaff9168e1466e5401385edf59543
+Author: Zhang Cen <rollkingzzc@gmail.com>
+Date:   Thu May 28 23:12:47 2026 +0800
+
+    ocfs2: reject FITRIM ranges shorter than a cluster
+    
+    ocfs2_trim_mainbm() trims the global bitmap in cluster units, but its
+    too-short range validation only checks sb->s_blocksize.
+    
+    On filesystems with a cluster size larger than the block size, a FITRIM
+    range that is at least one block but shorter than one cluster is accepted
+    and shifted down to len == 0.  The later start + len - 1 and len -= ...
+    arithmetic then underflows and can drive trimming past the requested
+    range.
+    
+    Reject ranges shorter than s_clustersize instead.  That preserves the
+    existing -EINVAL behavior for requests that cannot discard even one
+    allocation unit and keeps zero-cluster trims out of the group walk.
+    
+    Link: https://lore.kernel.org/20260528151247.361854-1-rollkingzzc@gmail.com
+    Fixes: aa89762c5480 ("ocfs2: return EINVAL if the given range to discard is less than block size")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit e234973f286ed2e8961a24561ec91594ec3e3ff8
+Author: Zhang Cen <rollkingzzc@gmail.com>
+Date:   Thu May 28 23:12:30 2026 +0800
+
+    ocfs2: validate fast symlink target during inode read
+    
+    ocfs2_validate_inode_block() already rejects several inconsistent
+    self-contained dinodes before they are exposed to the rest of the
+    filesystem.  Fast symlinks need the same treatment.
+    
+    A zero-cluster symlink is treated as a fast symlink and later read through
+    page_get_link() and ocfs2_fast_symlink_read_folio().  That path uses
+    strnlen() on the inline payload and then copies len + 1 bytes into the
+    folio.  If a corrupt dinode stores an i_size that does not fit the inline
+    area or omits the terminating NUL at i_size, that copy reads past the end
+    of the inode block buffer.
+    
+    Reject zero-cluster symlink dinodes whose i_size exceeds the inline
+    fast-symlink capacity or whose inline payload is not NUL-terminated
+    exactly at i_size when the inode block is validated.  This keeps malformed
+    fast symlinks from reaching the read path.
+    
+    Validation reproduced this kernel report:
+    KASAN use-after-free in ocfs2_fast_symlink_read_folio+0x12c/0x1f0
+    RIP: 0033:0x7f5c6d859aa7
+    Read of size 3905
+    Call trace:
+      dump_stack_lvl+0x66/0xa0 (?:?)
+      print_report+0xce/0x630 (?:?)
+      ocfs2_fast_symlink_read_folio+0x12c/0x1f0 (fs/ocfs2/inode.c:?)
+      srso_alias_return_thunk+0x5/0xfbef5 (?:?)
+      __virt_addr_valid+0x19f/0x330 (?:?)
+      kasan_report+0xe0/0x110 (?:?)
+      kasan_check_range+0x105/0x1b0 (?:?)
+      __asan_memcpy+0x23/0x60 (?:?)
+      filemap_read_folio+0x27/0xe0 (?:?)
+      filemap_read_folio+0x35/0xe0 (?:?)
+      do_read_cache_folio+0x138/0x230 (?:?)
+      __page_get_link+0x26/0x110 (?:?)
+      page_get_link+0x2e/0x70 (?:?)
+      vfs_readlink+0x15e/0x250 (?:?)
+      touch_atime+0x4d/0x370 (?:?)
+      do_readlinkat+0x186/0x200 (?:?)
+      do_user_addr_fault+0x65a/0x890 (?:?)
+      __x64_sys_readlink+0x46/0x60 (?:?)
+      do_syscall_64+0x115/0x6a0 (arch/x86/entry/syscall_64.c:87)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f (?:?)
+    
+    Link: https://lore.kernel.org/20260528151230.361127-1-rollkingzzc@gmail.com
+    Fixes: ea022dfb3c2a ("ocfs: simplify symlink handling")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Gui-Dong Han <2045gemini@gmail.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit a291c77c034b7a81849ce9b71cc9ecda9e587d89
+Author: Joseph Qi <joseph.qi@linux.alibaba.com>
+Date:   Sun May 31 21:16:45 2026 +0800
+
+    ocfs2: add journal NULL check in ocfs2_checkpoint_inode()
+    
+    During unmount, ocfs2_journal_shutdown() frees the journal and sets
+    osb->journal to NULL. Later, when VFS evicts remaining cached inodes,
+    ocfs2_evict_inode() -> ocfs2_clear_inode() -> ocfs2_checkpoint_inode()
+    -> ocfs2_ci_fully_checkpointed() dereferences osb->journal, causing a
+    NULL pointer dereference.
+    
+    Fix this by adding a NULL check for osb->journal in
+    ocfs2_checkpoint_inode(). If the journal is NULL, it has already been
+    fully flushed and destroyed during shutdown, so there is nothing to
+    checkpoint.
+    
+    Link: https://lore.kernel.org/20260531131645.3650299-1-joseph.qi@linux.alibaba.com
+    Reported-by: Farhad Alemi <farhad.alemi@berkeley.edu>
+    Fixes: da5e7c87827e ("ocfs2: cleanup journal init and shutdown")
+    Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Tested-by: Farhad Alemi <farhad.alemi@berkeley.edu>
+    Reviewed-by: Heming Zhao <heming.zhao@suse.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 6371a07148ee979af22a9d6f4c277462953a9a4a
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Fri May 29 12:41:28 2026 +0300
+
+    ocfs2: fix buffer head management in ocfs2_read_blocks()
+    
+    In ocfs2_read_blocks(), caller should't assume that buffer head returned
+    by 'sb_getblk()' is exclusively owned and so 'put_bh()' always drops
+    b_count from 1 to 0.  If it is not so, buffer head remains on hold and
+    likely to be returned by the next call to 'sb_getblk()' unchanged - that
+    is, with BH_Uptodate bit set even if it has failed validation previously,
+    thus allowing to insert that buffer head into OCFS2 metadata cache and
+    submit it to upper layers.  To avoid such a scenario, BH_Uptodate should
+    be cleared immediately after 'validate()' callback has detected some data
+    inconsistency.
+    
+    Link: https://lore.kernel.org/20260529094128.494293-1-dmantipov@yandex.ru
+    Fixes: cf76c78595ca ("ocfs2: don't put and assigning null to bh allocated outside")
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reported-by: syzbot+caacd220635a9cc3bac9@syzkaller.appspotmail.com
+    Closes: https://syzkaller.appspot.com/bug?extid=caacd220635a9cc3bac9
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 19c000ba93d609e15e95fed76a9e3b8055833098
+Author: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Date:   Thu May 28 12:53:01 2026 +0300
+
+    raid6: use kmalloc() in raid6_select_algo()
+    
+    raid6_select_algo() allocates 8 pages for buffer that is used
+    as a scratch area for selection of the best algorithm.
+    
+    This buffer can be allocated with kmalloc() as there's nothing special
+    about it to go directly to the page allocator.
+    
+    kmalloc() provides a better API than ancient __get_free_pages().
+    kmalloc() does not require ugly casts and kfree() does not need to know the
+    size of the freed object.
+    
+    There is no performance difference because kmalloc() redirects allocations
+    of such size to the page allocator.
+    
+    Replace __get_free_pages() call with kmalloc().
+    
+    Link: https://lore.kernel.org/all/635405e4-9423-4a25-a6e7-e03c8ea0bcbe@redhat.com
+    Link: https://lore.kernel.org/20260528-lib-v4-2-4e3ad1277279@kernel.org
+    Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Cc: Christoph Hellwig <hch@infradead.org>
+    Cc: Hannes Reinecke <hare@kernel.org>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Song Liu <song@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit d280a26a983f62bfeff3f134f9d5ba4035356b43
+Author: Mike Rapoport (Microsoft) <rppt@kernel.org>
+Date:   Thu May 28 12:53:00 2026 +0300
+
+    xor: use kmalloc() in calibrate_xor_blocks()
+    
+    Patch series "lib/raid: replace __get_free_pages() call with kmalloc()", v4.
+    
+    The xor benchmark allocates 4 pages for a scratch buffer that is used
+    purely as a CPU-only XOR working area.
+    
+    This buffer can be allocated with kmalloc() as there's nothing special
+    about it to go directly to the page allocator.
+    
+    kmalloc() provides a better API than ancient __get_free_pages().
+    kmalloc() does not require ugly casts and kfree() does not need to know
+    the size of the freed object.
+    
+    There is no performance difference because kmalloc() redirects allocations
+    of such size to the page allocator.
+    
+    Replace __get_free_pages() call with kmalloc().
+    
+    
+    This patch (of 2):
+    
+    The xor benchmark allocates 4 pages for a scratch buffer that is used
+    purely as a CPU-only XOR working area.
+    
+    This buffer can be allocated with kmalloc() as there's nothing special
+    about it to go directly to the page allocator.
+    
+    kmalloc() provides a better API than ancient __get_free_pages().
+    kmalloc() does not require ugly casts and kfree() does not need to know the
+    size of the freed object.
+    
+    There is no performance difference because kmalloc() redirects allocations
+    of such size to the page allocator.
+    
+    Replace __get_free_pages() call with kmalloc().
+    
+    Link: https://lore.kernel.org/20260528-lib-v4-0-4e3ad1277279@kernel.org
+    Link: https://lore.kernel.org/all/635405e4-9423-4a25-a6e7-e03c8ea0bcbe@redhat.com
+    Link: https://lore.kernel.org/all/635405e4-9423-4a25-a6e7-e03c8ea0bcbe@redhat.com
+    Link: https://lore.kernel.org/20260528-lib-v4-1-4e3ad1277279@kernel.org
+    Signed-off-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
+    Reviewed-by: Hannes Reinecke <hare@kernel.org>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Cc: Christoph Hellwig <hch@infradead.org>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Song Liu <song@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 9bd541e09dffff27e5bec0f9f45b0228173a5375
+Author: Zhang Cen <rollkingzzc@gmail.com>
+Date:   Sun May 24 19:12:48 2026 +0800
+
+    ocfs2: reject oversized group bitmap descriptors
+    
+    ocfs2_validate_gd_parent() only bounds bg_bits against the parent
+    allocator's chain geometry.  A malicious descriptor can still claim a
+    bg_size/bg_bits pair that exceeds the bitmap bytes that physically fit in
+    the group descriptor block, so later bitmap scans and bit updates can run
+    past bg_bitmap.
+    
+    Add a physical-cap check based on ocfs2_group_bitmap_size() for the parent
+    allocator type and reject descriptors whose bg_size or bg_bits exceed that
+    capacity.  Keep the existing chain geometry check so both the on-disk
+    bitmap layout and the allocator metadata must agree before the descriptor
+    is used.
+    
+    Validation reproduced this kernel report:
+    KASAN use-after-free in _find_next_bit+0x7f/0xc0
+    Read of size 8
+    Call trace:
+      dump_stack_lvl+0x66/0xa0 (?:?)
+      print_report+0xd0/0x630 (?:?)
+      _find_next_bit+0x7f/0xc0 (?:?)
+      srso_alias_return_thunk+0x5/0xfbef5 (?:?)
+      __virt_addr_valid+0x188/0x2f0 (?:?)
+      kasan_report+0xe4/0x120 (?:?)
+      ocfs2_find_max_contig_free_bits+0x35/0x70 (fs/ocfs2/suballoc.c:1375)
+      ocfs2_block_group_set_bits+0x472/0x4b0 (fs/ocfs2/suballoc.c:1457)
+      ocfs2_cluster_group_search+0x16b/0x440 (fs/ocfs2/suballoc.c:86)
+      ocfs2_bg_discontig_fix_result+0x1ef/0x230 (fs/ocfs2/suballoc.c:1786)
+      ocfs2_search_chain+0x8f8/0x10a0 (fs/ocfs2/suballoc.c:1886)
+      get_page_from_freelist+0x70e/0x2370 (?:?)
+      lock_release+0xc6/0x290 (?:?)
+      do_raw_spin_unlock+0x9a/0x100 (?:?)
+      kasan_unpoison+0x27/0x60 (?:?)
+      __bfs+0x147/0x240 (?:?)
+      get_page_from_freelist+0x83d/0x2370 (?:?)
+      ocfs2_claim_suballoc_bits+0x38c/0xe70 (fs/ocfs2/suballoc.c:96)
+      sched_domains_numa_masks_clear+0x70/0xd0 (?:?)
+      check_irq_usage+0xe8/0xb70 (?:?)
+      __ocfs2_claim_clusters+0x18d/0x4c0 (fs/ocfs2/suballoc.c:2497)
+      check_path+0x24/0x50 (?:?)
+      rcu_is_watching+0x20/0x50 (?:?)
+      check_prev_add+0xfd/0xd00 (?:?)
+      ocfs2_add_clusters_in_btree+0x17d/0x810 (fs/ocfs2/suballoc.c:?)
+      __folio_batch_add_and_move+0x1f5/0x3d0 (?:?)
+      ocfs2_add_inode_data+0xd9/0x120 (fs/ocfs2/suballoc.c:?)
+      filemap_add_folio+0x105/0x1f0 (?:?)
+      ocfs2_write_begin_nolock+0x29f7/0x2f80 (fs/ocfs2/suballoc.c:3043)
+      ocfs2_read_inode_block+0xb5/0x110 (fs/ocfs2/suballoc.c:?)
+      down_write+0xf5/0x180 (?:?)
+      ocfs2_write_begin+0x180/0x240 (fs/ocfs2/suballoc.c:?)
+      __mark_inode_dirty+0x758/0x9a0 (?:?)
+      inode_to_bdi+0x41/0x90 (?:?)
+      balance_dirty_pages_ratelimited_flags+0xf8/0x1d0 (?:?)
+      generic_perform_write+0x252/0x440 (?:?)
+      mnt_put_write_access_file+0x16/0x70 (?:?)
+      file_update_time_flags+0xe4/0x200 (?:?)
+      ocfs2_file_write_iter+0x80a/0x1320 (fs/ocfs2/suballoc.c:?)
+      lock_acquire+0x184/0x2f0 (?:?)
+      ksys_write+0xd2/0x170 (?:?)
+      apparmor_file_permission+0xf5/0x310 (?:?)
+      read_zero+0x8d/0x140 (?:?)
+      lock_is_held_type+0x8f/0x100 (?:?)
+    
+    Link: https://lore.kernel.org/20260524111248.1429884-1-rollkingzzc@gmail.com
+    Fixes: ccd979bdbce9 ("[PATCH] OCFS2: The Second Oracle Cluster Filesystem")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 9ac9a08e4ac4bc063e56e1aff266c5e8aa5c6c03
+Author: Thomas Weißschuh <linux@weissschuh.net>
+Date:   Tue May 26 18:43:40 2026 +0200
+
+    lib: kunit_iov_iter: repeatedly call alloc_pages_bulk()
+    
+    alloc_pages_bulk() is not guaranteed to return all requested pages in a
+    single call.
+    
+    Call it repeatedly until all pages have been allocated or no more progress
+    is being made.
+    
+    Link: https://lore.kernel.org/20260526-kunit_iov_iter-alloc_bulk-v2-1-24fbcd995c61@weissschuh.net
+    Fixes: 2d71340ff1d4 ("iov_iter: Kunit tests for copying to/from an iterator")
+    Signed-off-by: Thomas Weißschuh <linux@weissschuh.net>
+    Cc: "Christian A. Ehrhardt" <lk@c--e.de>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 94bfc7f3b0c7c33331ba4ff6cc64ff309dfcbce8
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Tue May 26 12:18:41 2026 +0200
+
+    err.h: use __always_inline on all error pointer helpers
+    
+    While testing randconfig builds on s390, I came across a link failure with
+    CONFIG_DMA_SHARED_BUFFER disabled:
+    
+    ERROR: modpost: "dma_buf_put" [drivers/iommu/iommufd/iommufd.ko] undefined!
+    
+    The problem here is that IS_ERR() is not inlined and dead code elimination
+    fails as a consequence.
+    
+    The err.h helpers all turn into a trivial assignment of a bit mask and
+    should never result in a function call, so force them to always be inline.
+    This should generally result in better object code aside from avoiding
+    the link failure above.
+    
+    Link: https://lore.kernel.org/20260526101851.2495110-1-arnd@kernel.org
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Reviewed-by: Alexander Lobakin <aleksander.lobakin@intel.com>
+    Reviewed-by: Nathan Chancellor <nathan@kernel.org>
+    Tested-by: Tamir Duberstein <tamird@kernel.org>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Andriy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Ansuel Smith <ansuelsmth@gmail.com>
+    Cc: Bjorn Andersson <andersson@kernel.org>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 9a79524d1420e6b79a6868208c264f4518d1318e
+Author: Karl Mehltretter <kmehltretter@gmail.com>
+Date:   Tue May 26 13:47:15 2026 +0200
+
+    kcov: use WRITE_ONCE() for selftest mode stores
+    
+    The KCOV selftest enables coverage by setting current->kcov_mode to
+    KCOV_MODE_TRACE_PC without installing a coverage area.  If an interrupt
+    records coverage in that window, the access should fault and expose the
+    bug.
+    
+    When building for QEMU raspi0 (Raspberry Pi Zero, ARMv6, CONFIG_CPU_V6K=y,
+    CONFIG_CURRENT_POINTER_IN_TPIDRURO=y) with GCC 13.3.0, the store that
+    enables the mode is removed.  The generated kcov_init() code only stores
+    zero after the wait loop:
+    
+      mrc   15, 0, r3, cr13, cr0, {3}
+      str   r4, [r3, #2028]
+    
+    where r4 is zero.  There is no store of KCOV_MODE_TRACE_PC before the
+    loop, so the selftest reports success without exercising coverage.
+    
+    Use WRITE_ONCE() for the temporary mode stores.  With the same compiler
+    and config, kcov_init() contains the intended mode store:
+    
+      mov   r3, #2
+      mrc   15, 0, r2, cr13, cr0, {3}
+      str   r3, [r2, #2028]
+    
+    Now that the KCOV selftest is actually executed, it may expose KCOV
+    instrumentation issues depending on the kernel config.  That is expected
+    for a selftest that was intended to catch coverage from interrupt paths.
+    
+    Link: https://lore.kernel.org/20260526114715.38280-1-kmehltretter@gmail.com
+    Fixes: 6cd0dd934b03 ("kcov: Add interrupt handling self test")
+    Assisted-by: Codex:gpt-5
+    Signed-off-by: Karl Mehltretter <kmehltretter@gmail.com>
+    Reviewed-by: Alexander Potapenko <glider@google.com>
+    Cc: Andrey Konovalov <andreyknvl@gmail.com>
+    Cc: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Kees Cook <kees@kernel.org>
+    Cc: Marco Elver <elver@google.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 93612d48fa42b3d1a637eb9279e15281c611c000
+Author: Zhang Cen <rollkingzzc@gmail.com>
+Date:   Mon May 25 12:17:26 2026 +0800
+
+    ocfs2: rebase copied fsdlm LVB pointers in locking_state
+    
+    The locking_state debugfs iterator snapshots struct ocfs2_lock_res by
+    value under ocfs2_dlm_tracking_lock and later formats that copy in
+    ocfs2_dlm_seq_show().  That is fine for the inline fields, but the
+    userspace fsdlm stack stores the LVB through lksb_fsdlm.sb_lvbptr.  Once
+    the iterator drops the tracking lock, a copied non-NULL sb_lvbptr still
+    points into the original lockres owner, so teardown can free that
+    container before the debugfs dump walks the raw LVB bytes.
+    
+    Rebase the copied sb_lvbptr to the copied l_lksb before dumping the raw
+    LVB.  The seq snapshot already carries the inline LVB storage reserved in
+    struct ocfs2_dlm_lksb, so the debugfs reader can dump the copied bytes
+    without borrowing the original lockres lifetime.
+    
+    The buggy scenario involves two paths, with each column showing the order
+    within that path:
+    
+    locking_state reader:                  lockres teardown:
+    1. ocfs2_dlm_seq_start()/next()        1. file release or another owner
+       copies struct ocfs2_lock_res           teardown reaches
+    2. ocfs2_dlm_seq_show() formats           ocfs2_lock_res_free()
+       the copied row                      2. the lockres is removed from the
+    3. ocfs2_dlm_lvb() follows the            tracking list
+       copied sb_lvbptr                   3. the owner frees the original
+                                              lockres container
+    
+    Validation reproduced this kernel report:
+    KASAN slab-use-after-free in ocfs2_dlm_seq_show+0x1bd/0x430
+    RIP: 0033:0x7f8ec4b1e29d
+    The buggy address belongs to the object at ffff88810a1e0800 which belongs
+    to the cache kmalloc-1k of size 1024
+    The buggy address is located 368 bytes inside of freed 1024-byte region
+    [ffff88810a1e0800, ffff88810a1e0c00)
+    Read of size 1
+    Call trace:
+      dump_stack_lvl+0x66/0xa0
+      print_report+0xce/0x630
+      ocfs2_dlm_seq_show+0x1bd/0x430 (fs/ocfs2/dlmglue.c:3137)
+      srso_alias_return_thunk+0x5/0xfbef5
+      __virt_addr_valid+0x19f/0x330
+      kasan_report+0xe0/0x110
+      seq_read_iter+0x29d/0x790
+      seq_read+0x20a/0x280
+      find_held_lock+0x2b/0x80
+      rcu_read_unlock+0x18/0x70
+      full_proxy_read+0x9e/0xd0
+      vfs_read+0x12c/0x590
+      ksys_read+0xd2/0x170
+      do_user_addr_fault+0x65a/0x890
+      do_syscall_64+0x115/0x6a0 (arch/x86/entry/syscall_64.c:87)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f
+    Allocated by task stack:
+      kasan_save_stack+0x33/0x60
+      kasan_save_track+0x14/0x30
+      __kasan_kmalloc+0xaa/0xb0
+      ocfs2_file_open+0x13e/0x300
+      do_dentry_open+0x233/0x7f0
+      vfs_open+0x5a/0x1b0
+      path_openat+0x66d/0x1540
+      do_file_open+0x186/0x2b0
+      do_sys_openat2+0xce/0x150
+      __x64_sys_openat+0xd0/0x140
+      do_syscall_64+0x115/0x6a0 (arch/x86/entry/syscall_64.c:87)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f
+    Freed by task stack:
+      kasan_save_stack+0x33/0x60
+      kasan_save_track+0x14/0x30
+      kasan_save_free_info+0x3b/0x60
+      __kasan_slab_free+0x5f/0x80
+      kfree+0x313/0x590
+      ocfs2_file_release+0x138/0x260
+      __fput+0x1df/0x4b0
+      fput_close_sync+0xd2/0x170
+      __x64_sys_close+0x55/0x90
+      do_syscall_64+0x115/0x6a0 (arch/x86/entry/syscall_64.c:87)
+      entry_SYSCALL_64_after_hwframe+0x77/0x7f
+    
+    Link: https://lore.kernel.org/20260525041726.4112882-1-rollkingzzc@gmail.com
+    Fixes: cf4d8d75d8ab ("ocfs2: add fsdlm to stackglue")
+    Assisted-by: Codex:gpt-5.5
+    Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c60ffec33ddf24577f6f4da18fe825b2058c5f78
+Author: Feng Tang <feng.tang@linux.alibaba.com>
+Date:   Thu May 21 11:03:36 2026 +0800
+
+    lib/nmi_backtrace: print out the CPUs which fail to respond to NMI
+    
+    When debugging RCU stall cases, usually all CPUs will respond to the NMI
+    and print out the backtrace.  But in some nasty or hardware related cases,
+    some CPUs may fail to respond in 10 seconds, and very likely this is sign
+    of severe issues.
+    
+    Paul McKenney has implemented the NMI backtrace stall check for x86, and
+    for other architectures, it should be also helpful to at least print out
+    those CPUs which failed to repond to the NMI, so that users can get an
+    early heads-up for possible CPU hard stall.
+    
+    [feng.tang@linux.alibaba.com: avoid hard-coding "10" in two places and in a comment]
+      Link: https://lore.kernel.org/ag-1ciG0FSomBf7q@U-2FWC9VHC-2323.local
+    [akpm@linux-foundation.org: use __stringify()]
+    Link: https://lore.kernel.org/20260521030336.92172-1-feng.tang@linux.alibaba.com
+    Signed-off-by: Feng Tang <feng.tang@linux.alibaba.com>
+    Reviewed-by: Petr Mladek <pmladek@suse.com>
+    Cc: "Paul E . McKenney" <paulmck@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 685568777c5a18fbc40bd0b64527fd9444c255be
+Author: Thorsten Blum <thorsten.blum@linux.dev>
+Date:   Thu May 14 18:56:03 2026 +0200
+
+    string: use min in sized_strscpy
+    
+    Use min() and drop the limit variable to simplify sized_strscpy().
+    
+    Link: https://lore.kernel.org/20260514165601.527883-3-thorsten.blum@linux.dev
+    Signed-off-by: Thorsten Blum <thorsten.blum@linux.dev>
+    Cc: Andy Shevchenko <andy@kernel.org>
+    Cc: Kees Cook <kees@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 2e73ea35a5dbe7e258b7fd396bcb100fa154f029
+Author: Stepan Ionichev <sozdayvek@gmail.com>
+Date:   Sat May 16 17:09:15 2026 +0500
+
+    lib/uuid_kunit: add tests for the four random UUID/GUID generators
+    
+    uuid_kunit currently exercises only guid_parse() and uuid_parse() (plus
+    their invalid-input paths).  The four random generators exported from
+    lib/uuid.c -- generate_random_uuid(), generate_random_guid(), uuid_gen()
+    and guid_gen() -- have no direct kunit coverage.
+    
+    Random output cannot be compared against a fixed expected value, but RFC
+    4122 section 4.4 specifies two invariants that any version-4 random
+    UUID/GUID must satisfy:
+    
+      - version 4 in the high nibble of the version byte
+        (byte 6 in the wire uuid_t layout, byte 7 in the byte-swapped
+        guid_t layout);
+      - variant DCE 1.1 (binary 10x) in the high bits of byte 8.
+    
+    Add four test cases that invoke each generator several times and verify
+    these bit patterns hold.  The same checks catch a regression in either the
+    mask/OR sequence in the generators or the layout constants.  Run the loop
+    a handful of times to cover the small but non-zero chance that an unmasked
+    random byte happens to satisfy the version/variant pattern by accident on
+    a single call.
+    
+    Link: https://lore.kernel.org/20260516120915.40544-1-sozdayvek@gmail.com
+    Signed-off-by: Stepan Ionichev <sozdayvek@gmail.com>
+    Acked-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Brendan Higgins <brendan.higgins@linux.dev>
+    Cc: David Gow <david@davidgow.net>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 7ebc672fab7a76e1e47e0f2fc1ee48118d27fde4
+Author: Michael Bommarito <michael.bommarito@gmail.com>
+Date:   Tue May 19 07:04:04 2026 -0400
+
+    ocfs2: reject non-inline dinodes with i_size and zero i_clusters
+    
+    On a volume mounted without OCFS2_FEATURE_INCOMPAT_SPARSE_ALLOC, a
+    non-inline regular file with non-zero i_size and zero i_clusters is
+    structurally malformed: the extent map declares no allocated clusters yet
+    the size header claims content exists.  Keep rejecting that shape, but
+    express it through a shared predicate so the same invariant is available
+    to normal inode reads and online filecheck.
+    
+    The same zero-cluster shape is also malformed for non-inline directories.
+    ocfs2 directory growth allocates backing storage before advancing i_size,
+    and ocfs2_dir_foreach_blk_el() later walks until ctx->pos reaches
+    i_size_read(inode).  A forged directory dinode with a huge i_size and no
+    clusters would repeatedly fail on holes while advancing through the
+    claimed size.
+    
+    Sparse regular files remain exempt: on sparse-alloc volumes, truncate can
+    legitimately grow i_size without allocating clusters.  System inodes and
+    inline-data dinodes also retain their separate storage rules.
+    
+    Mirror the check in ocfs2_filecheck_validate_inode_block() as well.
+    filecheck reports through its own error namespace, so malformed
+    size/cluster state is logged as a filecheck invalid-inode result rather
+    than via ocfs2_error(), but it must not proceed into
+    ocfs2_populate_inode().
+    
+    Link: https://lore.kernel.org/20260519110404.1803902-4-michael.bommarito@gmail.com
+    Fixes: b657c95c1108 ("ocfs2: Wrap inode block reads in a dedicated function.")
+    Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+    Link: https://sashiko.dev/#/patchset/20260517111015.3187935-1-michael.bommarito%40gmail.com
+    Assisted-by: Claude:claude-opus-4-7
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 51407c2d249987a466416890a5c931a2354a46aa
+Author: Michael Bommarito <michael.bommarito@gmail.com>
+Date:   Tue May 19 07:04:03 2026 -0400
+
+    ocfs2: reject dinodes whose i_rdev disagrees with the file type
+    
+    id1.dev1.i_rdev is the device-number arm of the ocfs2_dinode id1 union.
+    It is only meaningful for character and block device inodes.  For any
+    other user-visible file type the on-disk value must be zero.
+    
+    ocfs2_populate_inode() currently copies id1.dev1.i_rdev into inode->i_rdev
+    before the S_IFMT switch decides whether the inode is a special file.  A
+    non-device inode with a non-zero i_rdev can therefore publish stale or
+    attacker-controlled device state into the in-core inode.
+    
+    System inodes legitimately use other arms of the same union, so keep the
+    cross-check restricted to non-system inodes.  Factor that predicate into a
+    helper and use it in both the normal validator and online filecheck path;
+    filecheck reports the malformed dinode through
+    OCFS2_FILECHECK_ERR_INVALIDINO instead of ocfs2_error().
+    
+    Link: https://lore.kernel.org/20260519110404.1803902-3-michael.bommarito@gmail.com
+    Fixes: b657c95c1108 ("ocfs2: Wrap inode block reads in a dedicated function.")
+    Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+    Assisted-by: Claude:claude-opus-4-7
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 5366a017099c6a3c443be908a05f26fd72af12a1
+Author: Michael Bommarito <michael.bommarito@gmail.com>
+Date:   Tue May 19 07:04:02 2026 -0400
+
+    ocfs2: reject dinodes with non-canonical i_mode type
+    
+    Patch series "ocfs2: harden inode validators against forged metadata", v2.
+    
+    This series adds three structural checks to OCFS2 dinode validation so
+    malformed on-disk fields are rejected before ocfs2_populate_inode() copies
+    them into the in-core inode.
+    
+    The checks cover:
+    
+      - i_mode values whose type bits do not name a canonical POSIX file
+        type;
+      - non-device dinodes whose id1.dev1.i_rdev field is non-zero; and
+      - non-inline dinodes that claim non-zero i_size while i_clusters is
+        zero, covering directories unconditionally and regular files on
+        non-sparse volumes.
+    
+    The normal read path reports these through ocfs2_error(), matching the
+    existing suballoc-slot, inline-data, chain-list, and refcount checks.  The
+    online filecheck path uses the same structural predicates but keeps its
+    own reporting contract, returning OCFS2_FILECHECK_ERR_INVALIDINO instead
+    of calling ocfs2_error().
+    
+    
+    This patch (of 3):
+    
+    ocfs2_validate_inode_block() currently accepts any non-zero i_mode value.
+    ocfs2_populate_inode() then copies that mode verbatim into inode->i_mode
+    and dispatches on i_mode & S_IFMT to the file/dir/symlink/special_file
+    iops; an unrecognised type falls through to ocfs2_special_file_iops and
+    init_special_inode().
+    
+    Reject dinodes whose type bits do not name one of the seven canonical
+    POSIX file types.  Use fs_umode_to_ftype(), the same generic file-type
+    conversion helper OCFS2 already uses for directory entries, so the
+    accepted inode type set matches the kernel file-type vocabulary instead of
+    open-coding a local switch.
+    
+    Apply the same structural check to the online filecheck read path.
+    filecheck keeps its own error namespace, so it reports malformed i_mode
+    through the filecheck logger and OCFS2_FILECHECK_ERR_INVALIDINO instead of
+    calling ocfs2_error(), but it must not allow a malformed dinode to proceed
+    into ocfs2_populate_inode().
+    
+    Link: https://lore.kernel.org/20260519110404.1803902-1-michael.bommarito@gmail.com
+    Link: https://lore.kernel.org/20260519110404.1803902-2-michael.bommarito@gmail.com
+    Fixes: b657c95c1108 ("ocfs2: Wrap inode block reads in a dedicated function.")
+    Signed-off-by: Michael Bommarito <michael.bommarito@gmail.com>
+    Link: https://sashiko.dev/#/patchset/20260517111015.3187935-1-michael.bommarito%40gmail.com
+    Assisted-by: Claude:claude-opus-4-7
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 4d80db59de9c7b52f75d8f32005dafc8d64658b0
+Author: Ingyu Jang <ingyujang25@korea.ac.kr>
+Date:   Fri May 15 04:32:14 2026 +0900
+
+    error-inject: use IS_ERR() check for debugfs_create_file()
+    
+    debugfs_create_file() returns an error pointer on failure, never NULL, so
+    the !file check in ei_debugfs_init() never triggers and the
+    debugfs_remove() cleanup cannot run.
+    
+    Use IS_ERR() and propagate the actual error via PTR_ERR().
+    
+    Link: https://lore.kernel.org/20260514193214.2432769-1-ingyujang25@korea.ac.kr
+    Signed-off-by: Ingyu Jang <ingyujang25@korea.ac.kr>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f5b1910e23f1233c8d4185268b2e659df2bc5dbf
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date:   Mon May 18 13:23:40 2026 +0900
+
+    ocfs2: kill osb->system_file_mutex lock
+    
+    Commit 43b10a20372d ("ocfs2: avoid system inode ref confusion by adding
+    mutex lock") tried to avoid a refcount leak caused by allowing multiple
+    threads to call igrab(inode).  But addition of osb->system_file_mutex made
+    locking dependency complicated and is causing lockdep to warn about
+    possibility of AB-BA deadlock.
+    
+    Since _ocfs2_get_system_file_inode() returns the same inode for the same
+    input arguments, we don't need to serialize
+    _ocfs2_get_system_file_inode().  What we need to make sure is that
+    igrab(inode) is called for only once().  Therefore, replace
+    osb->system_file_mutex with cmpxchg()-based locking.
+    
+    Link: https://lore.kernel.org/fea8d1fd-afb0-4302-a560-c202e2ef7afd@I-love.SAKURA.ne.jp
+    Fixes: 43b10a20372d ("ocfs2: avoid system inode ref confusion by adding mutex lock")
+    Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Reviewed-by: Heming Zhao <heming.zhao@suse.com>
+    Acked-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f7ea0d13735ef812f7c777d5c0a79ff6a4b369c3
+Author: Costa Shulyupin <costa.shul@redhat.com>
+Date:   Fri May 15 21:34:24 2026 +0300
+
+    include: remove unused cnt32_to_63.h
+    
+    All users have been removed over time as ARM and other architectures
+    switched to generic sched_clock.  The last user was microblaze, removed in
+    commit 839396ab88e4 ("microblaze: timer: Use generic sched_clock
+    implementation").
+    
+    Assisted-by: Claude:claude-opus-4-6
+    Link: https://lore.kernel.org/20260515183429.1503740-1-costa.shul@redhat.com
+    Signed-off-by: Costa Shulyupin <costa.shul@redhat.com>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Nicolas Pitre <npitre@baylibre.com>
+    Cc: Nicolas Pitre <nico@fluxnic.net>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 8cf0a6c4bb9e09a2d280376dba723b218c139e58
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:18:01 2026 +0200
+
+    raid6_kunit: randomize buffer alignment
+    
+    Add code to add random alignment to the buffers to test the case where
+    they are not page aligned, and to move the buffers to the end of the
+    allocation so that they are next to the vmalloc guard page.
+    
+    This does not include the recovery buffers as the recovery requires page
+    alignment.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-19-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit fa0c812c0aa58d4375317d804dd54e44b8bcf5e3
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:18:00 2026 +0200
+
+    raid6_kunit: randomize parameters and increase limits
+    
+    The current test has double-quadratic behavior in the selection for the
+    updated ("XORed") disks, and in the selection of updated pointers, which
+    makes scaling it to more tests difficult.  At the same time it only ever
+    tests with the maximum number of disks, which leaves a coverage hole for
+    smaller ones.
+    
+    Fix this by randomizing the total number, failed disks and regions to
+    update, and increasing the upper number of tests disks.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-18-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 562bcbfcb99b2eb4fd17d6551d760450e128afe1
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:59 2026 +0200
+
+    raid6_kunit: cleanup dataptr handling
+    
+    Move the global dataptr array into test_recover() as all sites that fill
+    data or parity can use test_buffers directly, and this localized the
+    override for the failed slots to the recovery testing routine.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-17-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit d67c25712fe3c5d78fea03827771c49debb89c80
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:58 2026 +0200
+
+    raid6_kunit: dynamically allocate data buffers using vmalloc
+    
+    Use vmalloc for the data buffers instead of using static .data
+    allocations.  This provides for better out of bounds checking and avoids
+    wasting kernel memory after the test has run.  vmalloc is used instead of
+    kmalloc to provide for better out of bounds access checking as in other
+    kunit tests.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-16-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 2175395f76c3eb3b19f1ce9be54d9dc9b0e4e61e
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:57 2026 +0200
+
+    raid6_kunit: use KUNIT_CASE_PARAM
+    
+    The raid6 test combines various generation and recovery algorithms.  Use
+    KUNIT_CASE_PARAM and provide a generator that iterates over the possible
+    combinations instead of looping inside a single test instance.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-15-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 30bf04bd13a58cd9b877589569aa0abd06f04e52
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:56 2026 +0200
+
+    raid6: update top of file comments
+    
+    Drop the pointless mention of the file name, and use standard formatting
+    for the top of file comments.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-14-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit dd83de0341da9979d6e584cd10e44361a183c938
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:55 2026 +0200
+
+    raid6: use static_call for raid6_recov_2data and raid6_recov_datap
+    
+    Avoid expensive indirect calls for the recovery routines as well.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-13-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 10f4b8e2a16452a7ead747c91a27ba3fabfe948d
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:54 2026 +0200
+
+    raid6: use static_call for gen_syndrom and xor_syndrom
+    
+    Avoid indirect calls for P/Q parity generation.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-12-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit adfcf6e89bc1322c4a6cc37ad32e411cf0500622
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:53 2026 +0200
+
+    raid6: rework registration of optimized algorithms
+    
+    Replace the static array of algorithms with a call to an architecture
+    helper to register algorithms.  This serves two purposes: it avoid having
+    to register all algorithms in a single central place, and it removes the
+    need for the priority field by just registering the algorithms that the
+    architecture considers suitable for the currently running CPUs.
+    
+    [hch@lst.de: register avx512 after avx2]
+      Link: https://lore.kernel.org/20260527074539.2292913-3-hch@lst.de
+    Link: https://lore.kernel.org/20260518051804.462141-11-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 769d603fc44f896e7f61de7f0cdb8b78d46bc8c8
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:52 2026 +0200
+
+    raid6: hide internals
+    
+    Split out two new headers from the public pq.h:
+    
+     - lib/raid/raid6/algos.h contains the algorithm lists private to
+       lib/raid/raid6
+     - include/linux/raid/pq_tables.h contains the tables also used by
+       async_tx providers.
+    
+    The public include/linux/pq.h is now limited to the public interface for
+    the consumers of the RAID6 PQ API.
+    
+    [hch@lst.de: remove duplicate ccflags-y line]
+      Link: https://lore.kernel.org/20260527074539.2292913-2-hch@lst.de
+    Link: https://lore.kernel.org/20260518051804.462141-10-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 2790045a62eb52a5052eed06ddcc10b03b007a39
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:51 2026 +0200
+
+    raid6: warn when using less than four devices
+    
+    Quoting H.  Peter Anvin who came up with the RAID6 P/Q algorithm, and who
+    wrote the initial implementation, then still part of the md driver:
+    
+      The RAID-6 code has *never* supported only 3 units, and if it ever
+      worked for *any* of the implementations it was purely by accident.
+      Speaking as the original author I should know; this was deliberate as
+      in some cases the degenerate case (3) would have required extra trays
+      in the code to no user benefit.
+    
+    While md never allowed less than 4 devices, btrfs does.  This new warning
+    will trigger for such file systems, but given how it already causes havoc
+    that is a good thing.  If btrfs wants to fix third, it should switch to
+    transparently use three-way mirroring underneath, which will work as P and
+    Q are copies of the single data device by the definition of the Linux RAID
+    6 P/Q algorithm.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-9-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 35472bc6f31b64e58d1fe560340aa4f1684b8d6d
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:50 2026 +0200
+
+    raid6: improve the public interface
+    
+    Stop directly calling into function pointers from users of the RAID6 PQ
+    API, and provide exported functions with proper documentation and API
+    guarantees asserts where applicable instead.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-8-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 7e91f76a96686b3341c96e1e7f3e86c0f51e2cff
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:49 2026 +0200
+
+    raid6: use named initializers for struct raid6_calls
+    
+    Link: https://lore.kernel.org/20260518051804.462141-7-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 885d314231837a58258edc2757def1ee7fa0138c
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:48 2026 +0200
+
+    raid6: remove raid6_get_zero_page
+    
+    Just open code it as in other places in the kernel.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-6-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 06d2a66fb7c0b33ce893edb2f695add88291bff2
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:47 2026 +0200
+
+    raid6: remove unused defines in pq.h
+    
+    These are not used anywhere in the kernel.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-5-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 3626738bc7147d52cb49f3994a9846aa2d34810a
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:46 2026 +0200
+
+    raid6: move to lib/raid/
+    
+    Move the raid6 code to live in lib/raid/ with the XOR code, and change the
+    internal organization so that each architecture has a subdirectory similar
+    to the CRC, crypto and XOR libraries, and fix up the Makefile to only
+    build files actually needed.
+    
+    Also move the kunit test case from the history test/ subdirectory to
+    tests/ and use the normal naming scheme for it.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-4-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 3d6beb659ddf0664612bafacb0bd9030ba6ec7e6
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:45 2026 +0200
+
+    raid6: remove __KERNEL__ ifdefs
+    
+    With the test code ported to kernel space, none of this is required.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-3-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c4697486fc232e821a33191d809d0ac3bb600027
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon May 18 07:17:44 2026 +0200
+
+    raid6: turn the userspace test harness into a kunit test
+    
+    Patch series "cleanup the RAID6 P/Q library", v3.
+    
+    This series cleans up the RAID6 P/Q library to match the recent updates to
+    the RAID 5 XOR library and other CRC/crypto libraries.  This includes
+    providing properly documented external interfaces, hiding the internals,
+    using static_call instead of indirect calls and turning the user space
+    test suite into an in-kernel kunit test which is also extended to improve
+    coverage.
+    
+    Note that this changes registration so that non-priority algorithms are
+    not registered, which greatly helps with the benchmark time at boot time.
+    I'd like to encourage all architecture maintainers to see if they can
+    further optimized this by registering as few as possible algorithms when
+    there is a clear benefit in optimized or more unrolled implementations.
+    
+    
+    This patch (of 18):
+    
+    Currently the raid6 code can be compiled as userspace code to run the test
+    suite.  Convert that to be a kunit case with minimal changes to avoid
+    mutating global state so that we can drop this requirement.
+    
+    Note that this is not a good kunit test case yet and will need a lot more
+    work, but that is deferred until the raid6 code is moved to it's new
+    place, which is easier if the userspace makefile doesn't need adjustments
+    for the new location first.
+    
+    Link: https://lore.kernel.org/20260518051804.462141-1-hch@lst.de
+    Link: https://lore.kernel.org/20260518051804.462141-2-hch@lst.de
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Ard Biesheuvel <ardb@kernel.org> # kunit only on arm64
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Mason <clm@fb.com>
+    Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: David Sterba <dsterba@suse.com>
+    Cc: Heiko Carstens <hca@linux.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Huacai Chen <chenhuacai@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Li Nan <linan122@huawei.com>
+    Cc: Madhavan Srinivasan <maddy@linux.ibm.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Nicholas Piggin <npiggin@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Song Liu <song@kernel.org>
+    Cc: Sven Schnelle <svens@linux.ibm.com>
+    Cc: Vasily Gorbik <gor@linux.ibm.com>
+    Cc: WANG Xuerui <kernel@xen0n.name>
+    Cc: Will Deacon <will@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 91e11432d7db690dfa3e6d2e6f89f5cd865123f5
+Author: Jorge Ramirez-Ortiz <jorge.ramirez@oss.qualcomm.com>
+Date:   Mon May 18 11:10:05 2026 +0200
+
+    mailmap: update Jorge Ramirez-Ortiz email address
+    
+    Map old Linaro address to the new Qualcomm OSS address.
+    
+    Link: https://lore.kernel.org/20260518091019.3926371-1-jorge.ramirez@oss.qualcomm.com
+    Signed-off-by: Jorge Ramirez-Ortiz <jorge.ramirez@oss.qualcomm.com>
+    Cc: Jakub Kacinski <kuba@kernel.org>
+    Cc: Konrad Dybcio <konradybcio@kernel.org>
+    Cc: Martin Kepplinger <martink@posteo.de>
+    Cc: Shannon Nelson <sln@onemain.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 1d9c9493692eccd16b47610f1d21cc7a100199e9
+Author: Jann Horn <jannh@google.com>
+Date:   Tue May 5 11:00:46 2026 +0200
+
+    kcov: allow simultaneous KCOV_ENABLE/KCOV_REMOTE_ENABLE
+    
+    Allow the same userspace thread to simultaneously collect normal coverage
+    in syscall context (KCOV_ENABLE) and remote coverage of asynchronous work
+    created by the thread (KCOV_REMOTE_ENABLE).  With this, remote KCOV
+    coverage becomes useful for generic fuzzing and not just fuzzing of
+    specific data injection interfaces.
+    
+    This requires that the task_struct::kcov_* fields are separated into ones
+    that are used by the task that generates coverage, and ones that are used
+    by the task that requested remote coverage.  To split this up:
+    
+     - Split task_struct::kcov into kcov and kcov_remote. kcov_task_exit() now
+       has to clean up both separately.
+     - Only use task_struct::kcov_mode on the task that generates coverage.
+     - Only reset task_struct::kcov_handle on the task that requested remote
+       coverage.
+    
+    After this change, fields used by the task that generates coverage are:
+    
+     - kcov_mode
+     - kcov_size
+     - kcov_area
+     - kcov
+     - kcov_sequence
+     - kcov_softirq
+    
+    Fields used by the task that requested remote coverage are:
+    
+     - kcov_remote
+     - kcov_handle
+    
+    [jannh@google.com: remove unused constant KCOV_MODE_REMOTE, per Dmitry]
+      Link: https://lore.kernel.org/20260515-kcov-simultaneous-remote-v2-1-56fde1cfa509@google.com
+    [jannh@google.com: update documentation on remote coverage collection]
+      Link: https://lore.kernel.org/20260519-kcov-docs-v1-1-5bb22f4cb20c@google.com
+    [jannh@google.com: move and reword sentence on simultaneous normal/remote collection
+      Link: https://lore.kernel.org/20260520-kcov-docs-v2-1-819f78778763@google.com
+    Link: https://lore.kernel.org/20260505-kcov-simultaneous-remote-v1-1-a670ba7cefd2@google.com
+    Signed-off-by: Jann Horn <jannh@google.com>
+    Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Alexander Potapenko <glider@google.com>
+    Cc: Andrey Konovalov <andreyknvl@gmail.com>
+    Cc: Marco Elver <elver@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 442082297e3d38f3a59754ff56fc07d72a93fdbd
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:59 2026 +0300
+
+    riscv: fix building compressed EFI image
+    
+    When building vmlinuz.efi with CONFIG_EFI_ZBOOT enabled, '__lshrdi3()'
+    is also needed to fix yet another link error observed when building
+    riscv32 and loongarch32 images:
+    
+    riscv32-linux-gnu-ld: drivers/firmware/efi/libstub/lib-cmdline.stub.o: in function `__efistub_.L49':
+    __efistub_cmdline.c:(.init.text+0x202): undefined reference to `__efistub___lshrdi3'
+    
+    /usr/bin/loongarch32-linux-gnu-ld: ./drivers/firmware/efi/libstub/lib-cmdline.stub.o: in function `__efistub_.L47':
+    __efistub_cmdline.c:(.init.text+0x26c): undefined reference to `__efistub___lshrdi3'
+    
+    And since both riscv64 and loongarch64 can have CONFIG_EFI_ZBOOT but
+    doesn't need these library routines, rely on CONFIG_32BIT to manage
+    linking of lib-ashldi3.o and lib-lshrdi3.o on 32-bit variants only.
+    
+    [dmantipov@yandex.ru: fix loongarch32]
+      Link: https://lore.kernel.org/8095016e47aceab4830c2523ce78af968ec0497e.camel@yandex.ru
+    Link: https://lore.kernel.org/20260519172259.908980-9-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reported-by: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Closes: https://lore.kernel.org/linux-riscv/20260409050018.GA371560@inky.localdomain
+    Tested-by: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Suggested-by: Ard Biesheuvel <ardb@kernel.org>
+    Assisted-by: Gemini:gemini-3.1-pro-preview sashiko
+    Tested-by: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Andriy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 6bba2ae43e8f379d3bed4c3eb258ea6d81baae80
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:58 2026 +0300
+
+    lib: kunit: add tests for __ashldi3(), __ashrdi3(), and __lshrdi3()
+    
+    Add KUnit tests for '__ashldi3()', '__ashrdi3()', and '__lshrdi3()' helper
+    functions used to implement 64-bit arithmetic shift left, arithmetic shift
+    right and logical shift right, respectively, on a 32-bit CPUs.
+    
+    Tested with 'qemu-system-riscv32 -M virt' and 'qemu-system-arm -M virt'.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-8-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Tested-by: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Assisted-by: Gemini:gemini-3.1-pro-preview sashiko
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit a354b8de9ad607c0a11419a402df46b46503f921
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:57 2026 +0300
+
+    riscv: add platform-specific double word shifts for riscv32
+    
+    Add riscv32-specific '__ashldi3()', '__ashrdi3()', and '__lshrdi3()'.
+    Initially it was intended to fix the following link error observed when
+    building EFI-enabled kernel with CONFIG_EFI_STUB=y and
+    CONFIG_EFI_GENERIC_STUB=y:
+    
+    riscv32-linux-gnu-ld: ./drivers/firmware/efi/libstub/lib-cmdline.stub.o: in function `__efistub_.L49':
+    __efistub_cmdline.c:(.init.text+0x1f2): undefined reference to `__efistub___ashldi3'
+    riscv32-linux-gnu-ld: __efistub_cmdline.c:(.init.text+0x202): undefined reference to `__efistub___lshrdi3'
+    
+    Reported at [1] trying to build
+    https://patchew.org/linux/20260212164413.889625-1-dmantipov@yandex.ru,
+    tested with 'qemu-system-riscv32 -M virt' only.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-7-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reported-by: kernel test robot <lkp@intel.com>
+    Closes: https://lore.kernel.org/oe-kbuild-all/202603041925.KLKqpK6N-lkp@intel.com [1]
+    Suggested-by: Ard Biesheuvel <ardb@kernel.org>
+    Tested-by: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Assisted-by: Gemini:gemini-3.1-pro-preview sashiko
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Andriy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 117d2bfa0ab1bec88d600c50884000334f034338
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:56 2026 +0300
+
+    lib/cmdline: adjust a few comments to fix kernel-doc -Wreturn warnings
+    
+    Fix 'get_option()', 'memparse()' and 'parse_option_str()' comments to
+    match the commonly used style as suggested by kernel-doc -Wreturn.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-6-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Suggested-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit a535853b664988aba11771deed44673765df581e
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:55 2026 +0300
+
+    lib/cmdline_kunit: add test case for memparse()
+    
+    Better late than never, now there is a long-awaited basic test for
+    'memparse()' which is provided by cmdline.c.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-5-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Suggested-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit ab90fc1007245380988c500ddf7eff6da1b10056
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:54 2026 +0300
+
+    lib: add more string to 64-bit integer conversion overflow tests
+    
+    Add a few more string to 64-bit integer conversion tests to check whether
+    'kstrtoull()', 'kstrtoll()', 'kstrtou64()' and 'kstrtos64()' can handle
+    overflows reported by '_parse_integer_limit()'.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-4-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Suggested-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 9a4580db6e9f83428813f671a79486469684069f
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:53 2026 +0300
+
+    lib: fix memparse() to handle overflow
+    
+    Since '_parse_integer_limit()' (and so 'simple_strtoull()') is now capable
+    to handle overflow, adjust 'memparse()' to handle overflow (denoted by
+    ULLONG_MAX) returned from 'simple_strtoull()'.  Also use
+    'check_shl_overflow()' to catch an overflow possibly caused by processing
+    size suffix and denote it with ULLONG_MAX as well.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-3-dmantipov@yandex.ru
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 6e30111dbb4075e3c26c230417b32bc4a1c66831
+Author: Dmitry Antipov <dmantipov@yandex.ru>
+Date:   Tue May 19 20:22:52 2026 +0300
+
+    lib: fix _parse_integer_limit() to handle overflow
+    
+    Patch series "lib and lib/cmdline enhancements", v11.
+    
+    This series is a merge of the recently posted [1] and [2].  The first one
+    is intended to adjust '_parse_integer_limit()' and 'memparse()' to not
+    ignore overflows, extend string to 64-bit integer conversion tests, add
+    KUnit-based test for 'memparse()' and fix kernel-doc glitches found in
+    lib/cmdline.c.  The second one was originated from RISCV-specific build
+    fixes needed to integrate the former and now aims to provide
+    platform-specific double-word shifts and corresponding KUnit test.
+    
+    Getting feedback from RISCV core maintainers would be very helpful.
+    
+    Special thanks to Andy Shevchenko, Charlie Jenkins, and Andrew Morton.
+    
+    
+    This patch (of 8):
+    
+    In '_parse_integer_limit()', adjust native integer arithmetic with
+    near-to-overflow branch where 'check_mul_overflow()' and
+    'check_add_overflow()' are used to check whether an intermediate result
+    goes out of range, and denote such a case with ULLONG_MAX, thus making the
+    function more similar to standard C library's 'strtoull()'.  Adjust
+    comment to kernel-doc style as well.
+    
+    Link: https://lore.kernel.org/20260519172259.908980-1-dmantipov@yandex.ru
+    Link: https://lore.kernel.org/20260519172259.908980-2-dmantipov@yandex.ru
+    Link: https://lore.kernel.org/linux-riscv/20260403103338.1122415-1-dmantipov@yandex.ru [1]
+    Link: https://lore.kernel.org/linux-riscv/20260427090105.705529-1-dmantipov@yandex.ru [2]
+    Signed-off-by: Dmitry Antipov <dmantipov@yandex.ru>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Albert Ou <aou@eecs.berkeley.edu>
+    Cc: Alexandre Ghiti <alex@ghiti.fr>
+    Cc: Andriy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Ard Biesheuvel <ardb@kernel.org>
+    Cc: Palmer Dabbelt <palmer@dabbelt.com>
+    Cc: Charlie Jenkins <thecharlesjenkins@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit dcc8a57815534e3844f342b28ecfb6e626a816a0
+Author: Shuvam Pandey <shuvampandey1@gmail.com>
+Date:   Mon Mar 16 15:57:27 2026 +0545
+
+    lib/tests: extend cmdline KUnit with next_arg() tests
+    
+    The cmdline KUnit suite covers get_option() and get_options(), but it
+    does not exercise next_arg().
+    
+    Extend the suite with one test for a quoted value containing spaces and
+    one regression test for a bare quote token after a normal parameter.
+    
+    The regression test covers the bare quote token path fixed by commit
+    9847f21225c4 ("lib/cmdline: avoid page fault in next_arg").
+    
+    [shuvampandey1@gmail.com: extend cmdline next_arg() coverage with mixed tokens]
+      Link: https://lore.kernel.org/20260316211249.88601-1-shuvampandey1@gmail.com
+    Link: https://lore.kernel.org/20260316101227.15807-1-shuvampandey1@gmail.com
+    Signed-off-by: Shuvam Pandey <shuvampandey1@gmail.com>
+    Reviewed-by: Andy Shevchenko <andriy.shevchenko@intel.com>
+    Cc: Neel Natu <neelnatu@google.com>
+    Cc: Dmitry Antipov <dmantipov@yandex.ru>
+    Cc: "Darrick J. Wong" <djwong@kernel.org>
+    Cc: Kees Cook <kees@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 2f5026b8d4fe34601d692ae7f7cd27367e002266
+Author: Hongfu Li <lihongfu@kylinos.cn>
+Date:   Wed May 13 10:58:38 2026 +0800
+
+    selftests/perf_events: fix mmap() error check in sigtrap_threads
+    
+    In sigtrap_threads(), the return value of mmap() is checked against NULL.
+    mmap() returns MAP_FAILED, which is (void *)-1, not NULL, when it fails.
+    Since MAP_FAILED is non-zero and non-NULL, the condition "p == NULL" will
+    never be true on failure, causing the program to proceed with an invalid
+    pointer and segfault if mmap() actually fails under memory pressure.
+    
+    Link: https://lore.kernel.org/20260513025838.594945-1-lihongfu@kylinos.cn
+    Signed-off-by: Hongfu Li <lihongfu@kylinos.cn>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Mickael Salaun <mic@digikod.net>
+    Cc: SeongJae Park <sj@kernel.org>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Cc: Wei Yang <richard.weiyang@gmail.com>
+    Cc: Kyle Huey <khuey@kylehuey.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 1c56b9cb489e7aa820dd61860e3dd892bdebe80c
+Author: Lucas Poupeau <lucasp.linux@gmail.com>
+Date:   Mon May 4 22:16:07 2026 +0200
+
+    lib/bug: cleanup comment style, types and modernize logging
+    
+    Improve the overall code quality of lib/bug.c by:
+    - Reformatting the main documentation block to follow the standard
+      kernel multi-line comment style.
+    - Replacing 'unsigned' with the preferred 'unsigned int'.
+    - Converting legacy printk() calls to modern pr_warn() and pr_info()
+      macros to include proper facility levels and satisfy checkpatch.
+    
+    Link: https://lore.kernel.org/20260504201607.56932-1-lucasp.linux@gmail.com
+    Signed-off-by: Lucas Poupeau <lucasp.linux@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c210dfaa2720fcad9cbc8ec30fb45ddbabee4bf8
+Author: Yury Norov <ynorov@nvidia.com>
+Date:   Mon May 4 16:36:05 2026 -0400
+
+    scripts/bloat-o-meter: ignore _sdata
+    
+    _sdata is a linker symbol, but bloat-o-meter may consider it as a real
+    variable:
+    
+    $ scripts/bloat-o-meter vmlinux.orig vmlinux
+    add/remove: 7/1 grow/shrink: 0/0 up/down: 3437/-4096 (-659)
+    Function                                     old     new   delta
+    crc32table_le                                  -    1024   +1024
+    crc32table_be                                  -    1024   +1024
+    crc32ctable_le                                 -    1024   +1024
+    byte_rev_table                                 -     256    +256
+    crc32_be                                       -      39     +39
+    crc32c                                         -      35     +35
+    crc32_le                                       -      35     +35
+    _sdata                                      4096       -   -4096
+    Total: Before=8592564398, After=8592563739, chg -0.00%
+    
+    With the patch:
+    
+    $ scripts/bloat-o-meter vmlinux.orig vmlinux
+    add/remove: 7/0 grow/shrink: 0/0 up/down: 3437/0 (3437)
+    Function                                     old     new   delta
+    crc32table_le                                  -    1024   +1024
+    crc32table_be                                  -    1024   +1024
+    crc32ctable_le                                 -    1024   +1024
+    byte_rev_table                                 -     256    +256
+    crc32_be                                       -      39     +39
+    crc32c                                         -      35     +35
+    crc32_le                                       -      35     +35
+    Total: Before=8592560302, After=8592563739, chg +0.00%
+    
+    Link: https://lore.kernel.org/20260504203606.427972-1-ynorov@nvidia.com
+    Signed-off-by: Yury Norov <ynorov@nvidia.com>
+    Cc: Valtteri Koskivuori <vkoskiv@gmail.com>
+    Cc: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit bda614e6b4f27d3535ee86a96a6bab3b9b4f5e87
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Fri May 8 16:59:14 2026 +0800
+
+    ocfs2: validate inline xattr header before reflinking inline xattrs
+    
+    [BUG]
+    A corrupt inline xattr header can make ocfs2_reflink_xattr_inline() lock,
+    copy, and reflink xattr state from an unchecked ibody xattr header.
+    
+    [CAUSE]
+    The inline reflink path still trusted di->i_xattr_inline_size to compute
+    header_off, xh, and new_xh before handing the source header to the reflink
+    allocator and copy logic.
+    
+    [FIX]
+    Validate the source inode's inline xattr header with the shared helper
+    first, then derive the reflink copy offsets from the validated inline
+    size/header. This keeps the reflink path from traversing corrupt ibody
+    xattr geometry.
+    
+    Link: https://lore.kernel.org/20260508085914.61647-6-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Zixuan Fu <r33s3n6@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 4523ba0ee2e9ab6ee9c4b20b2867c3e4aa01f503
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Fri May 8 16:59:13 2026 +0800
+
+    ocfs2: validate inline xattr header before inline refcount attach
+    
+    [BUG]
+    A corrupt inline xattr header can make ocfs2_xattr_inline_attach_refcount()
+    feed an unchecked header into the refcount-attachment walk for inline
+    xattr values.
+    
+    [CAUSE]
+    The inline refcount-attach path still derived the header directly from
+    di->i_xattr_inline_size and then passed it to code that iterates xh_count
+    and xattr entries.
+    
+    [FIX]
+    Use the shared ibody header helper before attaching refcounts to inline
+    xattr values so corrupt header geometry is rejected with -EFSCORRUPTED
+    instead of being traversed.
+    
+    Link: https://lore.kernel.org/20260508085914.61647-5-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Zixuan Fu <r33s3n6@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit b8ba8bbe69ad8a37e2f9bc2792c1b825f1964c91
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Fri May 8 16:59:12 2026 +0800
+
+    ocfs2: validate inline xattr header before ibody remove
+    
+    [BUG]
+    A corrupt inline xattr header can make ocfs2_xattr_ibody_remove() pass an
+    unchecked header into ocfs2_remove_value_outside() during inode xattr
+    teardown.
+    
+    [CAUSE]
+    ocfs2_xattr_ibody_remove() still rebuilt the ibody xattr header directly
+    from di->i_xattr_inline_size and then handed it to code that iterates
+    xh_count and entry geometry.
+    
+    [FIX]
+    Validate the inline xattr header with the shared helper before handing it
+    to the outside-value removal path, and propagate -EFSCORRUPTED on bad
+    metadata instead of traversing the unchecked header.
+    
+    Link: https://lore.kernel.org/20260508085914.61647-4-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Zixuan Fu <r33s3n6@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit a61b83dd83ed44e937de7aead2b4ddd3ad32e3f8
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Fri May 8 16:59:11 2026 +0800
+
+    ocfs2: validate inline xattr header before checking outside values
+    
+    [BUG]
+    A corrupt inline xattr header can make
+    ocfs2_has_inline_xattr_value_outside() walk xh_count from an unchecked
+    header while refcount-tree teardown decides whether inline xattrs still
+    point outside the inode body.
+    
+    [CAUSE]
+    ocfs2_has_inline_xattr_value_outside() still computed the inline header
+    directly from di->i_xattr_inline_size and immediately iterated xh_count.
+    That is the same unchecked metadata boundary as the ibody lookup bug.
+    
+    [FIX]
+    Reuse the shared inline-header helper before iterating xh_count. Because
+    this helper returns a boolean-style answer to its caller, treat a corrupt
+    header conservatively as "has outside values" instead of walking it.
+    
+    Link: https://lore.kernel.org/20260508085914.61647-3-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Zixuan Fu <r33s3n6@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit bef1006da49c91e8e154223d3005829a394f8f78
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Fri May 8 16:59:10 2026 +0800
+
+    ocfs2: validate inline xattr header before ibody lookups
+    
+    Patch series "ocfs2: validate inline xattr header consumers".
+    
+    Corrupt i_xattr_inline_size can move the computed inode-body xattr header
+    outside the dinode block. Several OCFS2 paths then trust xh_count or
+    xattr entry geometry from that unchecked header.
+    
+    The reported KASAN splat hits the ibody lookup path:
+    
+      BUG: KASAN: use-after-free in ocfs2_xattr_find_entry+0x37b/0x3a0
+      ocfs2_xattr_ibody_get()
+      ocfs2_xattr_get_nolock()
+      ocfs2_calc_xattr_init()
+    
+    The same unchecked header derivation also exists in the outside-value
+    probe, ibody remove, inline refcount attach, and inline reflink paths.
+    
+    This series factors the existing ibody list validation into a shared
+    helper and then converts the remaining inline-header consumers one at a
+    time.
+    
+    Patch layout:
+    
+    1. validate ibody get/find and reuse the helper in ibody list
+    2. validate the outside-value probe
+    3. validate ibody remove
+    4. validate inline refcount attach
+    5. validate inline reflink
+    
+    
+    This patch (of 5):
+    
+    [BUG]
+    mknodat() can read past the end of a dinode block when ACL inheritance
+    walks a corrupted inode-body xattr header. Another report shows the same
+    unchecked lookup later faulting in the VFS open path after create
+    returns a garbage status.
+    
+    KASAN: use-after-free in
+    ocfs2_xattr_find_entry+0x37b/0x3a0 fs/ocfs2/xattr.c:1078
+    Read of size 2 at addr ffff88801c520300 by task syz.0.10/360
+    
+    Trace:
+     ...
+     ocfs2_xattr_find_entry+0x37b/0x3a0 fs/ocfs2/xattr.c:1078
+     ocfs2_xattr_ibody_get fs/ocfs2/xattr.c:1178 [inline]
+     ocfs2_xattr_get_nolock+0x2ee/0x1110 fs/ocfs2/xattr.c:1309
+     ocfs2_calc_xattr_init+0x716/0xac0 fs/ocfs2/xattr.c:628
+     ocfs2_mknod+0x935/0x2400 fs/ocfs2/namei.c:333
+     ocfs2_create+0x158/0x390 fs/ocfs2/namei.c:676
+     vfs_create fs/namei.c:3493 [inline]
+     vfs_create+0x445/0x6f0 fs/namei.c:3477
+     do_mknodat+0x2d8/0x5e0 fs/namei.c:4372
+     __do_sys_mknodat fs/namei.c:4400 [inline]
+     __se_sys_mknodat fs/namei.c:4397 [inline]
+     __x64_sys_mknodat+0xb6/0xf0 fs/namei.c:4397
+     ...
+    
+    Another report:
+     BUG: unable to handle page fault for address: fffffbfff3e40ec0
+     RIP: 0010:__d_entry_type include/linux/dcache.h:414 [inline]
+     RIP: 0010:d_can_lookup include/linux/dcache.h:429 [inline]
+     RIP: 0010:d_is_dir include/linux/dcache.h:439 [inline]
+     RIP: 0010:path_openat+0xe2f/0x2ce0 fs/namei.c:4134
+    
+    Trace:
+     ...
+     do_filp_open+0x1f6/0x430 fs/namei.c:4161
+     do_sys_openat2+0x117/0x1c0 fs/open.c:1437
+     __x64_sys_openat+0x15b/0x220 fs/open.c:1463
+     ...
+    
+    [CAUSE]
+    ocfs2_xattr_ibody_list() already validates the inline xattr size and
+    entry count, but ocfs2_xattr_ibody_get() and ocfs2_xattr_ibody_find()
+    still derive the inline header directly from di->i_xattr_inline_size and
+    then trust xh_count. A corrupted inline size or entry count can therefore
+    move the computed header outside the dinode block before get/find start
+    walking it. That can either make ocfs2_xattr_find_entry() dereference
+    xs->header->xh_count outside the block or make ocfs2_xattr_get_nolock()
+    bubble a garbage status back through ocfs2_calc_xattr_init() into the
+    create/open path.
+    
+    [FIX]
+    Factor the existing ibody header geometry checks into a shared helper.
+    Use it in ocfs2_xattr_ibody_get() and ocfs2_xattr_ibody_find(), and have
+    ocfs2_xattr_ibody_list() reuse the same helper instead of open-coding
+    the validation. Reject corrupt ibody metadata with -EFSCORRUPTED before
+    the lookup path can walk bogus xattr geometry or return a garbage status.
+    
+    Link: https://lore.kernel.org/20260508085914.61647-1-gality369@gmail.com
+    Link: https://lore.kernel.org/20260508085914.61647-2-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+    Cc: Zixuan Fu <r33s3n6@gmail.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c0438198c28b1d22c272751af5e717c11d9fa8dd
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Tue May 12 10:41:15 2026 +0800
+
+    ocfs2: don't BUG_ON an invalid journal dinode
+    
+    [BUG]
+    A fuzzed OCFS2 image can corrupt the current slot journal dinode while
+    mount is still in progress. The mount path first reports the invalid
+    journal block and then crashes in shutdown:
+    
+    kernel BUG at fs/ocfs2/journal.c:1034!
+    Oops: invalid opcode: 0000 [#1] SMP KASAN NOPTI
+    RIP: 0010:ocfs2_journal_toggle_dirty+0x2d6/0x340 fs/ocfs2/journal.c:1034
+    Call Trace:
+     ocfs2_journal_shutdown+0x414/0xc30 fs/ocfs2/journal.c:1116
+     ocfs2_mount_volume fs/ocfs2/super.c:1785 [inline]
+     ocfs2_fill_super+0x30a9/0x3cd0 fs/ocfs2/super.c:1083
+     get_tree_bdev_flags+0x38b/0x640 fs/super.c:1698
+     get_tree_bdev+0x24/0x40 fs/super.c:1721
+     ocfs2_get_tree+0x21/0x30 fs/ocfs2/super.c:1184
+     vfs_get_tree+0x9a/0x370 fs/super.c:1758
+     fc_mount fs/namespace.c:1199 [inline]
+     do_new_mount_fc fs/namespace.c:3642 [inline]
+     do_new_mount fs/namespace.c:3718 [inline]
+     path_mount+0x5b8/0x1ea0 fs/namespace.c:4028
+     do_mount fs/namespace.c:4041 [inline]
+     __do_sys_mount fs/namespace.c:4229 [inline]
+     __se_sys_mount fs/namespace.c:4206 [inline]
+     __x64_sys_mount+0x282/0x320 fs/namespace.c:4206
+     ...
+    
+    [CAUSE]
+    ocfs2_journal_toggle_dirty() used to return -EIO when journal->j_bh no
+    longer contained a valid dinode, because the startup and shutdown paths
+    already handled that failure. Commit 10995aa2451a
+    ("ocfs2: Morph the haphazard OCFS2_IS_VALID_DINODE() checks.") changed
+    the check to a BUG_ON() under the assumption that the journal dinode had
+    already been validated. That turns an unexpected invalid journal dinode
+    during mount teardown into a kernel crash instead of a normal mount
+    failure.
+    
+    [FIX]
+    Replace the BUG_ON() with WARN_ON() and return -EIO. This keeps the
+    invariant warning for debugging, but restores the original behavior of
+    failing startup or shutdown cleanly instead of panicking the kernel.
+    
+    Link: https://lore.kernel.org/20260512024115.4036371-1-gality369@gmail.com
+    Fixes: 10995aa2451a ("ocfs2: Morph the haphazard OCFS2_IS_VALID_DINODE() checks.")
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 738ce4979c802ba0f1f8249a893aa7db1fbb2cf8
+Author: ZhengYuan Huang <gality369@gmail.com>
+Date:   Tue May 12 10:16:00 2026 +0800
+
+    ocfs2: reject inconsistent inode size before truncate
+    
+    [BUG]
+    openat(..., O_WRONLY|O_CREAT|O_TRUNC) can hit:
+    
+    kernel BUG at fs/ocfs2/file.c:454!
+    Oops: invalid opcode: 0000 [#1] SMP KASAN NOPTI
+    RIP: 0010:ocfs2_truncate_file+0x1204/0x13c0 fs/ocfs2/file.c:454
+    Call Trace:
+     ocfs2_setattr+0xa6d/0x1fd0 fs/ocfs2/file.c:1212
+     notify_change+0x4b5/0x1030 fs/attr.c:546
+     do_truncate+0x1d2/0x230 fs/open.c:68
+     handle_truncate fs/namei.c:3596 [inline]
+     do_open fs/namei.c:3979 [inline]
+     path_openat+0x260f/0x2ce0 fs/namei.c:4134
+     do_filp_open+0x1f6/0x430 fs/namei.c:4161
+     do_sys_openat2+0x117/0x1c0 fs/open.c:1437
+     do_sys_open fs/open.c:1452 [inline]
+     __do_sys_openat fs/open.c:1468 [inline]
+     __se_sys_openat fs/open.c:1463 [inline]
+     __x64_sys_openat+0x15b/0x220 fs/open.c:1463
+     ...
+    
+    [CAUSE]
+    ocfs2_truncate_file() treats di_bh->i_size matching inode->i_size as an
+    internal code invariant and BUGs if it is broken.
+    
+    That assumption is too strong for corrupted metadata. The dinode block can
+    still be structurally valid enough to pass ocfs2_read_inode_block() while
+    no longer matching an already-instantiated VFS inode. On local mounts,
+    ocfs2_inode_lock_update() skips refresh entirely, so truncate can
+    observe the mismatch directly and crash instead of rejecting the
+    corruption.
+    
+    [FIX]
+    Turn the BUG_ON into normal OCFS2 corruption handling. If truncate sees
+    di_bh->i_size disagree with inode->i_size, report it with ocfs2_error() and
+    abort before touching truncate state.
+    
+    This keeps the fix at the first boundary that actually requires the
+    sizes to match and avoids widening checks into hotter generic
+    inode-lock paths
+    
+    Link: https://lore.kernel.org/20260512021601.3936417-1-gality369@gmail.com
+    Signed-off-by: ZhengYuan Huang <gality369@gmail.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 56cb9b7d96b28a1173a510ab25354b6599ad3a33
+Author: Konstantin Khorenko <khorenko@virtuozzo.com>
+Date:   Mon May 11 12:50:52 2026 +0200
+
+    gcov: use atomic counter updates to fix concurrent access crashes
+    
+    GCC's GCOV instrumentation can merge global branch counters with loop
+    induction variables as an optimization.  In inflate_fast(), the inner copy
+    loops get transformed so that the GCOV counter value is loaded multiple
+    times to compute the loop base address, start index, and end bound.  Since
+    GCOV counters are global (not per-CPU), concurrent execution on different
+    CPUs causes the counter to change between loads, producing inconsistent
+    values and out-of-bounds memory writes.
+    
+    The crash manifests during IPComp (IP Payload Compression) processing when
+    inflate_fast() runs concurrently on multiple CPUs:
+    
+      BUG: unable to handle page fault for address: ffffd0a3c0902ffa
+      RIP: inflate_fast+1431
+      Call Trace:
+       zlib_inflate
+       __deflate_decompress
+       crypto_comp_decompress
+       ipcomp_decompress [xfrm_ipcomp]
+       ipcomp_input [xfrm_ipcomp]
+       xfrm_input
+    
+    At the crash point, the compiler generated three loads from the same
+    global GCOV counter (__gcov0.inflate_fast+216) to compute base, start, and
+    end for an indexed loop.  Another CPU modified the counter between loads,
+    making the values inconsistent - the write went 3.4 MB past a 65 KB
+    buffer.
+    
+    Add -fprofile-update=prefer-atomic to CFLAGS_GCOV at the global level in
+    the top-level Makefile, guarded by a try-run compile test.  The test
+    compiles a minimal program with and without -fprofile-update=prefer-atomic
+    using the full KBUILD_CFLAGS, then compares undefined symbols in the
+    resulting object files.  If prefer-atomic introduces new undefined
+    references (such as __atomic_fetch_add_8 on i386 or __aarch64_ldadd8_relax
+    on arm64 with outline-atomics), the flag is not added -- the kernel does
+    not link against libatomic.
+    
+    On architectures where GCC inlines 64-bit atomic counter updates (x86_64,
+    s390, ...) the test passes and the flag is enabled, preventing the
+    compiler from merging counters with loop induction variables and fixing
+    the observed concurrent-access crash.
+    
+    On architectures where the flag would introduce libatomic dependencies, it
+    is silently omitted and behaviour is no worse than before this patch.
+    
+    Move the CFLAGS_GCOV block from its original position (before the arch
+    Makefile include) to after the core KBUILD_CFLAGS assignments but before
+    the scripts/Makefile.gcc-plugins include.  This placement ensures the
+    try-run test sees arch-specific flags (-m32, -march=,
+    -mno-outline-atomics) while avoiding GCC plugin flags (-fplugin=) that
+    would break the test on clean builds when plugin shared objects do not yet
+    exist.
+    
+    Link: https://lore.kernel.org/20260511105052.417187-2-khorenko@virtuozzo.com
+    Signed-off-by: Konstantin Khorenko <khorenko@virtuozzo.com>
+    Tested-by: Arnd Bergmann <arnd@arndb.de>
+    Tested-by: Peter Oberparleiter <oberpar@linux.ibm.com>
+    Reviewed-by: Peter Oberparleiter <oberpar@linux.ibm.com>
+    Cc: Masahiro Yamada <masahiroy@kernel.org>
+    Cc: Miguel Ojeda <ojeda@kernel.org>
+    Cc: Mikhail Zaslonko <zaslonko@linux.ibm.com>
+    Cc: Nathan Chancellor <nathan@kernel.org>
+    Cc: Pavel Tikhomirov <ptikhomirov@virtuozzo.com>
+    Cc: Thomas Weißschuh <linux@weissschuh.net>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 25c786a9f7f8b5e882367f569020f1f37ac9fea7
+Author: Philipp Stanner <phasta@kernel.org>
+Date:   Thu May 7 11:49:19 2026 +0200
+
+    llist: make locking comments consistent
+    
+    llist's locking requirement table has a legend which claims that all
+    operations not needing a lock a marked with '-', whereas in truth for some
+    table entries just a whitespace is used.
+    
+    Add the '-' to all appropriate places.
+    
+    Link: https://lore.kernel.org/20260507094918.23910-2-phasta@kernel.org
+    Signed-off-by: Philipp Stanner <phasta@kernel.org>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: "Paul E . McKenney" <paulmck@kernel.org>
+    Cc: Shakeel Butt <shakeel.butt@linux.dev>
+    Cc: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit e4f5f6f3c199ae7fbe142da6b79a97a504ac7e55
+Author: Alexander Potapenko <glider@google.com>
+Date:   Thu May 7 11:52:37 2026 +0200
+
+    kfence: fix KASAN HW tags bypass via runtime sample_interval change
+    
+    If a user writes a non-zero value to the sample_interval module parameter
+    at runtime, the missing KASAN HW tags check in the late init path allows
+    KFENCE to be enabled alongside KASAN HW tags, bypassing the boot
+    restriction.
+    
+    This patch adds the missing check to param_set_sample_interval() to reject
+    the parameter change if KASAN HW tags are enabled.
+    
+    Link: https://lore.kernel.org/20260507095237.741017-1-glider@google.com
+    Fixes: 09833d99db36 ("mm/kfence: disable KFENCE upon KASAN HW tags enablement")
+    Signed-off-by: Alexander Potapenko <glider@google.com>
+    Cc: Marco Elver <elver@google.com>
+    Cc: Greg Thelen <gthelen@google.com>
+    Cc: Roman Gushchin <roman.gushchin@linux.dev>
+    Cc: Pimyn Girgis <pimyn@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 83544c68f71da543f59fdc9b30c1f5ff66de1a25
+Author: Joe Perches <joe@perches.com>
+Date:   Thu May 7 10:41:46 2026 -0700
+
+    MAINTAINERS/CREDITS: remove inactive checkpatch reviewers
+    
+    Dwaipayan Ray and Lukas Bulwahn have not commented on checkpatch in
+    several years.
+    
+    Lukas is still active on MAINTAINERS.
+    Create an entry in CREDITS for Dwaipayan.
+    
+    Link: https://lore.kernel.org/64f057d1d7f247583eb616337b89b3ff7bcc627f.camel@perches.com
+    Signed-off-by: Joe Perches <joe@perches.com>
+    Cc: Dwaipayan Ray <dwaipayanray1@gmail.com>
+    Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit fc15e3a30ddd950f009c76765331783b9af94a87
+Author: Dan Carpenter <error27@gmail.com>
+Date:   Fri May 8 10:51:56 2026 +0300
+
+    rapidio/tsi721: prevent a bad dereference in tsi721_db_dpc()
+    
+    With a list_for_each() loop, if we don't find the item we are looking for
+    in the list, then the loop exits with the iterator, which is "dbell" in
+    this loop, pointing to invalid memory.
+    
+    This code uses the "found" variable to determine if we have found the
+    doorbell we are looking for or not.  However, the problem that the "found"
+    variable needs to be set to false at the start of each iteration,
+    otherwise after the first correct doorbell, then everything is marked as
+    found.
+    
+    Reset the "found" to false at the start of the iteration and move the
+    variable inside the loop.
+    
+    Link: https://lore.kernel.org/af2WHMZiqMwdYveO@stanley.mountain
+    Fixes: 48618fb4e522 ("RapidIO: add mport driver for Tsi721 bridge")
+    Signed-off-by: Dan Carpenter <error27@gmail.com>
+    Cc: Alexandre Bounine <alex.bou9@gmail.com>
+    Cc: Chul Kim <chul.kim@idt.com>
+    Cc: Matt Porter <mporter@kernel.crashing.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 5a13e296a3e32a70db2a520d8611a53d7bde10e8
+Author: Jann Horn <jannh@google.com>
+Date:   Thu Apr 30 16:15:33 2026 +0200
+
+    kcov: refactor common handle ID into kcov_common_handle_id
+    
+    Store common handle IDs in "struct kcov_common_handle_id", which consumes
+    no space in non-KCOV builds.
+    
+    This cleanup removes #ifdef boilerplate code from subsystems that
+    integrate with KCOV (in particular in usbip_common.h and skbuff.h, see the
+    diffstat).
+    
+    This should also make it easier to add KCOV remote coverage to more
+    subsystems in the future.
+    
+    Link: https://lore.kernel.org/20260430-kcov-refactor-common-handle-v1-1-23a0c7a0ba38@google.com
+    Signed-off-by: Jann Horn <jannh@google.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+    Acked-by: Jakub Kicinski <kuba@kernel.org>
+    Cc: Alexander Potapenko <glider@google.com>
+    Cc: Andrey Konovalov <andreyknvl@gmail.com>
+    Cc: Eugenio Pérez <eperezma@redhat.com>
+    Cc: Hongren (Zenithal) Zheng <i@zenithal.me>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: Jason Wang <jasowang@redhat.com>
+    Cc: "Michael S. Tsirkin" <mst@redhat.com>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Cc: Valentina Manea <valentina.manea.m@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit bd99fcfc6219ebe36ae4d0bf5333b5ecc17b53df
+Author: Yury Norov <ynorov@nvidia.com>
+Date:   Fri Apr 24 22:08:57 2026 -0400
+
+    uaccess: minimize INLINE_COPY_USER-related ifdefery
+    
+    Now that we've got the same config selecting inline vs outline
+    copy_to_user() and copy_from_user(), we can simplify the corresponding
+    logic in the uaccess.h.
+    
+    Link: https://lore.kernel.org/20260425020857.356850-4-ynorov@nvidia.com
+    Fixes: 1f9a8286bc0c ("uaccess: always export _copy_[from|to]_user with CONFIG_RUST")
+    Signed-off-by: Yury Norov <ynorov@nvidia.com>
+    Tested-by: Alice Ryhl <aliceryhl@google.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: Christophe Leroy (CS GROUP) <chleroy@kernel.org>
+    Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Randy Dunlap <rdunlap@infradead.org>
+    Cc: Viktor Malik <vmalik@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit c02be2ad2b88c67c5d7c06b6aa7083b5b40e1077
+Author: Yury Norov <ynorov@nvidia.com>
+Date:   Fri Apr 24 22:08:56 2026 -0400
+
+    uaccess: unify inline vs outline copy_{from,to}_user() selection
+    
+    The kernel allows arches to select between inline and outline
+    implementations of the copy_{from,to}_user() by defining individual
+    INLINE_COPY_FROM_USER and INLINE_COPY_TO_USER, correspondingly.  However,
+    all arches enable or disable them always together.
+    
+    Without the real use-case for one helper being inlined while the other
+    outlined, having independent controls is excessive and error prone.
+    
+    Switch the codebase to the single unified INLINE_COPY_USER control.
+    
+    Link: https://lore.kernel.org/20260425020857.356850-3-ynorov@nvidia.com
+    Signed-off-by: Yury Norov <ynorov@nvidia.com>
+    Tested-by: Alice Ryhl <aliceryhl@google.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: Christophe Leroy (CS GROUP) <chleroy@kernel.org>
+    Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Randy Dunlap <rdunlap@infradead.org>
+    Cc: Viktor Malik <vmalik@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f829d4d911cc296b32d14436a8a517e907228475
+Author: Yury Norov <ynorov@nvidia.com>
+Date:   Fri Apr 24 22:08:55 2026 -0400
+
+    rust: uaccess: use INLINE_COPY_TO_USER to guard copy_to_user()
+    
+    Patch series "uaccess: unify inline vs outline copy_{from,to}_user()
+    selection", v2.
+    
+    The kernel allows arches to select between inline and outline
+    implementations of the copy_{from,to}_user() by defining individual
+    INLINE_COPY_FROM_USER and INLINE_COPY_TO_USER, correspondingly.  However,
+    all arches enable or disable them always together.
+    
+    Without the real use-case for one helper being inlined while the other
+    outlined, having independent controls is excessive and error prone.
+    
+    The first patch of the series fixes rust/uaccess coppy_to_user() wrapper
+    guarded with INLINE_COPY_FROM_USER.  The 2nd patch switches codebase to
+    the unified INLINE_COPY_USER.  And the last patch cleans up ifdefery in
+    the include/linux/uaccess.h
+    
+    
+    This patch (of 3):
+    
+    The copy_to_user() rust helper is only needed when the main kernel inlines
+    the function.  It is controlled by INLINE_COPY_TO_USER, but the rust
+    helper is protected with INLINE_COPY_FROM_USER.
+    
+    Fix that.
+    
+    Link: https://lore.kernel.org/20260425020857.356850-1-ynorov@nvidia.com
+    Link: https://lore.kernel.org/20260425020857.356850-2-ynorov@nvidia.com
+    Fixes: d99dc586ca7c7 ("uaccess: decouple INLINE_COPY_FROM_USER and CONFIG_RUST")
+    Signed-off-by: Yury Norov <ynorov@nvidia.com>
+    Reported-by: Christophe Leroy (CS GROUP) <chleroy@kernel.org>
+    Closes: https://lore.kernel.org/all/746c9c50-20c4-4dc9-a539-bf1310ff9414@kernel.org/
+    Cc: Alice Ryhl <aliceryhl@google.com>
+    Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Randy Dunlap <rdunlap@infradead.org>
+    Cc: Viktor Malik <vmalik@redhat.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit b3c726f9f46600868bdbe4bb7f1d770fd7ebb2e6
+Author: Mark Brown <broonie@kernel.org>
+Date:   Thu Feb 26 16:05:27 2026 +0000
+
+    kselftest/filelock: add a .gitignore file
+    
+    Tell git to ignore the generated binary for the test.
+    
+    Link: https://lore.kernel.org/20260226-selftest-filelock-ktap-v4-3-db8ae192ff42@kernel.org
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Cc: Jeff Layton <jlayton@kernel.org>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 33d5b13098fb8db5ff120d4e2124c8b214696859
+Author: Mark Brown <broonie@kernel.org>
+Date:   Thu Feb 26 16:05:26 2026 +0000
+
+    kselftest/filelock: report each test in oftlocks separately
+    
+    The filelock test checks four different things but only reports an overall
+    status, convert to use ksft_test_result() for these individual tests.
+    Each test depends on the previous ones so we still bail out if any of them
+    fail but we get a bit more information from UIs parsing the results.
+    
+    Link: https://lore.kernel.org/20260226-selftest-filelock-ktap-v4-2-db8ae192ff42@kernel.org
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Cc: Jeff Layton <jlayton@kernel.org>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 47d020e2337461f8a2991a0dc301f10a71903710
+Author: Mark Brown <broonie@kernel.org>
+Date:   Thu Feb 26 16:05:25 2026 +0000
+
+    kselftest/filelock: use ksft_perror()
+    
+    Patch series "selftests/filelock: Make output more kselftestish", v4.
+    
+    This series makes the output from the ofdlocks test a bit easier for
+    tooling to work with, and also ignores the generated file while we're
+    here.
+    
+    
+    This patch (of 3):
+    
+    The ofdlocks test reports some errors via perror() which does not produce
+    KTAP output, convert to ksft_perror() which does.
+    
+    Link: https://lore.kernel.org/20260226-selftest-filelock-ktap-v4-0-db8ae192ff42@kernel.org
+    Link: https://lore.kernel.org/20260226-selftest-filelock-ktap-v4-1-db8ae192ff42@kernel.org
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Cc: Jeff Layton <jlayton@kernel.org>
+    Cc: Shuah Khan <shuah@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f424800c2a23d9fdc1355bdaf46ad2bc89741436
+Author: Josh Law <objecting@objecting.org>
+Date:   Tue Mar 24 22:32:10 2026 +0000
+
+    lib/base64: fix copy-pasted @padding doc in base64_decode()
+    
+    The @padding kernel-doc for base64_decode() says "whether to append '='
+    padding characters", which was copy-pasted from base64_encode().  In the
+    decode context, it controls whether the input is expected to include
+    padding, not whether to append it.
+    
+    Link: https://lore.kernel.org/20260324223210.47676-3-objecting@objecting.org
+    Signed-off-by: Josh Law <objecting@objecting.org>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit cae29a5787e38ce7ec7727a87ac7e393a85cb1ef
+Author: Josh Law <objecting@objecting.org>
+Date:   Tue Mar 24 22:32:09 2026 +0000
+
+    lib/base64: validate before writing in decode tail path
+    
+    Patch series "lib/base64: decode fixes", v2.
+    
+    Two small fixes for lib/base64.c:
+    
+    1. base64_decode() writes a decoded byte to the output buffer before
+       validating the input in the trailing-bytes path. Move the validity
+       checks before any writes so dst is untouched on invalid input.
+    
+    2. The @padding kernel-doc for base64_decode() was copy-pasted from
+       base64_encode() and describes the wrong direction.
+    
+    
+    This patch (of 2):
+    
+    The trailing-bytes path in base64_decode() writes a decoded byte to the
+    output buffer before checking whether the input characters are valid.  If
+    the input is malformed, garbage is written to dst before the function
+    returns -1.
+    
+    Move the validity checks before any writes so the output buffer is left
+    untouched on invalid input.
+    
+    Link: https://lore.kernel.org/20260324223210.47676-1-objecting@objecting.org
+    Link: https://lore.kernel.org/20260324223210.47676-2-objecting@objecting.org
+    Fixes: 9c7d3cf94d33 ("lib/base64: rework encode/decode for speed and stricter validation")
+    Signed-off-by: Josh Law <objecting@objecting.org>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit cd2464a059d6e88eecda87d71d3dbc87175289f0
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Tue Mar 31 16:28:38 2026 +0200
+
+    init.h: discard exitcall symbols early
+    
+    Any __exitcall() and built-in module_exit() handler is marked as __used,
+    which leads to the code being included in the object file and later
+    discarded at link time.
+    
+    As far as I can tell, this was originally added at the same time as
+    initcalls were marked the same way, to prevent them from getting dropped
+    with gcc-3.4, but it was never actaully necessary to keep exit functions
+    around.
+    
+    Mark them as __maybe_unused instead, which lets the compiler treat the
+    exitcalls as entirely unused, and make better decisions about dropping
+    specializing static functions called from these.
+    
+    Link: https://lore.kernel.org/all/acruxMNdnUlyRHiy@google.com/
+    Link: https://lore.kernel.org/20260331142846.3187706-1-arnd@kernel.org
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Acked-by: Nicolas Schier <nsc@kernel.org>
+    Cc: Andriy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+    Cc: Josh Poimboeuf <jpoimboe@kernel.org>
+    Cc: Kees Cook <kees@kernel.org>
+    Cc: Marco Elver <elver@google.com>
+    Cc: Nathan Chancellor <nathan@kernel.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Petr Mladek <pmladek@suse.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit fe495c4e2ee34f84d856c06d524d43512e1f4f98
+Author: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Date:   Mon Apr 6 21:32:48 2026 +0200
+
+    lib/tests: string_helpers: don't use "proxy" headers
+    
+    Update header inclusions to follow IWYU (Include What You Use) principle.
+    
+    Link: https://lore.kernel.org/20260406193425.1534197-3-andriy.shevchenko@linux.intel.com
+    Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Kees Cook <kees@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f53718d5a23b72149c9bb7287c9ca078ff4d4aab
+Author: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Date:   Mon Apr 6 21:32:47 2026 +0200
+
+    lib/tests: string_helpers: decouple unescape and escape cases
+    
+    Patch series "lib/tests: string_helpers: Slight improvements".
+    
+    Two ad-hoc patches to improve the test module.  It was induced by another
+    patch that poorly tried to add (existing) test cases and make me revisit
+    string_helpers_kunit.c.
+    
+    
+    This patch (of 2):
+    
+    Currently the escape and unescape test cases go in one step.  Decouple
+    them for the better granularity and understanding test coverage in the
+    results.
+    
+    Link: https://lore.kernel.org/20260406193425.1534197-1-andriy.shevchenko@linux.intel.com
+    Link: https://lore.kernel.org/20260406193425.1534197-2-andriy.shevchenko@linux.intel.com
+    Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Kees Cook <kees@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 97bd80a91858ea72be5aa4565af2721fb732eba6
+Author: Anand Moon <linux.amoon@gmail.com>
+Date:   Tue Apr 7 11:09:34 2026 +0530
+
+    treewide: fix indentation and whitespace in Kconfig files
+    
+    Clean up inconsistent indentation (mixing tabs and spaces) and remove
+    extraneous whitespace in several Kconfig files across the tree.  This is a
+    purely cosmetic change to improve readability.
+    
+    Adjust indentation from spaces to tab (+optional two spaces) as in
+    coding style with command like:
+    
+    $ sed -e 's/^        /\t/' -i */Kconfig
+    
+    Link: https://lore.kernel.org/20260407053945.14116-1-linux.amoon@gmail.com
+    Signed-off-by: Anand Moon <linux.amoon@gmail.com>
+    Reviewed-by: Jan Kara <jack@suse.cz>                    [fs]
+    Reviewed-by: Liam R. Howlett <Liam.Howlett@oracle.com>  [mm]
+    Reviewed-by: Lorenzo Stoakes <ljs@kernel.org>           [mm]
+    Reviewed-by: Christian Brauner <brauner@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 09d8b39563e84fc245d642182715a7e0e024b0f2
+Author: Sasha Levin <sashal@kernel.org>
+Date:   Wed Apr 8 15:45:42 2026 -0400
+
+    get_maintainer: add --json output mode
+    
+    Add a --json flag to get_maintainer.pl that emits structured JSON output,
+    making results machine-parseable for CI systems, IDE integrations, and
+    AI-assisted development tools.
+    
+    The JSON output includes a maintainers array with structured name, email,
+    and role fields, plus optional arrays for scm, status, subsystem, web, and
+    bug information when those flags are enabled.
+    
+    Normal text output behavior is completely unchanged when --json is not
+    specified.
+    
+    Assisted-by: Claude:claude-opus-4-6
+    Link: https://lore.kernel.org/20260408194542.1354549-1-sashal@kernel.org
+    Signed-off-by: Sasha Levin <sashal@kernel.org>
+    Acked-by: Joe Perches <joe@perches.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f13f1b0cb56491547243e502988282e5be50bc44
+Author: Shuvam Pandey <shuvampandey1@gmail.com>
+Date:   Thu Apr 9 02:08:51 2026 +0545
+
+    seq_buf: export seq_buf_putmem_hex() and add KUnit tests
+    
+    The seq_buf KUnit suite does not exercise seq_buf_putmem_hex().
+    
+    Add one test for the len > 8 chunking path and one overflow test where a
+    later chunk no longer fits in the buffer.
+    
+    Export seq_buf_putmem_hex() as well so SEQ_BUF_KUNIT_TEST=m links cleanly.
+    Without the export, modpost reports seq_buf_putmem_hex as undefined when
+    seq_buf_kunit is built as a module.
+    
+    Link: https://lore.kernel.org/20260408202351.21829-1-shuvampandey1@gmail.com
+    Signed-off-by: Shuvam Pandey <shuvampandey1@gmail.com>
+    Acked-by: Steven Rostedt (Google) <rostedt@goodmis.org>
+    Cc: David Gow <david@davidgow.net>
+    Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+    Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 20e4b31f8e837d923eee91cd5458f823a11cca9a
+Author: Yiyang Chen <cyyzero16@gmail.com>
+Date:   Mon Apr 13 23:45:45 2026 +0800
+
+    selftests/acct: add taskstats TGID retention test
+    
+    Add a kselftest for the taskstats TGID aggregation fix.
+    
+    The test creates a worker thread, snapshots TGID taskstats while the
+    worker is still alive, lets the worker exit, and then verifies that the
+    TGID CPU total does not regress after the thread has been reaped.
+    
+    The pass/fail check intentionally keys off ac_utime + ac_stime only, which
+    is the primary user-visible regression fixed by the taskstats change and
+    is less sensitive to scheduling noise than context-switch counters.
+    
+    Link: https://lore.kernel.org/0d55354911c54cd1b9f10a09f6fd378af85c8d43.1776094300.git.cyyzero16@gmail.com
+    Signed-off-by: Yiyang Chen <cyyzero16@gmail.com>
+    Acked-by: Balbir Singh <balbirs@nvidia.com>
+    Cc: Dr. Thomas Orgis <thomas.orgis@uni-hamburg.de>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Wang Yaxin <wang.yaxin@zte.com.cn>
+    Cc: Yang Yang <yang.yang29@zte.com.cn>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit b3e4fbb04220efc3bc022bcf31b5689d39c6b111
+Author: Yiyang Chen <cyyzero16@gmail.com>
+Date:   Mon Apr 13 23:45:44 2026 +0800
+
+    taskstats: retain dead thread stats in TGID queries
+    
+    Patch series "taskstats: fix TGID dead-thread stat retention", v3.
+    
+    This series fixes a taskstats TGID aggregation bug where fields added in
+    the TGID query path were not preserved after thread exit, and adds a
+    kselftest covering the regression.
+    
+    The first patch keeps the cached TGID aggregate used for dead threads in
+    step with the fields already accumulated for live threads, and also fixes
+    the final TGID exit notification emitted when group_dead is true.
+    
+    The second patch adds a kselftest that verifies TGID CPU stats do not
+    regress after a worker thread exits and has been reaped.
+    
+    
+    This patch (of 2):
+    
+    fill_stats_for_tgid() builds TGID stats from two sources: the cached
+    aggregate in signal->stats and a scan of the live threads in the group.
+    
+    However, fill_tgid_exit() only accumulates delay accounting into
+    signal->stats.  This means that once a thread exits, TGID queries lose the
+    fields that fill_stats_for_tgid() adds for live threads.
+    
+    This gap was introduced incrementally by two earlier changes that extended
+    fill_stats_for_tgid() but did not make the corresponding update to
+    fill_tgid_exit():
+    
+    - commit 8c733420bdd5 ("taskstats: add e/u/stime for TGID command")
+      added ac_etime, ac_utime, and ac_stime to the TGID query path.
+    - commit b663a79c1915 ("taskstats: add context-switch counters")
+      added nvcsw and nivcsw to the TGID query path.
+    
+    As a result, those fields were accounted for live threads in TGID queries,
+    but were dropped from the cached TGID aggregate after thread exit.  The
+    final TGID exit notification emitted when group_dead is true also copies
+    that cached aggregate, so it loses the same fields.
+    
+    Factor the per-task TGID accumulation into tgid_stats_add_task() and use
+    it in both fill_stats_for_tgid() and fill_tgid_exit().  This keeps the
+    cached aggregate used for dead threads aligned with the live-thread
+    accumulation used by TGID queries.
+    
+    Link: https://lore.kernel.org/cover.1776094300.git.cyyzero16@gmail.com
+    Link: https://lore.kernel.org/abd2a15d33343636ab5ba43d540bcfe508bd66c7.1776094300.git.cyyzero16@gmail.com
+    Fixes: 8c733420bdd5 ("taskstats: add e/u/stime for TGID command")
+    Fixes: b663a79c1915 ("taskstats: add context-switch counters")
+    Signed-off-by: Yiyang Chen <cyyzero16@gmail.com>
+    Acked-by: Balbir Singh <balbirs@nvidia.com>
+    Cc: Dr. Thomas Orgis <thomas.orgis@uni-hamburg.de>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Wang Yaxin <wang.yaxin@zte.com.cn>
+    Cc: Yang Yang <yang.yang29@zte.com.cn>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 99df2a8eba347e901e5355ee66bdb2ade76ff847
+Author: Bart Van Assche <bvanassche@acm.org>
+Date:   Mon Apr 13 11:23:48 2026 -0700
+
+    clang-format: fix formatting of guard() and scoped_guard() statements
+    
+    Without this patch clang-format formats guard() and scoped_guard()
+    statements as follows:
+    
+            guard(...)(...)
+            {
+                    ...
+            }
+    
+    With this patch clang-format formats guard() and scoped_guard()
+    statements as follows:
+    
+            guard(...)(...) {
+                    ...
+            }
+    
+    Link: https://lore.kernel.org/20260413182348.1865138-1-bvanassche@acm.org
+    Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 410002f8139cbf902f1567f0a8cbf0c5b6f43da2
+Author: Adi Nata <adinata.softwareengineer@gmail.com>
+Date:   Sun Apr 5 09:19:20 2026 +0800
+
+    kunit: fat: test cluster and directory i_pos layout helpers
+    
+    Add KUnit coverage for fat_clus_to_blknr() and fat_get_blknr_offset()
+    using stub msdos_sb_info values so cluster-to-sector and i_pos split math
+    stays correct.
+    
+    Link: https://lore.kernel.org/20260405011920.28622-1-adinata.softwareengineer@gmail.com
+    Signed-off-by: Adi Nata <adinata.softwareengineer@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Christian Brauner <brauner@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 1877a09b64f89278ce3dc83e0cf6a8b1516660cb
+Author: Joe Perches <joe@perches.com>
+Date:   Sat Apr 18 10:34:59 2026 -0700
+
+    checkpatch: add check for function pointer arrays in declarations
+    
+    checkpatch did not allow function pointer arrays when testing
+    declaration blocks.
+    
+    Add it.
+    
+    Link: https://lore.kernel.org/eb62763085eb42193a611bca00a62d6f0ae72e1e.1776530118.git.joe@perches.com
+    Signed-off-by: Joe Perches <joe@perches.com>
+    Cc: Andy Whitcroft <apw@canonical.com>
+    Cc: Dan Carpenter <dan.carpenter@linaro.org>
+    Cc: Dwaipayan Ray <dwaipayanray1@gmail.com>
+    Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 93c8c6ea90be9e9df8fe14048ad4e3caad0770a6
+Author: Tristan Madani <tristan@talencesecurity.com>
+Date:   Sat Apr 18 13:10:48 2026 +0000
+
+    ocfs2: use kzalloc for quota recovery bitmap allocation
+    
+    ocfs2 quota recovery allocates a bitmap buffer with kmalloc and does not
+    fully initialize it.  This can lead to use of uninitialized bits during
+    quota recovery from a corrupted filesystem image.
+    
+    Use kzalloc instead to ensure the bitmap is zero-initialized.
+    
+    Link: https://lore.kernel.org/20260418131048.1052507-1-tristmd@gmail.com
+    Reported-by: syzbot+7ea0b96c4ddb49fd1a70@syzkaller.appspotmail.com
+    Signed-off-by: Tristan Madani <tristan@talencesecurity.com>
+    Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+    Cc: Mark Fasheh <mark@fasheh.com>
+    Cc: Joel Becker <jlbec@evilplan.org>
+    Cc: Junxiao Bi <junxiao.bi@oracle.com>
+    Cc: Changwei Ge <gechangwei@live.cn>
+    Cc: Jun Piao <piaojun@huawei.com>
+    Cc: Heming Zhao <heming.zhao@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 0e75190fe40093d85c0c698d9f8dca66df842605
+Author: Yiyang Chen <cyyzero16@gmail.com>
+Date:   Thu Apr 23 23:11:39 2026 +0800
+
+    tools/accounting/getdelays: fix -Wformat-truncation warning in format_timespec
+    
+    Reproduce with GCC 13.3.0:
+    
+      $ cd tools/accounting
+      $ make
+    
+    This emits:
+    
+    getdelays.c: In function `format_timespec':
+    getdelays.c:218:67: warning: `:' directive output may be truncated writing 1 byte into a region of size between 0 and 16 [-Wformat-truncation=]
+      218 |         snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02d",
+          |
+    getdelays.c:218:9: note: `snprintf' output between 20 and 72 bytes into a destination of size 32
+    
+    The problem is that %04d and %02d specify minimum field widths only. GCC
+    cannot prove that formatting tm_year + 1900 and the other struct tm
+    fields will always fit in the fixed 32-byte buffer, so it warns about
+    possible truncation.
+    
+    Fix this by replacing the manual snprintf() formatting with
+    strftime("%Y-%m-%dT%H:%M:%S", ...). That matches the data we already have
+    in struct tm, keeps the intended timestamp format, and avoids the warning
+    when building tools/accounting with GCC.
+    
+    Link: https://lore.kernel.org/87d9723e0b59d816ee2e4bd7cddd58a54c6c9f91.1776956545.git.cyyzero16@gmail.com
+    Signed-off-by: Yiyang Chen <cyyzero16@gmail.com>
+    Cc: Fan Yu <fan.yu9@zte.com.cn>
+    Cc: Wang Yaxin <wang.yaxin@zte.com.cn>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit de5d0652d0633daaaa1f8f322721f600e65b1fb1
+Author: Thorsten Blum <thorsten.blum@linux.dev>
+Date:   Tue Apr 21 14:26:47 2026 +0200
+
+    proc: use strnlen() for name validation in __proc_create
+    
+    Replace strlen(fn) with strnlen(fn, NAME_MAX + 1) when validating the
+    final path component in __proc_create().
+    
+    This preserves the existing name limit while bounding the length scan to
+    one byte past the maximum name length.  Handle empty names separately, and
+    treat names longer than NAME_MAX as too long.
+    
+    Link: https://lore.kernel.org/20260421122648.56723-2-thorsten.blum@linux.dev
+    Signed-off-by: Thorsten Blum <thorsten.blum@linux.dev>
+    Reviewed-by: Jan Kara <jack@suse.cz>
+    Cc: Alexey Dobriyan <adobriyan@gmail.com>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Cc: Christian Brauner <brauner@kernel.org>
+    Cc: Thorsten Blum <thorsten.blum@linux.dev>
+    Cc: wangzijie <wangzijie1@honor.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit b8979a02f9c56d489e27690981d2aa29a3e79542
+Author: Petr Vorel <pvorel@suse.cz>
+Date:   Tue Apr 21 23:14:07 2026 +0200
+
+    checkpatch: add option to not force /* */ for SPDX
+    
+    Add option --spdx-cxx-comments to not force C comments (/* */) for SPDX,
+    but allow also C++ comments (//).
+    
+    As documented in aa19a176df95d6, this is required for some old toolchains
+    still have older assembler tools which cannot handle C++ style comments.
+    This avoids forcing this for projects which vendored checkpatch.pl (e.g.
+    LTP or u-boot).
+    
+    Link: https://lore.kernel.org/20260421211408.383972-2-pvorel@suse.cz
+    Signed-off-by: Petr Vorel <pvorel@suse.cz>
+    Reviewed-by: Simon Glass <sjg@chromium.org>
+    Acked-by: Joe Perches <joe@perches.com>
+    Cc: Dwaipayan Ray <dwaipayanray1@gmail.com>
+    Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 2ddfdfe1ad31ba5be5a1c3b4b2b950cf6b6d7c35
+Author: Petr Vorel <pvorel@suse.cz>
+Date:   Tue Apr 21 23:14:06 2026 +0200
+
+    checkpatch: allow passing config directory
+    
+    checkpatch.pl searches for .checkpatch.conf in $CWD, $HOME and
+    $CWD/.scripts.  Allow passing a single directory via CHECKPATCH_CONFIG_DIR
+    environment variable (empty value is ignored).  This allows to directly
+    use project configuration file for projects which vendored checkpatch.pl
+    (e.g.  LTP or u-boot).
+    
+    Although it'd be more convenient for user to have --conf-dir option
+    (instead of using environment variable), code would get ugly because
+    options from the configuration file needs to be read before processing
+    command line options with Getopt::Long.
+    
+    While at it, document directories and environment variable in -h help
+    and HTML doc.
+    
+    Link: https://lore.kernel.org/20260421211408.383972-1-pvorel@suse.cz
+    Signed-off-by: Petr Vorel <pvorel@suse.cz>
+    Reviewed-by: Simon Glass <sjg@chromium.org>
+    Acked-by: Joe Perches <joe@perches.com>
+    Cc: Dwaipayan Ray <dwaipayanray1@gmail.com>
+    Cc: Lukas Bulwahn <lukas.bulwahn@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit f7027ed76dfcf4905225272029a83cc74fd1816d
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Wed Apr 22 22:17:45 2026 +0300
+
+    proc: rewrite next_tgid()
+    
+    * deduplicate "iter.tgid += 1" line,
+      Right now it is done once inside next_tgid() itself and second time
+      inside "for" loop.
+    
+    * deduplicate next_tgid() call itself with different loop style:
+    
+            auto it = make_tgid_iter();
+            while (next_tgid(&it)) {
+                    ...
+            }
+    
+      gcc seems to inline it twice:
+    
+            $ ./scripts/bloat-o-meter ../vmlinux-000 ../obj/vmlinux
+            add/remove: 0/1 grow/shrink: 1/0 up/down: 100/-245 (-145)
+            Function                                     old     new   delta
+            proc_pid_readdir                             531     631    +100
+            next_tgid                                    245       -    -245
+    
+    * make tgid_iter.pid_ns const
+      it never changes during readdir anyway
+    
+    [akpm@linux-foundation.org: remove newline]
+    Link: https://lore.kernel.org/20260422191745.435556-2-adobriyan@gmail.com
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+
+commit 9794de4500e7dc8686f4ae5f2d11d76e43f299c5
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Wed Apr 22 22:17:44 2026 +0300
+
+    proc: add tgid_iter.pid_ns member
+    
+    next_tgid() accepts pid namespace as an argument, but it never changes
+    during readdir (which would be unthinkable thing to do anyway).
+    
+    Move it inside iterator type and hide from direct usage.
+    
+    Link: https://lore.kernel.org/20260422191745.435556-1-adobriyan@gmail.com
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
