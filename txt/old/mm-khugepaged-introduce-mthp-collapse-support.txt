@@ -1,10 +1,10 @@
 From: Nico Pache <npache@redhat.com>
 Subject: mm/khugepaged: introduce mTHP collapse support
-Date: Fri, 22 May 2026 09:00:06 -0600
+Date: Fri, 5 Jun 2026 10:14:18 -0600
 
 Enable khugepaged to collapse to mTHP orders.  This patch implements the
-main scanning logic using a bitmap to track occupied pages and a stack
-structure that allows us to find optimal collapse sizes.
+main scanning logic using a bitmap to track occupied pages and the
+algorithm to find optimal collapse sizes.
 
 Previous to this patch, PMD collapse had 3 main phases, a light weight
 scanning phase (mmap_read_lock) that determines a potential PMD collapse,
@@ -19,39 +19,30 @@ phase to avoid missing potential mTHP collapse candidates.  Once we have
 scanned the full PMD range and updated the bitmap to track occupied pages,
 we use the bitmap to find the optimal mTHP size.
 
-Implement collapse_scan_bitmap() to perform binary recursion on the bitmap
-and determine the best eligible order for the collapse.  A stack structure
-is used instead of traditional recursion to manage the search.  This also
-prevents a traditional recursive approach when the kernel stack struct is
-limited.  The algorithm recursively splits the bitmap into smaller chunks
-to find the highest order mTHPs that satisfy the collapse criteria.  We
-start by attempting the PMD order, then moved on the consecutively lower
-orders (mTHP collapse).  The stack maintains a pair of variables (offset,
-order), indicating the number of PTEs from the start of the PMD, and the
-order of the potential collapse candidate.
+Implement mthp_collapse() to walk forward through the bitmap and determine
+the best eligible order for each naturally-aligned region.  The algorithm
+starts at the beginning of the PMD range and, for each offset, tries the
+highest order that fits the alignment.  If the number of occupied PTEs in
+that region satisfies the max_ptes_none threshold for that order, a
+collapse is attempted.  On failure, the order is decremented and the same
+offset is retried at the next smaller size.  Once the smallest enabled
+order is exhausted (or a collapse succeeds), the offset advances past the
+region just processed, and the next attempt starts at the highest order
+permitted by the new offset's natural alignment.
 
-The algorithm for consuming the bitmap works as such:
-    1) push (0, HPAGE_PMD_ORDER) onto the stack
-    2) pop the stack
-    3) check if the number of set bits in that (offset,order) pair
-       statisfy the max_ptes_none threshold for that order
-    4) if yes, attempt collapse
-    5) if no (or collapse fails), push two new stack items representing
-       the left and right halves of the current bitmap range, at the
-       next lower order
-    6) repeat at step (2) until stack is empty.
-
-Below is a diagram representing the algorithm and stack items:
-
-                            offset   mid_offset
-                            |        |
-                            |        |
-                            v        v
-          ____________________________________
-         |          PTE Page Table            |
-         --------------------------------------
-			    <-------><------->
-                             order-1  order-1
+The algorithm works as follows:
+    1) set offset=0 and order=HPAGE_PMD_ORDER
+    2) if the order is not enabled, go to step (5)
+    3) count occupied PTEs in the (offset, order) range using
+       bitmap_weight_from()
+    4) if the count satisfies the max_ptes_none threshold, attempt
+       collapse; on success, advance to step (6)
+    5) if a smaller enabled order exists, decrement order and retry
+       from step (2) at the same offset
+    6) advance offset past the current region and compute the next
+       order from the new offset's natural alignment via __ffs(offset),
+       capped at HPAGE_PMD_ORDER
+    7) repeat from step (2) until the full PMD range is covered
 
 mTHP collapses reject regions containing swapped out or shared pages. 
 This is because adding new entries can lead to new none pages, and these
@@ -83,17 +74,19 @@ collapse.
 We can also remove the check for is_khugepaged inside the PMD scan as the
 collapse_max_ptes_none() function handles this logic now.
 
-Link: https://lore.kernel.org/20260522150009.121603-12-npache@redhat.com
+Link: https://lore.kernel.org/20260605161422.213817-12-npache@redhat.com
 Signed-off-by: Nico Pache <npache@redhat.com>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Reviewed-by: Lorenzo Stoakes <ljs@kernel.org>
 Cc: Alistair Popple <apopple@nvidia.com>
 Cc: Andrea Arcangeli <aarcange@redhat.com>
 Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+Cc: Bagas Sanjaya <bagasdotme@gmail.com>
 Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: Brendan Jackman <jackmanb@google.com>
 Cc: Byungchul Park <byungchul@sk.com>
 Cc: Catalin Marinas <catalin.marinas@arm.com>
-Cc: David Hildenbrand <david@kernel.org>
 Cc: David Rientjes <rientjes@google.com>
 Cc: Dev Jain <dev.jain@arm.com>
 Cc: Gregory Price <gourry@gourry.net>
@@ -107,7 +100,6 @@ Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
 Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
 Cc: Lance Yang <lance.yang@linux.dev>
 Cc: Liam R. Howlett <liam@infradead.org>
-Cc: Lorenzo Stoakes <ljs@kernel.org>
 Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
 Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
 Cc: Matthew Brost <matthew.brost@intel.com>
@@ -127,6 +119,7 @@ Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Takashi Iwai (SUSE) <tiwai@suse.de>
 Cc: Thomas Hellström <thomas.hellstrom@linux.intel.com>
 Cc: Usama Arif <usamaarif642@gmail.com>
+Cc: Usama Arif <usama.arif@linux.dev>
 Cc: Vishal Moola (Oracle) <vishal.moola@gmail.com>
 Cc: Vlastimil Babka <vbabka@suse.cz>
 Cc: Wei Yang <richard.weiyang@gmail.com>
@@ -134,5 +127,3 @@ Cc: Will Deacon <will@kernel.org>
 Cc: Yang Shi <yang@os.amperecomputing.com>
 Cc: Zach O'Keefe <zokeefe@google.com>
 Cc: Zi Yan <ziy@nvidia.com>
-Cc: Bagas Sanjaya <bagasdotme@gmail.com>
-Cc: Usama Arif <usama.arif@linux.dev>
