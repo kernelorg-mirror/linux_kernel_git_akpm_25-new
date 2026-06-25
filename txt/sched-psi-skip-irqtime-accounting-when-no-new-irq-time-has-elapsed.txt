@@ -1,0 +1,58 @@
+From: Usama Arif <usama.arif@linux.dev>
+Subject: sched/psi: skip irqtime accounting when no new irq time has elapsed
+Date: Wed, 17 Jun 2026 10:50:06 -0700
+
+psi_account_irqtime() reads irq_time_read() into a per-rq cumulative
+counter and only bails out when the delta vs.  the previously accounted
+amount is negative.  A delta of exactly zero is treated as "do the work":
+psi_write_begin() is taken, cpu_clock(cpu) is read (which on x86 ends up
+in native_sched_clock() / rdtsc) and the cgroup ancestor chain is walked
+to add zero to every group's PSI_IRQ_FULL bucket.
+
+The zero-delta case is common in practice -- it fires every time a context
+switch crosses a PSI group boundary on a CPU that hasn't serviced an
+interrupt between the two switches.
+
+Measured on a 176-thread AMD EPYC 9D64 server running a compute intensive
+production workload, instrumented with bpftrace over a 30s window
+(irq_time_read() read directly from the per-CPU cpu_irqtime so that delta
+== 0 and delta < 0 could be separated):
+
+  @total              17,229,311    (100.0%)
+  @ret_curr_swapper    7,864,195    ( 45.6%)  curr->pid == 0
+  @ret_samegrp           323,299    (  1.9%)  same cgroup as prev
+  @reached_delta       9,041,817    ( 52.5%)
+    @delta_positive    6,358,192    ( 36.9%)  real work
+    @delta_zero        2,683,625    ( 15.6%)  work wasted (this patch)
+    @delta_negative          (0)    (  0.0%)  monotonic clock
+
+So 15.6% of all psi_account_irqtime() calls - and 29.7% of the calls that
+get past the early returns - hit the delta == 0 case; delta < 0 did not
+occur once in the 30s window.  Under the current code each of those ~89k
+calls per second performs the full seqcount write + cpu_clock() read +
+cgroup-chain walk just to add 0 to every group's PSI_IRQ_FULL counter.
+
+Extend the early-return to also cover delta == 0.  rq->psi_irq_time does
+not need updating in that case (it would store the same value back) and no
+PSI bucket would change.  The existing behaviour for delta > 0 is
+untouched.
+
+Link: https://lore.kernel.org/20260617175219.2494857-2-usama.arif@linux.dev
+Signed-off-by: Usama Arif <usama.arif@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Reviewed-by: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Ben Segall <bsegall@google.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Dietmar Eggemann <dietmar.eggemann@arm.com>
+Cc: Ingo Molnar <mingo@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Juri Lelli <juri.lelli@redhat.com>
+Cc: K Prateek Nayak <kprateek.nayak@amd.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Valentin Schneider <vschneid@redhat.com>
+Cc: Vincent Guittot <vincent.guittot@linaro.org>

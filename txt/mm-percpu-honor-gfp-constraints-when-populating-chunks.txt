@@ -1,0 +1,68 @@
+From: Kaitao Cheng <chengkaitao@kylinos.cn>
+Subject: mm/percpu: honor GFP constraints when populating chunks
+Date: Thu, 18 Jun 2026 21:04:12 +0800
+
+pcpu_alloc_noprof() derives pcpu_gfp from the caller supplied GFP mask and
+passes it down to pcpu_populate_chunk().  pcpu_alloc_pages() already uses
+that mask for backing page allocation.
+
+However, the populate slow path still has internal allocations and page
+table allocations which can lose the caller's allocation context.  The
+temporary pages array is allocated by pcpu_get_pages() with GFP_KERNEL,
+and pcpu_map_pages() maps the backing pages through
+vmap_pages_range_noflush() using GFP_KERNEL.  The latter can allocate
+vmalloc page tables implicitly, so a caller which deliberately uses
+GFP_NOFS or GFP_NOIO can still enter FS or IO reclaim while populating a
+percpu chunk.
+
+This has the same concern as chunk creation: callers such as blk-cgroup
+may use GFP_NOIO because they hold locks which can be involved in queue
+freeze or IO reclaim dependencies.  If an allocation reaches the percpu
+slow path and needs to populate previously unbacked pages, the internal
+GFP_KERNEL allocations can defeat that context.
+
+One possible case is blk-cgroup after commit 5d726c4dbeed ("blk-cgroup:
+fix possible deadlock while configuring policy").  blkg_conf_prep() now
+serializes against blkcg_deactivate_policy() with q->blkcg_mutex, and
+blkg_alloc() was changed to GFP_NOIO for that reason:
+
+  CPU0: blkg_conf_prep()
+    mutex_lock(q->blkcg_mutex)
+    blkg_alloc(..., GFP_NOIO)
+      alloc_percpu_gfp(..., GFP_NOIO)
+        pcpu_alloc_noprof(..., GFP_NOIO)
+          pcpu_populate_chunk(GFP_NOIO)
+            pcpu_get_pages()
+	    pcpu_map_pages()
+              -> if the selected percpu chunk has unpopulated pages,
+	         chunk population may do internal GFP_KERNEL allocations
+              -> direct reclaim / writeback can issue IO to this queue
+              -> IO waits because the queue is frozen
+
+  CPU1: blkcg_deactivate_policy()
+    blk_mq_freeze_queue(q)
+    mutex_lock(q->blkcg_mutex)
+      -> waits for CPU0
+    ... unfreeze only happens after q->blkcg_mutex is acquired/released
+
+So the concern is that the caller deliberately uses GFP_NOIO because it
+may hold a lock which can be acquired after queue freeze, but the percpu
+slow path can temporarily lose that allocation context.
+
+Pass pcpu_gfp through pcpu_get_pages(), pcpu_map_pages() and
+__pcpu_map_pages().  Apply the corresponding memalloc scope around
+vmap_pages_range_noflush(), because vmalloc page table allocation does not
+pass the GFP mask down explicitly.  Keep the first chunk setup path using
+GFP_KERNEL, matching the previous early-init behavior.
+
+Link: https://lore.kernel.org/20260618130414.96383-3-kaitao.cheng@linux.dev
+Fixes: 9a5b183941b5 ("mm, percpu: do not consider sleepable allocations atomic")
+Signed-off-by: Kaitao Cheng <chengkaitao@kylinos.cn>
+Acked-by: Dennis Zhou <dennis@kernel.org>
+Acked-by: Michal Hocko <mhocko@suse.com>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Shivam Kalra <shivamkalra98@zohomail.in>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Uladzislau Rezki (Sony) <urezki@gmail.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
