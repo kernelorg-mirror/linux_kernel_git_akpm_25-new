@@ -1,0 +1,78 @@
+From: Breno Leitao <leitao@debian.org>
+Subject: mm/memory-failure: surface unhandlable kernel pages as -ENOTRECOVERABLE
+Date: Tue, 30 Jun 2026 05:46:05 -0700
+
+get_any_page() collapses every HWPoisonHandlable() rejection into a
+single -EIO via the __get_hwpoison_page() -> -EBUSY -> shake_page()
+-> retry path.  That is correct for the transient case (a userspace
+folio briefly off LRU during migration or compaction, which a later
+shake can drag back), but wrong for stable kernel-owned pages: slab,
+page-table, large-kmalloc and PG_reserved pages will never become
+HWPoisonHandlable(), so the retry loop is wasted work and the final
+-EIO loses the "this is structurally unrecoverable" information.
+memory_failure() then maps -EIO into MF_MSG_GET_HWPOISON, which the
+panic-on-unrecoverable sysctl deliberately does not act on.
+
+Introduce is_kernel_owned_page(), a small predicate that positively
+identifies pages the hwpoison handler cannot recover from:
+
+  is_kernel_owned_page(p) :=
+      PageReserved(p) ||
+      PageSlab(head) || PageTable(head) || PageLargeKmalloc(head)
+
+  where head = compound_head(p).
+
+PG_reserved is a per-page flag (PF_NO_COMPOUND) and is tested on the
+page directly.  The slab, page-table and large-kmalloc page-type bits
+are only stored on the head page, so those tests resolve the compound
+head first, then re-read compound_head(page) afterwards: a concurrent
+split or compound free that moves head invalidates the just-read flags
+and the loop retries.  The lookup still takes no refcount, mirroring
+the rest of get_any_page(); the recheck closes the common split race,
+and a residual free->alloc->free in the same window can only mis-tag
+a genuinely poisoned page, never reclassify a handlable one.
+
+No MF_SOFT_OFFLINE / page_has_movable_ops() opt-out is needed: a
+movable_ops page is always PageOffline or PageZsmalloc, whose page_type is
+mutually exclusive with slab, page-table and large-kmalloc, and it never
+carries PG_reserved, so it can never match any of the checks above.
+
+The list is intentionally not exhaustive.  vmalloc and kernel-stack pages,
+for example, do not carry a page_type bit and would need a different
+oracle; they keep going through the existing retry path unchanged.  This
+is the smallest set we can identify with certainty by page type.
+
+Wire the helper into the top of get_any_page() to short-circuit those
+pages before the retry loop runs.  On a hit, drop the caller's
+MF_COUNT_INCREASED reference (if any) and return -ENOTRECOVERABLE straight
+away.  Pages outside the helper's positive list still take the existing
+retry path and return -EIO, leaving operator-visible behaviour for those
+cases unchanged.
+
+Extend the unhandlable-page pr_err() to fire for either errno and update
+the get_hwpoison_page() kerneldoc to document the new return.
+
+memory_failure() still folds every negative return into
+MF_MSG_GET_HWPOISON via its existing "else if (res < 0)" branch, so this
+patch on its own only changes the errno that soft_offline_page() can
+propagate to its callers.  A follow-up wires -ENOTRECOVERABLE through
+memory_failure() and reports MF_MSG_KERNEL for the unrecoverable cases,
+which is what the panic_on_unrecoverable_memory_failure sysctl observes.
+
+Link: https://lore.kernel.org/20260630-ecc_panic-v10-2-c6ed5b62eea2@debian.org
+Signed-off-by: Breno Leitao <leitao@debian.org>
+Suggested-by: David Hildenbrand <david@kernel.org>
+Suggested-by: Lance Yang <lance.yang@linux.dev>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: "Masami Hiramatsu (Google)" <mhiramat@kernel.org>
+Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
