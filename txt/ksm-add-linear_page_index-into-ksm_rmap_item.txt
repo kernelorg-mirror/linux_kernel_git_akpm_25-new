@@ -1,0 +1,126 @@
+From: xu xin <xu.xin16@zte.com.cn>
+Subject: ksm: add linear_page_index into ksm_rmap_item
+Date: Fri, 3 Jul 2026 16:23:57 +0800 (CST)
+
+Patch series "KSM: performance optimizations for rmap_walk_ksm", v11.
+
+This series fixes a severe KSM reverse-mapping performance problem that
+can freeze applications for hundreds of milliseconds under memory pressure
+especially when a lot of unrelated VMAs sharing a single anon_vma.
+
+Two key highlights:
+
+1. Lock hold time drops from >500ms to <2ms
+   - In our benchmark (20,000 VMAs sharing an anon_vma), worst-case
+     anon_vma lock hold time during KSM rmap walk went from 705ms
+     down to 1.67ms (max) and 1.44ms (avg).
+
+2. Real user impact
+   - The anon_vma lock is also acquired by page faults, reclaim,
+     migration, compaction, mlock, exit_mmap, and cgroup accounting.
+
+   - A long hold due to inefficient rmap walks stalls application
+     threads, causing latency spikes, reduced throughput, or even
+     container timeouts.
+
+   - The problem occurs even without fork() – VMA splitting (e.g.,
+     via mprotect or madvise over time) can create tens of thousands
+     of VMAs all attached to the same anon_vma.
+
+Real-world examples:
+
+ - JVM / Go runtime: These use mmap for heap regions and later call
+   mprotect(PROT_NONE) for garbage collection barriers or guard pages,
+   splitting the original VMA into thousands of small pieces over time.
+
+ - Database engines (MySQL, PostgreSQL): Large shared memory buffers or
+   anonymous mappings are managed with madvise(MADV_DONTNEED) to release
+   specific pages, which also splits VMAs.
+
+Why the benchmark numbers are realistic: We observed ~20,000 VMAs sharing
+one anon_vma on a production system running a Java application with KSM
+enabled.  The lock hold time before the patch was measured at 228 ms
+(max) during rmap walks triggered by memory compaction and page migration.
+The benchmark reproduces that VMA count and lock‑hold behavior in a
+controlled environment.
+
+For systems that do not have thousands of VMAs per anon_vma, the patch
+adds negligible overhead (a single pgoff comparison).  For systems that do
+suffer from this issue, the improvement is dramatic: 1) Worst‑case
+anon_vma lock hold time drops from hundreds of milliseconds to under
+2 ms.2)This directly reduces blocking of parallel operations that need
+the same lock – page faults, reclaim, migration, compaction, mlock, and
+exit_mmap.
+
+End‑users will see lower tail latency (fewer application stalls), higher
+throughput under memory pressure, and no more spurious lockup warnings or
+container timeouts caused by excessive lock hold times.
+
+In short: workloads that do not hit this pathological pattern are
+unaffected; those that do will see a 100x to 500x reduction in lock hold
+times, which translates directly into a more responsive system.
+
+
+This patch (of 3):
+
+As preparation for KSM rmap optimizations, let's track the original
+linear_page_index() of a de-duplicated page in its ksm_rmap_item, so we
+can efficiently search for the page in an address space, avoiding scanning
+the entire address space.  This was previously discussed in [1, 2].
+
+To avoid growing ksm_rmap_item, let's squeeze it into the existing
+structure by overlying some members (oldchecksum, age, remaining_skips)
+that are only relevant while on the unstable tree.  The new entry will
+only be relevant for entries in the stable tree.
+
+However, as the age information is read by should_skip_rmap_item() with
+the smart-scanning approach even while we have an entry in the stable
+tree, but the page changes (no longer a KSM page, for example due to COW),
+we have to change the handling there a bit.
+
+We'll calculate the linear page index in try_to_merge_with_ksm_page(),
+when adding it to the stable tree, and reset the index (to reset overlayed
+data) when removing an item from the stable tree -- in
+remove_rmap_item_from_tree(), remove_node_from_stable_tree() and
+break_cow().
+
+To be specially clarified, the reason for resetting the stored index at
+break_cow() is:
+
+- When a page successfully becomes a KSM page (i.e., after
+  stable_tree_append() sets STABLE_FLAG), both anon_vma and the index are
+  stored and remain valid.
+
+- However, during the merging process, there are several failure paths
+  where we already prepared an rmap item to be added to the stable tree,
+  but must revert that as some part of the merge process failed. Examples
+  include:
+    1 The second call to try_to_merge_with_ksm_page() fails in
+      try_to_merge_two_pages().
+    2 stable_tree_insert() fails in cmp_and_merge_page().
+  In such cases, break_cow() is invoked to break the COW mapping and
+  discard the KSM state.
+
+Currently, break_cow() already contains a
+put_anon_vma(rmap_item->anon_vma) to release the reference taken during
+the aborted merge.  Because the index is logically paired with anon_vma
+(both are only meaningful when the rmap_item is in a stable state), it
+must also be cleared (or reset) in break_cow() to avoid leaving stale
+linear_page_index values that could confuse subsequent rmap walks or
+scanning logic.
+
+Link: https://lore.kernel.org/20260703162253688u8Str9eFLR8TGCmo7nIOF@zte.com.cn
+Link: https://lore.kernel.org/20260703162357853iIa-RP7if9hRlAIuTh5La@zte.com.cn
+Link: https://lore.kernel.org/all/adTPQSb-qSSHviJN@lucifer/ [1]
+Link: https://lore.kernel.org/all/202604091806051535BJWZ_FTtdIm3Snk24ei_@zte.com.cn/ [2]
+Signed-off-by: xu xin <xu.xin16@zte.com.cn>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: "Liam R. Howlett" <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Wang Yaxin <wang.yaxin@zte.com.cn>
