@@ -1,0 +1,88 @@
+From: Stanislav Kinsburskii <skinsburskii@gmail.com>
+Subject: mm/hmm: move page fault handling out of walk callbacks
+Date: Wed, 15 Jul 2026 11:15:58 -0700
+
+Patch series "mm/hmm: Add mmap lock-drop support for userfaultfd-backed
+mappings", v9.
+
+This series extends the HMM framework to support userfaultfd-backed memory
+by allowing the mmap read lock to be dropped during hmm_range_fault().
+
+Some page fault handlers most notably userfaultfd require the mmap lock to
+be released so that userspace can resolve the fault.  The current HMM
+interface never sets FAULT_FLAG_ALLOW_RETRY, making it impossible to fault
+in pages from userfaultfd-registered regions.
+
+This series follows the established int *locked pattern from
+get_user_pages_remote() in mm/gup.c.  A new helper function,
+hmm_range_fault_locked(), accepts an int *locked parameter.  When the mmap
+lock is dropped during fault resolution (VM_FAULT_RETRY or
+VM_FAULT_COMPLETED), the function returns 0 with *locked = 0, signalling
+the caller to restart its walk.  The existing hmm_range_fault() is
+refactored into a thin wrapper that passes NULL, preserving current
+behavior for all existing callers.
+
+Possible approaches to lift this limitation are documented in
+Documentation/mm/hmm.rst.
+
+
+This patch (of 8):
+
+hmm_range_fault() currently triggers page faults from inside the
+page-table walk callbacks: hmm_vma_walk_pmd(), hmm_vma_walk_pud(),
+hmm_vma_walk_hugetlb_entry() and the pte-level helper all call
+hmm_vma_fault(), which in turn calls handle_mm_fault() while the walker
+still holds nested locks.  The pte spinlock is dropped explicitly by each
+caller, and the hugetlb path manually drops and retakes
+hugetlb_vma_lock_read around the fault to dodge a deadlock against the
+walk framework's unconditional unlock.
+
+This layering does not extend cleanly to fault handlers that may release
+mmap_lock (VM_FAULT_RETRY, VM_FAULT_COMPLETED).  If the lock is dropped
+while walk_page_range() is mid-traversal, the VMA can be freed before the
+walk framework's matching hugetlb_vma_unlock_read(), turning that unlock
+into a use-after-free.
+
+Split the responsibilities the way get_user_pages() does.  Walk callbacks
+become inspect-only: when they detect a range that needs to be faulted in,
+they record it in struct hmm_vma_walk and return a private sentinel
+(HMM_FAULT_PENDING).  The outer loop in hmm_range_fault() then drops out
+of walk_page_range(), invokes a new helper hmm_do_fault() that calls
+handle_mm_fault() with only mmap_lock held, and restarts the walk so the
+now-present entries are collected into hmm_pfns.
+
+No functional change for existing callers.  As a side effect the hugetlb
+callback no longer needs the hugetlb_vma_{un}lock_read dance, and every
+fault-path exit from the callbacks now releases the pte spinlock on a
+single, common path.  This refactor is also a precursor for adding an
+unlockable variant of hmm_range_fault() in a follow-up patch.
+
+Link: https://lore.kernel.org/178413903133.1155966.3904063656020521607.stgit@skinsburskii
+Link: https://lore.kernel.org/178413935809.1155966.6398279131483632373.stgit@skinsburskii
+Signed-off-by: Stanislav Kinsburskii <skinsburskii@gmail.com>
+Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
+Cc: Danilo Krummrich <dakr@kernel.org>
+Cc: Dave Airlie <airlied@gmail.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Dexuan Cui <decui@microsoft.com>
+Cc: Haiyang Zhang <haiyangz@microsoft.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Kees Cook <kees@kernel.org>
+Cc: K. Y. Srinivasan <kys@microsoft.com>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lizhi Hou <lizhi.hou@amd.com>
+Cc: Long Li <longli@microsoft.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Lyude <lyude@redhat.com>
+Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Cc: Maxime Ripard <mripard@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Oded Gabbay <ogabbay@kernel.org>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Thomas Zimemrmann <tzimmermann@suse.de>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Wei Liu <wei.liu@kernel.org>
