@@ -1,6 +1,6 @@
 From: Qi Zheng <zhengqi.arch@bytedance.com>
 Subject: mm: mglru: fix stale batch updates after memcg reparenting
-Date: Wed, 1 Jul 2026 15:52:51 +0800
+Date: Fri, 10 Jul 2026 23:43:18 +0800
 
 The mglru page table walker batches per-generation size deltas in
 walk->nr_pages while walking page tables without holding the lruvec lock. 
@@ -43,40 +43,41 @@ flushing the pending batch.  A non-dying memcg keeps the original lruvec
 stable against RCU-delayed offlining; a dying memcg redirects the deltas
 to the first non-dying ancestor.
 
-Link: https://lore.kernel.org/20260701075251.56413-1-qi.zheng@linux.dev
+Link: https://lore.kernel.org/20260710154318.75388-1-qi.zheng@linux.dev
 Fixes: f304652609ea ("mm: vmscan: prepare for reparenting MGLRU folios")
 Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
 Reported-by: Peiyang He <peiyang_he@smail.nju.edu.cn>
 Closes: https://lore.kernel.org/all/5A9E929D82717101+12fcf643-efb8-4b9a-a53a-1e28cc894f0b@smail.nju.edu.cn
 Reviewed-by: Harry Yoo (Oracle) <harry@kernel.org>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Axel Rasmussen <axelrasmussen@google.com>
 Cc: Barry Song <baohua@kernel.org>
 Cc: David Hildenbrand <david@kernel.org>
-Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Kairui Song <kasong@tencent.com>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Muchun Song <muchun.song@linux.dev>
 Cc: Roman Gushchin <roman.gushchin@linux.dev>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Wei Xu <weixugc@google.com>
 Cc: Yuanchu Xie <yuanchu@google.com>
 Cc: <stable@vger.kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/vmscan.c |   41 ++++++++++++++++++++++++++++++++++-------
- 1 file changed, 34 insertions(+), 7 deletions(-)
+ include/linux/memcontrol.h |   25 +++++++++++++++++++++++++
+ mm/vmscan.c                |   11 ++++-------
+ 2 files changed, 29 insertions(+), 7 deletions(-)
 
---- a/mm/vmscan.c~mm-mglru-fix-stale-batch-updates-after-memcg-reparenting
-+++ a/mm/vmscan.c
-@@ -3262,10 +3262,40 @@ static void update_batch_size(struct lru
- 	walk->nr_pages[new_gen][type][zone] += delta;
+--- a/include/linux/memcontrol.h~mm-mglru-fix-stale-batch-updates-after-memcg-reparenting
++++ a/include/linux/memcontrol.h
+@@ -1472,6 +1472,31 @@ static inline void lruvec_lock_irq(struc
+ 	spin_lock_irq(&lruvec->lru_lock);
  }
  
-+#ifdef CONFIG_MEMCG
-+static struct lruvec *lock_batch_lruvec(struct lruvec *lruvec)
++static inline struct lruvec *lruvec_live_lock_irq(struct lruvec *lruvec)
 +{
++#ifdef CONFIG_MEMCG
 +	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 +	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 +
@@ -92,27 +93,28 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +	}
 +
 +	spin_lock_irq(&lruvec->lru_lock);
-+
-+	return lruvec;
-+}
 +#else
-+static struct lruvec *lock_batch_lruvec(struct lruvec *lruvec)
-+{
 +	lruvec_lock_irq(lruvec);
-+
-+	return lruvec;
-+}
 +#endif
 +
++	return lruvec;
++}
++
+ static inline void lruvec_unlock(struct lruvec *lruvec)
+ {
+ 	spin_unlock(&lruvec->lru_lock);
+--- a/mm/vmscan.c~mm-mglru-fix-stale-batch-updates-after-memcg-reparenting
++++ a/mm/vmscan.c
+@@ -3265,7 +3265,7 @@ static void update_batch_size(struct lru
  static void reset_batch_size(struct lru_gen_mm_walk *walk)
  {
  	int gen, type, zone;
 -	struct lruvec *lruvec = walk->lruvec;
-+	struct lruvec *lruvec = lock_batch_lruvec(walk->lruvec);
++	struct lruvec *lruvec = lruvec_live_lock_irq(walk->lruvec);
  	struct lru_gen_folio *lrugen = &lruvec->lrugen;
  
  	walk->batched = 0;
-@@ -3285,6 +3315,8 @@ static void reset_batch_size(struct lru_
+@@ -3285,6 +3285,8 @@ static void reset_batch_size(struct lru_
  			lru += LRU_ACTIVE;
  		__update_lru_size(lruvec, lru, zone, delta);
  	}
@@ -121,7 +123,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  }
  
  static int should_skip_vma(unsigned long start, unsigned long end, struct mm_walk *args)
-@@ -3779,11 +3811,8 @@ static void walk_mm(struct mm_struct *mm
+@@ -3779,11 +3781,8 @@ static void walk_mm(struct mm_struct *mm
  			mmap_read_unlock(mm);
  		}
  
@@ -134,7 +136,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  		cond_resched();
  	} while (err == -EAGAIN);
-@@ -4867,9 +4896,7 @@ retry:
+@@ -4867,9 +4866,7 @@ retry:
  	walk = current->reclaim_state->mm_walk;
  	if (walk && walk->batched) {
  		walk->lruvec = lruvec;
