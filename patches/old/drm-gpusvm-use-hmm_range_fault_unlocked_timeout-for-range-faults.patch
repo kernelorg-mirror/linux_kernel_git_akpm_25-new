@@ -1,22 +1,25 @@
 From: Stanislav Kinsburskii <skinsburskii@gmail.com>
 Subject: drm/gpusvm: use hmm_range_fault_unlocked_timeout() for range faults
-Date: Fri, 10 Jul 2026 14:27:19 -0700
+Date: Wed, 15 Jul 2026 11:16:52 -0700
 
-Several GPU SVM paths take mmap_read_lock() only to call
-hmm_range_fault(), then retry -EBUSY until HMM_RANGE_DEFAULT_TIMEOUT
-expires.  Those paths use MMU interval notifiers whose mm matches the mm
-that was locked for the HMM fault.
+Several GPU SVM paths take mmap_read_lock() only to call hmm_range_fault()
+and open-code mmu interval sequence setup before each HMM walk.  They also
+retry -EBUSY until HMM_RANGE_DEFAULT_TIMEOUT expires.
 
-Use hmm_range_fault_unlocked_timeout() for those faults and pass the
-remaining retry budget to HMM.  The helper owns mmap_lock acquisition and
-refreshes range->notifier_seq internally for each retry, while GPU SVM
-keeps its existing driver-lock validation with mmu_interval_read_retry()
-after a successful fault.
+Use hmm_range_fault_unlocked_timeout() for those faults.  The HMM helper
+now owns mmap_lock acquisition and refreshes range->notifier_seq for its
+internal retries, while GPU SVM keeps its existing driver-lock validation
+with mmu_interval_read_retry() after a successful fault.
+
+Pass HMM_RANGE_DEFAULT_TIMEOUT as the helper retry budget for each HMM
+fault attempt.  This scopes the timeout to repeated HMM notifier retries
+while preserving the outer retry loops that restart when the interval is
+invalidated before GPU SVM updates or consumes the mapping state.
 
 Leave drm_gpusvm_check_pages() on hmm_range_fault() because that path is
 called with the mmap lock already held by its caller.
 
-Link: https://lore.kernel.org/178371883977.900500.2198446134676328631.stgit@skinsburskii
+Link: https://lore.kernel.org/178413941236.1155966.14485211391150425997.stgit@skinsburskii
 Signed-off-by: Stanislav Kinsburskii <skinsburskii@gmail.com>
 Reviewed-by: Jason Gunthorpe <jgg@nvidia.com>
 Cc: Danilo Krummrich <dakr@kernel.org>
@@ -47,12 +50,22 @@ Cc: Wei Liu <wei.liu@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- drivers/gpu/drm/drm_gpusvm.c |   52 ++++-----------------------------
- 1 file changed, 7 insertions(+), 45 deletions(-)
+ drivers/gpu/drm/drm_gpusvm.c |   61 +++------------------------------
+ 1 file changed, 7 insertions(+), 54 deletions(-)
 
 --- a/drivers/gpu/drm/drm_gpusvm.c~drm-gpusvm-use-hmm_range_fault_unlocked_timeout-for-range-faults
 +++ a/drivers/gpu/drm/drm_gpusvm.c
-@@ -788,22 +788,8 @@ enum drm_gpusvm_scan_result drm_gpusvm_s
+@@ -773,8 +773,7 @@ enum drm_gpusvm_scan_result drm_gpusvm_s
+ 		.end = end,
+ 		.dev_private_owner = dev_private_owner,
+ 	};
+-	unsigned long timeout =
+-		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
++	unsigned long timeout = msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+ 	enum drm_gpusvm_scan_result state = DRM_GPUSVM_SCAN_UNPOPULATED, new_state;
+ 	unsigned long *pfns;
+ 	unsigned long npages = npages_in_range(start, end);
+@@ -788,22 +787,7 @@ enum drm_gpusvm_scan_result drm_gpusvm_s
  	hmm_range.hmm_pfns = pfns;
  
  retry:
@@ -72,12 +85,31 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		break;
 -	}
 -	mmap_read_unlock(range->gpusvm->mm);
-+	err = hmm_range_fault_unlocked_timeout(&hmm_range,
-+					       max(timeout - jiffies, 1L));
++	err = hmm_range_fault_unlocked_timeout(&hmm_range, timeout);
  	if (err)
  		goto err_free;
  
-@@ -1439,21 +1425,8 @@ retry:
+@@ -1421,8 +1405,7 @@ int drm_gpusvm_get_pages(struct drm_gpus
+ 		.dev_private_owner = ctx->device_private_page_owner,
+ 	};
+ 	void *zdd;
+-	unsigned long timeout =
+-		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
++	unsigned long timeout = msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+ 	unsigned long i, j;
+ 	unsigned long npages = npages_in_range(pages_start, pages_end);
+ 	unsigned long num_dma_mapped;
+@@ -1437,9 +1420,6 @@ int drm_gpusvm_get_pages(struct drm_gpus
+ 	struct dma_iova_state *state = &svm_pages->state;
+ 
+ retry:
+-	if (time_after(jiffies, timeout))
+-		return -EBUSY;
+-
+ 	hmm_range.notifier_seq = mmu_interval_read_begin(notifier);
+ 	if (drm_gpusvm_pages_valid_unlocked(gpusvm, svm_pages))
+ 		goto set_seqno;
+@@ -1454,21 +1434,7 @@ retry:
  	}
  
  	hmm_range.hmm_pfns = pfns;
@@ -96,12 +128,21 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		}
 -		break;
 -	}
-+	err = hmm_range_fault_unlocked_timeout(&hmm_range,
-+				max_t(long, timeout - jiffies, 1));
++	err = hmm_range_fault_unlocked_timeout(&hmm_range, timeout);
  	mmput(mm);
  	if (err)
  		goto err_free;
-@@ -1736,24 +1709,13 @@ int drm_gpusvm_range_evict(struct drm_gp
+@@ -1741,8 +1707,7 @@ int drm_gpusvm_range_evict(struct drm_gp
+ 		.end = drm_gpusvm_range_end(range),
+ 		.dev_private_owner = NULL,
+ 	};
+-	unsigned long timeout =
+-		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
++	unsigned long timeout = msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+ 	unsigned long *pfns;
+ 	unsigned long npages = npages_in_range(drm_gpusvm_range_start(range),
+ 					       drm_gpusvm_range_end(range));
+@@ -1757,24 +1722,12 @@ int drm_gpusvm_range_evict(struct drm_gp
  		return -ENOMEM;
  
  	hmm_range.hmm_pfns = pfns;
@@ -118,8 +159,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -		if (err != -EBUSY)
 -			break;
 -	}
-+	err = hmm_range_fault_unlocked_timeout(&hmm_range,
-+				max_t(long, timeout - jiffies, 1));
++	err = hmm_range_fault_unlocked_timeout(&hmm_range, timeout);
  
  	kvfree(pfns);
  	mmput(mm);
