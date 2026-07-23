@@ -1,0 +1,121 @@
+From: Usama Arif <usama.arif@linux.dev>
+Subject: mm/vmscan: reduce lru_lock contention via vmstat-derived scan-balance cost
+Date: Mon, 20 Jul 2026 09:41:23 -0700
+
+The anon/file scan balance in get_scan_count() is driven by two scalars in
+struct lruvec, anon_cost and file_cost, accumulated by every reclaim
+producer under lruvec->lru_lock.  The acquisition sites for cost work
+specifically are:
+
+  - shrink_inactive_list() re-takes lru_lock at function exit purely
+    to call lru_note_cost_unlock_irq() with (nr_pageout, nr_scanned -
+    nr_reclaimed). One acquisition per inactive shrink.
+  - shrink_active_list() does the same with (0, nr_rotated). One
+    acquisition per active shrink.
+  - workingset_refault() takes the lock via folio_lruvec_lock_irq()
+    purely to record the refault cost. One acquisition per refault.
+  - prepare_scan_control() takes lru_lock just to snapshot the two
+    scalars into sc->{anon,file}_cost.
+  - lru_note_cost_unlock_irq() itself walks parent_lruvec and
+    re-acquires lru_lock on each ancestor to propagate the update,
+    adding O(memcg-depth) acquisitions per producer call.
+
+This hurts because lru_lock is already a heavy contention point on
+memory-heavy workloads: every isolate_lru_folios(), move_folios_to_lru()
+and folio_add_lru() takes it.  The cost work itself is trivial (two scalar
+bumps and one comparison), but it contends with and causes contention for
+actual LRU manipulation.  The parent_lruvec() walk also multiplies
+cost-update overhead by memcg hierarchy depth.
+
+Replace the producer-side accumulators with a read-side accumulator fed
+from per-LRU vmstat counters.  The old producer formula was:
+
+  cost = nr_io * SWAP_CLUSTER_MAX + nr_rotated
+
+Reuse NR_VMSCAN_WRITE for reclaim-driven anon pageout submissions.  It is
+already bumped by writeout() for the same successful outcome that fed
+reclaim_stat.nr_pageout.  Reclaim does not submit filesystem folios from
+this path, so there is no file pageout term.  Charge NR_VMSCAN_WRITE via
+lruvec_stat_mod_folio() and include it in memcg_node_stat_items so it can
+be sampled per lruvec and aggregated through the memcg hierarchy.
+
+Add explicit PGROTATE_{ANON,FILE} node_stat counters for the remaining
+producer-local input.  They are bumped from shrink_inactive_list() by
+nr_scanned - nr_reclaimed and from shrink_active_list() by nr_rotated. 
+WORKINGSET_RESTORE_{ANON,FILE} already captures the refault IO that
+lru_note_cost_refault() used to bill.
+
+Add a per-side struct lru_cost { count, last_rotated, last_io } to struct
+lruvec.  In prepare_scan_control() the two monotonic inputs are sampled
+separately - rotated from PGROTATE_ANON/FILE, io from
+WORKINGSET_RESTORE_BASE + f plus (for anon) NR_VMSCAN_WRITE - and the raw
+per-side deltas are computed against cost->last_rotated and cost->last_io
+before the SWAP_CLUSTER_MAX IO weighting is applied.  Extracting the
+deltas from the individual counters (rather than from a pre-weighted sum)
+keeps the unsigned modular subtraction bounded by the true per-counter
+growth, so a signed-long wraparound of any underlying vmstat still yields
+the correct delta on 32-bit.  The weighted delta is folded into
+cost->count.  Since one vmstat delta can cover many producer events
+between reclaim passes, halve cost->count on both sides until their sum is
+back within the lrusize/4 bound instead of halving only once.
+
+Moving accumulation and decay to the reclaim side also improves the cost
+model across reclaim gaps.  With producer-side decay, events that happen
+while reclaim is idle still age each other before reclaim ever samples the
+costs.  If a workload refaults a large anon set and then a smaller file
+set before reclaim runs again, the later file activity can age the earlier
+anon activity out of the cost model.  The new scheme observes the whole
+between-reclaim delta and decays anon and file proportionally, so the
+scan-balance history better represents what happened since the last
+reclaim pass.
+
+A dedicated per-lruvec spinlock, cost_lock, serialises the delta
+extraction, the cost->count update and the halving loop against concurrent
+reclaimers in the same memcg+node.
+
+Hierarchy aggregation is now implicit in the vmstat accounting.  The
+producer-side parent_lruvec() walk and lru_reparent_memcg() cost splice
+existed only because anon_cost/file_cost were private lruvec fields.  With
+the cost expressed as lruvec vmstats, rstat propagates the underlying
+counters through the memcg hierarchy and prepare_scan_control() consumes
+the same ratelimited rstat view as the surrounding reclaim heuristics.
+
+NR_VMSCAN_WRITE is accounted at writeout(), so reclaim_stat.nr_pageout is
+no longer needed and is removed.
+
+memcg-v1's memory.stat anon_cost/file_cost is now sourced from
+cost[].count instead of the removed lruvec anon_cost/file_cost fields. 
+The reported values only refresh when prepare_scan_control() runs and are
+bounded at ~lrusize/4 by the halving loop; the scan-balance signal they
+express is unchanged.
+
+Under pure MGLRU the scan-balance signal itself is not consumed (both
+prepare_scan_control() and get_scan_count() are short-circuited on the
+MGLRU paths, and MGLRU's own type/tier selection comes from
+read_ctrl_pos() on lrugen->{avg_refaulted,avg_total,refaulted,evicted},
+not from anon_cost/file_cost).  NR_VMSCAN_WRITE naturally covers writeout
+from either reclaim implementation, and PGROTATE_{ANON,FILE} are bumped
+from evict_folios() so per-memcg observability of rotation-driven reclaim
+work stays consistent across both implementations.
+
+Link: https://lore.kernel.org/20260720164207.450685-3-usama.arif@linux.dev
+Signed-off-by: Usama Arif <usama.arif@linux.dev>
+Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
