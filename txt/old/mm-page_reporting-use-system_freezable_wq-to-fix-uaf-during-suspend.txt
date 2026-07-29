@@ -1,6 +1,6 @@
 From: Link Lin <linkl@google.com>
 Subject: mm/page_reporting: use system_freezable_wq to fix UAF during suspend
-Date: Fri, 17 Jul 2026 00:22:20 +0000
+Date: Tue, 21 Jul 2026 00:55:33 +0000
 
 During PM freeze (e.g.  S3 suspend or S4 hibernation), device drivers like
 virtio_balloon reset their underlying virtio devices and delete their
@@ -8,9 +8,12 @@ virtqueues via vdev->config->del_vqs().
 
 However, page reporting work (page_reporting_process) was scheduled on the
 global system_wq.  Because system_wq lacks the WQ_FREEZABLE flag, the PM
-freezer skips it, leaving page_reporting_process active during suspend. 
-If pages are freed into the buddy allocator while suspending, page
-reporting invokes virtballoon_free_page_report() on deleted virtqueues:
+freezer skips it, leaving page_reporting_process active during suspend.
+
+If pages are freed into the buddy allocator while suspending (for example,
+when core MM invokes the balloon shrinker during S4 hibernation image
+saving), page reporting triggers virtballoon_free_page_report() on deleted
+virtqueues, resulting in a Use-After-Free / General Protection Fault:
 
     [  196.795226] general protection fault, probably for non-canonical address 0xaa1436fe70dae6df: 0000 [#1] SMP NOPTI
     [  196.825967] Workqueue: events page_reporting_process
@@ -20,7 +23,10 @@ reporting invokes virtballoon_free_page_report() on deleted virtqueues:
 
 Fix this by switching page reporting work to system_freezable_wq.  This
 ensures that the PM freezer pauses page_reporting_process before device
-drivers destroy their reporting virtqueues.
+drivers destroy their reporting virtqueues.  Because the reporting worker
+is frozen, memory reclamation/freeing (e.g.  via shrinker execution) can
+safely return pages to MM during freeze without triggering unfrozen
+reporting work on deleted virtqueues.
 
 This aligns with the driver's existing design. The comment in
 virtballoon_freeze() states:
@@ -29,14 +35,23 @@ virtballoon_freeze() states:
      * function is called.
      */
 
-Link: https://lore.kernel.org/20260717002311.681748-2-linkl@google.com
-Fixes: 924a663f75e2 ("virtio-balloon: Reporting free page reservations")
+Testing:
+I have verified these fixes using Google’s virtualization infrastructure
+by running continuous suspend/resume iterations (40+ cycles) while
+churning memory using stress-ng (`stress-ng --vm 4 --vm-bytes 60%
+--timeout 1`) to constantly create free pages for the buddy allocator.  We
+also set the `page_reporting_order` parameter to 0 to make the page
+reporting worker highly sensitive, forcing it to pick up any 4K free
+pages.  This confirmed that the UAF crashes are no longer reproducible.
+
+Link: https://lore.kernel.org/20260721005603.1710551-1-linkl@google.com
+Fixes: 36e66c554b5c ("mm: introduce Reported pages")
 Signed-off-by: Link Lin <linkl@google.com>
-Suggested-by: David Hildenbrand <david@redhat.com>
+Suggested-by: David Hildenbrand (Arm) <david@kernel.org>
 Suggested-by: Michael S. Tsirkin <mst@redhat.com>
-Acked-by: Michael S. Tsirkin <mst@redhat.com>
-Acked-by: David Hildenbrand (Arm) <david@kernel.org>
 Acked-by: David Rientjes <rientjes@google.com>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Acked-by: Michael S. Tsirkin <mst@redhat.com>
 Cc: Alexander Duyck <alexander.duyck@gmail.com>
 Cc: Greg Thelen <gthelen@google.com>
 Cc: James Houghton <jthoughton@google.com>
