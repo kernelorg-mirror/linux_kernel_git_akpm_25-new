@@ -1,12 +1,12 @@
 From: Jianlin Shi <shijianlin11@foxmail.com>
 Subject: mm/page_alloc: only update lowmem_reserve_ratio on sysctl write
-Date: Sat, 1 Aug 2026 23:11:25 +0800
+Date: Sun, 2 Aug 2026 22:57:07 +0800
 
 lowmem_reserve_ratio_sysctl_handler() ignores the return value of
 proc_dointvec_minmax() and always calls setup_per_zone_lowmem_reserve(),
 even for read operations.
 
-Fix two issues:
+Fix three issues:
 
 1. Propagate errors from proc_dointvec_minmax() instead of always
    returning success.  For example, writing non-integer garbage to the
@@ -14,57 +14,80 @@ Fix two issues:
    unchanged values.
 
 2. Only call setup_per_zone_lowmem_reserve() when the sysctl is
-   actually written.  Reading /proc/sys/vm/lowmem_reserve_ratio should
-   not recompute derived lowmem_reserve[] and totalreserve_pages when
-   the inputs did not change, matching min_free_kbytes and
-   watermark_scale_factor handlers.
+   actually written, matching the write-only refresh pattern of
+   min_free_kbytes and watermark_scale_factor handlers.
 
-Drop the manual "< 1 -> 0" sanitization loop and set .extra1 = SYSCTL_ZERO
-on the ctl_table entry so proc_dointvec_minmax() enforces the minimum on
-write; negative values now return -EINVAL instead of being silently
-coerced to 0 (suggested by Vlastimil Babka).
+3. On write, parse into a temporary ratio[] array and only copy into
+   sysctl_lowmem_reserve_ratio[] and refresh derived state after the
+   full vector is validated.  This avoids leaving the ratio array
+   partially updated while skipping setup when proc_dointvec_minmax()
+   returns an error on a later element (suggested by Andrew Morton).
 
-Link: https://lore.kernel.org/tencent_1BB7A5C4D5EEA67346634417753190E92A09@qq.com
+Drop the manual "< 1 -> 0" sanitization loop and set .extra1 =
+SYSCTL_ZERO on the ctl_table entry so proc_dointvec_minmax() enforces
+the minimum on write; negative values now return -EINVAL instead of
+being silently coerced to 0 (suggested by Vlastimil Babka).
+
+[akpm@linux-foundation.org: use ARRAY_SIZE to dimension ratio[]]
+Link: https://lore.kernel.org/tencent_B9556590D4B65ACF74C06897689A6E39F206@qq.com
 Link: https://lore.kernel.org/linux-mm/tencent_FFD4F4D728AAE8A8AE0AF277A59854A29A06@qq.com/
 Signed-off-by: Jianlin Shi <shijianlin11@foxmail.com>
-Reviewed-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
-Acked-by: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Brendan Jackman <jackmanb@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
 Cc: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
- mm/page_alloc.c |   14 +++++++-------
- 1 file changed, 7 insertions(+), 7 deletions(-)
+ mm/page_alloc.c |   24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
 
 --- a/mm/page_alloc.c~mm-page_alloc-only-update-lowmem_reserve_ratio-on-sysctl-write
 +++ a/mm/page_alloc.c
-@@ -6925,16 +6925,15 @@ static int sysctl_min_slab_ratio_sysctl_
+@@ -6915,8 +6915,8 @@ static int sysctl_min_slab_ratio_sysctl_
+ 
+ /*
+  * lowmem_reserve_ratio_sysctl_handler - just a wrapper around
+- *	proc_dointvec() so that we can call setup_per_zone_lowmem_reserve()
+- *	whenever sysctl_lowmem_reserve_ratio changes.
++ *	proc_dointvec_minmax() so that we can call
++ *	setup_per_zone_lowmem_reserve() when the sysctl is written.
+  *
+  * The reserve ratio obviously has absolutely no relation with the
+  * minimum watermarks. The lowmem reserve ratio can only make sense
+@@ -6925,16 +6925,23 @@ static int sysctl_min_slab_ratio_sysctl_
  static int lowmem_reserve_ratio_sysctl_handler(const struct ctl_table *table,
  		int write, void *buffer, size_t *length, loff_t *ppos)
  {
 -	int i;
++	struct ctl_table tmp = *table;
++	int ratio[ARRAY_SIZE(sysctl_lowmem_reserve_ratio)];
 +	int rc;
  
 -	proc_dointvec_minmax(table, write, buffer, length, ppos);
-+	rc = proc_dointvec_minmax(table, write, buffer, length, ppos);
-+	if (rc)
-+		return rc;
++	if (!write)
++		return proc_dointvec_minmax(table, write, buffer, length, ppos);
  
 -	for (i = 0; i < MAX_NR_ZONES; i++) {
 -		if (sysctl_lowmem_reserve_ratio[i] < 1)
 -			sysctl_lowmem_reserve_ratio[i] = 0;
 -	}
-+	if (write)
-+		setup_per_zone_lowmem_reserve();
++	memcpy(ratio, sysctl_lowmem_reserve_ratio, sizeof(ratio));
++	tmp.data = ratio;
  
--	setup_per_zone_lowmem_reserve();
++	rc = proc_dointvec_minmax(&tmp, write, buffer, length, ppos);
++	if (rc)
++		return rc;
++
++	memcpy(sysctl_lowmem_reserve_ratio, ratio, sizeof(ratio));
+ 	setup_per_zone_lowmem_reserve();
++
  	return 0;
  }
  
-@@ -7033,6 +7032,7 @@ static const struct ctl_table page_alloc
+@@ -7033,6 +7040,7 @@ static const struct ctl_table page_alloc
  		.maxlen		= sizeof(sysctl_lowmem_reserve_ratio),
  		.mode		= 0644,
  		.proc_handler	= lowmem_reserve_ratio_sysctl_handler,
