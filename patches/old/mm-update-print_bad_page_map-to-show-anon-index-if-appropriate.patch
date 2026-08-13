@@ -1,65 +1,29 @@
 From: "Lorenzo Stoakes (ARM)" <ljs@kernel.org>
-Subject: mm/vma: only permit MAP_PRIVATE /dev/zero to be mapped anonymous
-Date: Thu, 06 Aug 2026 21:21:42 +0100
+Subject: mm: update print_bad_page_map() to show anon index if appropriate
+Date: Thu, 06 Aug 2026 21:21:30 +0100
 
-In order to use mmap_prepare() with MAP_PRIVATE mappings of /dev/zero
-without the success_hook hack we explicitly permitted mmap_prepare
-handlers to set NULL vm_ops.
+If the VMA is a CoW mapping page offset may differ from anon page offset,
+indicating different positions in the relevant rmap trees.
 
-However this is dangerous and we really only want to allow this for
-MAP_PRIVATE-mapped /dev/zero.
+Update print_bad_page_map() to reflect that - if the mapping is non-CoW or
+the indexes match, then output only one index as before, otherwise output
+both with (file) or (anon) suffixes to reflect which is which.
 
-Make it possible to explicitly identify /dev/zero by setting a global
-DEVZERO_MINOR device minor number then explicitly check for this in mmap
-code for a MAP_PRIVATE mapping and only set the VMA anonymous if we have
-positively identified it.
+It's not possible to give only one index as there is no folio available to
+perform folio_test_anon() upon (the page table entry is bad so this is
+unavailable).
 
-Then remove all ability for mmap_prepare or mmap hooks to set a VMA
-anonymous and update mmap_zero_prepare() to leave it to the core mmap code
-to mark the VMA anonymous.
+This is potentially useful debugging information and matches the existing
+page offset provided.
 
-Note that this disallows nested MAP_PRIVATE-mappings of /dev/zero regions.
-Doing this would be broken in any case.
+Use the raw __linear_anon_page_index() function so as to always output
+this value regardless of whether the mapping is file-backed or not and to
+avoid asserts that shouldn't apply here.
 
-We therefore do not need to update the mmap_prepare() compatibility layer
-to reflect these changes, as the mmap hook check suffices to disallow this
-behaviour.
-
-Now we're setting vma->vm_ops to NULL for an mmap_prepare-initialised
-MAP_PRIVATE-/dev/zero mapping, we have to avoid a subtle issue when
-updating user-defined fields via set_vma_user_defined_fields().
-
-The default for vma->vm_ops for all mmap_prepare-initialised mappings is
-vma_dummy_vm_ops, so map->vm_ops will be set to this and setting
-vma->vm_ops to this will render the VMA mistakenly non-anon.
-
-In general, we should never be setting user-defined fields for an
-anonymous VMA, so explicitly check for this to avoid doing so for the one
-case where a mapping can be both mmap_prepare and anonymous.
-
-In the case of legacy ->mmap hooks some drivers may set vma->vm_ops NULL
-believing this is the equivalent of setting no VMA operations.  Therefore
-update mmap_file() to correct this by setting dummy VMA operations if this
-occurs.
-
-An example of this is drm_gem_shmem_mmap() which deliberately clears
-vma->vm_ops before handing the VMA to dma-buf.  Cases such as this will be
-updated when they are converted to mmap_prepare.
-
-Also, in order to avoid a single commit bisection hazard, add a temporary
-workaround to set the VMA anonymous only after vma->vm_file is assigned in
-__mmap_new_file_vma().
-
-This is because vma_set_range() calls vma_set_pgoff() and
-assert_sane_pgoff() in turn, prior to the vma->vm_file being assigned.  If
-we set the VMA anonymous early then this assert will fail.
-
-This is removed in the subsequent commit.
-
-Also update the VMA userland tests to reflect the change.
-
-Link: https://lore.kernel.org/20260806-b4-scalable-cow-virt-pgoff-v4-17-ab318a350404@kernel.org
+Link: https://lore.kernel.org/20260806-b4-scalable-cow-virt-pgoff-v4-5-ab318a350404@kernel.org
 Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Reviewed-by: Gregory Price (Meta) <gourry@gourry.net>
 Cc: Adrian Hunter <adrian.hunter@intel.com>
 Cc: Alexander Deucher <alexander.deucher@amd.com>
 Cc: Alexander Gordeev <agordeev@linux.ibm.com>
@@ -78,11 +42,9 @@ Cc: Christan König <christian.koenig@amd.com>
 Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
 Cc: Claudio Imbrenda <imbrenda@linux.ibm.com>
 Cc: Dave Airlie <airlied@gmail.com>
-Cc: David Hildenbrand (Arm) <david@kernel.org>
 Cc: Dev Jain <dev.jain@arm.com>
 Cc: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
 Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Cc: Gregory Price (Meta) <gourry@gourry.net>
 Cc: Harry Yoo <harry@kernel.org>
 Cc: Heiko Carstens <hca@linux.ibm.com>
 Cc: Huang Ray <Ray.Huang@amd.com>
@@ -137,3 +99,45 @@ Cc: Vasily Gorbik <gor@linux.ibm.com>
 Cc: Vlastimil Babka <vbabka@kernel.org>
 Cc: Xu Xin <xu.xin16@zte.com.cn>
 Cc: Zi Yan <ziy@nvidia.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ mm/memory.c |   13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/mm/memory.c~mm-update-print_bad_page_map-to-show-anon-index-if-appropriate
++++ a/mm/memory.c
+@@ -631,13 +631,14 @@ static void print_bad_page_map(struct vm
+ {
+ 	struct address_space *mapping;
+ 	char entry_str[PTVAL_STR_MAX];
+-	pgoff_t index;
++	pgoff_t index, anon_index;
+ 
+ 	if (is_bad_page_map_ratelimited())
+ 		return;
+ 
+ 	mapping = vma->vm_file ? vma->vm_file->f_mapping : NULL;
+ 	index = linear_page_index(vma, addr);
++	anon_index = __linear_anon_page_index(vma, addr);
+ 
+ 	ptval_bytes_to_hex_str(entry_str, sizeof(entry_str), entry, entry_size);
+ 	pr_alert("BUG: Bad page map in process %s  %s:%s", current->comm,
+@@ -645,8 +646,14 @@ static void print_bad_page_map(struct vm
+ 	__print_bad_page_map_pgtable(vma->vm_mm, addr);
+ 	if (page)
+ 		dump_page(page, "bad page map");
+-	pr_alert("addr:%px vm_flags:%08lx anon_vma:%px mapping:%px index:%lx\n",
+-		 (void *)addr, vma->vm_flags, vma->anon_vma, mapping, index);
++	pr_alert("addr:%px vm_flags:%08lx anon_vma:%px mapping:%px",
++		 (void *)addr, vma->vm_flags, vma->anon_vma, mapping);
++	if (!vma_is_cow_mapping(vma) || index == anon_index) {
++		pr_cont(" index:%lx\n", index);
++	} else {
++		pr_cont(" index:%lx (file) %lx (anon)\n", index, anon_index);
++	}
++
+ 	pr_alert("file:%pD fault:%ps mmap:%ps mmap_prepare: %ps read_folio:%ps\n",
+ 		 vma->vm_file,
+ 		 vma->vm_ops ? vma->vm_ops->fault : NULL,
+_
