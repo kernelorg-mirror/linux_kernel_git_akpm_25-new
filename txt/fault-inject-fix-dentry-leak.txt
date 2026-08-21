@@ -1,0 +1,66 @@
+From: Michael Liang <mliang@purestorage.com>
+Subject: fault-inject: fix dentry leak
+Date: Fri, 21 Aug 2026 12:15:27 -0600
+
+fault_create_debugfs_attr() has always taken an extra dentry reference on
+the created directory (attr->dname = dget(dir)) so that fail_dump() could
+print the name via %pd from any context.  Nothing anywhere in the tree
+ever calls dput() on attr->dname.
+
+For callers with a matching teardown, that unmatched reference causes one
+dentry plus its attached inode to leak per fault_create_debugfs_attr /
+debugfs_remove_recursive cycle.  simple_recursive_removal() drops
+debugfs's own +1 ref on the child dentry, but the dget()'d ref keeps its
+refcount at 1: the dentry ends up unhashed but pinned, and its inode is
+never freed.
+
+Boot-once callers (mm/failslab, block/blk-core, etc.) leak exactly once at
+init and never destroy the tree, so the impact there is bounded.  But
+per-lifecycle callers (drivers/nvme, drivers/infiniband/hw/hfi1,
+drivers/mmc, drivers/iommu/iommufd, drivers/media, drivers/misc,
+drivers/gpu/drm/msm, drivers/crypto, net/sunrpc) leak on every
+create/destroy cycle.
+
+We observed this in production: an NVMe/RDMA host repeatedly reconnecting
+to a target that rejected the CRTO Property Get went through ~50 nvme
+controller create/destroy cycles per second, and dentry and inode_cache
+grew by ~13k pinned objects per 240 s -- unrecoverable through
+drop_caches.  Byte math matched a per-cycle 1-dentry / 1-inode leak from
+the "fault_inject" directory dentry.
+
+Fix this by not holding any external reference in fault_attr.  Embed the
+directory name as a fixed-size char array (FAULT_ATTR_DNAME_LEN, 64 bytes)
+inside struct fault_attr, copied by strscpy() at
+fault_create_debugfs_attr() time.  fail_dump() prints it via %s.
+
+Advantages of an embedded array over kstrdup() + kfree() paired with a new
+destroy API:
+
+  - Zero API footprint.  No new export and no caller changes required:
+    callers already own their fault_attr's memory and free it when
+    they are done, and now that suffices.
+  - No allocation on the create path.
+  - fault_create_debugfs_attr() cannot fail from the name-copy step.
+  - No lifetime coupling between attr->dname and debugfs; the string
+    is valid for exactly as long as the containing struct.
+
+The 64-byte length accommodates every in-tree caller with generous
+headroom (the longest current name is "fail_dma_array_full", 19 chars).
+
+The user-visible fail_dump() format changes from "name %pd" to "name %s",
+but the printed content is identical -- %pd on the created directory
+renders the same string that was passed in as @name.
+
+drivers/infiniband/hw/hfi1/fault.c drops a now-invalid "attr.dname = NULL"
+statement; the surrounding kzalloc() already zero-initialises the array.
+
+Link: https://lore.kernel.org/20260821181527.3271414-1-mliang@purestorage.com
+Fixes: 6adc4a22f20b ("fault-inject: add ratelimit option")
+Signed-off-by: Michael Liang <mliang@purestorage.com>
+Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Akinbou Mita <akinobu.mita@gmail.com>
+Cc: Dennis Dalessandro <dennis.dalessandro@cornelisnetworks.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: <stable@vger.kernel.org>
