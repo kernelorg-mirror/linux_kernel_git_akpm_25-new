@@ -1,0 +1,59 @@
+From: Vishal Badole <Vishal.Badole@amd.com>
+Subject: lib/group_cpus: snapshot cluster masks to keep grouping hotplug invariant
+Date: Wed, 26 Aug 2026 22:45:37 +0530
+
+group_cpus_evenly() builds the managed-IRQ affinity spread used by
+multi-queue devices such as NVMe.  That spread is meant to be a property
+of the static CPU topology: it walks cpu_present_mask and then
+cpu_possible_mask so every hardware queue owns a fixed set of CPUs,
+including CPUs that are offline at the time.  A driver depends on that
+partition staying stable across re-computation - the CPUs a queue is given
+at probe must still describe the same queue after the device is later
+reset and its affinity recomputed.
+
+On an AMD system that stability breaks across an s2idle cycle.  With CPUs
+3-11 offlined and only CPUs 0-2 left online, the machine is suspended to
+s2idle and resumed.  The NVMe controller uses the simple-suspend quirk, so
+resume fully re-initialises it and recomputes the affinity spread.  The
+system then hangs for roughly two minutes and stays sluggish afterwards,
+the controller only making progress through its command-timeout poll:
+
+  nvme nvme0: I/O tag 898 (3382) QID 9 timeout, completion polled
+  nvme nvme0: I/O tag 398 (618e) QID 11 timeout, completion polled
+
+QID 9 and QID 11 are the queues whose CPUs were offline when the spread
+was recomputed.  "completion polled" means the commands did finish in
+hardware, but their interrupts were never delivered to a CPU that was
+watching the queue, so nothing reaped them until the timeout fired.
+
+It happens because commit 89802ca36c96 ("lib/group_cpus: make group CPU
+cluster aware") derives the cluster groups from
+topology_cluster_cpumask(), which lists only the cluster siblings that are
+online when it is called.  The resulting partition therefore depends on
+the transient online mask rather than on the topology alone.  Recomputed
+on resume while the non-boot CPUs are still offline, it no longer matches
+the boot-time partition, and a queue is left with an affinity that does
+not cover the CPU it is meant to serve once that CPU comes back online. 
+The dependence is on the online mask, not on any AMD-specific behaviour,
+so the same stall is reproducible on Intel platforms as well.
+
+Make the cluster grouping depend on the complete cluster topology rather
+than on whichever CPUs happen to be online.  Snapshot the cluster masks
+once while every present CPU is online and reuse that view for every later
+spread.  Every spread then groups from the same masks, so the partition
+computed when the controller is reset matches the one computed at probe
+and each queue's IRQ still covers the CPUs it serves.  If the snapshot was
+never taken, the cluster path is skipped and the plain present/possible
+spread is used.
+
+Link: https://lore.kernel.org/20260826171537.4167367-1-Vishal.Badole@amd.com
+Fixes: 89802ca36c96 ("lib/group_cpus: make group CPU cluster aware")
+Signed-off-by: Vishal Badole <Vishal.Badole@amd.com>
+Cc: "Borislav Petkov (AMD)" <bp@alien8.de>
+Cc: Radu Rendec <radu@rendec.net>
+Cc: Thomas Gleixner <tglx@kernel.org>
+Cc: Tim Chen <tim.c.chen@linux.intel.com>
+Cc: Wangyang Guo <wangyang.guo@intel.com>
+Cc: Tianyou Li <tianyou.li@intel.com>
+Cc: Dan Liang <dan.liang@intel.com>
+Cc: <stable@vger.kernel.org>
