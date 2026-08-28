@@ -1,0 +1,72 @@
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Subject: ocfs2: defer suballocator block group reclaim to workqueue
+Date: Fri, 28 Aug 2026 19:28:25 +0800
+
+When the last bit in a suballocator block group is freed,
+_ocfs2_free_suballoc_bits() reclaims the group back to the global bitmap. 
+The reclaim takes inode_lock() on the global bitmap inode while running
+inside the freeing transaction, adding a lock dependency of
+
+  j_trans_barrier -> global bitmap inode i_rwsem
+
+This forms a circular dependency with paths such as
+ocfs2_shutdown_local_alloc(), which take the global bitmap inode lock
+before starting a transaction:
+
+  Task1 (dealloc):
+    ocfs2_run_deallocs
+      ocfs2_free_cached_blocks
+        ocfs2_start_trans
+          down_read(j_trans_barrier)
+        _ocfs2_free_suballoc_bits
+          _ocfs2_reclaim_suballoc_to_main
+            inode_lock(main_bm_inode)  <- wait on Task2
+
+  Task2 (dismount):
+    ocfs2_shutdown_local_alloc
+      inode_lock(main_bm_inode)
+      ocfs2_start_trans
+        down_read(j_trans_barrier)  <- wait on Task3
+
+  Task3 (ocfs2cmt):
+    ocfs2_commit_cache
+      down_write(j_trans_barrier)  <- wait on Task1's handle
+      jbd2_journal_flush
+
+Task1 waits for Task2's inode_lock(), Task2 waits for the j_trans_barrier
+down_write() held by ocfs2cmt, and ocfs2cmt waits for Task1's running
+transaction to commit - a real deadlock, observed with aio-stress direct
+IO writes racing dismount.
+
+Fix it by deferring the reclaim to the per-superblock ocfs2_wq workqueue,
+so the freeing transaction no longer takes the global bitmap inode lock. 
+The worker re-checks under the suballocator locks that the block group is
+still fully freed (it may have been allocated from again in the meantime),
+takes the global bitmap inode locks before starting its own transaction,
+and performs the same suballocator cleanup and space return.  The inode
+lock order (suballocator inode -> global bitmap inode) is consistent with
+the existing "inode lock before transaction" order, breaking the cycle.
+
+Reclaim work can still be queued late in dismount, e.g.  when the truncate
+log is flushed or orphan dir recovery frees inode bits, so both
+ocfs2_dismount_volume() and the mount error path flush ocfs2_wq right
+before the system inodes are released, while the journal is still alive,
+to make sure no reclaim work is left running.  The worker also bails out
+if the journal is already gone.
+
+Tested with the ocfs2 testsuite (including aio-stress direct IO) and
+umount/mount cycles on a CONFIG_PROVE_LOCKING kernel: the circular locking
+dependency is gone and freed block groups are still returned to the global
+bitmap.
+
+Link: https://lore.kernel.org/20260828112825.666097-3-joseph.qi@linux.alibaba.com
+Fixes: 4a54331616b3 ("ocfs2: give ocfs2 the ability to reclaim suballocator free bg")
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Reviewed-by: Heming Zhao <heming.zhao@suse.com>
+Assisted-by: Qoder:Qwen3.8-Max
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Changwei Ge <gechangwei@live.cn>
+Cc: Jun Piao <piaojun@huawei.com>
+Cc: Heming Zhao <heming.zhao@suse.com>
