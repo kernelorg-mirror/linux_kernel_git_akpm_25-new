@@ -1,0 +1,49 @@
+From: Qi Zheng <zhengqi.arch@bytedance.com>
+Subject: mm: shmem: make unused huge shrinker memcg aware
+Date: Mon, 17 Aug 2026 17:03:28 +0800
+
+The shmem unused huge shrinker keeps a per-superblock list of inodes whose
+tail huge folio extends beyond i_size.  Since that list is not memcg
+aware, reclaim triggered by one memcg can scan inodes from the whole
+superblock and split shmem huge folios charged to unrelated memcgs.
+
+Convert the shrink list to a memcg-aware list_lru.  Queue each inode on
+the list_lru sublist matching the memcg and node of the current tail huge
+folio, so non-root memcg reclaim only walks candidates charged to the
+reclaiming memcg.  Global reclaim, root memcg reclaim and shmem quota
+reclaim keep global semantics.
+
+Rather than pinning a struct mem_cgroup reference in shmem_inode_info,
+store a struct obj_cgroup reference instead.  The list_lru add and delete
+paths resolve the current memcg from the objcg under RCU, so that memcg
+offline and list_lru entry migration remain consistent: list_lru migrates
+entries to the parent memcg sublist on offline, and obj_cgroup_memcg()
+follows the same reparenting, ensuring the correct sublist is always found
+at delete time.  This avoids pinning a dying memcg through a long-lived
+CSS reference.
+
+The list_lru still tracks inodes while the actual split target is the
+current tail huge folio, so validate the folio memcg/node during scan.  If
+the folio no longer matches the reclaim context or splitting cannot
+proceed, requeue the inode according to the current tail folio; if the
+inode is no longer shrinkable, drop the scan entry.
+
+This can be tested with the shrinker debugfs interface by allocating 32
+tmpfs tail THPs in each of two memcgs, then scanning the sb-tmpfs shrinker
+with memcg A's cgroup id:
+
+               before A scan    after A scan
+  base         A=64M, B=64M     A=64M, B=64M (per-memcg count is skipped)
+  patched      A=64M, B=64M     A=0,   B=64M
+
+Link: https://lore.kernel.org/94cc7fe1fd645254ae90effc1c0687678438d940.1786955972.git.zhengqi.arch@bytedance.com
+Signed-off-by: Qi Zheng <zhengqi.arch@bytedance.com>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
