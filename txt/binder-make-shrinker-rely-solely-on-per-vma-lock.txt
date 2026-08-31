@@ -1,0 +1,73 @@
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Subject: binder: make shrinker rely solely on per-VMA lock
+Date: Mon, 31 Aug 2026 13:30:53 -0700
+
+tl;dr: lock_vma_under_rcu() is already a trylock.  No need to do both it
+and mmap_read_trylock().
+
+Long Version:
+
+== Background ==
+
+Historically, binder used an mmap_read_trylock() in its shrinker code. 
+This ensures that reclaim is not blocked on an mmap_lock.  Commit
+95bc2d4a9020 ("binder: use per-vma lock in page reclaiming") added support
+for the per-VMA lock, but left mmap_read_trylock() as a fallback.
+
+This was presumably because the per-VMA locking can fail for several
+reasons and most (all?) lock_vma_under_rcu() callers have a fallback to
+mmap_read_trylock().
+
+== Problem ==
+
+The fallback is not worth the complexity here.  lock_vma_under_rcu() is
+essentially already a non-blocking trylock.  The main reason it fails is
+also the reason mmap_read_trylock() fails: something is holding
+mmap_write_lock().
+
+The only remedy for a collision with mmap_write_lock() is to wait, which
+this code can not do.  So the "fallback" after lock_vma_under_rcu()
+failure is not really a fallback: it is really likely to just be retrying
+in vain.  That retry in an of itself isn't horrible.  But it adds
+complexity.
+
+== Solution ==
+
+Now that per-VMA locks are universally available, lock_vma_under_rcu()
+will not persistently fail.  Rely on it alone and simplify the code.  The
+removal of the fallback does not affect NOMMU case because binder driver
+depends on CONFIG_MMU.
+
+While at it we also make the handling of the cases where the original
+binder VMA is gone consistent. There are two cases to consider when
+Binder VMA is gone:
+1. there is no VMA at that location anymore.
+2. there is now another unrelated VMA at that location.
+
+Before this change we handle case 1 by having the shrinker proceed to free
+the page, and just skip the zap_vma_range() call.  And we handle case 2 by
+having the shrinker return LRU_SKIP.  While either behavior is acceptable,
+we need to handle them in a consistent way.  Handle both cases by freeing
+the page without touching the VMA (skipping the zap_vma_range()).
+
+Full disclosure: I originally tried to do this with
+lock_vma_under_rcu_wait(), but it did not fit well with the mmap_lock
+trylock semantics.  Claude caught this in a review and suggested the
+approach in this path.  It seemed sane to me.  So, Suggesed-by: Claude, I
+guess.
+
+Link: https://lore.kernel.org/20260831203056.838265-3-surenb@google.com
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Alice Ryhl <aliceryhl@google.com>
+Acked-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Acked-by: Carlos Llamas <cmllamas@google.com>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Todd Kjos <tkjos@android.com>
+Cc: Christian Brauner <christian@brauner.io>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: David Ahern <dsahern@kernel.org>
+Cc: Arve Hjønnevåg <arve@android.com>

@@ -1,0 +1,170 @@
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Subject: mm: make per-VMA locks available universally
+Date: Mon, 31 Aug 2026 13:30:52 -0700
+
+Patch series "mm: Unconditional per-VMA locks and cleanups", v7.
+
+tl;dr: Make per-VMA locks available in all configs.  Simplify some of the
+per-VMA lock users now that they can rely on them being always available.
+
+Binder and networking folks: Your code is the target of the cleanups.  I'm
+cc'ing you now on v2 because there's emerging consensus on the mm side
+that the approach here is sane.  I'm not quite sure how this pile would
+get merged, but ack/review tags would be appreciated if this looks good to
+you.
+
+Longer version:
+
+When working on some x86 shadow stack code, it was a real pain to avoid
+causing recursive locking problems with mmap_lock.  One way to avoid those
+was to avoid mmap_lock and use per-VMA locks instead.  They are great, but
+they are not available in all configs which makes them unusable in generic
+code, or if you want to completely avoid mmap_lock.
+
+Make per-VMA locks available in all configs.  Right now, they are only
+available on select architectures when SMP and MMU are enabled.  But all
+of the primitives that per-VMA locks are built on (RCU, maple trees,
+refcounts) work just fine without SMP or MMU.
+
+The only real downside is that making VMAs a wee bit bigger on !MMU and
+!SMP builds.
+
+The upside is much cleaner code, lower complexity and less #ifdeffery.
+
+Clean up a binder VMA locking site now that it can rely on per-VMA locks.
+
+Building on top of universally-available per-VMA locks, introduce a new
+helper.  Since the new API does not require callers to have a fallback to
+mmap_lock, it's much easier to use.  Callers can potentially replace this
+very common kernel idiom:
+
+	mmap_read_lock(mm);
+	vma = vma_lookup()
+	// fiddle with vma
+	mmap_read_unlock(mm);
+
+with:
+
+	vma = vma_start_read_unlocked(mm, address);
+	// fiddle with vma
+	vma_end_read(vma);
+
+Which avoids mmap_lock entirely in the fast path.
+
+Use that new API for another binder site and one in the TCP code.
+
+
+This patch (of 7):
+
+The per-VMA locks have been around for several years.  They've had some
+bugs worked out of them and have seen quite wide use.  However, they are
+still only available when architectures explicitly enable them.  Remove
+the conditional compilation around the per-VMA locks, making them
+available on all architectures and configs.
+
+The approach up to now seemed to be to add ARCH_SUPPORTS_PER_VMA_LOCK when
+the architecture started using per-VMA locks in the fault handler.  But,
+contrary to the naming, the Kconfig option does not really indicate
+whether the architecture supports per-VMA locks or not.  It is more of a
+marker for whether the architecture is likely to benefit from per-VMA
+locks.
+
+To me, the most important thing side-effect of universal availability is
+letting per-VMA locks be used in SMP=n configs.  This lets us use
+per-VMA locking in all x86 code without fallbacks.
+
+Overall, this just generally makes the kernel simpler.  Just look at the
+diffstat.  It also opens the door to users that want to use the per-VMA
+locks in common code.  Doing *that* brings additional simplifications.
+
+The downside of this is adding some fields to vm_area_struct and
+mm_struct.  There are likely ways to optimize this, especially for things
+like SMP=n configs.  For now, do the simplest thing: use the same
+implementation everywhere.
+
+== Considerations for NOMMU config ==
+
+NOMMU systems do not write-lock VMAs, therefore read-locking a VMA would
+always succeed unless VMA is detached.  Therefore for NOMMU config we make
+vma_mark_attached() a NOOP, which keeps VMAs always in detached state. 
+This causes VMA read-locking to always fail and the caller falls back to
+locking mmap_lock.
+
+The following functions will have a different implementation in NOMMU
+config:
+
+- vma_mark_attached(), vma_mark_detached() are made NOOPs, keeping VMAs
+  always in a detached state and preventing assertions and refcount
+  underflows;
+
+- vma_start_write(), vma_start_write_killable() are made NOOPs to avoid
+  warnings in __vma_start_write() due to VMAs being detached.  These
+  functions are not used in NOMMU code but __vma_start_write() is an
+  exported function, therefore might be used by drivers.
+
+- vma_assert_attached() is made NOOP because it's reachable from NOMMU
+  code via split_vma()->vma_iter_store_new()->vma_iter_store_overwrite();
+
+- vma_assert_write_locked() is asserting vma->vm_mm is write-locked, as
+  was done before this change;
+
+- vma_assert_locked() is asserting vma->vm_mm is locked, as was done
+  before this change;
+
+The following functions work for both MMU and NOMMU configs:
+
+- vma_lock_init() performs the same initialization as for MMU config;
+
+- mm_lock_seqcount_init(), mm_lock_seqcount_begin(),
+  mm_lock_seqcount_end() are called from mmap_write_{lock|unlock} and
+  update mm_lock_seq correctly.
+
+- mmap_lock_speculate_try_begin(), mmap_lock_speculate_retry() work as
+  is because mm_lock_seq is updated correctly;
+
+- vma_start_read(), vma_start_read_locked() will always fail because
+  VMAs are always detached;
+
+- vma_end_read() will never be called because vma_start_read() never
+  succeeds;
+
+- vma_is_attached() always return false because VMAs are always
+  detached;
+
+- vma_assert_detached() will never trigger because VMAs are never
+  attached;
+
+- vma_start_read_locked() always return false because VMAs are always
+  detached;
+
+- lock_vma_under_rcu() will be safe as the attempted read lock will bail;
+
+Changes in the following files are not affecting NOMMU config:
+
+task_mmu.c - not compiled when CONFIG_MMU=n;
+pagewalk.c - not compiled when CONFIG_MMU=n;
+userfaultfd.c - not compiled when CONFIG_MMU=n (CONFIG_USERFAULTFD depends
+on CONFIG_MMU);
+
+The following changes in the BPF code are made to keep NOMMU config
+working like before:
+
+stack_map_lock_vma() - keeps mmap_lock in NOMMU config;
+bpf_iter_task_vma_new() - bails out in NOMMU config;
+
+Link: https://lore.kernel.org/20260831203056.838265-1-surenb@google.com
+Link: https://lore.kernel.org/20260831203056.838265-2-surenb@google.com
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Cc: Liam R. Howlett <Liam.Howlett@oracle.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Todd Kjos <tkjos@android.com>
+Cc: Christian Brauner <christian@brauner.io>
+Cc: Carlos Llamas <cmllamas@google.com>
+Cc: Alice Ryhl <aliceryhl@google.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: David Ahern <dsahern@kernel.org>
+Cc: Arve Hjønnevåg <arve@android.com>
