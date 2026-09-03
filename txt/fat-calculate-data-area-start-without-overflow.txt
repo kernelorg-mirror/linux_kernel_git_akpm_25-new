@@ -1,0 +1,100 @@
+From: Hengyu Liang <hengyul@cs.unc.edu>
+Subject: fat: calculate data area start without overflow
+Date: Wed, 2 Sep 2026 13:01:15 -0400
+
+On 32-bit architectures, sbi->fat_length, sbi->dir_start and
+sbi->data_start are unsigned long.  The number of FATs is an 8-bit BPB
+field, while the FAT32 length is a 32-bit BPB field.  Therefore, the
+calculation
+
+    sbi->fat_start + sbi->fats * sbi->fat_length
+
+can wrap before data_start is checked against total_sectors.
+
+For example, with fat_start=32, fats=2 and fat_length=0x80000001, the
+unwrapped data area start is 0x100000022 (4294967330), but the calculation
+wraps to 34 on i386.  With total_sectors=36, the validation then
+incorrectly passes.
+
+The following script creates an image that demonstrates the problem:
+
+    python3 - <<'PY'
+    import struct
+
+    S = 512
+    b = bytearray(36 * S)
+
+    def p(off, fmt, value):
+        struct.pack_into(fmt, b, off, value)
+
+    # FAT32 BPB
+    b[0:3] = b'\xeb\x58\x90'
+    b[3:11] = b'MSWIN4.1'
+    p(11, '<H', 512)
+    b[13] = 1
+    p(14, '<H', 32)             # reserved sectors
+    b[16] = 2                   # number of FATs
+    p(17, '<H', 0)
+    p(19, '<H', 0)
+    b[21] = 0xf8
+    p(22, '<H', 0)
+    p(24, '<H', 1)
+    p(26, '<H', 1)
+    p(32, '<I', 36)             # total sectors
+    p(36, '<I', 0x80000001)     # FAT32 length
+    p(44, '<I', 2)              # root cluster
+    p(48, '<H', 1)              # FSINFO sector
+    b[64] = 0x80
+    b[66] = 0x29
+    p(67, '<I', 0x12345678)
+    b[71:82] = b'OVERFLOW   '
+    b[82:90] = b'FAT32   '
+    b[510:512] = b'\x55\xaa'
+
+    # FSINFO
+    p(S, '<I', 0x41615252)
+    p(S + 484, '<I', 0x61417272)
+    p(S + 488, '<I', 0xffffffff)
+    p(S + 492, '<I', 0xffffffff)
+
+    # Wrapped FAT starts at sector 32
+    fat = 32 * S
+    p(fat + 8, '<I', 0x0fffffff)   # FAT[2]
+    p(fat + 12, '<I', 0x0fffffff)  # FAT[3]
+
+    # Wrapped data_start == 34
+    root = 34 * S
+    b[root:root + 11] = b'ESCAPE  TXT'
+    b[root + 11] = 0x20
+    p(root + 26, '<H', 3)
+    p(root + 28, '<I', 4)
+    b[35 * S:35 * S + 4] = b'OOB!'
+
+    open('fat-overflow.img', 'wb').write(b)
+    PY
+
+Attach fat-overflow.img as /dev/sdb and run:
+
+    mount -t vfat -o ro /dev/sdb /mnt
+    cat /mnt/ESCAPE.TXT
+
+On an unpatched i386 kernel, the mount succeeds and reading the file
+returns:
+
+    OOB!
+
+On an x86-64 kernel and on a patched i386 kernel, mounting is rejected
+with:
+
+    mount: mounting /dev/sdb on /mnt failed: Invalid argument
+
+Calculate dir_start and data_start in u32 using check_mul_overflow() and
+check_add_overflow().  Since total_sectors is also a u32 value, any result
+that overflows u32 cannot describe a valid volume.  Reject such layouts
+before storing the values in the existing unsigned long fields.  The
+existing total_sectors check handles values that fit in u32 but still lie
+beyond the volume.
+
+Link: https://lore.kernel.org/20260902170115.4162222-1-hengyul@cs.unc.edu
+Signed-off-by: Hengyu Liang <hengyul@cs.unc.edu>
+Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
