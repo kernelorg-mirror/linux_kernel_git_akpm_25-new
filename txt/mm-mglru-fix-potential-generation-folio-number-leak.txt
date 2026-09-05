@@ -1,0 +1,65 @@
+From: Kairui Song <kasong@tencent.com>
+Subject: mm/mglru: fix potential generation folio number leak
+Date: Sun, 06 Sep 2026 00:51:11 +0800
+
+Each generation of MGLRU accounts anon and file folio numbers separately,
+and the page table walker updates each generation's counters in batch once
+the walk is done.  The walker promotes a folio's generation with a cmpxchg
+on folio->flags, and update_batch_size() then reads the live flags again
+to pick the anon/file column to charge.  The walk holds neither the lruvec
+lock nor the folio lock, so the type can flip between the cmpxchg and that
+read: the lazyfree path clears PG_swapbacked, and reclaim sets it back on
+a dirty lazyfree folio.  The batched delta pair is then recorded in the
+wrong type column.  Nothing reconciles it afterwards, permanently skewing
+lrugen->nr_pages and the reclaim budgets derived from it.
+
+Fix it by capturing the type from the flags snapshot the cmpxchg
+linearized against: folio_update_gen() returns the type of the state it
+transitioned from, and update_batch_size() accounts with that.
+
+A folio's type only changes while it is off the LRU list, inside a del/add
+pair under the lruvec lock, with the gen bits cleared in between.  The
+generation and PG_swapbacked sit in the same folio->flags word, so the
+cmpxchg snapshot captures them together.  Let G be the generation that
+snapshot captured (old_gen) and G' the one it wrote (new_gen); the CAS can
+land in only three places:
+
+  - before the del: the folio is anon at G; the batch records anon
+    G -> G', and the del later removes the folio from the anon
+    counters;
+  - between del and add: gen == -1, so folio_update_gen() returns -1
+    without touching the flags and no batch is recorded; the del/add
+    pair accounts for the move alone;
+  - after the add: the folio is file at the fresh generation the add
+    charged; the batch records file, that gen -> G', matching that
+    charge.
+
+Unlike the drift of lazy promotions, which sort_folio() repairs under the
+lruvec lock, the phantom deltas from before this fix land in a column the
+folio never occupies again, so nothing ever repairs them.
+
+Link: https://lore.kernel.org/20260906-mglru-flags-cleanup-v6-6-9aacbd77d4ca@tencent.com
+Fixes: bd74fdaea146 ("mm: multi-gen LRU: support page table walks")
+Signed-off-by: Kairui Song <kasong@tencent.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Kairui Song <ryncsn@gmail.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lian Wang <lianux.mm@gmail.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Ridong Chen <ridong.chen@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Yu Zhao <yuzhao@google.com>
+Cc: Zi Yan <ziy@nvidia.com>
