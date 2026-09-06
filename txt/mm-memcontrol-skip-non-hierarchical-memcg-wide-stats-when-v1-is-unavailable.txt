@@ -1,0 +1,57 @@
+From: Joanne Koong <joannelkoong@gmail.com>
+Subject: mm/memcontrol: skip non-hierarchical memcg-wide stats when v1 is unavailable
+Date: Thu, 3 Sep 2026 14:56:16 -0700
+
+memcg_vmstats keeps a non-hierarchical copy of every memcg-wide stat item
+and event alongside the hierarchical one.  The only readers however are
+the legacy memory.stat and memory.numa_stat, and reparenting on offline. 
+All of them live under CONFIG_MEMCG_V1, and their accessors
+(memcg_page_state_local() and memcg_events_local()) are already compiled
+out with it.  This means on a CONFIG_MEMCG_V1=n kernel, memcg_vmstats's
+non-hierarchical arrays are written to on every rstat flush, despite their
+values never being read / accessed.
+
+The same holds when the kernel does support v1 but the controller has been
+blocked from v1 hierarchies with the boot param cgroup_no_v1={memory,all}.
+A v1 mount is refused in that case, so the legacy memory.stat can never
+exist and the arrays are just as unread / unaccessed.
+
+Compile out the non-hierarchical memcg-wide arrays if CONFIG_MEMCG_V1 is
+not set.  If it is set but cgroup_no_v1= has blocked the controller, skip
+updates on the arrays.
+
+This makes flushes cheaper.  mem_cgroup_stat_aggregate() can now skip the
+read-modify-write of ac->local[i].  Nothing else accesses state_local or
+events_local, so those cachelines were getting pulled in solely for the
+writes and they are separate from the ones the loop is already walking.
+
+On an 80-cpu x86_64 machine with 500 cgroups each running a workload that
+dirties anon, file, dirty/writeback, slab, kmem, mlock, and reclaim
+counters, timing mem_cgroup_css_rstat_flush() in-kernel in TSC ticks per
+flush showed roughly
+
+                         before   after    delta
+memcg-wide aggregation   1231     1180     -4.1%
+overall flush function   2452     2397     -2.2%
+
+These numbers are from taking the median of 70 samples, one per 20s window
+on each kernel.  The 95% intervals observed on the two deltas are [-5.41%,
+-1.76%] and [-4.53%, -0.14%].  The values above include the timing
+overhead itself, so only the delta is meaningful here.
+
+Counting the items that actually changed, a median of 1.5 of the 77
+memcg-wide items (57 state + 20 events) had a non-zero per-cpu delta at
+each flush, which means the benchmarks above are with one or two fewer
+cachelines pulled in per flush.  The count is low because the benchmark
+reads memory.stat in a loop to keep the flush rate up.  For cases where
+flushes are triggered only by the 2s periodic worker, more changes will
+have accumulated between flushes, so more cachelines are skipped and the
+per-flush saving should be larger.
+
+Link: https://lore.kernel.org/20260903215616.1456239-1-joannelkoong@gmail.com
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
