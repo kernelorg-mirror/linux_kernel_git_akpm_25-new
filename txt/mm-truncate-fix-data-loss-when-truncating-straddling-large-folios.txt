@@ -1,0 +1,107 @@
+From: Zhang Yi <yi.zhang@huawei.com>
+Subject: mm/truncate: fix data loss when truncating straddling large folios
+Date: Wed, 9 Sep 2026 14:23:39 +0800
+
+truncate_inode_partial_folio() splits a large folio so that the caller's
+truncate loop can drop the in-range sub-folios while keeping the
+out-of-range tail.  The first split at the punch start edge is
+non-uniform, which leaves the sub-folio at the truncation end edge as
+large as possible, this means it may still straddle the range, holding
+both zeroed in-range and valid out-of-range data.  The function then
+attempts a second split at offset + length to isolate that tail.
+
+If the second split fails the straddling sub-folio stays merged.  The
+function returned true unconditionally on all exit paths of the success
+block, telling the caller it was fully handled.  The caller kept its
+default end and the truncate loop truncated every sub-folio below it,
+including the merged straddler, discarding the valid out-of-range tail.
+
+For example, a 4-page order-2 folio punched from offset 0 to the middle of
+the last page:
+
+  truncate_inode_pages_range()
+    truncate_inode_partial_folio()      # same_folio == true
+      1st split at page0 -> [p0, p1, p2-3]   # non-uniform, success
+      folio2 = p2-3 # straddles: p2 zeroed, p3 tail valid
+      2nd split of folio2 fails / cannot lock
+      return true                       # BUG: caller keeps default end
+    end = 3
+    loop truncates p0, p1, p2-3        # p3's valid tail is lost
+
+This became reachable after commit 7460b470a131 ("mm/truncate: use
+folio_split() in truncate operation") replaced the atomic split_folio()
+with folio_split(), whose non-uniform split can partially split a folio
+and leave the end edge merged.
+
+It has gone unnoticed because a dirty large folio normally carries the
+filesystem's private data, for example buffer_head, so
+filemap_release_folio() -> iomap_release_folio() returns false on a dirty
+folio and folio_split() aborts with -EBUSY before any split, leaving the
+straddler safely unsplit.  The bug is only reachable on paths that produce
+dirty large folios without filesystem private data, and it was caught on
+the upcoming ext4 iomap buffered I/O path when no ifs is attached.
+
+In addition, even when both splits succeed, data can still be lost when
+the mapping's minimum folio order (min_order) is non-zero.  folio_split()
+stops at min_order instead of order 0, so the sub-folio containing a split
+point stays aligned to 1 << min_order rather than to a page.  The original
+success path left start at the page-aligned head of the range and set end
+to the exact page index of the end edge, neither of which is a folio
+boundary in general.  Either one could land inside the large folio at its
+edge, and the truncate loop would drop that straddling folio together with
+its valid out-of-range tail.
+
+For example, a 64K (order-4) folio with min_order = 2 punched from
+offset 0 to 36K:
+
+  truncate_inode_pages_range()
+    truncate_inode_partial_folio()        # same_folio == true
+      1st split at p0 -> [p0-p3, p4-p7, p8-p15]  # non-uniform, min_order
+      folio2 = p8-p15 # straddles: p8 in range, p9-p15 tail valid
+      2nd split of folio2 -> [p8-p11, p12-p15]   # success
+      end = p9                           # BUG: p9 inside [p8-p11]
+    loop truncates ... p8-p11           # p9-p11's valid tail is lost
+
+Rework the contract so the caller is told the page range to discard:
+
+  - Return true only when a split occurred, false otherwise. This
+    clarifies the existing confusing return value semantics.
+
+  - Add pgoff_t *pstart and *pend out-parameters that receive the page
+    range fully covered by [lstart, lend] after any split (or none),
+    i.e. the pages wholly within the range and safe to discard. They are
+    aligned up (pstart) and down (pend) to the mapping's minimum folio
+    order so they always fall on a folio boundary.
+
+  - Rename the byte-range parameters start/end to lstart/lend to avoid
+    clashing with the new outputs and to separate byte offsets from
+    folio indices.
+
+Callers in truncate_inode_pages_range() and shmem_undo_range() pass
+&pstart for the folio at the start edge and &pend for the folio at the end
+edge, so the truncate loop drops exactly the fully covered pages and never
+touches a straddling folio that still holds valid out-of-range data.
+
+Link: https://lore.kernel.org/20260909062339.473816-1-yi.zhang@huaweicloud.com
+Fixes: 7460b470a131 ("mm/truncate: use folio_split() in truncate operation")
+Signed-off-by: Zhang Yi <yi.zhang@huawei.com>
+Suggested-by: Brian Foster <bfoster@redhat.com>
+Link: https://lore.kernel.org/linux-fsdevel/anH-WKA1coW6wtfG@bfoster/
+Reviewed-by: Jan Kara <jack@suse.cz>
+Reviewed-by: Joanne Koong <joannelkoong@gmail.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Brian foster <bfoster@redhat.com>
+Cc: "Darrick J. Wong" <djwong@kernel.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: ErKun Yang <yangerkun@huawei.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kefeng Wang <wangkefeng.wang@huawei.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Zhihao Cheng <chengzhihao1@huawei.com>
+Cc: Zi Yan <ziy@nvidia.com>

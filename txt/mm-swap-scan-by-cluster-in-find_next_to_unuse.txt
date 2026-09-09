@@ -1,0 +1,54 @@
+From: Youngjun Park <youngjun.park@lge.com>
+Subject: mm/swap: scan by cluster in find_next_to_unuse()
+Date: Thu, 10 Sep 2026 01:15:52 +0900
+
+find_next_to_unuse() walks every offset from 0 to si->max, and swapoff
+restarts that walk on each retry, so the cost scales with the size of the
+device rather than with the few slots the shmem and mmlist passes could
+not free.  It has caused stalls before.
+
+The flat walk predates the swap table.  Slot state now lives in a per
+cluster table, and wait_for_allocation() stops all allocation before
+try_to_unuse() runs, so a cluster that holds no slot in use stays that
+way.  Skip such a cluster instead of reading all of its entries.
+
+Fill a 1 TiB swap up to some amount, then swapoff.  What is left sits at
+the top of what was filled, so every slot below it is free.  Medians over
+11 pairs at 32 and 128 GiB, 3 pairs at 256 and 512.
+
+	filled		swapoff
+			old	new
+	 32 GiB		 92.4ms	 66.3ms
+	128 GiB		157.6ms	 94.4ms
+	256 GiB		209.7ms	 63.8ms
+	512 GiB		391.8ms	 73.4ms
+
+old grows with how much was filled, new does not.
+
+In the ordinary case swap still holds real data and swapoff spends its
+time reading it back.  it is tested 4 GiB on an 8 GiB device, where the
+scan is 1.4% of try_to_unuse(), and there is no difference either way.
+
+Commit dc644a073769 ("mm: add three more cond_resched() in swapoff")
+answered those stalls with a cond_resched() every 256 offsets.  A walk
+bounded by one cluster no longer needs that counter.  The loop now runs at
+most SWAPFILE_CLUSTER times before it returns or reschedules, the same
+bound swap_reclaim_full_clusters() already scans between cond_resched()
+calls.
+
+The scan end is clamped to si->max, so the walk stops there rather than
+running into the masked tail of the last cluster.
+
+ci->count is read without ci->lock, so READ_ONCE() marks the read for
+KCSAN.  Allocation is already stopped, so the count can only drop, and a
+slot stops being counted only after its folio has left the swap cache.  An
+empty cluster therefore holds nothing for try_to_unuse() to act on.
+
+Link: https://lore.kernel.org/20260909161552.2335971-3-youngjun.park@lge.com
+Signed-off-by: Youngjun Park <youngjun.park@lge.com>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Acked-by: Kairui Song <kasong@tencent.com>
+Reviewed-by: Baoquan He <baoquan.he@linux.dev>
+Reviewed-by: Nhat Pham <nphamcs@gmail.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
