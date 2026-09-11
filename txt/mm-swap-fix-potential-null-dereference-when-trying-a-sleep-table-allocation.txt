@@ -1,0 +1,83 @@
+From: Kemeng Shi <shikemeng@huaweicloud.com>
+Subject: mm, swap: fix potential NULL dereference when trying a sleep table allocation
+Date: Mon, 7 Sep 2026 17:13:53 +0800
+
+Patch series "mm, swap: some random fixes and cleanups", v3.
+
+This series contains some random fixes and cleanups.  More details can be
+found in respective patches.
+
+
+This patch (of 4):
+
+The root cause of this issue is because multi-tables are updated in non
+atomic context.  To be more specific, the issue could be triggerred as
+following:
+
+swap_alloc_fast         swap_cluster_populate()
+                         /* Try a sleep allocation */
+                         spin_unlock(&ci->lock);
+                         swap_cluster_alloc_table()
+                          rcu_assign_pointer(ci->table, table);
+
+ ci = swap_cluster_lock(si, offset)
+ cluster_is_usable(ci, order）
+  if (!cluster_table_is_alloced(ci)) // ok
+ alloc_swap_scan_cluster()
+  cluster_scan_range()
+   __swap_table_get()
+
+                          /* free table when more table allocation fails */
+                          ci->memcg_table = kzalloc_obj(*ci->memcg_table,
+                                                        gfp);
+                          if (!ci->memcg_table)
+                           swap_cluster_free_table()
+                            rcu_assign_pointer(ci->table, NULL);
+
+    table = rcu_dereference_check(ci->table, lockdep_is_held(&ci->lock));
+     atomic_long_read(&table[off]); // NULL dereference
+
+Since memory order guarantee between ci->table, as well as between
+ci->table and ci->zero_bitmap, fix the issue by making tables visible at
+the end of swap_cluster_populate().
+
+Current memory order guarantee is as following: On write side:
+rcu_assign_pointer(ci->table, table) will offer release to ensure
+zero_bitmap and memcg_table visible before ci->table.
+
+On read side:
+folio_alloc_swap
+ swap_alloc_fast/swap_alloc_slow
+  /* ci->table: protected by cluster lock */
+  swap_cluster_lock
+  cluster_is_usable
+  ...
+  __swap_table_set
+  ...
+  swap_cluster_unlock
+
+ mem_cgroup_try_charge_swap
+  ...
+  /* memcg_table: protected by cluster lock */
+  swap_cluster_get_and_lock
+  __swap_cgroup_set
+  swap_cluster_unlock
+
+swap_writeout
+ swap_zeromap_folio_set
+  /* zero_bitmap: protected by cluster lock */
+  swap_cluster_get_and_lock
+  __swap_table_set_zero
+  swap_cluster_unlock
+
+Link: https://lore.kernel.org/20260907091356.53026-1-shikemeng@huaweicloud.com
+Link: https://lore.kernel.org/20260907091356.53026-2-shikemeng@huaweicloud.com
+Fixes: b197d41462c2 ("mm/memcg, swap: store cgroup id in cluster table directly")
+Signed-off-by: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Luiz Capitulino <luizcap@redhat.com>
+Cc: Youngjun Park <youngjun.park@lge.com>
