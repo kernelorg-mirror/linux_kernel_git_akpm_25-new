@@ -1,0 +1,120 @@
+From: Suren Baghdasaryan <surenb@google.com>
+Subject: proc/task_mmu: read proc/pid/smaps_rollup under per-vma lock
+Date: Fri, 18 Sep 2026 08:33:17 -0700
+
+proc/pid/smaps_rollup can be read using the combination of RCU and VMA
+read locks, similar to proc/pid/{maps|smaps|numa_maps}.  RCU is required
+to safely traverse the VMA tree and VMA lock stabilizes the VMA being
+processed and the pagetable walk.  Note that we have to keep the logic to
+drop mmap_lock on contention because even when using per-VMA locks we
+might have to fall back to holding the mmap_lock.
+
+Running Paul's contention benchmark [1] shows considerable improvement
+both in median and in the worst case latencies:
+
+Execution command: run-proc-vs-map.sh --nsamples 20 --rawdata -- \
+--busyduration 2 --procfile smaps_rollup
+
+Baseline:
+   Median   Minimum   Maximum
+    0.174     0.161     2.553
+    0.174     0.164     2.663
+    0.174     0.165     2.664
+    0.174     0.166     2.679
+    0.174     0.167     2.691
+    0.174     0.168     2.704
+    0.174     0.169     2.729
+    0.174     0.172     2.741
+    0.174     0.174     2.745
+    0.174     0.174     2.755
+    0.174     0.175     2.790
+    0.174     0.177     2.809
+    0.174     0.179     3.096
+    0.174     0.183     3.144
+    0.174     0.184     3.158
+    0.174     0.185     3.175
+    0.174     0.185     4.568
+    0.174     0.198     4.821
+    0.174     0.214     5.143
+    0.174     0.251     5.220
+
+Patched:
+   Median   Minimum   Maximum
+    0.007     0.007     1.952
+    0.007     0.007     1.955
+    0.007     0.007     1.955
+    0.007     0.007     1.955
+    0.007     0.007     1.957
+    0.007     0.007     1.969
+    0.007     0.007     2.065
+    0.007     0.007     2.075
+    0.007     0.007     2.146
+    0.007     0.007     2.195
+    0.007     0.007     2.223
+    0.007     0.007     2.259
+    0.007     0.007     2.488
+    0.007     0.007     2.562
+    0.007     0.007     2.599
+    0.007     0.007     2.697
+    0.007     0.007     3.030
+    0.007     0.007     3.075
+    0.007     0.007     3.145
+    0.007     0.007     3.225
+
+Remove now unused lock_ctx_mm() and move unlock_ctx_vma() next to
+unlock_ctx_mm() as they are logically related.
+
+Remove a long comment about 4 cases that we handle when dropping the mmap
+lock in the middle of VMA walk due to contention.  The first 3 cases
+explained there are handled naturally and only case 4 needs to be handled
+in a special way, which is done in smap_gather_stats() by gathering stats
+from the portion of the VMA that has not yet been processed.  For
+posterity, moving this comment here:
+
+After dropping the lock, there are four cases to consider.  See the
+following example for explanation.
+
+  +------+------+-----------+
+  | VMA1 | VMA2 | VMA3      |
+  +------+------+-----------+
+  |      |      |           |
+ 4k     8k     16k         400k
+
+Suppose we drop the lock after reading VMA2 due to
+contention, then we get:
+
+	last_vma_end = 16k
+
+1) VMA2 is freed, but VMA3 exists:
+
+   vma_next(vmi) will return VMA3.
+   In this case, just continue from VMA3.
+
+2) VMA2 still exists:
+
+   vma_next(vmi) will return VMA3.
+   In this case, just continue from VMA3.
+
+3) No more VMAs can be found:
+
+   vma_next(vmi) will return NULL.
+   No more things to do, just break.
+
+4) (last_vma_end - 1) is the middle of a vma (VMA'):
+
+   vma_next(vmi) will return VMA' whose range
+   contains last_vma_end.
+   Iterate VMA' from last_vma_end.
+
+Link: https://lore.kernel.org/20260918153318.758387-7-surenb@google.com
+Link: https://github.com/paulmckrcu/proc-mmap_sem-test [1]
+Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+Reviewed-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Cc: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Liam R. Howlett (Oracle) <liam@infradead.org>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: "Paul E . McKenney" <paulmck@kernel.org>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Vlastimil Babka <vbabka@kernel.org>
