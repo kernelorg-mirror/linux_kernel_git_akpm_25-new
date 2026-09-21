@@ -1,6 +1,6 @@
 From: Zi Yan <ziy@nvidia.com>
 Subject: mm/page-flags: check page/folio->private instead of PG_private
-Date: Sun, 13 Sep 2026 22:24:08 -0400
+Date: Sun, 20 Sep 2026 22:28:06 -0400
 
 After the changes of the prior commits, page/folio->private != NULL is now
 equivalent to checking PG_private.
@@ -16,18 +16,21 @@ folio_test_swapbacked(), since PG_swapbacked is stable when a folio is
 added to/removed from swapcache.  Add a helper,
 folio_has_attached_private(), for this check.
 
-folio_expected_ref_count() can be called without folio lock, so annotate
-folio_test_private() with data_race() to avoid triggering race condition
-checks.  While at it, annotate folio->mapping too.  Add data_race()
-annotation for other lockless callers too.
+folio_test_private() and PagePrivate() now read folio/page->private
+plainly instead of an atomic read of PG_private bit, so KCSAN complains
+about possible data races.  Annotate them with data_race().
 
-folio_set/clear_private() and Set/ClearPagePrivate() become no-ops. 
-PG_private is no longer checked at page free time.
+folio_expected_ref_count() can be called without the folio lock, so
+annotate folio->mapping with data_race() while at it.
+
+folio_set/clear_private() and Set/ClearPagePrivate() become no-ops.
+PG_private is no longer checked at page free time. They will be removed in
+an upcoming commit.
 
 Remove KPF_PRIVATE since PG_private is no longer used.
 
 Assisted-by: LLM
-Link: https://lore.kernel.org/20260913-remove-pg_private-v4-10-848550f7574e@nvidia.com
+Link: https://lore.kernel.org/20260920-remove-pg_private-v5-10-bb68b6a21869@nvidia.com
 Signed-off-by: Zi Yan <ziy@nvidia.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Cc: David Hildenbrand <david@kernel.org>
@@ -67,15 +70,15 @@ Cc: Wei Xu <weixugc@google.com>
 
  fs/proc/page.c                    |    1 
  include/linux/kernel-page-flags.h |    1 
- include/linux/mm.h                |   20 +++++++-----
- include/linux/page-flags.h        |   46 ++++++++++++++++++++++++----
- include/trace/events/pagemap.h    |    3 +
- mm/huge_memory.c                  |    3 +
- mm/migrate.c                      |    2 -
- mm/page-writeback.c               |    3 +
- mm/vmscan.c                       |    2 -
- tools/mm/page-types.c             |    2 -
- 10 files changed, 62 insertions(+), 21 deletions(-)
+ include/linux/mm.h                |   19 +++++----
+ include/linux/page-flags.h        |   57 +++++++++++++++++++++++++---
+ include/trace/events/pagemap.h    |    2 
+ mm/huge_memory.c                  |    2 
+ mm/migrate.c                      |    2 
+ mm/page-writeback.c               |    2 
+ mm/vmscan.c                       |    2 
+ tools/mm/page-types.c             |    2 
+ 10 files changed, 68 insertions(+), 22 deletions(-)
 
 --- a/fs/proc/page.c~mm-page-flags-check-page-folio-private-instead-of-pg_private
 +++ a/fs/proc/page.c
@@ -112,7 +115,7 @@ Cc: Wei Xu <weixugc@google.com>
   *
   * Does currently not consider references from the LRU cache. If the folio
   * was isolated from the LRU (which is the case during migration or split),
-@@ -3044,10 +3044,16 @@ static inline int folio_expected_ref_cou
+@@ -3044,10 +3044,15 @@ static inline int folio_expected_ref_cou
  	ref_count += folio_test_swapcache(folio) << order;
  
  	if (!folio_test_anon(folio)) {
@@ -127,28 +130,36 @@ Cc: Wei Xu <weixugc@google.com>
 +		ref_count += !!data_race(folio->mapping) << order;
 +		/*
 +		 * One reference from filesystem private data.
-+		 * Use data_race() since folio might not be locked.
 +		 */
-+		ref_count += data_race(folio_has_attached_private(folio));
++		ref_count += folio_has_attached_private(folio);
  	}
  
  	/* One reference per page table mapping. */
 --- a/include/linux/page-flags.h~mm-page-flags-check-page-folio-private-instead-of-pg_private
 +++ a/include/linux/page-flags.h
-@@ -577,7 +577,23 @@ FOLIO_FLAG(swapbacked, FOLIO_HEAD_PAGE)
+@@ -575,9 +575,31 @@ FOLIO_FLAG(swapbacked, FOLIO_HEAD_PAGE)
+ /*
+  * Private page markings that may be used by the filesystem that owns the page
   * for its own purposes.
-  * - PG_private and PG_private_2 cause release_folio() and co to be invoked
+- * - PG_private and PG_private_2 cause release_folio() and co to be invoked
++ * - folio->private and PG_private_2 cause release_folio() and co to be invoked
   */
 -PAGEFLAG(Private, private, PF_ANY)
 +
 +static __always_inline bool folio_test_private(const struct folio *folio)
 +{
-+	return folio->private;
++	/*
++	 * data_race() is added for readers without holding the folio lock.
++	 * Only the NULL/non-NULL answer is used and both are valid while
++	 * private is being attached or detached, so the race is benign.
++	 */
++	return data_race(folio->private);
 +}
 +
 +static __always_inline int PagePrivate(const struct page *page)
 +{
-+	return !!page->private;
++	/* See folio_test_private() for data_race() use */
++	return !!data_race(page->private);
 +}
 +
 +/* no-ops during transition */
@@ -160,7 +171,7 @@ Cc: Wei Xu <weixugc@google.com>
  FOLIO_FLAG(private_2, FOLIO_HEAD_PAGE)
  
  /* owner_2 can be set on tail pages for anon memory */
-@@ -1169,7 +1185,7 @@ static __always_inline void __ClearPageA
+@@ -1169,7 +1191,7 @@ static __always_inline void __ClearPageA
   */
  #define PAGE_FLAGS_CHECK_AT_FREE				\
  	(1UL << PG_lru		| 1UL << PG_locked	|	\
@@ -169,7 +180,7 @@ Cc: Wei Xu <weixugc@google.com>
  	 1UL << PG_writeback	| 1UL << PG_reserved	|	\
  	 1UL << PG_active 	|				\
  	 1UL << PG_unevictable	| __PG_MLOCKED | LRU_GEN_MASK)
-@@ -1193,8 +1209,28 @@ static __always_inline void __ClearPageA
+@@ -1193,8 +1215,31 @@ static __always_inline void __ClearPageA
  	(0xffUL /* order */		| 1UL << PG_has_hwpoisoned |	\
  	 1UL << PG_large_rmappable	| 1UL << PG_partially_mapped)
  
@@ -180,27 +191,30 @@ Cc: Wei Xu <weixugc@google.com>
 + * @folio: The folio to check.
 + *
 + * Use this in code that may encounter swapcache or hugetlb folios but only
-+ * wants to detect attached private data. Swapcache stores swp_entry_t in
-+ * folio->swap, a union with folio->private, and hugetlb stores its own flags
-+ * in folio->private; both are excluded.
++ * wants to detect attached private data.
 + *
-+ * NOTE: For swapcache, folio->swap.val PG_swapcache are not set as a whole,
-+ * so folio_test_swapcache() is not reliable to exclude swapcache.
-+ * Use folio_test_swapbacked() instead, since it remains set when a folio is
-+ * added to/removed from swapcache.
-+ *
-+ * Return: true if folio->private is set and the folio is neither swapcache
-+ * nor hugetlb.
++ * Return: true if the folio has private data attached.
 + */
 +static inline bool folio_has_attached_private(const struct folio *folio)
 +{
++	/*
++	 * Swapcache stores swp_entry_t in folio->swap, a union with
++	 * folio->private, and hugetlb stores its own flags in folio->private;
++	 * both are excluded.
++	 *
++	 * NOTE: For swapcache, folio->swap.val PG_swapcache are not set as
++	 * a whole, so folio_test_swapcache() is not reliable to exclude
++	 * swapcache. Use folio_test_swapbacked() instead, since it remains set
++	 * when a folio is added to/removed from swapcache.
++	 */
++
 +	return folio_test_private(folio) && !folio_test_swapbacked(folio) &&
 +	       !folio_test_hugetlb(folio);
 +}
  /**
   * folio_has_private - Determine if folio has private stuff
   * @folio: The folio to be checked
-@@ -1204,7 +1240,7 @@ static __always_inline void __ClearPageA
+@@ -1204,7 +1249,7 @@ static __always_inline void __ClearPageA
   */
  static inline int folio_has_private(const struct folio *folio)
  {
@@ -211,26 +225,23 @@ Cc: Wei Xu <weixugc@google.com>
  #undef PF_ANY
 --- a/include/trace/events/pagemap.h~mm-page-flags-check-page-folio-private-instead-of-pg_private
 +++ a/include/trace/events/pagemap.h
-@@ -22,7 +22,8 @@
+@@ -22,7 +22,7 @@
  	(folio_test_swapcache(folio)	? PAGEMAP_SWAPCACHE  : 0) | \
  	(folio_test_swapbacked(folio)	? PAGEMAP_SWAPBACKED : 0) | \
  	(folio_test_mappedtodisk(folio)	? PAGEMAP_MAPPEDDISK : 0) | \
 -	(folio_test_private(folio)	? PAGEMAP_BUFFERS    : 0) \
-+	/* data_race() is used to read attached private locklessly */ \
-+	(data_race(folio_has_attached_private(folio))	? PAGEMAP_BUFFERS    : 0) \
++	(folio_has_attached_private(folio)	? PAGEMAP_BUFFERS    : 0) \
  	)
  
  TRACE_EVENT(mm_lru_insertion,
 --- a/mm/huge_memory.c~mm-page-flags-check-page-folio-private-instead-of-pg_private
 +++ a/mm/huge_memory.c
-@@ -4845,8 +4845,9 @@ static int split_huge_pages_pid(int pid,
- 		 * For folios with private, split_huge_page_to_list_to_order()
+@@ -4846,7 +4846,7 @@ static int split_huge_pages_pid(int pid,
  		 * will try to drop it before split and then check if the folio
  		 * can be split or not. So skip the check here.
-+		 * data_race() is used to read attached private locklessly.
  		 */
 -		if (!folio_test_private(folio) &&
-+		if (!data_race(folio_has_attached_private(folio)) &&
++		if (!folio_has_attached_private(folio) &&
  		    folio_expected_ref_count(folio) != folio_ref_count(folio))
  			goto next;
  
@@ -247,13 +258,12 @@ Cc: Wei Xu <weixugc@google.com>
  		}
 --- a/mm/page-writeback.c~mm-page-flags-check-page-folio-private-instead-of-pg_private
 +++ a/mm/page-writeback.c
-@@ -2705,7 +2705,8 @@ bool filemap_dirty_folio(struct address_
+@@ -2705,7 +2705,7 @@ bool filemap_dirty_folio(struct address_
  	if (folio_test_set_dirty(folio))
  		return false;
  
 -	__folio_mark_dirty(folio, mapping, !folio_test_private(folio));
-+	/* data_race() is used to read attached private locklessly */
-+	__folio_mark_dirty(folio, mapping, !data_race(folio_has_attached_private(folio)));
++	__folio_mark_dirty(folio, mapping, !folio_has_attached_private(folio));
  
  	if (mapping->host) {
  		/* !PageAnon && !swapper_space */
