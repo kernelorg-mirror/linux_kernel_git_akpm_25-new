@@ -1,0 +1,85 @@
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Subject: ocfs2: fix possible deadlock between nfs_sync_rwlock and fs_reclaim
+Date: Tue, 22 Sep 2026 17:34:37 +0800
+
+syzbot detected a circular locking dependency on &osb->nfs_sync_rwlock:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(fs_reclaim);
+                               lock(&ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE]);
+                               lock(fs_reclaim);
+  rlock(&osb->nfs_sync_rwlock);
+
+ *** DEADLOCK ***
+
+Chain exists of:
+  &osb->nfs_sync_rwlock --> &ocfs2_sysfile_lock_key[INODE_ALLOC_SYSTEM_INODE] --> fs_reclaim
+
+CPU0 is kswapd.  The dentry shrinker runs under fs_reclaim and reaches
+ocfs2_delete_inode() through ->evict_inode():
+
+kswapd
+ balance_pgdat
+  shrink_node
+   shrink_slab
+    super_cache_scan
+     prune_dcache_sb
+      shrink_dentry_list
+       dentry_kill
+        ocfs2_dentry_iput
+         evict
+          ocfs2_evict_inode
+           ocfs2_delete_inode
+            ocfs2_nfs_sync_lock
+             down_read(&osb->nfs_sync_rwlock)      //C0: grabbing
+
+CPU1 is a task deleting an inode.  It takes nfs_sync_rwlock first, then
+the orphan dir and inode alloc system inode i_rwsems, and allocates the
+metadata reservation with GFP_KERNEL while holding them:
+
+evict
+ ocfs2_evict_inode
+  ocfs2_delete_inode
+  + ocfs2_nfs_sync_lock
+  |  down_read(&osb->nfs_sync_rwlock)              //C1: hold
+  + ocfs2_wipe_inode
+     + inode_lock(orphan_dir_inode)                //C1: hold
+     + ocfs2_truncate_for_delete
+     |  ocfs2_commit_truncate
+     |   ocfs2_remove_btree_range
+     |    ocfs2_reserve_blocks_for_rec_trunc
+     |     ocfs2_reserve_new_metadata_blocks
+     |      kzalloc_obj()                          //C1: grabbing
+     |      // GFP_KERNEL -> might_alloc -> fs_reclaim_acquire
+     + ocfs2_remove_inode
+        inode_lock(inode_alloc_inode)
+
+jbd2 pins allocations to GFP_NOFS for the lifetime of a transaction
+handle, but these reservations are made before ocfs2_start_trans(), so
+fs_reclaim is acquired with ocfs2 locks still held and the cycle closes.
+
+The same cycle is reachable from ocfs2_get_dentry() and
+ocfs2_get_parent(), which hold nfs_sync_rwlock for write across
+ocfs2_test_inode_bit() and ocfs2_iget().
+
+This is more than a lockdep artifact.  A GFP_KERNEL allocation under the
+orphan dir i_rwsem enters direct reclaim, which runs the shrinkers, which
+can evict another ocfs2 inode and re-enter ocfs2_wipe_inode() on the same
+task; the second inode_lock() on the singleton orphan dir inode then
+self-deadlocks, since i_rwsem is not recursive.
+
+Establish a GFP_NOFS allocation context for the whole nfs_sync_rwlock
+critical section so that nothing holding it can recurse into filesystem
+reclaim.  Do it in ocfs2_nfs_sync_lock()/ocfs2_nfs_sync_unlock() rather
+than at the call sites, so that future callers cannot forget it.
+
+Link: https://lore.kernel.org/20260922093437.954127-1-joseph.qi@linux.alibaba.com
+Fixes: 6ca497a83e59 ("ocfs2: fix rare stale inode errors when exporting via nfs")
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Reported-by: syzbot+a68ce48df87b8e36e915@syzkaller.appspotmail.com
+Closes: https://syzkaller.appspot.com/bug?extid=a68ce48df87b8e36e915
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>

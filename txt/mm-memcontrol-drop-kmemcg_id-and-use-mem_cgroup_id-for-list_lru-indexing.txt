@@ -1,0 +1,94 @@
+From: Qinyun Tan <qinyuntan@linux.alibaba.com>
+Subject: mm: memcontrol: drop kmemcg_id and use mem_cgroup_id() for list_lru indexing
+Date: Thu, 10 Sep 2026 16:07:19 +0800
+
+Patch series "mm: restore per-memcg reclaim for NONSLAB shrinkers under
+nokmem", v3.
+
+With cgroup.memory=nokmem, the THP deferred split shrinker and the zswap
+shrinker are degraded in two ways.
+
+First, both shrinkers are missing the SHRINKER_NONSLAB flag, so
+shrinker_memcg_alloc() demotes them to non-memcg-aware shrinkers:
+limit-induced reclaim of a cgroup neither splits its partially unmapped
+THPs nor writes back its zswapped pages.  v1 of this series [1] restored
+the flag to fix that.
+
+However, as Sashiko's review of v1 pointed out [2], the flag alone is not
+enough.  __list_lru_init() also collapses every list_lru into per-node
+lists under nokmem, so even with the flag restored, the objects of all
+cgroups share one list per node: the per-memcg shrinker bit is only set
+for whichever memcg happens to repopulate the empty list, so pressure in
+other cgroups may not even trigger the scan, and when it does, the scan
+walks everyone's objects.
+
+Before commit fafaeceb89a5 ("mm: switch deferred split shrinker to
+list_lru"), THP had fully per-memcg deferred split queues embedded in
+struct mem_cgroup, working independently of kmem accounting.  nokmem only
+opts out of kernel slab accounting; THPs and zswapped pages are user
+memory and remain charged to their cgroups, so per-memcg reclaim is still
+what these shrinkers want.
+
+This series keeps list_lrus backed by SHRINKER_NONSLAB shrinkers memcg
+aware under nokmem:
+
+Patch 1 drops the kmemcg_id copy, which is only assigned when kmem
+accounting is enabled, and indexes the list_lru xarray with
+mem_cgroup_id() instead, so the index works independently of kmem
+accounting.  The list_lru plumbing passes memcg pointers now, and
+memcg_online_kmem()/memcg_offline_kmem() are inlined into the css
+online/offline hooks.  It also drops the nokmem early return from the
+offline path so these lrus are reparented on offline.
+
+Patch 2 keeps a list_lru memcg aware under nokmem when its backing
+shrinker is registered SHRINKER_NONSLAB.
+
+Patches 3 and 4 restore/add SHRINKER_NONSLAB on the THP deferred split
+shrinker and the zswap shrinker.
+
+The savings of nokmem are preserved: slab-backed lrus (e.g.  the
+superblock dentry/inode lrus) still fall back to per-node lists, and the
+per-memcg lists are only allocated when a memcg actually holds such
+objects.
+
+
+This patch (of 4):
+
+kmemcg_id is a copy of the private memcg ID and serves no purpose other
+than indexing the per-memcg list_lru xarray.  It is assigned when kmem
+accounting goes online, which never happens with cgroup.memory=nokmem, and
+the memcgs then all resolve to the per-node lists.  The next patch needs
+the index to work under nokmem as well.
+
+Index the lists with mem_cgroup_id().  The cgroup ID is unique per memcg
+and is only recycled once the cgroup is destroyed, long after offlining
+has erased the xarray entries, so a recycled ID cannot resurrect a stale
+entry.  The lookup now takes memcg pointers and routes root and NULL to
+the per-node lists itself.
+
+Also drop the nokmem early return from the offline path, so that the
+reparenting covers lrus that stay memcg aware without kmem accounting. 
+memcg_online_kmem() and memcg_offline_kmem() are each down to a single
+statement now; inline them into the css online and offline hooks, dropping
+the root check, as css_offline() is never called for the root and a memcg
+that failed css_online() cannot have list_lru entries.
+
+Link: https://lore.kernel.org/20260910080722.3961351-1-qinyuntan@linux.alibaba.com
+Link: https://lore.kernel.org/20260910080722.3961351-2-qinyuntan@linux.alibaba.com
+Signed-off-by: Qinyun Tan <qinyuntan@linux.alibaba.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Michal Hocko <mhocko@kernel.org>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Michal Koutný <mkoutny@suse.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Dave Chinner <david@fromorbit.com>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Yosry Ahmed <yosry@kernel.org>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Xunlei Pang <xlpang@linux.alibaba.com>
