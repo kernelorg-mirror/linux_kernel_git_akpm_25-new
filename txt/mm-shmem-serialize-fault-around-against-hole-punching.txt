@@ -1,0 +1,46 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: mm: shmem: serialize fault-around against hole punching
+Date: Sun Oct 4 09:05:31 PM PDT 2026
+
+shmem uses filemap_map_pages() for fault-around.  Unlike shmem_fault(),
+filemap_map_pages() does not participate in shmem's fallocate exclusion
+protocol.
+
+During a partial hole punch of a large shmem folio, the folio can be split
+and the resulting smaller folios can remain temporarily visible in the
+page cache while shmem_undo_range() restarts its walk.  Fault-around can
+then map one of those folios again before the hole-punch path removes it.
+
+shmem_undo_range() may subsequently delete that folio from the page cache
+despite the new userspace mapping.  This can trigger "still mapped when
+deleted" warnings and leave stale mappings or inconsistent RSS/page-table
+accounting behind.
+
+The race dates back to d7c1755179b8 ("mm: implement ->map_pages for
+shmem/tmpfs"), which enabled generic fault-around for shmem without making
+it participate in shmem's hole-punch exclusion protocol.
+
+Serialize shmem fault-around against the hole-punch unmap/truncate
+sequence with mapping->invalidate_lock.  The hole-punch side holds the
+lock exclusively while unmapping and removing pages.
+
+do_fault_around() invokes ->map_pages() under rcu_read_lock(), so the
+fault-around side cannot block on invalidate_lock.  Use the shared trylock
+instead.  If the trylock fails, skip fault-around and let the normal shmem
+fault path handle the fault.  Otherwise hold the shared lock while
+filemap_map_pages() installs mappings.
+
+This preserves fault-around in the uncontended case while ensuring that
+pages in a punched range cannot be remapped between unmap_mapping_range()
+and shmem_truncate_range().
+
+Fixes: d7c1755179b8 ("mm: implement ->map_pages for shmem/tmpfs")
+Reported-by: Ayush Ranjan <ayushr@modal.com>
+Closes: https://lore.kernel.org/20260924061708.1645968-1-ayushr@modal.com
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Pedro Falcato <pfalcato@suse.de>
