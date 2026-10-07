@@ -1,6 +1,6 @@
 From: Muchun Song <songmuchun@bytedance.com>
 Subject: mm/hugetlb: switch HugeTLB to section-based vmemmap optimization
-Date: Tue, 25 Aug 2026 16:46:01 +0800
+Date: Thu, 10 Sep 2026 14:32:49 +0800
 
 HugeTLB bootmem vmemmap optimization still carries its own early setup
 path, including pre-populating optimized mappings before the generic
@@ -12,17 +12,19 @@ bootmem huge page range with the appropriate order.  The generic
 sparse-vmemmap population path can then allocate and map the shared tail
 vmemmap pages without any HugeTLB-specific early population code.
 
-Do that by setting the section order when a bootmem huge page is allocated
-and dropping the dedicated pre-HVO helpers and related special-casing.
+Do that by recording the compound page order when a bootmem huge page is
+allocated and dropping the dedicated pre-HVO helpers and related
+special-casing.
 
 This removes duplicate early setup logic and switches HugeTLB to the
 section-based vmemmap optimization path.
 
-Link: https://lore.kernel.org/20260825084608.47437-11-songmuchun@bytedance.com
+Link: https://lore.kernel.org/20260910063256.64386-11-songmuchun@bytedance.com
 Signed-off-by: Muchun Song <songmuchun@bytedance.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Acked-by: Mike Rapoport (Microsoft) <rppt@kernel.org>
 Acked-by: Qi Zheng <qi.zheng@linux.dev>
-Cc: David Hildenbrand <david@kernel.org>
+Cc: David Hildenbrand (Arm) <david@kernel.org>
 Cc: David Laight <david.laight.linux@gmail.com>
 Cc: Liam R. Howlett <liam@infradead.org>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
@@ -30,17 +32,16 @@ Cc: Michal Hocko <mhocko@suse.com>
 Cc: Oscar Salvador <osalvador@suse.de>
 Cc: Suren Baghdasaryan <surenb@google.com>
 Cc: Vlastimil Babka <vbabka@kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 ---
 
  include/linux/hugetlb.h |    1 
  include/linux/mm.h      |    3 -
- mm/hugetlb.c            |   30 +-----------
- mm/hugetlb_vmemmap.c    |   90 ++------------------------------------
+ mm/hugetlb.c            |   31 ++----------
+ mm/hugetlb_vmemmap.c    |   91 ++------------------------------------
  mm/hugetlb_vmemmap.h    |   14 ++---
- mm/sparse-vmemmap.c     |   31 -------------
- mm/sparse.h             |   27 +++++++++++
- 7 files changed, 42 insertions(+), 154 deletions(-)
+ mm/sparse-vmemmap.c     |   31 ------------
+ mm/sparse.h             |   30 ++++++++++++
+ 7 files changed, 47 insertions(+), 154 deletions(-)
 
 --- a/include/linux/hugetlb.h~mm-hugetlb-switch-hugetlb-to-section-based-vmemmap-optimization
 +++ a/include/linux/hugetlb.h
@@ -83,7 +84,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  /*
   * Due to ordering constraints across the init code for various
-@@ -3161,6 +3162,7 @@ static bool __init alloc_bootmem_huge_pa
+@@ -3150,6 +3151,7 @@ static bool __init alloc_bootmem_huge_pa
  	} else {
  		list_add_tail(&m->list, &huge_boot_pages[nid]);
  		m->flags |= HUGE_BOOTMEM_ZONES_VALID;
@@ -91,15 +92,16 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  		/*
  		 * Only initialize the head struct page in memmap_init_reserved_pages,
  		 * rest of the struct pages will be initialized by the HugeTLB
-@@ -3321,6 +3323,7 @@ static void __init gather_bootmem_preall
+@@ -3310,6 +3312,8 @@ static void __init gather_bootmem_preall
  			 * this folio.
  			 */
  			folio_set_hugetlb_vmemmap_optimized(folio);
-+		section_set_order_range(folio_pfn(folio), folio_nr_pages(folio), 0);
++		section_set_compound_order_range(folio_pfn(folio),
++						 folio_nr_pages(folio), 0);
  
  		if (hugetlb_bootmem_page_earlycma(m))
  			folio_set_hugetlb_cma(folio);
-@@ -3364,31 +3367,6 @@ void __init hugetlb_bootmem_struct_page_
+@@ -3353,31 +3357,6 @@ void __init hugetlb_bootmem_struct_page_
  		.max_threads	= num_node_state(N_MEMORY),
  		.numa_aware	= true,
  	};
@@ -143,7 +145,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
  /**
   * struct vmemmap_remap_walk - walk vmemmap page table
-@@ -706,95 +705,18 @@ void hugetlb_vmemmap_optimize_bootmem_fo
+@@ -706,95 +705,19 @@ void hugetlb_vmemmap_optimize_bootmem_fo
  	__hugetlb_vmemmap_optimize_folios(h, folio_list, true);
  }
  
@@ -235,8 +237,9 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 -			pnum++;
 -		}
 -
-+	section_set_order_range(pfn, pages_per_huge_page(h), huge_page_order(h));
-+	if (vmemmap_optimizable_order(pfn_to_section_order(pfn)))
++	section_set_compound_order_range(pfn, pages_per_huge_page(h),
++					 huge_page_order(h));
++	if (vmemmap_optimizable_order(pfn_to_section_compound_order(pfn)))
  		m->flags |= HUGE_BOOTMEM_HVO;
 -	}
  }
@@ -287,18 +290,20 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
  
 --- a/mm/sparse.h~mm-hugetlb-switch-hugetlb-to-section-based-vmemmap-optimization
 +++ a/mm/sparse.h
-@@ -16,6 +16,24 @@ static inline unsigned int section_order
- 	return section->order;
+@@ -16,6 +16,26 @@ static inline unsigned int section_compo
+ 	return section->compound_page_order;
  }
  
-+static inline void section_set_order(struct mem_section *section, unsigned int order)
++static inline void section_set_compound_order(struct mem_section *section,
++					      unsigned int order)
 +{
-+	VM_WARN_ON(section_order(section) && order && section_order(section) != order);
-+	section->order = order;
++	VM_WARN_ON(section_compound_order(section) && order &&
++		   section_compound_order(section) != order);
++	section->compound_page_order = order;
 +}
 +
-+static inline void section_set_order_range(unsigned long pfn, unsigned long nr_pages,
-+					   unsigned int order)
++static inline void section_set_compound_order_range(unsigned long pfn,
++		unsigned long nr_pages, unsigned int order)
 +{
 +	unsigned long section_nr = pfn_to_section_nr(pfn);
 +
@@ -306,26 +311,27 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 +		return;
 +
 +	for (unsigned long i = 0; i < nr_pages / PAGES_PER_SECTION; i++)
-+		section_set_order(__nr_to_section(section_nr + i), order);
++		section_set_compound_order(__nr_to_section(section_nr + i), order);
 +}
 +
- static inline unsigned int pfn_to_section_order(unsigned long pfn)
+ static inline unsigned int pfn_to_section_compound_order(unsigned long pfn)
  {
- 	return section_order(__pfn_to_section(pfn));
-@@ -26,6 +44,15 @@ static inline unsigned int section_order
+ 	return section_compound_order(__pfn_to_section(pfn));
+@@ -26,6 +46,16 @@ static inline unsigned int section_compo
  	return 0;
  }
  
-+static inline void section_set_order(struct mem_section *section, unsigned int order)
++static inline void section_set_compound_order(struct mem_section *section,
++					      unsigned int order)
 +{
 +}
 +
-+static inline void section_set_order_range(unsigned long pfn, unsigned long nr_pages,
-+					   unsigned int order)
++static inline void section_set_compound_order_range(unsigned long pfn,
++		unsigned long nr_pages, unsigned int order)
 +{
 +}
 +
- static inline unsigned int pfn_to_section_order(unsigned long pfn)
+ static inline unsigned int pfn_to_section_compound_order(unsigned long pfn)
  {
  	return 0;
 --- a/mm/sparse-vmemmap.c~mm-hugetlb-switch-hugetlb-to-section-based-vmemmap-optimization
