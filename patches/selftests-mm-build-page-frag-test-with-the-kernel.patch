@@ -1,0 +1,636 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: selftests/mm: build the page fragment test with the kernel
+Date: Thu, 08 Oct 2026 17:49:06 -0700
+
+The page fragment selftest builds page_frag_test.ko as an external module
+under tools/testing/selftests/mm.  With CONFIG_TRIM_UNUSED_KSYMS=y, the
+kernel build cannot account for its symbol references.  Exports needed by
+the test, such as __cpu_active_mask, can therefore be trimmed before the
+selftest module is built, causing modpost to fail.
+
+Building the module from the userspace selftest Makefile also uses the
+selftest compiler.  This need not be the compiler used for the kernel: for
+example, a nolibc cross compiler can build the kernel but cannot link the
+userspace tests, while the native compiler may not support the flags
+recorded in the kernel configuration.
+
+Move the module to lib/test_page_frag.c and add CONFIG_TEST_PAGE_FRAG so
+that it is built with the kernel and its references are visible to the
+normal symbol-trimming pass.  Restrict the option to modules because the
+test is invoked explicitly with parameters and returns -EAGAIN after
+running, rather than remaining loaded.
+
+Add CONFIG_TEST_PAGE_FRAG=m to tools/testing/selftests/mm/config.  This
+file is a kernel configuration fragment listing settings needed by the MM
+selftests.  make kselftest-merge merges the fragments from all selftest
+directories into the existing kernel .config and runs olddefconfig.  Run
+it before building the kernel and modules so that modpost sees the test
+module's references and retains the required exports.  Building the
+userspace selftests alone does not merge the fragment or enable
+CONFIG_TEST_PAGE_FRAG.
+
+Remove the external module build rules and update test_page_frag.sh to
+load the installed test_page_frag module with modprobe.  Install the
+module for the kernel under test with make modules_install.  Keep the test
+implementation and its parameters unchanged.
+
+Fixes: 7fef0dec415c ("mm: page_frag: add a test module for page_frag")
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Assisted-by: LLM
+Cc: Yunsheng Lin <linyunsheng@huawei.com>
+Cc: Alexander Duyck <alexanderduyck@fb.com>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: David Hildenbrand <david@kernel.org>
+---
+
+ MAINTAINERS                                           |    1 
+ lib/Kconfig.debug                                     |   11 
+ lib/Makefile                                          |    1 
+ lib/test_page_frag.c                                  |  200 ++++++++++
+ tools/testing/selftests/mm/Makefile                   |   16 
+ tools/testing/selftests/mm/config                     |    1 
+ tools/testing/selftests/mm/page_frag/Makefile         |   18 
+ tools/testing/selftests/mm/page_frag/page_frag_test.c |  200 ----------
+ tools/testing/selftests/mm/test_page_frag.sh          |   18 
+ 9 files changed, 223 insertions(+), 243 deletions(-)
+
+--- a/lib/Kconfig.debug~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/lib/Kconfig.debug
+@@ -2593,6 +2593,17 @@ config TEST_BITOPS
+ 
+ 	  If unsure, say N.
+ 
++config TEST_PAGE_FRAG
++	tristate "Test module for page fragment allocation"
++	depends on m
++	help
++	  This builds the "test_page_frag" module to test the correctness
++	  and performance of the page fragment allocator. The test runs
++	  at module load time and does not remain loaded after completion.
++	  Use tools/testing/selftests/mm/test_page_frag.sh to run it.
++
++	  If unsure, say N.
++
+ config TEST_VMALLOC
+ 	tristate "Test module for stress/performance analysis of vmalloc allocator"
+ 	default n
+--- a/lib/Makefile~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/lib/Makefile
+@@ -79,6 +79,7 @@ CFLAGS_test_ubsan.o += $(call cc-disable
+ UBSAN_SANITIZE_test_ubsan.o := y
+ obj-$(CONFIG_TEST_KSTRTOX) += test-kstrtox.o
+ obj-$(CONFIG_TEST_LKM) += test_module.o
++obj-$(CONFIG_TEST_PAGE_FRAG) += test_page_frag.o
+ obj-$(CONFIG_TEST_VMALLOC) += test_vmalloc.o
+ obj-$(CONFIG_TEST_WORKQUEUE) += test_workqueue.o
+ obj-$(CONFIG_TEST_RHASHTABLE) += test_rhashtable.o
+diff --git a/lib/test_page_frag.c a/lib/test_page_frag.c
+new file mode 100644
+--- /dev/null
++++ a/lib/test_page_frag.c
+@@ -0,0 +1,200 @@
++// SPDX-License-Identifier: GPL-2.0
++
++/*
++ * Test module for page_frag cache
++ *
++ * Copyright (C) 2024 Yunsheng Lin <linyunsheng@huawei.com>
++ */
++
++#include <linux/module.h>
++#include <linux/cpumask.h>
++#include <linux/completion.h>
++#include <linux/ptr_ring.h>
++#include <linux/kthread.h>
++#include <linux/page_frag_cache.h>
++
++#define TEST_FAILED_PREFIX	"page_frag_test failed: "
++
++static struct ptr_ring ptr_ring;
++static int nr_objs = 512;
++static atomic_t nthreads;
++static struct completion wait;
++static struct page_frag_cache test_nc;
++static int test_popped;
++static int test_pushed;
++static bool force_exit;
++
++static int nr_test = 2000000;
++module_param(nr_test, int, 0);
++MODULE_PARM_DESC(nr_test, "number of iterations to test");
++
++static bool test_align;
++module_param(test_align, bool, 0);
++MODULE_PARM_DESC(test_align, "use align API for testing");
++
++static int test_alloc_len = 2048;
++module_param(test_alloc_len, int, 0);
++MODULE_PARM_DESC(test_alloc_len, "alloc len for testing");
++
++static int test_push_cpu;
++module_param(test_push_cpu, int, 0);
++MODULE_PARM_DESC(test_push_cpu, "test cpu for pushing fragment");
++
++static int test_pop_cpu;
++module_param(test_pop_cpu, int, 0);
++MODULE_PARM_DESC(test_pop_cpu, "test cpu for popping fragment");
++
++static int page_frag_pop_thread(void *arg)
++{
++	struct ptr_ring *ring = arg;
++
++	pr_info("page_frag pop test thread begins on cpu %d\n",
++		smp_processor_id());
++
++	while (test_popped < nr_test) {
++		void *obj = __ptr_ring_consume(ring);
++
++		if (obj) {
++			test_popped++;
++			page_frag_free(obj);
++		} else {
++			if (force_exit)
++				break;
++
++			cond_resched();
++		}
++	}
++
++	if (atomic_dec_and_test(&nthreads))
++		complete(&wait);
++
++	pr_info("page_frag pop test thread exits on cpu %d\n",
++		smp_processor_id());
++
++	return 0;
++}
++
++static int page_frag_push_thread(void *arg)
++{
++	struct ptr_ring *ring = arg;
++
++	pr_info("page_frag push test thread begins on cpu %d\n",
++		smp_processor_id());
++
++	while (test_pushed < nr_test && !force_exit) {
++		void *va;
++		int ret;
++
++		if (test_align) {
++			va = page_frag_alloc_align(&test_nc, test_alloc_len,
++						   GFP_KERNEL, SMP_CACHE_BYTES);
++
++			if ((unsigned long)va & (SMP_CACHE_BYTES - 1)) {
++				force_exit = true;
++				WARN_ONCE(true, TEST_FAILED_PREFIX "unaligned va returned\n");
++			}
++		} else {
++			va = page_frag_alloc(&test_nc, test_alloc_len, GFP_KERNEL);
++		}
++
++		if (!va)
++			continue;
++
++		ret = __ptr_ring_produce(ring, va);
++		if (ret) {
++			page_frag_free(va);
++			cond_resched();
++		} else {
++			test_pushed++;
++		}
++	}
++
++	pr_info("page_frag push test thread exits on cpu %d\n",
++		smp_processor_id());
++
++	if (atomic_dec_and_test(&nthreads))
++		complete(&wait);
++
++	return 0;
++}
++
++static int __init page_frag_test_init(void)
++{
++	struct task_struct *tsk_push, *tsk_pop;
++	int last_pushed = 0, last_popped = 0;
++	ktime_t start;
++	u64 duration;
++	int ret;
++
++	page_frag_cache_init(&test_nc);
++	atomic_set(&nthreads, 2);
++	init_completion(&wait);
++
++	if (test_alloc_len > PAGE_SIZE || test_alloc_len <= 0 ||
++	    test_push_cpu < 0 || test_push_cpu >= nr_cpu_ids ||
++	    test_pop_cpu < 0 || test_pop_cpu >= nr_cpu_ids ||
++	    !cpu_active(test_push_cpu) || !cpu_active(test_pop_cpu))
++		return -EINVAL;
++
++	ret = ptr_ring_init(&ptr_ring, nr_objs, GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	tsk_push = kthread_create_on_cpu(page_frag_push_thread, &ptr_ring,
++					 test_push_cpu, "page_frag_push");
++	if (IS_ERR(tsk_push))
++		return PTR_ERR(tsk_push);
++
++	tsk_pop = kthread_create_on_cpu(page_frag_pop_thread, &ptr_ring,
++					test_pop_cpu, "page_frag_pop");
++	if (IS_ERR(tsk_pop)) {
++		kthread_stop(tsk_push);
++		return PTR_ERR(tsk_pop);
++	}
++
++	start = ktime_get();
++	wake_up_process(tsk_push);
++	wake_up_process(tsk_pop);
++
++	pr_info("waiting for test to complete\n");
++
++	while (!wait_for_completion_timeout(&wait, msecs_to_jiffies(10000))) {
++		/* exit if there is no progress for push or pop size */
++		if (last_pushed == test_pushed || last_popped == test_popped) {
++			WARN_ONCE(true, TEST_FAILED_PREFIX "no progress\n");
++			force_exit = true;
++			continue;
++		}
++
++		last_pushed = test_pushed;
++		last_popped = test_popped;
++		pr_info("page_frag_test progress: pushed = %d, popped = %d\n",
++			test_pushed, test_popped);
++	}
++
++	if (force_exit) {
++		pr_err(TEST_FAILED_PREFIX "exit with error\n");
++		goto out;
++	}
++
++	duration = (u64)ktime_us_delta(ktime_get(), start);
++	pr_info("%d of iterations for %s testing took: %lluus\n", nr_test,
++		test_align ? "aligned" : "non-aligned", duration);
++
++out:
++	ptr_ring_cleanup(&ptr_ring, NULL);
++	page_frag_cache_drain(&test_nc);
++
++	return -EAGAIN;
++}
++
++static void __exit page_frag_test_exit(void)
++{
++}
++
++module_init(page_frag_test_init);
++module_exit(page_frag_test_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Yunsheng Lin <linyunsheng@huawei.com>");
++MODULE_DESCRIPTION("Test module for page_frag");
+--- a/MAINTAINERS~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/MAINTAINERS
+@@ -17278,6 +17278,7 @@ F:	include/linux/cma.h
+ F:	include/linux/dmapool.h
+ F:	include/linux/ioremap.h
+ F:	include/linux/page_idle.h
++F:	lib/test_page_frag.c
+ F:	mm/backing-dev.c
+ F:	mm/cma.c
+ F:	mm/cma_debug.c
+--- a/tools/testing/selftests/mm/config~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/tools/testing/selftests/mm/config
+@@ -1,6 +1,7 @@
+ CONFIG_SYSVIPC=y
+ CONFIG_USERFAULTFD=y
+ CONFIG_PTE_MARKER_UFFD_WP=y
++CONFIG_TEST_PAGE_FRAG=m
+ CONFIG_TEST_VMALLOC=m
+ CONFIG_DEVICE_PRIVATE=y
+ CONFIG_TEST_HMM=m
+--- a/tools/testing/selftests/mm/Makefile~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/tools/testing/selftests/mm/Makefile
+@@ -49,13 +49,6 @@ LDLIBS = -lrt -lpthread -lm
+ # warnings.
+ CFLAGS += -U_FORTIFY_SOURCE
+ 
+-KDIR ?= $(if $(O),$(O),$(realpath ../../../..))
+-ifneq (,$(wildcard $(KDIR)/Module.symvers))
+-TEST_GEN_MODS_DIR := page_frag
+-else
+-PAGE_FRAG_WARNING = "missing Module.symvers, please have the kernel built first"
+-endif
+-
+ TEST_GEN_FILES = cow
+ TEST_GEN_FILES += compaction_test
+ TEST_GEN_FILES += gup
+@@ -279,12 +272,3 @@ warn_missing_liburing:
+ 	echo "Warning: missing liburing support. Some tests will be skipped." ; \
+ 	echo
+ endif
+-
+-ifneq ($(PAGE_FRAG_WARNING),)
+-all: warn_missing_page_frag
+-
+-warn_missing_page_frag:
+-	@echo ; \
+-	echo "Warning: $(PAGE_FRAG_WARNING). page_frag test will be skipped." ; \
+-	echo
+-endif
+diff --git a/tools/testing/selftests/mm/page_frag/Makefile a/tools/testing/selftests/mm/page_frag/Makefile
+deleted file mode 100644
+--- a/tools/testing/selftests/mm/page_frag/Makefile
++++ /dev/null
+@@ -1,18 +0,0 @@
+-PAGE_FRAG_TEST_DIR := $(realpath $(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
+-KDIR ?= $(if $(O),$(O),$(realpath ../../../../..))
+-
+-ifeq ($(V),1)
+-Q =
+-else
+-Q = @
+-endif
+-
+-MODULES = page_frag_test.ko
+-
+-obj-m += page_frag_test.o
+-
+-all:
+-	+$(Q)make -C $(KDIR) M=$(PAGE_FRAG_TEST_DIR) modules
+-
+-clean:
+-	+$(Q)make -C $(KDIR) M=$(PAGE_FRAG_TEST_DIR) clean
+diff --git a/tools/testing/selftests/mm/page_frag/page_frag_test.c a/tools/testing/selftests/mm/page_frag/page_frag_test.c
+deleted file mode 100644
+--- a/tools/testing/selftests/mm/page_frag/page_frag_test.c
++++ /dev/null
+@@ -1,200 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-
+-/*
+- * Test module for page_frag cache
+- *
+- * Copyright (C) 2024 Yunsheng Lin <linyunsheng@huawei.com>
+- */
+-
+-#include <linux/module.h>
+-#include <linux/cpumask.h>
+-#include <linux/completion.h>
+-#include <linux/ptr_ring.h>
+-#include <linux/kthread.h>
+-#include <linux/page_frag_cache.h>
+-
+-#define TEST_FAILED_PREFIX	"page_frag_test failed: "
+-
+-static struct ptr_ring ptr_ring;
+-static int nr_objs = 512;
+-static atomic_t nthreads;
+-static struct completion wait;
+-static struct page_frag_cache test_nc;
+-static int test_popped;
+-static int test_pushed;
+-static bool force_exit;
+-
+-static int nr_test = 2000000;
+-module_param(nr_test, int, 0);
+-MODULE_PARM_DESC(nr_test, "number of iterations to test");
+-
+-static bool test_align;
+-module_param(test_align, bool, 0);
+-MODULE_PARM_DESC(test_align, "use align API for testing");
+-
+-static int test_alloc_len = 2048;
+-module_param(test_alloc_len, int, 0);
+-MODULE_PARM_DESC(test_alloc_len, "alloc len for testing");
+-
+-static int test_push_cpu;
+-module_param(test_push_cpu, int, 0);
+-MODULE_PARM_DESC(test_push_cpu, "test cpu for pushing fragment");
+-
+-static int test_pop_cpu;
+-module_param(test_pop_cpu, int, 0);
+-MODULE_PARM_DESC(test_pop_cpu, "test cpu for popping fragment");
+-
+-static int page_frag_pop_thread(void *arg)
+-{
+-	struct ptr_ring *ring = arg;
+-
+-	pr_info("page_frag pop test thread begins on cpu %d\n",
+-		smp_processor_id());
+-
+-	while (test_popped < nr_test) {
+-		void *obj = __ptr_ring_consume(ring);
+-
+-		if (obj) {
+-			test_popped++;
+-			page_frag_free(obj);
+-		} else {
+-			if (force_exit)
+-				break;
+-
+-			cond_resched();
+-		}
+-	}
+-
+-	if (atomic_dec_and_test(&nthreads))
+-		complete(&wait);
+-
+-	pr_info("page_frag pop test thread exits on cpu %d\n",
+-		smp_processor_id());
+-
+-	return 0;
+-}
+-
+-static int page_frag_push_thread(void *arg)
+-{
+-	struct ptr_ring *ring = arg;
+-
+-	pr_info("page_frag push test thread begins on cpu %d\n",
+-		smp_processor_id());
+-
+-	while (test_pushed < nr_test && !force_exit) {
+-		void *va;
+-		int ret;
+-
+-		if (test_align) {
+-			va = page_frag_alloc_align(&test_nc, test_alloc_len,
+-						   GFP_KERNEL, SMP_CACHE_BYTES);
+-
+-			if ((unsigned long)va & (SMP_CACHE_BYTES - 1)) {
+-				force_exit = true;
+-				WARN_ONCE(true, TEST_FAILED_PREFIX "unaligned va returned\n");
+-			}
+-		} else {
+-			va = page_frag_alloc(&test_nc, test_alloc_len, GFP_KERNEL);
+-		}
+-
+-		if (!va)
+-			continue;
+-
+-		ret = __ptr_ring_produce(ring, va);
+-		if (ret) {
+-			page_frag_free(va);
+-			cond_resched();
+-		} else {
+-			test_pushed++;
+-		}
+-	}
+-
+-	pr_info("page_frag push test thread exits on cpu %d\n",
+-		smp_processor_id());
+-
+-	if (atomic_dec_and_test(&nthreads))
+-		complete(&wait);
+-
+-	return 0;
+-}
+-
+-static int __init page_frag_test_init(void)
+-{
+-	struct task_struct *tsk_push, *tsk_pop;
+-	int last_pushed = 0, last_popped = 0;
+-	ktime_t start;
+-	u64 duration;
+-	int ret;
+-
+-	page_frag_cache_init(&test_nc);
+-	atomic_set(&nthreads, 2);
+-	init_completion(&wait);
+-
+-	if (test_alloc_len > PAGE_SIZE || test_alloc_len <= 0 ||
+-	    test_push_cpu < 0 || test_push_cpu >= nr_cpu_ids ||
+-	    test_pop_cpu < 0 || test_pop_cpu >= nr_cpu_ids ||
+-	    !cpu_active(test_push_cpu) || !cpu_active(test_pop_cpu))
+-		return -EINVAL;
+-
+-	ret = ptr_ring_init(&ptr_ring, nr_objs, GFP_KERNEL);
+-	if (ret)
+-		return ret;
+-
+-	tsk_push = kthread_create_on_cpu(page_frag_push_thread, &ptr_ring,
+-					 test_push_cpu, "page_frag_push");
+-	if (IS_ERR(tsk_push))
+-		return PTR_ERR(tsk_push);
+-
+-	tsk_pop = kthread_create_on_cpu(page_frag_pop_thread, &ptr_ring,
+-					test_pop_cpu, "page_frag_pop");
+-	if (IS_ERR(tsk_pop)) {
+-		kthread_stop(tsk_push);
+-		return PTR_ERR(tsk_pop);
+-	}
+-
+-	start = ktime_get();
+-	wake_up_process(tsk_push);
+-	wake_up_process(tsk_pop);
+-
+-	pr_info("waiting for test to complete\n");
+-
+-	while (!wait_for_completion_timeout(&wait, msecs_to_jiffies(10000))) {
+-		/* exit if there is no progress for push or pop size */
+-		if (last_pushed == test_pushed || last_popped == test_popped) {
+-			WARN_ONCE(true, TEST_FAILED_PREFIX "no progress\n");
+-			force_exit = true;
+-			continue;
+-		}
+-
+-		last_pushed = test_pushed;
+-		last_popped = test_popped;
+-		pr_info("page_frag_test progress: pushed = %d, popped = %d\n",
+-			test_pushed, test_popped);
+-	}
+-
+-	if (force_exit) {
+-		pr_err(TEST_FAILED_PREFIX "exit with error\n");
+-		goto out;
+-	}
+-
+-	duration = (u64)ktime_us_delta(ktime_get(), start);
+-	pr_info("%d of iterations for %s testing took: %lluus\n", nr_test,
+-		test_align ? "aligned" : "non-aligned", duration);
+-
+-out:
+-	ptr_ring_cleanup(&ptr_ring, NULL);
+-	page_frag_cache_drain(&test_nc);
+-
+-	return -EAGAIN;
+-}
+-
+-static void __exit page_frag_test_exit(void)
+-{
+-}
+-
+-module_init(page_frag_test_init);
+-module_exit(page_frag_test_exit);
+-
+-MODULE_LICENSE("GPL");
+-MODULE_AUTHOR("Yunsheng Lin <linyunsheng@huawei.com>");
+-MODULE_DESCRIPTION("Test module for page_frag");
+--- a/tools/testing/selftests/mm/test_page_frag.sh~selftests-mm-build-page-frag-test-with-the-kernel
++++ a/tools/testing/selftests/mm/test_page_frag.sh
+@@ -11,7 +11,7 @@
+ #     a) analyse performance of page fragment allocations;
+ #     b) stressing and stability check of page_frag subsystem.
+ 
+-DRIVER="./page_frag/page_frag_test.ko"
++DRIVER="test_page_frag"
+ CPU_LIST=$(grep -m 2 processor /proc/cpuinfo | cut -d ' ' -f 2)
+ TEST_CPU_0=$(echo $CPU_LIST | awk '{print $1}')
+ 
+@@ -52,13 +52,13 @@ check_test_requirements()
+ 		exit $ksft_skip
+ 	fi
+ 
+-	if ! which insmod > /dev/null 2>&1; then
+-		echo "$0: You need insmod installed"
++	if ! command -v modprobe > /dev/null 2>&1; then
++		echo "$0: You need modprobe installed"
+ 		exit $ksft_skip
+ 	fi
+ 
+-	if [ ! -f $DRIVER ]; then
+-		echo "$0: You need to compile page_frag_test module"
++	if ! modinfo "$DRIVER" > /dev/null 2>&1; then
++		echo "$0: You need CONFIG_TEST_PAGE_FRAG=m and the module installed"
+ 		exit $ksft_skip
+ 	fi
+ }
+@@ -67,21 +67,21 @@ run_nonaligned_check()
+ {
+ 	echo "Run performance tests to evaluate how fast nonaligned alloc API is."
+ 
+-	insmod $DRIVER $NONALIGNED_PARAM > /dev/null 2>&1
++	modprobe "$DRIVER" $NONALIGNED_PARAM > /dev/null 2>&1
+ }
+ 
+ run_aligned_check()
+ {
+ 	echo "Run performance tests to evaluate how fast aligned alloc API is."
+ 
+-	insmod $DRIVER $ALIGNED_PARAM > /dev/null 2>&1
++	modprobe "$DRIVER" $ALIGNED_PARAM > /dev/null 2>&1
+ }
+ 
+ run_smoke_check()
+ {
+ 	echo "Run smoke test."
+ 
+-	insmod $DRIVER $SMOKE_PARAM > /dev/null 2>&1
++	modprobe "$DRIVER" $SMOKE_PARAM > /dev/null 2>&1
+ }
+ 
+ usage()
+@@ -144,7 +144,7 @@ function run_manual_check()
+ 	validate_passed_args $@
+ 
+ 	echo "Run the test with following parameters: $@"
+-	insmod $DRIVER $@ > /dev/null 2>&1
++	modprobe "$DRIVER" "$@" > /dev/null 2>&1
+ }
+ 
+ function run_test()
+_
