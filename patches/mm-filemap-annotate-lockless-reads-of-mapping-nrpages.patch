@@ -1,0 +1,78 @@
+From: Nguyen Ngoc Thang <ngocthang2710.1999@gmail.com>
+Subject: mm/filemap: annotate lockless reads of mapping->nrpages
+Date: Mon, 12 Oct 2026 21:39:21 +0700
+
+mapping->nrpages is updated under the i_pages lock but is read locklessly
+as a cheap "anything cached?" hint, e.g.  in invalidate_bdev() and
+filemap_write_and_wait_range().  KCSAN reports the race:
+
+  BUG: KCSAN: data-race in __filemap_add_folio / invalidate_bdev
+
+  read-write to 0xffff8881004c4178 of 8 bytes by task 3600 on cpu 0:
+   __filemap_add_folio+0x6b7/0x910 mm/filemap.c:919
+   filemap_add_folio+0x1cd/0x380
+   page_cache_ra_unbounded+0x1a4/0x3a0
+   ...
+   blkdev_read_iter+0x21e/0x2d0
+  read to 0xffff8881004c4178 of 8 bytes by task 3601 on cpu 1:
+   invalidate_bdev+0x25/0x70 block/bdev.c:98
+   ext4_fill_super+0x2ccb/0x37b0
+
+The same counter also races with filemap_write_and_wait_range() through
+mapping_needs_writeback().
+
+The race is benign: a stale value only makes the caller do or skip a
+harmless invalidate/flush pass.  Mark the lockless reads with data_race()
+in invalidate_bdev() and in the two callers of mapping_needs_writeback(),
+rather than inside the helper, so a future user needing a reliable answer
+is not silently covered.
+
+Link: https://lore.kernel.org/20261012143921.283806-1-ngocthang2710.1999@gmail.com
+Signed-off-by: Nguyen Ngoc Thang <ngocthang2710.1999@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: <syzbot+e0624b5bf72b99131402@syzkaller.appspotmail.com>
+Closes: https://syzkaller.appspot.com/bug?extid=e0624b5bf72b99131402
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jens Axboe <axboe@kernel.dk>
+---
+
+ block/bdev.c |    3 ++-
+ mm/filemap.c |    6 ++++--
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+--- a/block/bdev.c~mm-filemap-annotate-lockless-reads-of-mapping-nrpages
++++ a/block/bdev.c
+@@ -95,7 +95,8 @@ void invalidate_bdev(struct block_device
+ {
+ 	struct address_space *mapping = bdev->bd_mapping;
+ 
+-	if (mapping->nrpages) {
++	/* Lockless hint; a stale value only costs or skips a harmless pass */
++	if (data_race(mapping->nrpages)) {
+ 		invalidate_bh_lrus();
+ 		lru_add_drain_all();	/* make sure all lru add caches are flushed */
+ 		invalidate_mapping_pages(mapping, 0, -1);
+--- a/mm/filemap.c~mm-filemap-annotate-lockless-reads-of-mapping-nrpages
++++ a/mm/filemap.c
+@@ -680,7 +680,8 @@ int filemap_write_and_wait_range(struct
+ 	if (lend < lstart)
+ 		return 0;
+ 
+-	if (mapping_needs_writeback(mapping)) {
++	/* Lockless hint; a stale value is harmless */
++	if (data_race(mapping_needs_writeback(mapping))) {
+ 		err = filemap_fdatawrite_range(mapping, lstart, lend);
+ 		/*
+ 		 * Even if the above returned error, the pages may be
+@@ -782,7 +783,8 @@ int file_write_and_wait_range(struct fil
+ 	if (lend < lstart)
+ 		return 0;
+ 
+-	if (mapping_needs_writeback(mapping)) {
++	/* Lockless hint; a stale value is harmless */
++	if (data_race(mapping_needs_writeback(mapping))) {
+ 		err = filemap_fdatawrite_range(mapping, lstart, lend);
+ 		/* See comment of filemap_write_and_wait() */
+ 		if (err != -EIO)
+_
