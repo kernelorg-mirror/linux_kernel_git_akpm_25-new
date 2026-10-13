@@ -1,6 +1,6 @@
 From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
 Subject: mm/collapse: separate scanning a PTE table from collapsing it
-Date: Wed, 16 Sep 2026 10:31:35 +0100
+Date: Mon, 28 Sep 2026 11:06:23 +0100
 
 A collapse is two jobs.  One reads a PTE table under mmap_lock and decides
 whether the range is worth collapsing.  The other allocates, isolates,
@@ -11,10 +11,10 @@ in the middle of a function.
 
 Give each half its own function:
 
-  - collapse_scan_pmd() scans one table and only reads.  The anonymous
-    scan that used to carry that name keeps its body as
-    collapse_scan_anon_pmd(), and collapse_scan_pmd() is now the entry
-    that picks the anonymous or the file side.
+  - collapse_scan_pmd() scans one table.  The anonymous scan that used to
+    carry that name keeps its body as collapse_scan_anon_pmd(), and
+    collapse_scan_pmd() is now the entry that picks the anonymous or the
+    file side.
 
   - collapse_run_pmd() does the collapse the scan asked for, and is
     handed what the scan returned.  SCAN_SUCCEED means there is
@@ -24,62 +24,51 @@ Give each half its own function:
     nothing to do.
 
 collapse_single_pmd() is now the two of them with the mmap_lock drop in
-between, so its callers see what they saw before.
+between, so its callers see what they saw before.  collapse_control_init()
+sets a control up before its first scan.
 
-What the scan found and the run needs travels in collapse_control.  For an
-anonymous table that is the orders and the referenced and swapped-out
-counts, which mthp_collapse() and collapse_huge_page() now read from there
-instead of taking as arguments.  For a file it is the file itself and the
-offset in it.
+What the scan found and the run needs travels in collapse_control.  For
+an anonymous table that is the orders and the referenced and swapped-out
+counts, which mthp_collapse() and collapse_huge_page() now read from
+there instead of taking as arguments.  For a file it is the file itself
+and the offset in it: a file collapse works on the page cache and never
+sees a VMA, so the scan takes the reference while it still has one and
+the run gives it back.
 
-The file side moves with the anonymous one.  collapse_scan_file() used to
-run with mmap_lock already given up, and called collapse_file() itself
-when the page cache looked worth it.  It now runs under the lock like the
-anonymous scan and only reads; the run does the collapse.  A file collapse
-works on the page cache and never sees a VMA, so the scan takes the file
-reference while it still has one and the run gives it back.
+The file scan moves under mmap_lock with the anonymous one, where before
+the lock was given up first.  The lock is now held over the page cache
+walk, an RCU walk over one table's worth of slots with no PTL, and taken
+fewer times.  collapse_scan_mm_slot() ends its walk whenever the lock was
+dropped, so a refused file table used to cost khugepaged an unlock, a
+trip back through khugepaged_do_scan(), a relock and a VMA lookup.  Now
+only a table that goes on to be collapsed does.
 
-That changes what a refused file table costs khugepaged.  Every file table
-it scanned used to end its pass over that mm, because the lock had been
-dropped to scan it; now only a table it goes on to collapse does.
-
-Two things on the file side stop being rescanned.  When the page cache
-already holds the PMD folio, the scan says so and the run goes straight to
-retracting the PTE table.  A run that refuses dirty pages and may write
-them back retries collapse_file() alone.  The checks the scan makes ahead
-of it are ones collapse_file() repeats under the page cache lock.
-
-Tracing changes with it.  mm_khugepaged_scan_pmd and
-mm_khugepaged_scan_file used to fire after the collapse, so for an
-accepted table their status field carried what the collapse made of it. 
-They now fire before it and read SCAN_SUCCEED for an accepted table.  What
-the collapse then made of it is for mm_collapse_huge_page and
-mm_khugepaged_collapse_file to report.
-
-Link: https://lore.kernel.org/20260916093145.4022188-9-kirill@shutemov.name
+Link: https://lore.kernel.org/20260928100630.21870-10-kirill@shutemov.name
 Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Reviewed-by: Zi Yan <ziy@nvidia.com>
-Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
 Assisted-by: LLM
-Cc: Barry Song <baohua@kernel.org>
 Cc: David Hildenbrand <david@kernel.org>
-Cc: Dev Jain <dev.jain@arm.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Lance Yang <lance.yang@linux.dev>
-Cc: Liam R. Howlett <liam@infradead.org>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Nico Pache <nico.pache@linux.dev>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
 Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Jann Horn <jannh@google.com>
 ---
 
- mm/collapse.h   |   14 +++
- mm/khugepaged.c |  166 ++++++++++++++++++++++++++++++++--------------
- 2 files changed, 130 insertions(+), 50 deletions(-)
+ mm/collapse.h   |   14 ++++
+ mm/khugepaged.c |  141 ++++++++++++++++++++++++++++++----------------
+ 2 files changed, 108 insertions(+), 47 deletions(-)
 
 --- a/mm/collapse.h~mm-collapse-separate-scanning-a-pte-table-from-collapsing-it
 +++ a/mm/collapse.h
-@@ -88,6 +88,20 @@ struct collapse_control {
+@@ -98,6 +98,20 @@ struct collapse_control {
  
  	/* Each bit marks a PTE the scan accepted as a collapse source */
  	DECLARE_BITMAP(eligible_ptes, MAX_PTRS_PER_PTE);
@@ -102,7 +91,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  #endif	/* __MM_COLLAPSE_H */
 --- a/mm/khugepaged.c~mm-collapse-separate-scanning-a-pte-table-from-collapsing-it
 +++ a/mm/khugepaged.c
-@@ -1254,8 +1254,8 @@ static pgtable_t alloc_deposit_pte_table
+@@ -1252,8 +1252,8 @@ static pgtable_t alloc_deposit_pte_table
   * while allocating a THP, as that could trigger direct reclaim/compaction.
   * Note that the VMA must be rechecked after grabbing the mmap_lock again.
   */
@@ -113,7 +102,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  		unsigned int order)
  {
  	const unsigned long pmd_addr = start_addr & HPAGE_PMD_MASK;
-@@ -1302,14 +1302,14 @@ static enum scan_result collapse_huge_pa
+@@ -1300,14 +1300,14 @@ static enum scan_result collapse_huge_pa
  		goto out_nolock;
  	}
  
@@ -130,7 +119,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  		if (result != SCAN_SUCCEED)
  			goto out_nolock;
  	}
-@@ -1478,9 +1478,8 @@ static unsigned int max_order_from_offse
+@@ -1476,9 +1476,8 @@ static unsigned int max_order_from_offse
   * If a collapse is permitted, we attempt to collapse the PTE range into a
   * mTHP.
   */
@@ -142,7 +131,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  {
  	unsigned int nr_eligible_ptes, nr_ptes, max_ptes_none;
  	enum scan_result last_result = SCAN_FAIL;
-@@ -1493,7 +1492,7 @@ static enum scan_result mthp_collapse(st
+@@ -1491,7 +1490,7 @@ static enum scan_result mthp_collapse(st
  	while (offset < HPAGE_PMD_NR) {
  		nr_ptes = 1UL << order;
  
@@ -151,7 +140,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  			goto next_order;
  
  		max_ptes_none = collapse_max_ptes_none(cc, NULL, order);
-@@ -1501,19 +1500,18 @@ static enum scan_result mthp_collapse(st
+@@ -1499,19 +1498,18 @@ static enum scan_result mthp_collapse(st
  						      offset + nr_ptes);
  
  		/*
@@ -176,7 +165,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  
  			switch (ret) {
  			/* Cases where we continue to next collapse candidate */
-@@ -1555,7 +1553,7 @@ next_order:
+@@ -1553,7 +1551,7 @@ next_order:
  		 * we must always move to the next offset.
  		 */
  		if (order > COLLAPSE_MIN_MTHP_ORDER &&
@@ -185,7 +174,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  			order--;
  			continue;
  		}
-@@ -1580,14 +1578,14 @@ done:
+@@ -1578,14 +1576,14 @@ done:
  	return last_result;
  }
  
@@ -203,7 +192,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  	pmd_t *pmd;
  	pte_t *pte, *_pte, pteval;
  	int i;
-@@ -1767,12 +1765,9 @@ static enum scan_result collapse_scan_pm
+@@ -1765,12 +1763,9 @@ static enum scan_result collapse_scan_pm
  out_unmap:
  	pte_unmap_unlock(pte, ptl);
  	if (result == SCAN_SUCCEED) {
@@ -219,20 +208,8 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  	}
  out:
  	trace_mm_khugepaged_scan_pmd(mm, failed_pfn, referenced,
-@@ -2762,45 +2757,86 @@ static enum scan_result collapse_scan_fi
- 	else
- 		cc->progress += HPAGE_PMD_NR;
- 
--	if (result == SCAN_SUCCEED) {
--		if (present < HPAGE_PMD_NR - max_ptes_none) {
--			result = SCAN_EXCEED_NONE_PTE;
--			count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
--		} else {
--			result = collapse_file(mm, addr, file, start, cc);
--		}
-+	if (result == SCAN_SUCCEED && present < HPAGE_PMD_NR - max_ptes_none) {
-+		result = SCAN_EXCEED_NONE_PTE;
-+		count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
+@@ -2772,41 +2767,67 @@ static enum scan_result collapse_scan_fi
+ 		count_vm_event(THP_SCAN_EXCEED_NONE_PTE);
  	}
  
 -	trace_mm_khugepaged_scan_file(mm, failed_pfn, file, present, swap, result);
@@ -254,20 +231,6 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
 +	cc->scan_file = NULL;
 +}
 +
-+/* A scan that took a file reference should have been run */
-+static void collapse_put_scan_file(struct collapse_control *cc)
-+{
-+	if (WARN_ON_ONCE(cc->scan_file)) {
-+		fput(cc->scan_file);
-+		cc->scan_file = NULL;
-+	}
-+}
-+
-+static void collapse_control_release(struct collapse_control *cc)
-+{
-+	collapse_put_scan_file(cc);
-+}
-+
 +static enum scan_result collapse_scan_pmd(struct vm_area_struct *vma,
 +		unsigned long addr, struct collapse_control *cc)
  {
@@ -280,7 +243,10 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
 -	mmap_assert_locked(mm);
 +	mmap_assert_locked(vma->vm_mm);
 +	/* Whatever the last scan found has to have been run by now */
-+	collapse_put_scan_file(cc);
++	if (WARN_ON_ONCE(cc->scan_file)) {
++		fput(cc->scan_file);
++		cc->scan_file = NULL;
++	}
  
  	if (vma_is_anonymous(vma))
 -		return collapse_scan_pmd(mm, vma, addr, lock_dropped, cc);
@@ -288,16 +254,21 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  
 -	file = get_file(vma->vm_file);
  	pgoff = linear_page_index(vma, addr);
-+	result = collapse_scan_file(vma->vm_mm, addr, vma->vm_file, pgoff, cc);
-+	/*
-+	 * SCAN_PTE_MAPPED_HUGEPAGE is work too: the page cache already holds
-+	 * the PMD folio, and retracting the PTE table is the run's job.
-+	 */
-+	if (result != SCAN_SUCCEED && result != SCAN_PTE_MAPPED_HUGEPAGE)
-+		return result;
- 
+-
 -	mmap_read_unlock(mm);
 -	*lock_dropped = true;
+-
++	result = collapse_scan_file(vma->vm_mm, addr, vma->vm_file, pgoff, cc);
+ 	/*
+ 	 * SCAN_PTE_MAPPED_HUGEPAGE is work too: the page cache already holds
+-	 * the PMD folio, and only the PTE table is left to retract.
++	 * the PMD folio, and retracting the PTE table is the run's job.
+ 	 */
+-	result = collapse_scan_file(mm, addr, file, pgoff, cc);
+-	if (result != SCAN_SUCCEED)
++	if (result != SCAN_SUCCEED && result != SCAN_PTE_MAPPED_HUGEPAGE)
++		return result;
++
 +	/*
 +	 * A file collapse works on the page cache and never sees a VMA, so take
 +	 * what it needs from this one while it is still here.
@@ -323,18 +294,11 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
 +
 +	/* The scan found the PMD folio in place: nothing to collapse */
 +	if (result == SCAN_PTE_MAPPED_HUGEPAGE)
-+		goto retract;
+ 		goto put;
  retry:
--	result = collapse_scan_file(mm, addr, file, pgoff, cc);
-+	result = collapse_file(mm, addr, file, pgoff, cc);
- 
- 	/* Dirty pages are worth a writeback and one more try, if asked for */
- 	if (cc->policy.writeback_dirty && result == SCAN_PAGE_DIRTY_OR_WRITEBACK &&
-@@ -2812,8 +2848,13 @@ retry:
- 		triggered_wb = true;
- 		goto retry;
- 	}
-+retract:
+ 	result = collapse_file(mm, addr, file, pgoff, cc);
+@@ -2824,6 +2845,10 @@ retry:
+ put:
  	fput(file);
  
 +	/*
@@ -344,7 +308,7 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  	if (result == SCAN_PTE_MAPPED_HUGEPAGE) {
  		mmap_read_lock(mm);
  		if (collapse_test_exit_or_disable(mm))
-@@ -2828,6 +2869,28 @@ retry:
+@@ -2838,6 +2863,28 @@ put:
  	return result;
  }
  
@@ -373,43 +337,25 @@ Cc: Vlastimil Babka <vbabka@kernel.org>
  static void collapse_scan_mm_slot(unsigned int progress_max,
  		enum scan_result *result, struct collapse_control *cc)
  	__releases(&khugepaged_mm_lock)
-@@ -2970,10 +3033,10 @@ static void khugepaged_do_scan(struct co
+@@ -2980,9 +3027,9 @@ static void khugepaged_do_scan(struct co
  
  	lru_add_drain_all();
  
 +	collapse_control_init(cc);
- 	/* One policy for the whole pass, so every table is treated the same */
  	collapse_policy_khugepaged(&cc->policy);
  
 -	cc->progress = 0;
  	while (true) {
  		cond_resched();
  
-@@ -3004,6 +3067,8 @@ static void khugepaged_do_scan(struct co
- 			khugepaged_alloc_sleep();
- 		}
- 	}
-+
-+	collapse_control_release(cc);
- }
- 
- static bool khugepaged_should_wakeup(void)
-@@ -3200,8 +3265,8 @@ int madvise_collapse(struct vm_area_stru
+@@ -3209,8 +3256,8 @@ int madvise_collapse(struct vm_area_stru
  	cc = kmalloc_obj(*cc);
  	if (!cc)
  		return -ENOMEM;
 +	collapse_control_init(cc);
- 	collapse_policy_forced(&cc->policy);
+ 	collapse_policy_madvise(&cc->policy);
 -	cc->progress = 0;
  
  	lru_add_drain_all();
  
-@@ -3258,6 +3323,7 @@ out_maybelock:
- 	}
- out_nolock:
- 	mmap_assert_locked(mm);
-+	collapse_control_release(cc);
- 	kfree(cc);
- 
- 	return thps == ((hend - hstart) >> HPAGE_PMD_SHIFT) ? 0
 _

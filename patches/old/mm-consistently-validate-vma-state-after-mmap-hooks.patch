@@ -1,6 +1,6 @@
 From: "Lorenzo Stoakes (ARM)" <ljs@kernel.org>
 Subject: mm: consistently validate VMA state after mmap[_prepare] hooks
-Date: Sat, 03 Oct 2026 17:32:34 +0100
+Date: Fri, 09 Oct 2026 19:03:57 +0100
 
 When the f_op->mmap_prepare or deprecated f_op->mmap hooks are invoked, the
 driver might have done something crazy that is not permitted by the kernel.
@@ -42,7 +42,7 @@ While we're here, also fixup a couple disjoint blocks of #ifdef CONFIG_MMU.
 
 Finally, update the VMA userland tests to reflect the change.
 
-Link: https://lore.kernel.org/20261003-b4-mmap-prepare-vma-flag-sanify-v4-3-a1f052500fd7@kernel.org
+Link: https://lore.kernel.org/20261009-b4-mmap-prepare-vma-flag-sanify-v5-3-923b70125b1e@kernel.org
 Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Reviewed-by: Gregory Price (Meta) <gourry@gourry.net>
@@ -152,14 +152,17 @@ Cc: Chengming Zhou <chengming.zhou@linux.dev>
 Cc: Michal Hocko <mhocko@kernel.org>
 Cc: Miklos Szeredi <miklos@szeredi.hu>
 Cc: Xu Xin <xu.xin@linux.dev>
+Cc: Ihor Solodrai <ihor.solodrai@linux.dev>
+Cc: Bert Karwatzki <spasswolf@web.de>
 ---
 
- mm/internal.h                   |   50 ++++++++-----
- mm/util.c                       |   19 +++--
- mm/vma.c                        |  109 +++++++++++++++++++++++++-----
- mm/vma.h                        |   25 ++++++
- tools/testing/vma/include/dup.h |   10 ++
- 5 files changed, 168 insertions(+), 45 deletions(-)
+ mm/internal.h                     |   50 ++++++++-----
+ mm/util.c                         |   19 +++--
+ mm/vma.c                          |  106 ++++++++++++++++++++++++----
+ mm/vma.h                          |   25 +++++-
+ tools/testing/vma/include/dup.h   |   10 ++
+ tools/testing/vma/include/stubs.h |    4 +
+ 6 files changed, 172 insertions(+), 42 deletions(-)
 
 --- a/mm/internal.h~mm-consistently-validate-vma-state-after-mmap-hooks
 +++ a/mm/internal.h
@@ -275,23 +278,20 @@ Cc: Xu Xin <xu.xin@linux.dev>
  
 --- a/mm/vma.c~mm-consistently-validate-vma-state-after-mmap-hooks
 +++ a/mm/vma.c
-@@ -2628,26 +2628,19 @@ static int __mmap_new_file_vma(struct mm
+@@ -2628,6 +2628,12 @@ static int __mmap_new_file_vma(struct mm
  	if (error) {
  		UNMAP_STATE(unmap, vmi, vma, vma->vm_start, vma->vm_end,
  			    map->prev, map->next);
--		if (map_same_file(map))
--			fput(map->vm_file);
- 
--		vma->vm_file = NULL;
- 		vma_iter_set(vmi, vma->vm_end);
- 		/* Undo any partial mapping done by a device driver. */
- 		unmap_region(&unmap);
-+		/* Only safe once unmapped. */
-+		vma_close(vma);
 +
-+		if (map_same_file(map))
-+			fput(map->vm_file);
-+		vma->vm_file = NULL;
++		if (vma->vm_ops->close) {
++			zap_vma(vma);
++			/* Safe, because VMA zapped. */
++			vma_close(vma);
++		}
+ 		if (map_same_file(map))
+ 			fput(map->vm_file);
+ 
+@@ -2638,16 +2644,6 @@ static int __mmap_new_file_vma(struct mm
  		return error;
  	}
  
@@ -308,7 +308,7 @@ Cc: Xu Xin <xu.xin@linux.dev>
  	map->vma_flags = vma->flags;
  
  	return 0;
-@@ -2725,11 +2718,6 @@ static int __mmap_new_vma(struct mmap_st
+@@ -2725,11 +2721,6 @@ static int __mmap_new_vma(struct mmap_st
  		vma->flags = map->vma_flags;
  	}
  
@@ -320,7 +320,7 @@ Cc: Xu Xin <xu.xin@linux.dev>
  	/* Lock the VMA since it is modified after insertion into VMA tree */
  	vma_start_write(vma);
  	vma_iter_store_new(vmi, vma);
-@@ -2792,6 +2780,80 @@ static void __mmap_complete(struct mmap_
+@@ -2792,6 +2783,80 @@ static void __mmap_complete(struct mmap_
  	vma_set_page_prot(vma);
  }
  
@@ -401,7 +401,7 @@ Cc: Xu Xin <xu.xin@linux.dev>
  static int call_action_prepare(struct mmap_state *map,
  			       struct vm_area_desc *desc)
  {
-@@ -2818,6 +2880,7 @@ static int call_action_prepare(struct mm
+@@ -2818,6 +2883,7 @@ static int call_action_prepare(struct mm
  static int call_mmap_prepare(struct mmap_state *map,
  		struct vm_area_desc *desc)
  {
@@ -409,7 +409,7 @@ Cc: Xu Xin <xu.xin@linux.dev>
  	int err;
  
  	/* Invoke the hook. */
-@@ -2837,6 +2900,11 @@ static int call_mmap_prepare(struct mmap
+@@ -2837,6 +2903,11 @@ static int call_mmap_prepare(struct mmap
  	if (err)
  		return err;
  
@@ -421,7 +421,7 @@ Cc: Xu Xin <xu.xin@linux.dev>
  	/* Update fields permitted to be changed. */
  	map->pgoff = desc->pgoff;
  	map->vma_flags = desc->vma_flags;
-@@ -3472,10 +3540,15 @@ int __vm_munmap(unsigned long start, siz
+@@ -3472,10 +3543,15 @@ int __vm_munmap(unsigned long start, siz
  int insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
  {
  	unsigned long charged = vma_pages(vma);
@@ -511,4 +511,17 @@ Cc: Xu Xin <xu.xin@linux.dev>
  	/* Update the VMA from the descriptor. */
  	compat_set_vma_from_desc(vma, desc);
  	/* Complete any specified mmap actions. */
+--- a/tools/testing/vma/include/stubs.h~mm-consistently-validate-vma-state-after-mmap-hooks
++++ a/tools/testing/vma/include/stubs.h
+@@ -329,6 +329,10 @@ static inline void vma_close(struct vm_a
+ {
+ }
+ 
++static inline void zap_vma(struct vm_area_struct *vma)
++{
++}
++
+ static inline int mmap_file(struct file *file, struct vm_area_struct *vma)
+ {
+ 	return 0;
 _

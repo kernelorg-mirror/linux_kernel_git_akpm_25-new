@@ -1,6 +1,6 @@
 From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
 Subject: mm/collapse: implement MADV_COLLAPSE in madvise.c
-Date: Wed, 16 Sep 2026 10:31:39 +0100
+Date: Mon, 28 Sep 2026 11:06:27 +0100
 
 MADV_COLLAPSE is a madvise operation, but its implementation sat in
 khugepaged.c.  The daemon's file therefore also held a syscall's worth of
@@ -18,27 +18,29 @@ collapse changes.
 
 The !CONFIG_TRANSPARENT_HUGEPAGE stub moves in with it.
 
-Link: https://lore.kernel.org/20260916093145.4022188-13-kirill@shutemov.name
+Link: https://lore.kernel.org/20260928100630.21870-14-kirill@shutemov.name
 Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Zi Yan <ziy@nvidia.com>
 Assisted-by: LLM
-Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
-Cc: Barry Song <baohua@kernel.org>
 Cc: David Hildenbrand <david@kernel.org>
-Cc: Dev Jain <dev.jain@arm.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Lance Yang <lance.yang@linux.dev>
-Cc: Liam R. Howlett <liam@infradead.org>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Nico Pache <nico.pache@linux.dev>
 Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
 Cc: Vlastimil Babka <vbabka@kernel.org>
-Cc: Zi Yan <ziy@nvidia.com>
+Cc: Jann Horn <jannh@google.com>
 ---
 
  include/linux/huge_mm.h |    9 --
- mm/khugepaged.c         |  158 -----------------------------------
- mm/madvise.c            |  169 +++++++++++++++++++++++++++++++++++++-
- 3 files changed, 169 insertions(+), 167 deletions(-)
+ mm/khugepaged.c         |  159 -----------------------------------
+ mm/madvise.c            |  170 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 170 insertions(+), 168 deletions(-)
 
 --- a/include/linux/huge_mm.h~mm-collapse-implement-madv_collapse-in-madvisec
 +++ a/include/linux/huge_mm.h
@@ -67,21 +69,23 @@ Cc: Zi Yan <ziy@nvidia.com>
  					 unsigned long start,
 --- a/mm/khugepaged.c~mm-collapse-implement-madv_collapse-in-madvisec
 +++ a/mm/khugepaged.c
-@@ -969,21 +969,6 @@ static void collapse_policy_khugepaged(s
+@@ -972,23 +972,6 @@ static void collapse_policy_khugepaged(s
  	p->tva_type = TVA_KHUGEPAGED;
  }
  
 -/* MADV_COLLAPSE was asked for explicitly, so it is not held to those */
--static void collapse_policy_forced(struct collapse_policy *p)
+-static void collapse_policy_madvise(struct collapse_policy *p)
 -{
--	p->max_ptes_none = HPAGE_PMD_NR;
--	p->max_ptes_swap = HPAGE_PMD_NR;
--	p->max_ptes_shared = HPAGE_PMD_NR;
--	p->strict_sub_pmd = false;
--	p->skip_lazyfree = false;
--	p->require_referenced = false;
--	p->install_pmd = true;
--	p->writeback_dirty = true;
+-	p->pmd.max_ptes_none = HPAGE_PMD_NR;
+-	p->pmd.max_ptes_swap = HPAGE_PMD_NR;
+-	p->pmd.max_ptes_shared = HPAGE_PMD_NR;
+-	/* Never read: MADV_COLLAPSE collapses to PMD order only */
+-	p->sub_pmd = p->pmd;
+-
+-	p->anon_skip_lazyfree = false;
+-	p->anon_require_referenced = false;
+-	p->file_install_pmd = true;
+-	p->file_writeback_dirty = true;
 -	p->gfp = GFP_TRANSHUGE;
 -	p->tva_type = TVA_FORCED_COLLAPSE;
 -}
@@ -89,9 +93,9 @@ Cc: Zi Yan <ziy@nvidia.com>
  #ifdef CONFIG_NUMA
  static int collapse_find_target_node(struct collapse_control *cc)
  {
-@@ -2845,9 +2830,8 @@ enum scan_result collapse_scan_pmd(struc
-  * and with it the VMA and anything derived under it.  The run revalidates for
-  * itself rather than trusting what the scan saw.
+@@ -2864,9 +2847,8 @@ enum scan_result collapse_scan_pmd(struc
+  *
+  * Return: what the collapse made of the table.
   */
 -enum scan_result collapse_run_pmd(struct mm_struct *mm,
 -		unsigned long addr, enum scan_result result,
@@ -101,7 +105,7 @@ Cc: Zi Yan <ziy@nvidia.com>
  {
  	struct file *file = cc->scan_file;
  	bool triggered_wb = false;
-@@ -3221,141 +3205,3 @@ bool current_is_khugepaged(void)
+@@ -3237,140 +3219,3 @@ bool current_is_khugepaged(void)
  {
  	return kthread_func(current) == khugepaged;
  }
@@ -165,7 +169,7 @@ Cc: Zi Yan <ziy@nvidia.com>
 -	if (!cc)
 -		return -ENOMEM;
 -	collapse_control_init(cc);
--	collapse_policy_forced(&cc->policy);
+-	collapse_policy_madvise(&cc->policy);
 -
 -	lru_add_drain_all();
 -
@@ -191,7 +195,7 @@ Cc: Zi Yan <ziy@nvidia.com>
 -			vma = found;
 -			hend = min(hend, vma->vm_end & HPAGE_PMD_MASK);
 -			orders = collapse_possible_orders(vma, vma->vm_flags,
--							  cc->policy.tva_type);
+-							  TVA_FORCED_COLLAPSE);
 -		}
 -
 -		result = collapse_scan_pmd(vma, addr, cc, orders);
@@ -237,7 +241,6 @@ Cc: Zi Yan <ziy@nvidia.com>
 -		mmap_read_lock(mm);
 -out_locked:
 -	mmap_assert_locked(mm);
--	collapse_control_release(cc);
 -	kfree(cc);
 -
 -	return thps == ((hend - hstart) >> HPAGE_PMD_SHIFT) ? 0
@@ -253,23 +256,25 @@ Cc: Zi Yan <ziy@nvidia.com>
  
  #define __MADV_SET_ANON_VMA_NAME (-1)
  
-@@ -906,6 +907,171 @@ bool madvise_dontneed_free_valid_vma(str
+@@ -907,6 +908,172 @@ bool madvise_dontneed_free_valid_vma(str
  	return true;
  }
  
 +#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 +
 +/* MADV_COLLAPSE was asked for explicitly, so it is not held to those */
-+static void collapse_policy_forced(struct collapse_policy *p)
++static void collapse_policy_madvise(struct collapse_policy *p)
 +{
-+	p->max_ptes_none = HPAGE_PMD_NR;
-+	p->max_ptes_swap = HPAGE_PMD_NR;
-+	p->max_ptes_shared = HPAGE_PMD_NR;
-+	p->strict_sub_pmd = false;
-+	p->skip_lazyfree = false;
-+	p->require_referenced = false;
-+	p->install_pmd = true;
-+	p->writeback_dirty = true;
++	p->pmd.max_ptes_none = HPAGE_PMD_NR;
++	p->pmd.max_ptes_swap = HPAGE_PMD_NR;
++	p->pmd.max_ptes_shared = HPAGE_PMD_NR;
++	/* Never read: MADV_COLLAPSE collapses to PMD order only */
++	p->sub_pmd = p->pmd;
++
++	p->anon_skip_lazyfree = false;
++	p->anon_require_referenced = false;
++	p->file_install_pmd = true;
++	p->file_writeback_dirty = true;
 +	p->gfp = GFP_TRANSHUGE;
 +	p->tva_type = TVA_FORCED_COLLAPSE;
 +}
@@ -334,7 +339,7 @@ Cc: Zi Yan <ziy@nvidia.com>
 +	if (!cc)
 +		return -ENOMEM;
 +	collapse_control_init(cc);
-+	collapse_policy_forced(&cc->policy);
++	collapse_policy_madvise(&cc->policy);
 +
 +	lru_add_drain_all();
 +
@@ -360,7 +365,7 @@ Cc: Zi Yan <ziy@nvidia.com>
 +			vma = found;
 +			hend = min(hend, vma->vm_end & HPAGE_PMD_MASK);
 +			orders = collapse_possible_orders(vma, vma->vm_flags,
-+							  cc->policy.tva_type);
++							  TVA_FORCED_COLLAPSE);
 +		}
 +
 +		result = collapse_scan_pmd(vma, addr, cc, orders);
@@ -406,7 +411,6 @@ Cc: Zi Yan <ziy@nvidia.com>
 +		mmap_read_lock(mm);
 +out_locked:
 +	mmap_assert_locked(mm);
-+	collapse_control_release(cc);
 +	kfree(cc);
 +
 +	return thps == ((hend - hstart) >> HPAGE_PMD_SHIFT) ? 0
@@ -425,7 +429,7 @@ Cc: Zi Yan <ziy@nvidia.com>
  static long madvise_dontneed_free(struct madvise_behavior *madv_behavior)
  {
  	struct mm_struct *mm = madv_behavior->mm;
-@@ -1373,8 +1539,7 @@ static int madvise_vma_behavior(struct m
+@@ -1380,8 +1547,7 @@ static int madvise_vma_behavior(struct m
  	case MADV_DONTNEED_LOCKED:
  		return madvise_dontneed_free(madv_behavior);
  	case MADV_COLLAPSE:
