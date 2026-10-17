@@ -20,7 +20,7 @@ such a subject, consult the named active record or archive FIRST.
 - `mm/mglru: fix using folio_mark_accessed to replace folio_set_active`
   ACTIVE: [R-001](#r-001); author feedback outstanding.
 - `mm: multi-gen LRU: fix NULL lruvec->pgdat deref with memcg disabled on cmdline`
-  ACTIVE: [R-002](#r-002); author feedback outstanding.
+  ACTIVE: [R-002](#r-002); author proposes common helper.
 - `mm/vma: avoid spurious write locks when mm->mm_lock_seq overflows`
   ACTIVE: [R-003](#r-003); author feedback outstanding.
 - `mm/ksm: keep smart scan from losing duplicate pages`
@@ -74,7 +74,7 @@ Method lesson: check EVERY writer and consumer of changed state, plus
 Subject: mm: multi-gen LRU: fix NULL lruvec->pgdat deref with memcg
   disabled on cmdline
 Author: Siddharth Chintamaneni. Version: [PATCH v1], 2026-10-17 UTC.
-Status: PENDING author/maintainer feedback.
+Status: AUTHOR REPLIED 2026-10-16 PT; proposal assessed, awaiting v2.
 Fixes: `e4dde56cd208` (per-node MGLRU memcg lists).
 
 Findings:
@@ -89,9 +89,24 @@ Findings:
   but not reproduced. Proposed to investigate use of
   `mem_cgroup_lruvec(NULL, pgdat)` there too.
 
-Proposed reply: an email draft asking the author to investigate F2;
-  no evidence in this conversation that the draft was sent.
-Next: collect author's reply or a reproducer before resolving F2.
+Author feedback (2026-10-16 PT): The author replied to the sent
+  review message, initially asking to replace the special-cased code
+  with `mem_cgroup_lruvec()`. His follow-up proposes simplifying the
+  whole local helper `get_lruvec(memcg, nid)` to:
+
+      struct pglist_data *pgdat = NODE_DATA(nid);
+      VM_WARN_ON_ONCE(!memcg && !mem_cgroup_disabled());
+      return mem_cgroup_lruvec(memcg, pgdat);
+
+Assessment: Recommended. Valid calls retain their selected lruvec,
+  and the common helper also initializes/reinitializes its pgdat link.
+  The warning preserves the existing invalid-NULL-memcg diagnostic.
+  A NULL memcg with memcg *enabled* is already a WARN case: the old
+  code returned the node lruvec; the new code returns the root memcg's
+  per-node lruvec, a change only in that unsupported case.
+  Keep the original `lru_gen_shrink_node()` fix too. No revised patch
+  or runtime verification supplied yet.
+Next: inspect the author's v2 and any tests, then resolve F2.
 Method lesson: search nearby MM for sibling instances of the *cause*,
   not just calls to the changed function. Added to AKPM workflow.
 
