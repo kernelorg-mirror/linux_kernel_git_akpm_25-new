@@ -11,6 +11,26 @@ historical reference. Do not load it for routine reviews, modify it or
 delete it without authorization. The older
 `kernel-patch-review-workflow.md` is also superseded.
 
+## Standalone handoff
+
+This file alone is sufficient as the review-policy handoff for a NEW
+patch or series. The reviewer must also have the submitted patch and
+access to its matching kernel source and public upstream review guides.
+Fetch Tejun's modules and Chris Mason's prompts by verified commit SHA
+as described below. No local Tejun copy or AKPM activity ledger is
+needed to perform the review.
+
+`review-activity.md` contains AKPM's active cases, prior feedback and
+upstream version checkpoints, not additional review methodology. It is
+OPTIONAL for fresh reviews. If absent, put the review's identifiers,
+findings, evidence and upstream SHAs in the review report. Establish an
+initial checkpoint where no previous SHA is known; do not invent an
+upstream comparison or previous finding. The ledger (and any indicated
+dated archive) is needed to CONTINUE an existing AKPM review.
+
+AKPM's weekly Lore feedback monitor is not part of this file and does
+not automatically run for another reviewer.
+
 ## Execution order: two separate review passes
 
 For every review, including single patches and mbox series:
@@ -52,10 +72,12 @@ These include `core/evidence-discipline.md`, `code/kernel-idioms.md`,
 `review/formal-model-check.md`, and the relevant `patches/` guides.
 Use `mail/lore-thread.md` when retrieving posted discussions.
 
-If HEAD changes, compare the previous checkpoint against the new one:
+When HEAD advances from a known checkpoint, compare the revisions:
 read additions to `UPGRADING.md` and only the relevant module diffs.
-Record the new SHA, check date, and material changes or conflicts in
-`review-activity.md`. AKPM-specific policies here prevail on conflicts;
+Record the SHA, check date and material changes or conflicts in the
+activity ledger if present, otherwise in the review report. With no
+previous checkpoint, record the initial SHA without claiming a diff.
+AKPM-specific policies here prevail on conflicts;
 never silently weaken them or infer an upgrade from unverified files.
 If upstream access fails, disclose which version or module was not
 verified. Do not mix modules from different SHAs in a review.
@@ -83,16 +105,17 @@ For our reviews, apply these additional version-pinning requirements:
    index, and all triggered guides and patterns. Never combine files
    from different revisions or assume unversioned GitHub requests
    provide a consistent snapshot.
-3. In the review's `review-activity.md` entry, record the full prompt
-   SHA, its commit date, the date checked, and whether all required
-   files were successfully loaded. Cite that SHA in the combined review
+3. In the review record (`review-activity.md` when maintained,
+   otherwise the review report), record the full prompt SHA, its commit
+   date, the date checked, and whether all required files were loaded.
+   Cite that SHA in the combined review
    when reproducibility matters. Never retroactively invent a SHA for
    earlier reviews where the prompt version was not recorded.
-4. At each refresh, compare the new SHA against the previous checkpoint
-   recorded in `review-activity.md`. Briefly inspect the upstream diff,
-   especially MM, locking, concurrency, false-positive guidance and
-   `review-core.md`. Record significant changes and their SHAs in the
-   small prompt-tracking section there. Update its checked HEAD SHA.
+4. When the SHA advances from a known checkpoint, briefly inspect the
+   upstream diff, especially MM, locking, concurrency, false-positive
+   guidance and `review-core.md`. Record significant changes and SHAs
+   in the activity ledger if present, otherwise the review report.
+   With no previous checkpoint, record the initial SHA without a diff.
    Do not copy entire upstream commit logs or prompts into local files.
 5. When reviewing author feedback or reassessing a previous finding,
    distinguish improvements in the kernel source from changes in the
@@ -103,9 +126,10 @@ For our reviews, apply these additional version-pinning requirements:
    version current, pinned, or complete without evidence.
 
 Treat newer prompts as updated review instructions, not automatic proof of
-better results. Keep AKPM-specific methodology here, review state and
-upstream tracking in `review-activity.md`, and all external sources
-read-only. Refresh on reviews or explicit requests; do not claim
+better results. Keep AKPM-specific methodology here. Keep review state
+and upstream tracking in an activity ledger when used, or in the review
+report for standalone work; all external sources remain read-only.
+Refresh on reviews or explicit requests; do not claim
 continuous monitoring between reviews.
 
 ## Selective Sashiko integration
@@ -122,8 +146,10 @@ During active reviews, check Sashiko's default-branch HEAD at most once
 per seven days (the next interaction after seven days, not a background
 process). Compare only if its SHA advanced, and inspect only relevant
 MM, concurrency, false-positive and methodology changes. Record the
-full SHA, check date, comparison date and any adopted changes in
-`review-activity.md`. Carry forward vetted techniques; do not redo an
+full SHA, check date, comparison date and adopted changes in the
+activity ledger if present, otherwise the review report. Without a
+prior checkpoint, record the initial SHA without claiming a comparison.
+Carry forward vetted techniques; do not redo an
 upstream methodology comparison for each patch.
 
 Apply these refinements within the existing two-pass review:
@@ -137,8 +163,8 @@ Apply these refinements within the existing two-pass review:
   callees, macros, configurations and lifecycle paths. Distrust both
   the finding and its dismissal. Conclude `CONFIRMED`, `REJECTED` or
   `UNRESOLVED` from evidence; never force an unresolved claim to be
-  confirmed. This technical assessment does not override the separate
-  author-feedback disposition policy in `review-activity.md`.
+  confirmed. This technical assessment does not override the
+  author-feedback disposition policy below.
 - During reconciliation, deduplicate repeated reports, but preserve
   distinct execution paths, lifecycle stages and consequences even if
   they share a root cause.
@@ -322,12 +348,14 @@ override conflicting upstream style defaults.
 ## Review activity, feedback and archive protocol
 
 Keep review state outside the permanent workflow. This file describes
-HOW to review; `review-activity.md` records WHICH reviews remain open.
-The latter also indexes closed or dormant records in dated archives.
+HOW to review; an optional `review-activity.md` records WHICH reviews
+remain open, and indexes archived records. For a standalone review with
+no ledger, keep the corresponding record in the review report.
 
 1. At the start of a substantive patch review, create or update a
-   compact entry in `review-activity.md` if writable. Key it by the
-   original `Subject:` after removing `Re:` and patch/version/series
+   compact ledger entry if available and writable; otherwise use the
+   review report. Key it by the original `Subject:` after removing `Re:`
+   and patch/version/series
    brackets for lookup. Retain the exact original Subject, version,
    author, patch link/Message-ID, base SHA, and related series subjects
    in the detailed record. Disambiguate collisions by Message-ID/base.
@@ -340,8 +368,10 @@ The latter also indexes closed or dormant records in dated archives.
    `PENDING`, `CONFIRMED`, `REJECTED`, `PARTIAL`, `UNRESOLVED`, or
    `SUPERSEDED`. Until an author or other corroborating evidence weighs
    in, our own source verification alone does not mean `CONFIRMED`.
-4. Use the already scheduled weekly public Lore feedback check, and
-   examine any author/maintainer response supplied in chat immediately.
+4. For AKPM's ongoing cases, use the already scheduled weekly public
+   Lore feedback check. Other reviewers do not inherit that schedule;
+   inspect public feedback when continuing a review. Examine any
+   author/maintainer response supplied in chat immediately.
    For meaningful feedback, reopen the entry, attribute the response,
    verify its technical claims against actual source and update each
    finding independently. For rejections, record the EXACT false
@@ -373,16 +403,18 @@ The latter also indexes closed or dormant records in dated archives.
    the active index. Do not silently erase unresolved findings or
    author feedback; historical dated archives may stay in the git tree.
 
-A new chat normally needs only `akpm-patch-review-workflow.md` and
-`review-activity.md`. Retrieve pinned Tejun and Chris sources on demand;
-retrieve dated archives only for resumed subjects.
+For a NEW review, only `akpm-patch-review-workflow.md` is needed as
+a policy document. Supply the patch or mbox and identify its base tree
+if known. Fetch pinned upstream material on demand. To RESUME AKPM's
+older reviews, also provide `review-activity.md` and the dated archive
+identified by its index, if any.
 
 ## Handoff for subsequent chats
 
-Attach `akpm-patch-review-workflow.md` and `review-activity.md`. After
-the independent review pass, load the pinned Tejun modules and Chris
-prompts from their repositories, checking current versions as above.
-Retrieve only the dated `review-activity-YYYY-MM-DD.md` archive named by
-the active index for a resumed subject. Do not attach the historical
+For fresh reviews, attach only `akpm-patch-review-workflow.md`, plus
+the patch/mbox. After the independent pass, fetch the current pinned
+Tejun modules and Chris prompts as directed above. When continuing
+AKPM's previous findings or feedback, also attach `review-activity.md`
+and only the relevant dated archive. Do not attach the historical
 `tj-patch-review-workflow.md` or `kernel-patch-review-workflow.md`.
 Neither file should be modified or deleted without authorization.
