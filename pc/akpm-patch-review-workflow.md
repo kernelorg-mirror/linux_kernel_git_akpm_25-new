@@ -205,10 +205,68 @@ not edits to Tejun's original document.
   methodology or a checklist unless specifically requested. Provide
   plain-ASCII, 75-column, LKML-ready email text when asked.
 
+## Review activity, feedback and archive protocol
+
+Keep review state outside the permanent workflow. This file describes
+HOW to review; `review-activity.md` records WHICH reviews remain open.
+The latter also indexes closed or dormant records in dated archives.
+
+1. At the start of a substantive patch review, create or update a
+   compact entry in `review-activity.md` if writable. Key it by the
+   original `Subject:` after removing `Re:` and patch/version/series
+   brackets for lookup. Retain the exact original Subject, version,
+   author, patch link/Message-ID, base SHA, and related series subjects
+   in the detailed record. Disambiguate collisions by Message-ID/base.
+2. Assign stable review and finding IDs. Record claimed defect, concrete
+   execution path, evidence, uncertainty, practical impact and any
+   proposed reply. Distinguish our source analysis from external review
+   assertions. Do not reproduce full patch bodies or mailing-list
+   threads when a Message-ID or commit identifies them.
+3. Treat dispositions as feedback, not as confidence labels. Use:
+   `PENDING`, `CONFIRMED`, `REJECTED`, `PARTIAL`, `UNRESOLVED`, or
+   `SUPERSEDED`. Until an author or other corroborating evidence weighs
+   in, our own source verification alone does not mean `CONFIRMED`.
+4. When new feedback arrives, reopen the entry, attribute the feedback,
+   verify its concrete counterargument against the actual source and
+   update each finding's disposition independently. For rejections,
+   record the EXACT false assumption, actual guarding condition or
+   misunderstood API, and evidence disproving the finding. Include
+   what was missed and how to catch it in a future independent review.
+5. Promote a lesson to THIS AKPM workflow only if it improves review
+   methodology across patches. Do not append a special rule for every
+   bug, false positive, or argument. Do not edit Tejun's workflow.
+6. Archive records which are resolved or sufficiently dormant to be
+   removed from the active working set. Use one file per local close-off
+   date, `review-activity-YYYY-MM-DD.md` (America/Los_Angeles). Several
+   reviews may share that file. An archived `UNRESOLVED` review is
+   *dormant*, not approved or rejected by its author.
+7. When archiving, MOVE the compact record out of the active section;
+   leave a Subject-to-filename mapping in the index. Retain the finding
+   dispositions, counterarguments, durable lesson and source references
+   in the archive. Remove superseded detail and transcript repetition.
+   Archive files are snapshots: normally append to the day's file, but
+   do not rewrite previous snapshots just to tidy the active index.
+8. When a topic resurfaces in another chat, consult the active/index
+   file by normalized Subject and identify its exact archive filename.
+   Read that archive before resuming; request that file if unavailable.
+   Copy only the still-relevant state back to the active entry, preserve
+   the archive link and finding IDs, and update the index to `ACTIVE`.
+   On a later close-off, use that day's archive with a backlink.
+9. Periodically remove obsolete or uninteresting Subject mappings from
+   the active index. Do not silently erase unresolved findings or
+   author feedback; historical dated archives may stay in the git tree.
+
+A new chat normally needs `akpm-patch-review-workflow.md`,
+`tj-patch-review-workflow.md`, and `review-activity.md`. Retrieve dated
+archives only for the topics being resumed; do not preload them all.
+
 ## Handoff for subsequent chats
 
 Use `akpm-patch-review-workflow.md` as the entry point and attach
-`tj-patch-review-workflow.md` alongside it. Treat Tejun's file as a
-read-only, verbatim upstream reference. Never modify it while refining
-AKPM's local preferences. Amend only this file when new local rules are
-requested. The former `kernel-patch-review-workflow.md` is obsolete.
+`tj-patch-review-workflow.md` alongside it. Add `review-activity.md`
+when continuing reviews or incorporating author feedback, and supply
+only the archived `review-activity-YYYY-MM-DD.md` file indicated by its
+index for a resumed dormant subject. Treat Tejun's file as a read-only,
+verbatim upstream reference. Never modify it while refining AKPM's
+local preferences. The former `kernel-patch-review-workflow.md` is
+obsolete; do not attach it.
