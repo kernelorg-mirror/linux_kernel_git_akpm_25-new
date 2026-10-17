@@ -1,7 +1,8 @@
 # Linux kernel patch review workflow
 
-Version: 2026-10-15
-Purpose: handoff instructions for future ChatGPT kernel-review conversations.
+Version: 2026-10-17
+Purpose: handoff instructions for future ChatGPT kernel-review
+conversations.
 
 ## How to use this document
 
@@ -17,6 +18,33 @@ concrete execution paths to either superficial approval or speculative
 complaints. Scale effort to the patch: a simple fix needs a focused review;
 a complex concurrency protocol warrants a deeper review.
 
+## Plain-text output requirements
+
+These rules apply to all replies, review reports, suggested patch or commit
+messages, and email drafts. Treat them as standing requirements:
+
+- Use plain 7-bit ASCII. No typographic quotes, Unicode bullets, special
+  quotation symbols, or other non-ASCII punctuation.
+- For email quotations, prefix every quoted line with literal "> " (a
+  greater-than sign and a space). Do not replace it with a rendered
+  blockquote bar or other symbol. Preserve these characters when copied.
+- Hard-wrap at 75 columns, counting "> " prefixes and list indentation.
+  Prefer still shorter lines where readability benefits. An unbreakable
+  identifier, command, or URL may exceed the limit if unavoidable.
+- Use plain hyphen-minus ("-") for bullets, not decorative glyphs.
+- Present every proposed email or patch-review reply in a fenced
+  `text` code block containing literal ASCII. Do not use a rich-text
+  writing block or Markdown list/blockquote for the draft: rendered
+  bullets, quote bars, and escaping can corrupt copy-and-paste.
+- Never escape `> ` quotes or `- ` bullets with backslashes. The code
+  block must contain exactly the text intended for copying, with no
+  added markup, backslashes, or converted bullet characters.
+- Before sending, check that the copyable draft contains only ASCII,
+  every line is at most 75 columns, and quotes and bullets copy as-is.
+- For references to patches in a numbered series, use the exact
+  subject-style notation `[N/M]`, for example `[1/2]` or `[2/2]`. Do
+  not write `patch 1` or `patch 2` in review email replies.
+
 ## Inputs and source integrity
 
 1. Read **all relevant messages** in the supplied mbox, including cover
@@ -28,10 +56,11 @@ a complex concurrency protocol warrants a deeper review.
    context/preimage agrees with that base. Inspect each patch against its
    incremental tree (base + patches 1 through N), not only the final tree.
 3. Read source, types, callers, callees, error paths, and related commits
-   at the **pinned revision**. Prefer a local read-only checkout if present.
-   Otherwise use direct Gitiles/GitHub source retrieval, not stale search
-   snippets. Verify a moving branch's current SHA before using it; do not
-   silently substitute mainline for mm-new, mm-everything, or linux-next.
+   at the **pinned revision**. Prefer a local read-only checkout when
+   available. Otherwise use direct Gitiles/GitHub source retrieval, not
+   stale search snippets. Verify a moving branch's current SHA before
+   using it; do not silently substitute mainline for mm-new,
+   mm-everything, or linux-next.
 4. If a required source, mbox, diff, test log, or revision is unavailable,
    disclose the gap. Never claim to have compiled, executed, or verified
    something solely because it looks plausible.
@@ -42,6 +71,26 @@ a complex concurrency protocol warrants a deeper review.
    `kernel/subsystem/*.md` guidance. Consult kernel code itself to validate
    assertions made in review prompts, comments, or changelogs.
 
+## Mandatory dual independent review
+
+For every kernel patch review, make TWO distinct passes and reconcile:
+
+1. Independent review: analyze the patch from first principles using the
+   actual diff and pinned kernel source. Form and verify findings in your
+   own judgment, without relying on Tejun Heo's/Chris Mason's prompts to
+   decide what to look for, what constitutes a defect, or what to report.
+2. Prompt-guided review: separately apply Tejun's workflow and Chris
+   Mason's review prompts to the same patch. Investigate additional leads
+   to the same source-based verification standard. Never report something
+   merely because a prompt says it is a bug.
+3. Reconcile: compare findings, recheck disagreements and false positives,
+   and give one consolidated review. Indicate which findings arose
+   independently, from the prompts, or from both when useful. Neither
+   pass has veto power over the other.
+
+Do not replace the independent pass with a generic summary of prompt-guided
+checks or treat the two passes as merely two names for one pass.
+
 ## Review passes
 
 ### A. Understand each change
@@ -51,8 +100,8 @@ a complex concurrency protocol warrants a deeper review.
 - Read every hunk in context; list all changed conditions, early exits,
   locking transitions, allocations, frees, and lifetime changes.
 - Verify the claimed Fixes commit and whether behavior really changes.
-- For a series, note any issue valid after patch N but repaired by patch N+k;
-  that still matters for bisection and independent patch correctness.
+- For a series, note any issue valid after patch N but repaired by
+  patch N+k; that still matters for bisection and patch correctness.
 
 ### B. Correctness and regression analysis
 
@@ -87,8 +136,9 @@ a complex concurrency protocol warrants a deeper review.
   hangs, SIGBUS/SIGSEGV, unexpected errno, data loss, wrong contents,
   corrupted mappings, performance collapse, OOM, and kernel crashes.
 - Separate **observed/reproduced**, **source-supported potential**, and
-  **speculative worst-case** effects. Do not claim exploitation, disclosure,
-  or data corruption without a demonstrated or well-supported path.
+  **speculative worst-case** effects. Do not claim exploitation,
+  disclosure, or data corruption without a demonstrated or
+  well-supported path.
 - Explain trigger conditions and how the patch changes observable behavior.
   Describing only an internal warning, wrong counter, UAF, or race is
   insufficient when the runtime consequence can be established.
@@ -126,8 +176,8 @@ For a substantive model:
    at each distinct shared-state access. Record assumptions and excluded
    behavior.
 2. Create a **buggy/original** variant. Verify that TLC finds the intended
-   counterexample (falsification); if it does not, the model or property may
-   be too weak.
+   counterexample (falsification); if it does not, the model or
+   property may be too weak.
 3. Check the **patched** variant with the same properties and bounds.
    Record the configuration, state count, depth, result, and tool version.
 4. Translate every counterexample step back to the C path. A model-only
@@ -187,7 +237,8 @@ reasonably compact reports over a recital of every method used.
    repository when available. Supply `tla2tools.jar` if TLC is needed;
    availability of an attachment in a past chat must not be assumed.
 2. Read all supplied patch messages, verify base and complete source.
-3. Run source-based correctness, concurrency, and changelog passes.
+3. Run a first-principles independent pass, then a separate
+   Tejun/Chris Mason prompt-guided pass, and reconcile their findings.
 4. Verify findings with a concrete execution path; decide whether a formal
    model or LKMM litmus test is justified and actually run available tools.
 5. Report concise, actionable findings with proven versus possible runtime
