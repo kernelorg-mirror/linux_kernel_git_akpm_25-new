@@ -96,6 +96,30 @@ Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing
 example of ONE failure path does not end the search for others.
 
+## Similar-bug search: mandatory in BOTH passes
+
+When reviewing an MM fix, search related MM code for other instances of
+its underlying bug pattern, not merely other calls to the changed helper.
+
+- Identify the actual failure mechanism and the minimal state or code
+  pattern needed to trigger it (such as an uninitialized pointer,
+  mismatched flags, unchecked bounds, or a missing lifecycle step).
+- Search nearby functions, sibling paths, analogous helpers, other MM
+  subsystems and relevant configurations for the same mechanism.
+  Check old and new paths, including exceptional, disabled-feature,
+  fallback, teardown and initialization cases.
+- For each candidate, trace a concrete caller and preconditions to
+  establish whether the problematic state is reachable. Compare its
+  initialization, locking and lifetime guarantees with the patched site.
+- Distinguish confirmed additional bugs, suspected analogues, already
+  protected code and unrelated lookalikes. Do not infer a bug from a
+  matching name or textual pattern alone.
+- Consider whether a narrow patch fixes only one manifestation of a
+  broader issue. Report any verified siblings and recommend the smallest
+  appropriate scope; avoid unnecessary refactoring.
+- Include the similar-code search in the two-pass coverage comparison,
+  and explicitly say when it was limited by available source access.
+
 ## Independent pass: additional review obligations
 
 - Start from the intended userspace behavior: what the bug does to real
