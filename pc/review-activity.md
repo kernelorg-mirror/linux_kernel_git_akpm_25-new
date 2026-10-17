@@ -29,12 +29,58 @@ These are examples, not every upstream change or independent proof of
 improved review accuracy.
 
 For each new Tejun-guided review, record the FULL Chris prompt SHA and
-fetch/check date in that review's active entry. Compare `main` with the
-previous checked HEAD and summarize material changes to MM, locking,
-false-positive handling, and review instructions here. Keep this section
-short, retaining only the latest checkpoint and useful change notes.
+fetch/check date in that review's active entry. Check HEAD each review,
+but analyze substantive upstream prompt diffs at most weekly while
+actively reviewing (or earlier if relevant to a particular finding).
+Keep only the latest checkpoint and generalizable change notes.
 The earlier reviews R-001 through R-005 have no recorded prompt pin:
 DO NOT infer they used the HEAD recorded above.
+
+## Upstream Sashiko tracking (weekly, not per patch)
+
+Repository: https://github.com/sashiko-dev/sashiko
+Reference branch: `main`
+Last examined: 2026-10-16 (America/Los_Angeles)
+Examined commit: `f4b72fa04f232fe5f2183d32d7cf9c09e5d735ec`
+Chris reference: `d048f8742f6740c38833adf02e87901412d771ca`
+Observations: Sashiko's vendored `mm-reclaim`, `mm-folio`,
+`mm-pagetable`, `mm-largepage` and `locking` guides match Chris at
+that reference. Sashiko-specific `mm-vma` and false-positive rules
+contain additional material which requires independent validation.
+Its separate `concerns`/`dismissed_concerns`/`hard_cases` processing
+suggests a targeted disagreement check, not importing its pipeline.
+Next substantive comparison: after 2026-10-23 PT (while active), or
+when the user requests it. HEAD may be checked more cheaply.
+
+## Public mailing-list follow-up tracking
+
+Monitoring: weekly Monday mornings (America/Los_Angeles), beginning
+2026-10-19; scheduled task active. When author feedback is supplied
+in chat, review it immediately instead of waiting for Monday.
+Purpose: identify WHY a finding was right, wrong or incomplete, and
+produce broadly applicable review rules -- not merely count replies.
+
+Last full Lore batch: NOT YET RUN. This ledger is not a live feed.
+Monitoring source: ACTIVE records below only. Exact Message-IDs and
+sent-review IDs are preferred. No initial thread-wide last-seen cursor
+has been verified. On each successful check, record the check date,
+new reply IDs and per-finding disposition; preserve unverified states.
+A future scheduled check may not see changes made only in a private
+local Git tree: provide an accessible current ledger or an exact
+read-only repository path when needed. Never infer missing replies.
+
+Review-specific status:
+- R-001: original Message-ID unknown; fallback to exact Subject.
+  Last checked: not yet. Our sent-reply ID: unknown.
+- R-002: original Message-ID unknown; fallback to exact Subject.
+  Known author reply: 2026-10-16 PT, already summarized below.
+  Last public-thread check: not yet. Our sent-reply ID: unknown.
+- R-003: original Message-ID unknown; fallback to exact Subject.
+  Last checked: not yet. Our sent-reply ID: unknown.
+- R-004: original Message-ID recorded in R-004; last checked: not yet.
+  Our sent-reply ID: unknown.
+- R-005: original Message-ID and whether draft was sent are unknown.
+  Do not treat it as an active publicly posted review until verified.
 
 ## Subject index
 
