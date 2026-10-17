@@ -37,6 +37,47 @@ that subagents, builds, runtime tests, TLC, or herd7 ran unless they did.
 The independent pass is required even when the prompt-guided pass is
 much deeper. Neither pass has veto power over the other.
 
+## Chris Mason prompt version pinning and update tracking
+
+Tejun's S2 workflow says to `git pull` Chris Mason's prompts before
+review. Add the following requirements without editing Tejun's file:
+
+1. Complete and record the independent first pass BEFORE reading Chris's
+   prompts. At the start of the Tejun-guided pass, determine the current
+   HEAD commit SHA and commit date on the default branch of
+   https://github.com/masoncl/review-prompts. Fetch or pull afresh for
+   EACH review; do not quietly reuse prompts cached from earlier chats.
+2. Load ALL required Chris prompt files from exactly that one SHA, using
+   a checkout pinned to it or source requests with `ref=<full SHA>`.
+   Include core, technical, false-positive, build, the subsystem
+   index, and all triggered guides and patterns. Never combine files
+   from different revisions or assume unversioned GitHub requests
+   provide a consistent snapshot.
+3. In the review's `review-activity.md` entry, record the full prompt
+   SHA, its commit date, the date checked, and whether all required
+   files were successfully loaded. Cite that SHA in the combined review
+   when reproducibility matters. Never retroactively invent a SHA for
+   earlier reviews where the prompt version was not recorded.
+4. At each refresh, compare the new SHA against the previous checkpoint
+   recorded in `review-activity.md`. Briefly inspect the upstream diff,
+   especially MM, locking, concurrency, false-positive guidance and
+   `review-core.md`. Record significant changes and their SHAs in the
+   small prompt-tracking section there. Update its checked HEAD SHA.
+   Do not copy entire upstream commit logs or prompts into local files.
+5. When reviewing author feedback or reassessing a previous finding,
+   distinguish improvements in the kernel source from changes in the
+   prompt version. If an older review has a known prompt SHA, use it to
+   reproduce that review before comparing with current upstream prompts.
+6. If GitHub access, SHA resolution, or required prompt files fail,
+   state exactly what could not be verified. Do not label the prompt
+   version current, pinned, or complete without evidence.
+
+Treat newer prompts as updated review instructions, not automatic proof of
+better results. Keep AKPM-specific methodology in THIS file, review state
+and upstream change tracking in `review-activity.md`, and Tejun's file
+unchanged. Refresh on review runs or explicit request; do not claim
+continuous monitoring between reviews.
+
 ## Source integrity and review scope
 
 - Read all relevant material in the supplied mbox: the actual patches,

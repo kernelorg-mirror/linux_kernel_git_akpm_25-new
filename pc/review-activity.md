@@ -10,6 +10,32 @@ current understanding, NOT author acceptance. Messages, tests and later
 feedback not yet supplied are not presumed to exist. Keep each record
 short; detailed mail and diffs are retrieved by reference as needed.
 
+## Chris Mason prompt tracking
+
+Repository: https://github.com/masoncl/review-prompts
+Upstream branch: `main`
+Last checked: 2026-10-16 (America/Los_Angeles)
+Checked HEAD: `d048f8742f6740c38833adf02e87901412d771ca`
+HEAD commit date: 2026-10-01 11:53:46 UTC
+HEAD subject: README: add pahole to the project lists
+Status: initial version-tracking checkpoint; no previous pinned SHA.
+
+Recent upstream improvements already in this baseline:
+- 2026-09-21 `2e5e252bfe56`: MM race refcount budgeting.
+- 2026-09-21 `a39be13ca052`: avoid a `virt_to_page()` false positive.
+- 2026-09-23 `f85b3a017072`: guides and false-positive updates.
+- 2026-10-01 `1a1befd0c56f`: correct guide rules contradicted by code.
+These are examples, not every upstream change or independent proof of
+improved review accuracy.
+
+For each new Tejun-guided review, record the FULL Chris prompt SHA and
+fetch/check date in that review's active entry. Compare `main` with the
+previous checked HEAD and summarize material changes to MM, locking,
+false-positive handling, and review instructions here. Keep this section
+short, retaining only the latest checkpoint and useful change notes.
+The earlier reviews R-001 through R-005 have no recorded prompt pin:
+DO NOT infer they used the HEAD recorded above.
+
 ## Subject index
 
 The literal text inside each backtick pair is the normalized `Subject:`
