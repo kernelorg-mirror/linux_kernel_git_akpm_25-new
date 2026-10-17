@@ -1,12 +1,15 @@
 # AKPM kernel patch review workflow
 
 Purpose: local review policy for future ChatGPT kernel patch reviews.
-This is the entry point. It invokes `tj-patch-review-workflow.md`, which
-is Tejun Heo's original S2 workflow and must be left unchanged.
+This is the entry point. Tejun's current generic review workflow is at
+https://github.com/htejun/kernel-agent-workflows; fetch its relevant
+modules at a pinned commit. This file provides AKPM-specific additions
+and overrides. Chris Mason's prompts are a separate upstream source.
 
-This file contains AKPM-specific instructions and additions. It does
-not replace or edit Tejun's instructions. The old
-`kernel-patch-review-workflow.md` is superseded: do not use or update it.
+The original `tj-patch-review-workflow.md` (S2) is a retired, read-only
+historical reference. Do not load it for routine reviews, modify it or
+delete it without authorization. The older
+`kernel-patch-review-workflow.md` is also superseded.
 
 ## Execution order: two separate review passes
 
@@ -14,14 +17,14 @@ For every review, including single patches and mbox series:
 
 1. First perform an independent, first-principles review of the entire
    submitted change against the relevant kernel source. Do not consult
-   Tejun's instructions or Chris Mason's prompts to choose the review
-   questions or decide on findings in this pass. Preserve the findings
-   and the paths checked before proceeding.
-2. Then read and apply `tj-patch-review-workflow.md` as a separate pass.
-   Follow its instructions to use Chris Mason's review prompts:
-   https://github.com/masoncl/review-prompts
-   Load the current core, technical, false-positive, build, and matching
-   subsystem guidance. Verify all leads against source code. A prompt's
+   Tejun's instructions or Chris Mason's or Sashiko's prompts to choose
+   review questions or findings in this pass. Preserve the findings and
+   the paths checked before proceeding.
+2. Then read and apply Tejun's pinned `review/patchset-review.md`
+   module and its applicable dependencies as a separate pass. Use Chris
+   Mason's pinned prompts at https://github.com/masoncl/review-prompts.
+   Load core, technical, false-positive, build, and matching subsystem
+   guidance. Verify all leads against source code. A prompt's
    declaration that something is wrong is not evidence by itself.
 3. Reconcile the two passes. Compare their path coverage, not just their
    reported bugs. Investigate paths checked by only one pass, resolve
@@ -37,17 +40,43 @@ that subagents, builds, runtime tests, TLC, or herd7 ran unless they did.
 The independent pass is required even when the prompt-guided pass is
 much deeper. Neither pass has veto power over the other.
 
+## Tejun upstream modules and upgrade tracking
+
+Tejun's current workflow is
+https://github.com/htejun/kernel-agent-workflows. After recording the
+independent pass, check the default-branch HEAD SHA and commit date at
+each substantive review. Fetch all applicable modules from ONE full SHA
+(or reuse complete, already verified copies if unchanged), starting
+with `review/patchset-review.md` and its relevant `Depends on` modules.
+These include `core/evidence-discipline.md`, `code/kernel-idioms.md`,
+`review/formal-model-check.md`, and the relevant `patches/` guides.
+Use `mail/lore-thread.md` when retrieving posted discussions.
+
+If HEAD changes, compare the previous checkpoint against the new one:
+read additions to `UPGRADING.md` and only the relevant module diffs.
+Record the new SHA, check date, and material changes or conflicts in
+`review-activity.md`. AKPM-specific policies here prevail on conflicts;
+never silently weaken them or infer an upgrade from unverified files.
+If upstream access fails, disclose which version or module was not
+verified. Do not mix modules from different SHAs in a review.
+
+`INTEGRATION.md` also describes installing a persistent local agent
+profile, overlays, and instruction-file hooks. Do not install those for
+ChatGPT reviews or alter any Git checkout without express permission.
+Use the upstream modules read-only, not a local copy to maintain.
+The original standalone S2 file is kept only for historical comparison.
+
 ## Chris Mason prompt version pinning and update tracking
 
-Tejun's S2 workflow says to `git pull` Chris Mason's prompts before
-review. Add the following requirements without editing Tejun's file:
+Tejun's `review/patchset-review.md` uses Chris Mason's prompts.
+For our reviews, apply these additional version-pinning requirements:
 
 1. Complete and record the independent first pass BEFORE reading Chris's
-   prompts. At the start of the Tejun-guided pass, check the current
-   HEAD commit SHA and date of the default branch of
-   https://github.com/masoncl/review-prompts for EACH review. When
-   unchanged, reuse verified prompt files pinned to that exact SHA if
-   available; otherwise fetch them. Never reuse an unverified cache.
+   prompts. At the start of the Tejun-guided pass, determine the current
+   HEAD commit SHA and commit date on the default branch of
+   https://github.com/masoncl/review-prompts. Check HEAD afresh for EACH
+   review. Reuse complete, previously verified, SHA-pinned prompt files
+   when the SHA is unchanged; otherwise fetch the new revision.
 2. Load ALL required Chris prompt files from exactly that one SHA, using
    a checkout pinned to it or source requests with `ref=<full SHA>`.
    Include core, technical, false-positive, build, the subsystem
@@ -59,13 +88,12 @@ review. Add the following requirements without editing Tejun's file:
    files were successfully loaded. Cite that SHA in the combined review
    when reproducibility matters. Never retroactively invent a SHA for
    earlier reviews where the prompt version was not recorded.
-4. On each review check only the HEAD SHA and fetch relevant prompt
-   content as needed. Perform substantive upstream diff/lesson analysis
-   no more than once in seven days while reviewing, unless a particular
-   change directly affects the current patch. Record meaningful MM,
-   locking, concurrency and false-positive changes and SHAs in the
-   small tracking section of `review-activity.md`. No full-history scan
-   or repeated analysis of unchanged commits.
+4. At each refresh, compare the new SHA against the previous checkpoint
+   recorded in `review-activity.md`. Briefly inspect the upstream diff,
+   especially MM, locking, concurrency, false-positive guidance and
+   `review-core.md`. Record significant changes and their SHAs in the
+   small prompt-tracking section there. Update its checked HEAD SHA.
+   Do not copy entire upstream commit logs or prompts into local files.
 5. When reviewing author feedback or reassessing a previous finding,
    distinguish improvements in the kernel source from changes in the
    prompt version. If an older review has a known prompt SHA, use it to
@@ -75,37 +103,48 @@ review. Add the following requirements without editing Tejun's file:
    version current, pinned, or complete without evidence.
 
 Treat newer prompts as updated review instructions, not automatic proof of
-better results. Keep AKPM-specific methodology in THIS file, review state
-and upstream change tracking in `review-activity.md`, and Tejun's file
-unchanged. Refresh on review runs or explicit request; do not claim
+better results. Keep AKPM-specific methodology here, review state and
+upstream tracking in `review-activity.md`, and all external sources
+read-only. Refresh on reviews or explicit requests; do not claim
 continuous monitoring between reviews.
 
-## Sashiko: upstream comparison without clone-and-own
+## Selective Sashiko integration
 
-Upstream: https://github.com/sashiko-dev/sashiko
+Chris Mason's `masoncl/review-prompts` remains the primary external
+prompt source. `sashiko-dev/sashiko` is supplemental: adopt useful MM
+review techniques, not its prompt set or multi-stage review pipeline.
+Sashiko vendors Chris's prompts and may alter them, notably
+`third_party/prompts/kernel/subsystem/mm-vma.md` and
+`third_party/prompts/kernel/false-positive-guide.md`. Treat categorical
+Sashiko-specific rules as hypotheses, not authority: some may hide bugs.
 
-- In an active reviewing period, check Sashiko's HEAD and analyze its
-  relevant methodology/prompt changes at most once every seven days,
-  or on explicit request. Record last-checked date and SHA in
-  `review-activity.md`. Do NOT do a full Sashiko comparison per patch.
-- When changed, inspect only relevant review-protocol changes and
-  Sashiko-specific MM guidance that differs from the pinned Chris
-  version. Compare against Chris's exact SHA, not unpinned branches.
-  Neither project's prompts prove kernel behavior without code evidence.
-- Do not clone-and-own Sashiko's Rust pipeline or its forked prompt
-  tree. Distill only small, general review procedures into THIS file;
-  otherwise read relevant upstream material by pinned SHA on demand.
-- During two-pass reconciliation, retain substantial hypotheses that
-  either pass examined and dismissed, with the actual disproving code.
-  A disagreement or weakly proven dismissal is a "disputed finding":
-  formulate one concrete verification question and investigate the
-  competing explanations in the exact kernel source. Check all relevant
-  callers, macros, configurations and lifecycle modes. Preserve
-  CONFIRMED, REJECTED and UNRESOLVED outcomes; never force certainty.
-- When merging findings, retain distinct setup, runtime, retry and
-  teardown paths and their different failure mechanisms. Multiple
-  reviewers making the same claim is not a substitute for proof.
-- Keep this targeted: no separate Sashiko execution on routine reviews.
+During active reviews, check Sashiko's default-branch HEAD at most once
+per seven days (the next interaction after seven days, not a background
+process). Compare only if its SHA advanced, and inspect only relevant
+MM, concurrency, false-positive and methodology changes. Record the
+full SHA, check date, comparison date and any adopted changes in
+`review-activity.md`. Carry forward vetted techniques; do not redo an
+upstream methodology comparison for each patch.
+
+Apply these refinements within the existing two-pass review:
+
+- In BOTH passes retain substantive, plausible hypotheses that were
+  dismissed, with the exact source evidence, guard or precondition
+  supporting dismissal. Omit trivial or unsupported speculation.
+- If reviewers disagree, or dismissal depends on an unverified premise,
+  conduct a focused third examination. State arguments for and against,
+  frame the specific technical question, and trace source, callers,
+  callees, macros, configurations and lifecycle paths. Distrust both
+  the finding and its dismissal. Conclude `CONFIRMED`, `REJECTED` or
+  `UNRESOLVED` from evidence; never force an unresolved claim to be
+  confirmed. This technical assessment does not override the separate
+  author-feedback disposition policy in `review-activity.md`.
+- During reconciliation, deduplicate repeated reports, but preserve
+  distinct execution paths, lifecycle stages and consequences even if
+  they share a root cause.
+
+Do not read Sashiko prompts in the independent pass, create a mandatory
+Sashiko review pass, or copy or maintain its upstream workflow locally.
 
 ## Source integrity and review scope
 
@@ -227,8 +266,13 @@ its underlying bug pattern, not merely other calls to the changed helper.
 
 ## Modeling and verification
 
-Use Tejun's Sections 7-9 for the formal-model decision and protocol.
-The following local safeguards are additive:
+Use Tejun's pinned `review/formal-model-check.md` for model triggers,
+procedure, and verification. Make an explicit `model: yes` or
+`model: no (reason)` decision for each review, even though Tejun's
+profile defaults `$FORMAL_MODEL` to `off`. That default does not waive
+our review: model consequential multi-actor protocols and unresolved
+interleavings when warranted, not every routine arithmetic change.
+These local safeguards are additive:
 
 - Use PlusCal/TLC for a meaningful multi-actor shared-state protocol
   when appropriate, not mechanically for every change. The model must
@@ -248,8 +292,8 @@ The following local safeguards are additive:
 ## Reporting and email formatting: mandatory
 
 These requirements apply to ALL user-facing replies, review summaries,
-suggested changelogs and proposed emails. They are AKPM's preferences,
-not edits to Tejun's original document.
+suggested changelogs and proposed emails. These AKPM preferences
+override conflicting upstream style defaults.
 
 - Plain 7-bit ASCII only. No curly quotes, Unicode punctuation,
   decorative bullets, typographic quotation bars, or special symbols.
@@ -296,20 +340,18 @@ The latter also indexes closed or dormant records in dated archives.
    `PENDING`, `CONFIRMED`, `REJECTED`, `PARTIAL`, `UNRESOLVED`, or
    `SUPERSEDED`. Until an author or other corroborating evidence weighs
    in, our own source verification alone does not mean `CONFIRMED`.
-4. When new feedback arrives, reopen the entry, attribute the feedback,
-   verify its concrete counterargument against the actual source and
-   update each finding's disposition independently. For rejections,
-   record the EXACT false assumption, actual guarding condition or
-   misunderstood API, and evidence disproving the finding. For accepted
-   findings, record why the original review found the problem. Then
-   ask: what general verification rule would prevent the same error?
-5. Identify the failure mode of OUR REVIEW (missed producer/consumer,
-   unexpanded macro, wrong config, invalid lifetime/locking invariant,
-   mistaken impact, etc.), not merely whether the patch was accepted.
-   Test each proposed lesson against other plausible paths to avoid
-   overfitting. Promote a SHORT high-level rule to THIS file only when
-   genuinely useful across patches; leave specifics in the ledger.
-   Do not edit Tejun's workflow.
+4. Use the already scheduled weekly public Lore feedback check, and
+   examine any author/maintainer response supplied in chat immediately.
+   For meaningful feedback, reopen the entry, attribute the response,
+   verify its technical claims against actual source and update each
+   finding independently. For rejections, record the EXACT false
+   assumption, guard or misunderstood API and the disproving evidence.
+   For confirmations or partial rejections, identify any missed paths or
+   mistaken dismissals. Distill what a future independent review should
+   do differently to prevent false positives and false negatives.
+5. Promote a lesson to THIS AKPM workflow only if it improves review
+   methodology across patches. Do not append a special rule for every
+   bug, false positive, or argument. Do not edit upstream modules.
 6. Archive records which are resolved or sufficiently dormant to be
    removed from the active working set. Use one file per local close-off
    date, `review-activity-YYYY-MM-DD.md` (America/Los_Angeles). Several
@@ -331,44 +373,16 @@ The latter also indexes closed or dormant records in dated archives.
    the active index. Do not silently erase unresolved findings or
    author feedback; historical dated archives may stay in the git tree.
 
-## Lore feedback check: weekly, with immediate manual follow-up
-
-- A weekly Monday-morning scheduled check (America/Los_Angeles) looks
-  for NEW public replies to ACTIVE entries in `review-activity.md`.
-  It uses exact Message-IDs where known and otherwise verified subject
-  matches. It does not monitor dormant reviews or unsent draft replies.
-- Record per thread: original Message-ID, our sent reply ID if known,
-  last-seen reply IDs, last-check date, and meaningful dispositions.
-  Unrecorded IDs are UNKNOWN, never fabricated. Do not assert that a
-  thread was checked if Lore or the source file was inaccessible.
-- Scan new author/maintainer objections, corroboration, tests and new
-  patch revisions. Distinguish responses to OUR finding from generic
-  discussion. Inspect exact code at the relevant patch version before
-  assigning CONFIRMED, REJECTED, PARTIAL, UNRESOLVED or SUPERSEDED.
-- Deliver only meaningful changes; no weekly no-news notification.
-  Any feedback the user brings to chat gets assessed immediately,
-  without waiting for the scheduled check.
-- Primary output is the GENERAL REVIEW LESSON: our claim, concrete
-  author feedback, evidence confirming/refuting it, mistaken premise,
-  and a concise cross-patch rule that prevents recurrence. Update the
-  activity ledger first; only promote proven general rules into this
-  file. Do not copy email transcripts into workflow documentation.
-- A scheduled task cannot be assumed to see files modified only in
-  the user's local Git tree. Use a current accessible ledger if one is
-  available; otherwise report access limits and do not claim durable
-  updates. Never modify GitHub repositories without permission.
-
-A new chat normally needs `akpm-patch-review-workflow.md`,
-`tj-patch-review-workflow.md`, and `review-activity.md`. Retrieve dated
-archives only for the topics being resumed; do not preload them all.
+A new chat normally needs only `akpm-patch-review-workflow.md` and
+`review-activity.md`. Retrieve pinned Tejun and Chris sources on demand;
+retrieve dated archives only for resumed subjects.
 
 ## Handoff for subsequent chats
 
-Use `akpm-patch-review-workflow.md` as the entry point and attach
-`tj-patch-review-workflow.md` alongside it. Add `review-activity.md`
-when continuing reviews or incorporating author feedback, and supply
-only the archived `review-activity-YYYY-MM-DD.md` file indicated by its
-index for a resumed dormant subject. Treat Tejun's file as a read-only,
-verbatim upstream reference. Never modify it while refining AKPM's
-local preferences. The former `kernel-patch-review-workflow.md` is
-obsolete; do not attach it.
+Attach `akpm-patch-review-workflow.md` and `review-activity.md`. After
+the independent review pass, load the pinned Tejun modules and Chris
+prompts from their repositories, checking current versions as above.
+Retrieve only the dated `review-activity-YYYY-MM-DD.md` archive named by
+the active index for a resumed subject. Do not attach the historical
+`tj-patch-review-workflow.md` or `kernel-patch-review-workflow.md`.
+Neither file should be modified or deleted without authorization.
