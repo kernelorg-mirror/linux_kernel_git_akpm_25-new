@@ -43,7 +43,7 @@ when unchanged. Do not attribute this SHA to reviews R-001 through R-005.
 
 Repository: https://github.com/masoncl/review-prompts
 Upstream branch: `main`
-Last checked: 2026-10-16 (America/Los_Angeles)
+Last checked: 2026-10-17 (America/Los_Angeles)
 Checked HEAD: `d048f8742f6740c38833adf02e87901412d771ca`
 HEAD commit date: 2026-10-01 11:53:46 UTC
 HEAD subject: README: add pahole to the project lists
@@ -108,6 +108,12 @@ such a subject, consult the named active record or archive FIRST.
   ACTIVE: [R-004](#r-004); review of its [1/2], [2/2] series.
 - `ipc/sem: account enlarged sops arrays to memcg`
   ACTIVE: [R-005](#r-005); review response drafted.
+- `mm/vmalloc: read vm_map_ram block regions from the requested offset`
+  ACTIVE: [R-006](#r-006); v1 needs an off-by-one correction.
+- `proc/kcore: advance the vmalloc retry by the last copy, not the total`
+  ACTIVE: [R-007](#r-007); v1 source-reviewed, no defect found.
+- `mm: retry page faults once under the per-VMA lock`
+  STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
   DORMANT: A-001 in
   [review-activity-2026-10-16.md](review-activity-2026-10-16.md#a-001).
@@ -154,9 +160,18 @@ Method lesson: check EVERY writer and consumer of changed state, plus
 
 Subject: mm: multi-gen LRU: fix NULL lruvec->pgdat deref with memcg
   disabled on cmdline
-Author: Siddharth Chintamaneni. Version: [PATCH v1], 2026-10-17 UTC.
-Status: AUTHOR REPLIED 2026-10-16 PT; proposal assessed, awaiting v2.
-Fixes: `e4dde56cd208` (per-node MGLRU memcg lists).
+Author: Siddharth Chintamaneni. Latest: [PATCH v2 1/2] and [2/2],
+  2026-10-17 UTC. Earlier review: v1 and author reply 2026-10-16 PT.
+Status: v2 source reviewed; no introduced defect found; PENDING
+  author/maintainer feedback and runtime verification.
+V2 input: `mbox(20261017-195805)`; Message-IDs:
+  <20261017050928.128582-1-sidchintamaneni@gmail.com>
+  <20261017050928.128582-2-sidchintamaneni@gmail.com>
+Source comparison: `mm/vmscan.c` preimage blob `f11491ee9ed5` at
+  mainline `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`;
+  no explicit base-commit in the supplied v2 mbox.
+Fixes: [1/2] `e4dde56cd208` (per-node MGLRU memcg lists),
+  [2/2] `ec1c86b25f4b` (MGLRU groundwork); both verified.
 
 Findings:
 - R-002/F1: The one-line change from `&pgdat->__lruvec` to
@@ -185,9 +200,35 @@ Assessment: Recommended. Valid calls retain their selected lruvec,
   A NULL memcg with memcg *enabled* is already a WARN case: the old
   code returned the node lruvec; the new code returns the root memcg's
   per-node lruvec, a change only in that unsupported case.
-  Keep the original `lru_gen_shrink_node()` fix too. No revised patch
-  or runtime verification supplied yet.
-Next: inspect the author's v2 and any tests, then resolve F2.
+  Keep the original `lru_gen_shrink_node()` fix too.
+
+V2 focused review (2026-10-17):
+- [1/2] uses `mem_cgroup_lruvec(NULL, pgdat)` for disabled memcg
+  reclaim. This initializes the node `lruvec->pgdat` under
+  `CONFIG_MEMCG=y` and retains the node lruvec selection. Under
+  `CONFIG_MEMCG=n` the helper is a stub and `lruvec_pgdat()` uses
+  `container_of()`, so the initialization is unnecessary.
+- [2/2] implements the proposed common-helper `get_lruvec()`.
+  The source shows the MGLRU debugfs iterator uses this helper and
+  reads `lruvec_pgdat()`. The common helper selects and initializes
+  the correct lruvec on both disabled and enabled memcg paths.
+- The previous invalid `memcg == NULL` with memcg enabled WARN
+  remains. Its post-WARN return changes to the root memcg lruvec,
+  but no supported path relies on the old value; not a reported bug.
+- Similar-bug source search found the only direct node `__lruvec`
+  accesses in vmscan.c at the two changed sites. Initialization in
+  mm/mm_init.c is not another consumer; no further sibling found.
+- No v2 regression established. v2 reproducer and stack traces are
+  author-provided evidence, not tests executed in this review.
+  No build, runtime test, or parallel subagents here. The two review
+  passes were performed sequentially.
+- Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`
+  and Chris `d048f8742f6740c38833adf02e87901412d771ca`,
+  verified 2026-10-17; relevant core, MM reclaim, false-positive and
+  build guidance consulted. Sashiko's weekly refresh was not due;
+  previously accepted verification techniques applied.
+Next: await maintainer/author feedback and any runtime confirmation;
+  no source-based changes requested for v2.
 Method lesson: search nearby MM for sibling instances of the *cause*,
   not just calls to the changed function. Added to AKPM workflow.
 
@@ -267,6 +308,139 @@ Findings:
 
 Next: collect author feedback before labeling recommendations as
   fixes. Reevaluate whether the 1000 limit is appropriate.
+
+### R-006
+
+Subject: mm/vmalloc: read vm_map_ram block regions from the requested
+  offset
+Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-17.
+Message-ID: <20261017154120.795844-1-nickolai@csail.mit.edu>
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`
+Fixes: `06c8994626d1` (verified against original commit).
+Status: PENDING author feedback; read-only source review, no build or
+  kernel runtime test performed. Two separate sequential passes were
+  performed; no parallel review agents were available.
+
+Upstream guidance checked for this review:
+- Tejun: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  2026-10-17, applicable review, evidence and model modules.
+- Chris Mason: `d048f8742f6740c38833adf02e87901412d771ca`;
+  2026-10-17, core, technical, false-positive, build and relevant
+  MM allocation, XArray, locking and RCU guidance successfully loaded.
+- Sashiko: weekly refresh not due. Applied previously accepted
+  hypotheses/dispute/independent-path verification techniques.
+
+Findings:
+- R-006/F1: The two proposed changes (skipping earlier used-map runs
+  and deriving the copy offset from `addr - start`) fix the reported
+  wrong-page reads through `/proc/kcore`. Confirmed against the full
+  `vmap_ram_vread_iter()` and its `read_kcore_iter()` caller.
+- R-006/F2: The patch retains `(re - rs + 1) << PAGE_SHIFT` when it
+  computes `size`. `for_each_set_bitrange()` produces half-open
+  `[rs, re)` ranges, verified in `include/linux/find.h`. Therefore the
+  extent incorrectly includes the first clear bitmap page. During
+  `vb_free()`, `bitmap_clear()` precedes `vunmap_range_noflush()`;
+  a reader of that first cleared page can copy its still-present
+  mapping instead of zero-filling it. The off-by-one is pre-existing
+  (already in `06c8994626d1`), but this patch carries it forward.
+  Proposed correction: `size = (re - rs) << PAGE_SHIFT`.
+- R-006/F3: Finite enumeration: 78,336 stable bitmap/read cases matched
+  expected contents for either width. A concrete transient bitmap/PTE
+  mismatch returned stale page contents with the retained `+1`, versus
+  zero with the corrected size. These are logic tests, not kernel tests.
+
+Dismissed leads: `start + size` address overflow is blocked by the
+  bounded block allocation and `vread_iter()` range clipping; no
+  new lock ordering, non-block VMAP_RAM path, or vb lifetime change.
+Model: no formal model; local interval arithmetic and an explicit
+  two-actor ordering path suffice. No herd7 or TLC was run.
+Next: recommend v2 with the one-line size correction and consider a
+  test for an interior freed page followed by another live allocation.
+Method lesson: verify iterator/macro endpoint conventions against the
+  implementation before computing interval sizes. The independent
+  pass originally assumed an inclusive `re` and missed this bug.
+
+
+### R-007
+
+Subject: proc/kcore: advance the vmalloc retry by the last copy,
+  not the total
+Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-16 PT.
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
+Fixes: `4c91c07c93bb` (verified in the introducing commit).
+Status: PENDING author/maintainer feedback; no regression established.
+
+Finding R-007/F1: The old `KCORE_VMALLOC` retry loop accumulates bytes
+  in `read`, then incorrectly advances `src` and decreases `left` by
+  that total. Multiple short copies from a multi-iovec destination
+  can overadvance the source and underflow `left`, producing `EFAULT`.
+  The patch advances by this call's `n` and preserves `read` for the
+  completion test. The source and iterator now advance equally, and
+  `read + left == tsz` is maintained. Recommend taking the patch.
+
+Verification: Examined `read_kcore_iter()`, `vread_iter()`,
+  `aligned_vread_iter()`, `copy_page_to_iter_nofault()`,
+  `iterate_iovec()`, `fault_in_iov_iter_writeable()`, and the original
+  Fixes commit. Similar retry loops in GFS2 and Btrfs use the correct
+  respective return-value semantics; no confirmed sibling found.
+  Reproducer statistics are author-reported, not independently run.
+
+Minor prose observation: access to `/proc/kcore` is checked with
+  `CAP_SYS_RAWIO`, not strictly UID 0. Optional wording cleanup only.
+  No claim of bad data on successful reads was independently shown.
+
+Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  Chris `d048f8742f6740c38833adf02e87901412d771ca` checked
+  2026-10-17. Sashiko weekly refresh not due; existing techniques
+  applied. Passes were sequential; no subagents, build, live test,
+  TLC or herd7. Model: no (local retry/accounting arithmetic).
+
+Next: await author feedback. No new generalizable workflow change;
+  existing producer/consumer and similar-code checks cover this case.
+
+## Methodology studies
+
+### L-001
+
+Subject: mm: retry page faults once under the per-VMA lock
+Input: `mbox(20261017-211929)`; 12 messages, 2026-09-11 to 2026-10-03.
+Root Message-ID: <20260911025613.1220845-1-zhanghongru@xiaomi.com>
+Supplied v6 base: `3628c3df6cd2797b34714d23113cd44cb30801e7`.
+Status: methodology study completed 2026-10-17, NOT a completed review
+  of v6 or its experimental alternatives. No merge verdict inferred.
+
+Evidence and distinctions:
+- Lorenzo's 2026-09-21 reply <arFYRAa-i7CIwmHL@gremlin> challenges
+  the workload framing, overloaded retry semantics, architecture
+  duplication and the cost of a small workaround. His 2026-09-22
+  follow-up allows an interim fix alongside longer-term redesign.
+- Matthew's 2026-09-21 reply
+  <arF-E3Nsw9ZliH0t@casper.infradead.org> distinguishes retry from a
+  requirement for mmap_lock and corrects some AI-derived claims. Treat
+  that list as disputed leads, not a verified catalogue of bugs.
+- Matthew's 2026-10-01 alternative
+  <ar7MsOb6IJLt4eLo@casper.infradead.org> removes parent VMA write
+  locking during fork. Lorenzo's 2026-10-02 response
+  <ar-o1TrOMGrrcxLX@gremlin> cites past corruption and explains parent
+  CoW/TLB, THP and PTE-table stability assumptions, plus contention
+  shifted to other VMA writers. This concerns the alternative, not a
+  demonstrated regression introduced by Hongru's original retry patch.
+- Independently fetched historical commit
+  `fb49c455323ff8319a123dd312be9082c49a23a5`: it adds parent VMA
+  write locking and explains source-VMA/anon_vma stability during fork.
+  The other detailed source claims in this thread were not all audited.
+- Xueyuan reports real-app gains; Hongru supplies a writer-queue causal
+  explanation, more app measurements and a Perfetto screenshot. Barry
+  identifies Android KMI constraints and prior VMA-lock/fork contention.
+  These are supplied observations, not tests run in this study. The
+  screenshot is not a complete before/after performance validation.
+
+Method change: architectural framing, safeguard provenance, whole-
+  operation invariants, cost shifting and bounded alternatives are now
+  in the standalone AKPM workflow. Preserve rejected designs and their
+  reasons between revisions. Do not label this as a prior false negative
+  by our review: no earlier review of this v6 patch is recorded here.
+Upstream review prompts were not refreshed for a methodology-only study.
 
 ## Maintenance reminder
 

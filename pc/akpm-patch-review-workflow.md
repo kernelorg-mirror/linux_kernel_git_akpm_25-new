@@ -49,7 +49,8 @@ For every review, including single patches and mbox series:
 3. Reconcile the two passes. Compare their path coverage, not just their
    reported bugs. Investigate paths checked by only one pass, resolve
    disagreements, eliminate false positives, and deliver ONE combined
-   judgment. Indicate the origin of a finding when informative.
+   judgment. Keep bug proof, fix proof and architectural suitability
+   distinct. Indicate the origin of a finding when informative.
 
 Both passes must use their own producer/consumer inventory and inspect
 all relevant paths. Do not simply relabel one pass as two. If the tools
@@ -195,6 +196,72 @@ Sashiko review pass, or copy or maintain its upstream workflow locally.
 - Scale effort to the change. Favor a fast, decisive review of small
   fixes; use more research and modeling for subtle, consequential bugs.
   Tractability matters, but never replace required coverage with speed.
+
+## Architectural and historical framing: BOTH passes
+
+Do not accept the patch's framing without checking it. Distinguish a
+real problem, a safe repair, and a suitable design. Use these questions
+within the existing passes, not as another full review pipeline:
+
+- Identify the actual workload, observable goal and bottleneck. Connect
+  measurements to the proposed mechanism; distinguish synthetic stress,
+  representative workloads and effects on competing operations. Keep
+  deployment constraints separate from general upstream requirements.
+- Identify the contract and its owner before adding another exception.
+  For overloaded flags or results, distinguish progress, lock ownership,
+  retry eligibility and mandatory fallback using the existing coverage
+  inventory. Shared spelling does not establish shared semantics.
+- Before removing or weakening a lock, check, retry rule or other
+  safeguard, inspect why it was introduced: relevant history, fixes,
+  reverts, discussion and reproducers. State which old failure it blocks
+  and what changed to make that protection unnecessary. Follow moved
+  code where needed; unknown history is not evidence of redundancy.
+- Trace the whole operation, including changes to source/parent objects,
+  cached state and deferred completion. Identify which protection spans
+  that operation and what lower-level code assumes. A local lock or a
+  harmless userspace interleaving does not prove the full protocol safe.
+- Ask whether the change removes work or moves waiting and risk to other
+  callers. Repeated policy in architecture or subsystem wrappers is a
+  reason to consider a common owner. Count new states, exceptions and
+  future synchronization work, not only changed lines. Do not demand an
+  unrelated redesign merely because shared code would be cleaner.
+- Compare the bounded workaround with the structural alternative and
+  the status quo. Separate correctness findings from architectural and
+  performance tradeoffs. An interim improvement may be worth taking,
+  but name its scope and remaining debt; a simpler-looking alternative
+  needs the same evidence and fix proof as the submitted patch.
+
+Keep this proportional: a brief framing check for routine patches;
+expand targeted history and design analysis only for material questions.
+Reuse verified context. Record consequential rejected alternatives and
+why they failed in the review record, with references, so later versions
+and chats do not restart a settled design discussion. Reopen a rejection
+when its premises change. Do not turn these examples into special rules
+for individual patches or treat maintainer recollection as proof.
+
+## Separate bug proof from fix proof: mandatory in BOTH passes
+
+Demonstrating the old failure does not establish that the proposed fix
+is correct. Treat these as two separate proof obligations:
+
+- Bug proof: trace a reachable old-code path to the reported observable
+  failure, distinguishing reproduction from inferred consequences.
+- Fix proof: enumerate what the patch changes for ALL relevant paths,
+  configurations, owners and lifecycle stages, not just the reproducer.
+  State the invariant that must hold when new behavior becomes visible,
+  including who can still access or release the affected object.
+- Check the earliest point at which the new state, flag or decision is
+  published. Follow outstanding references, sharing, error cleanup,
+  asynchronous work, retries, and concurrency across that point.
+- Verify that the fix removes the original failure without creating a
+  new failure or suppressing a legitimate recovery path. Compare both
+  the old and new results for each reachable state class.
+- Where fix safety rests on a premise not established by source, mark it
+  UNRESOLVED and name the missing guard, ordering rule or test. Do not
+  turn proof of the original failure into presumed proof of the repair.
+
+Apply this explicitly during reconciliation; keep the two proof results
+separate even when an author has supplied a convincing reproducer.
 
 ## Mandatory impact-coverage gate, in BOTH passes
 
