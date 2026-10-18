@@ -236,6 +236,21 @@ within the existing passes, not as another full review pipeline:
   performance tradeoffs. An interim improvement may be worth taking,
   but name its scope and remaining debt; a simpler-looking alternative
   needs the same evidence and fix proof as the submitted patch.
+- When a fix adds a preparation scan, prefetch, readahead, or retry,
+  measure its cost on the COMMON successful path, not just the reported
+  failure: extra lookups, folio locks, waiting, drains, allocations,
+  passes and I/O. Ask whether work needed only after an exceptional
+  event can run on demand after unwinding held locks/references. Compare
+  eager and deferred designs before recommending an upstream merge;
+  a correct lock-order fix can still be unnecessarily expensive.
+- Before introducing local retries or prepasses, examine higher callers
+  for existing recovery and bounded retry machinery. Prefer one clear
+  owner of each retry, with established status codes and cleanup; prove
+  the alternative's locking, object lifetime and forward progress too.
+- Choose a clean, maintainable UPSTREAM fix on its merits. Older stable
+  branches may need separate adapted backports and validation; missing
+  infrastructure there is not by itself a reason to complicate the
+  upstream design or duplicate existing retry logic.
 
 Keep this proportional: a brief framing check for routine patches;
 expand targeted history and design analysis only for material questions.
@@ -342,6 +357,15 @@ its underlying bug pattern, not merely other calls to the changed helper.
 - For concurrency, identify actors and shared data; show an explicit
   interleaving and test it against locks, references and barriers.
   Distinguish a state-machine interleaving from LKMM ordering.
+- For each inserted path and goto/cleanup label, establish which
+  locks and references are actually held THERE. Do not infer ownership
+  from an adjacent old code path, or treat a removed unlock as a bug
+  without confirming the new path acquired that lock.
+- For asynchronous reads, a completed wait or successful folio lock
+  does NOT establish successful I/O or PG_uptodate. Separately decide
+  whether a true status check is necessary AT THAT STAGE, especially
+  when the eventual consumer already checks it. Validate semantics
+  and necessity independently; don't retain redundant work by default.
 - Consider the strongest counterargument to each suspected bug, then
   resolve it with actual source. Do not report defensive programming
   suggestions without a reachable failure.
@@ -569,6 +593,18 @@ override conflicting upstream style defaults.
 - Keep the final response compact and useful. Do not recite the review
   methodology or a checklist unless specifically requested. Provide
   plain-ASCII, 75-column, LKML-ready email text when asked.
+
+## Artifact delivery: mandatory
+
+- When creating or updating Markdown or other project files, provide
+  direct, verified, download-ready links for EACH resulting file.
+- Prefer the platform download tray when available. Never substitute
+  formatted file cards, decorative layouts or descriptive text for
+  actual download links.
+- Verify each exact generated file path exists before linking it. If
+  a file or tray delivery is unavailable, say so rather than claiming
+  it was delivered.
+- Never delete or replace a user file without authorization.
 
 ## Review activity, feedback and archive protocol
 

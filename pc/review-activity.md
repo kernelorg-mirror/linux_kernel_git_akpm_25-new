@@ -120,8 +120,6 @@ such a subject, consult the named active record or archive FIRST.
   ACTIVE: [R-010](#r-010); v1 sound, security coordination pending.
 - `mm/mempolicy: apply bind policies against the scoped allocation zone`
   ACTIVE: [R-011](#r-011); source-reviewed, take as submitted.
-- `zram: redesign zcomp and rework backends`
-  ACTIVE: [R-013](#r-013); v5 source-reviewed; tests requested.
 - `mm: retry page faults once under the per-VMA lock`
   STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
@@ -780,72 +778,6 @@ preparation, compare deferred recovery after rollback, search for
 higher-level retry owners, separate check validity from necessity,
 track lock state at each new path, and favor upstream design over
 backport convenience. General lessons added to the AKPM workflow.
-
-### R-013
-
-Subject: zram: redesign zcomp and rework backends
-Author: Sergey Senozhatsky. Version: [PATCH v5 00/13], 2026-10-18
-  (+0900). Input: user-supplied mbox with all 13 patches and two older
-  v1 discussion replies, 2026-10-17 PT.
-Status: SOURCE REVIEW COMPLETE; no proven code defect; ask for
-  correctness/stress validation before taking the full series.
-
-Independent pass:
-- [01-08/13]: printk prefix, debugfs cleanup, dictionary and workspace
-  optimizations, and writeback reset inspected. No confirmed defect.
-- [09/13]: compression and decompression stream split preserves each
-  backend's mutable-context ownership; zstd/deflate retain exclusive
-  dctx, while LZO/LZ4/842 decompression is stateless. CPU hotplug
-  releases C/D contexts using their separate locks. No proven defect.
-- [10-11/13]: stateless decompression can use a read-held lifetime
-  semaphore; mutable dctx and the fallback local_copy require the
-  exclusivity mutex. Spanning objects use a GFP_NOWAIT bounce buffer
-  with serialized fallback. SG lifetime maintained. No proven defect.
-- [12/13]: wait_event() repeatedly scans online CPUs and acquires a
-  read pin plus exclusive mutex by trylock. Release wakes waiters;
-  bounce-buffer fallback also wakes. The online CPU stream is pinned
-  through hotplug teardown. No proven missed wake or UAF.
-- [13/13]: secondary compressors are used by recompress_store() under
-  dev_lock write; singleton compressor preserves independent per-CPU
-  decompressors for reads. Allocation and cleanup paths examined.
-- Although read_compressed_page() may sleep between
-  zs_obj_read_sg_begin/end(), current zsmalloc's counted reader pin
-  explicitly permits sleeping (its writer uses trylock); not a bug.
-
-Actionable feedback:
-- Large synchronization and allocation series warrants documented
-  round-trip/corruption and CPU hotplug/reset/failure-injection tests,
-  especially zstd/deflate dictionaries, lz4hc and multi-CPU exclusive
-  stream borrowing. Submitted benchmarks are performance evidence,
-  not an exhaustive correctness matrix; no tests run here.
-- [08/13] changelog should make the userspace symptom explicit:
-  reset of a reused zram device retained writeback limits/options,
-  potentially causing unexpected -EIO on later writeback when the
-  retained enabled limit is zero. Historical commit cited in prose;
-  assess Fixes/stable separately if a maintained branch is affected.
-- Older [00/10] replies request deferral until next -rc1; no
-  contradiction with current v5, and no request for immediate merge.
-
-Impact-changelog: [08/13] needs a concrete operational example for
-  downstream diagnosis; rest are principally performance or local
-  resource fixes. Stable: [08/13] possible standalone candidate,
-  requires affected-tree confirmation. Do not stable-tag 13-patch
-  performance redesign automatically.
-
-Guided review: Tejun HEAD
-  c8cc6a8bee854cf2850f44e0a61be581c19f1d4e; Chris HEAD
-  d048f8742f6740c38833adf02e87901412d771ca, checked 2026-10-17.
-  Inspected patch-review, evidence, kernel-idioms, technical,
-  false-positive, block, locking, allocator and build guidance;
-  no new source-supported defect from guided pass.
-Validation: source-only against submitted diffs, Linux mainline
-  backend implementation and public linux-next zsmalloc reference;
-  the zcomp SG conversion predates mainline snapshot and was supplied
-  as part of the patch preimage. No build, test, formal model or
-  independent performance benchmark performed.
-Next: request concise functional/stress coverage and strengthen the
-  [08/13] changelog; review follow-up before applying a tag. Reply
-  drafted, NOT SENT.
 
 ## Maintenance reminder
 
