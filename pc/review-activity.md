@@ -109,9 +109,15 @@ such a subject, consult the named active record or archive FIRST.
 - `ipc/sem: account enlarged sops arrays to memcg`
   ACTIVE: [R-005](#r-005); review response drafted.
 - `mm/vmalloc: read vm_map_ram block regions from the requested offset`
-  ACTIVE: [R-006](#r-006); v1 needs an off-by-one correction.
+  ACTIVE: [R-006](#r-006); v2 resolves v1 issue; no new defect.
 - `proc/kcore: advance the vmalloc retry by the last copy, not the total`
   ACTIVE: [R-007](#r-007); v1 source-reviewed, no defect found.
+- `mm/mremap: do not charge a shrinking move twice`
+  ACTIVE: [R-008](#r-008); v1 code sound, changelog needs correction.
+- `ucount: take the rlimit reference before checking the limit`
+  ACTIVE: [R-009](#r-009); v1 source-reviewed, code sound.
+- `lib/buildid: reject file offsets that do not fit in pgoff_t`
+  ACTIVE: [R-010](#r-010); v1 sound, security coordination pending.
 - `mm: retry page faults once under the per-VMA lock`
   STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
@@ -313,52 +319,53 @@ Next: collect author feedback before labeling recommendations as
 
 Subject: mm/vmalloc: read vm_map_ram block regions from the requested
   offset
-Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-17.
-Message-ID: <20261017154120.795844-1-nickolai@csail.mit.edu>
-Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`
-Fixes: `06c8994626d1` (verified against original commit).
-Status: PENDING author feedback; read-only source review, no build or
-  kernel runtime test performed. Two separate sequential passes were
-  performed; no parallel review agents were available.
+Author: Nickolai Zeldovich. Latest: [PATCH v2], 2026-10-17.
+V1 Message-ID: <20261017154120.795844-1-nickolai@csail.mit.edu>.
+V2 Message-ID: not supplied in this chat; v2 full patch supplied.
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
+Fixes: `06c8994626d1` (verified introducing commit).
+Status: v2 source-reviewed, no additional change requested. PENDING
+  maintainer feedback; author tests not independently reproduced.
 
-Upstream guidance checked for this review:
-- Tejun: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
-  2026-10-17, applicable review, evidence and model modules.
-- Chris Mason: `d048f8742f6740c38833adf02e87901412d771ca`;
-  2026-10-17, core, technical, false-positive, build and relevant
-  MM allocation, XArray, locking and RCU guidance successfully loaded.
-- Sashiko: weekly refresh not due. Applied previously accepted
-  hypotheses/dispute/independent-path verification techniques.
+Findings and v1-to-v2 resolution:
+- R-006/F1: v1 and v2 skip expired used-map runs and copy at the
+  requested offset (`addr - start`). Verified against the entire
+  `vmap_ram_vread_iter()` and its `vread_iter()` and kcore callers.
+- R-006/F2: v1 retained a pre-existing off-by-one: it counted
+  `[rs, re)` as `(re - rs + 1)` pages, including the first clear bit.
+  With `vb_free()` clearing used-map bits before unmapping, a reader
+  could copy a newly freed page. V2 correctly uses `(re - rs)` pages.
+  The author supplied an additional `msleep()` race reproducer showing
+  zero-fill with v2; the author ran it, not this reviewer.
+- R-006/F3: V2 finite enumeration checked 135,168 combinations of
+  eight-bit page-occupancy maps, read offsets and lengths with a
+  four-byte simulated page; all matched the expected bitmap-based
+  contents. This tests stable-map arithmetic, not kernel concurrency.
 
-Findings:
-- R-006/F1: The two proposed changes (skipping earlier used-map runs
-  and deriving the copy offset from `addr - start`) fix the reported
-  wrong-page reads through `/proc/kcore`. Confirmed against the full
-  `vmap_ram_vread_iter()` and its `read_kcore_iter()` caller.
-- R-006/F2: The patch retains `(re - rs + 1) << PAGE_SHIFT` when it
-  computes `size`. `for_each_set_bitrange()` produces half-open
-  `[rs, re)` ranges, verified in `include/linux/find.h`. Therefore the
-  extent incorrectly includes the first clear bitmap page. During
-  `vb_free()`, `bitmap_clear()` precedes `vunmap_range_noflush()`;
-  a reader of that first cleared page can copy its still-present
-  mapping instead of zero-filling it. The off-by-one is pre-existing
-  (already in `06c8994626d1`), but this patch carries it forward.
-  Proposed correction: `size = (re - rs) << PAGE_SHIFT`.
-- R-006/F3: Finite enumeration: 78,336 stable bitmap/read cases matched
-  expected contents for either width. A concrete transient bitmap/PTE
-  mismatch returned stale page contents with the retained `+1`, versus
-  zero with the corrected size. These are logic tests, not kernel tests.
+Architectural/historical check (v2): Introducing commit `06c8994626d1`
+  deliberately made used-map regions readable and holes zero-filled.
+  The bitmap defines the intended public `/proc/kcore` contents, not
+  temporarily present page-table mappings. Fixing the reader rather
+  than changing kcore or the alloc/free ordering is correctly scoped.
+  `vb_alloc()` sets bits under `vb->lock`; `vb_free()` clears them
+  under that lock before unmapping. `vread_iter()` retains its
+  `vn->busy.lock` while the block reader obtains `vb->lock`.
+  `free_vmap_block()` unlinks the VA under `vn->busy.lock` before RCU
+  freeing the block, so no new block-lifetime problem was found.
+  Direct, non-VMAP_BLOCK allocations follow `aligned_vread_iter()`
+  unchanged. The separate kcore retry issue is tracked as R-007.
 
-Dismissed leads: `start + size` address overflow is blocked by the
-  bounded block allocation and `vread_iter()` range clipping; no
-  new lock ordering, non-block VMAP_RAM path, or vb lifetime change.
-Model: no formal model; local interval arithmetic and an explicit
-  two-actor ordering path suffice. No herd7 or TLC was run.
-Next: recommend v2 with the one-line size correction and consider a
-  test for an interior freed page followed by another live allocation.
-Method lesson: verify iterator/macro endpoint conventions against the
-  implementation before computing interval sizes. The independent
-  pass originally assumed an inclusive `re` and missed this bug.
+Dismissed leads: `start + size` stays within the block's VA range;
+  the copy size is capped by `remains`; zero-fill handles holes and
+  partial user copies. No new lock nesting or material fast-path cost.
+Model: no formal model; local interval logic and lock order suffice.
+  No kernel build, runtime test, TLC or herd7 was executed here.
+Review: two sequential passes, no parallel subagents. Tejun
+  `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`; Chris
+  `d048f8742f6740c38833adf02e87901412d771ca` checked
+  2026-10-17. Sashiko weekly refresh not due; prior methods applied.
+Next: take v2 as submitted; await feedback. Preserve the general
+  lesson of verifying iterator endpoint conventions against source.
 
 
 ### R-007
@@ -397,6 +404,61 @@ Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
 
 Next: await author feedback. No new generalizable workflow change;
   existing producer/consumer and similar-code checks cover this case.
+
+### R-008
+
+Subject: mm/mremap: do not charge a shrinking move twice
+Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-17.
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
+Fixes: `b714ccb02a76` (refactoring move_vma; verified).
+Status: PENDING author/maintainer feedback; no introduced defect found.
+
+Findings:
+- R-008/F1: `check_prep_vma()` records original `vrm->delta` as the
+  positive length difference. `mremap_to()` unmaps the shrink tail
+  (which uncharges VM_ACCOUNT), then changes `vrm->old_len` to
+  `vrm->new_len` without updating delta. `move_vma()` calls
+  `vrm_calc_charge()`, which charges the stale positive delta through
+  `security_vm_enough_memory_mm()`. The move's source unmap suppresses
+  uncharging using VMA_ACCOUNT, and the extra global commitment survives
+  future unmap/exit. An original 2 MiB -> 1 MiB move leaks 1 MiB of
+  Committed_AS. The proposed second `vrm_set_delta()` sets delta=0
+  after the shrink; both successful and failed move paths keep correct
+  charging. Recommend taking the one-line patch.
+- R-008/F2: Every use of `vrm->delta` in mm/mremap.c was inventoried.
+  Early checks and shrink operation use the original value, before the
+  reset. Non-fixed in-place shrink, expansion and MREMAP_DONTUNMAP do
+  not take the changed path. `remap_move()` recalculates delta when
+  processing same-sized subranges; `copy_vma_and_data()` may also
+  change old_len on error but no subsequent delta consumer depends on
+  it. The unchanged remap_type still describes the initial request.
+- R-008/F3: Material changelog correction requested: the statement
+  that a move which does NOT unmap its source needs only a growth charge
+  is backwards. `vrm_calc_charge()` charges the entire new mapping for
+  `MREMAP_DONTUNMAP` and just delta for the ordinary move, which unmaps
+  its source. Here shrink_vma() already uncharged the tail, so the
+  subsequent ordinary move requires zero extra pages. Also optional:
+  "every accounted allocation ... fails until reboot" is too absolute,
+  as unrelated mappings may be released. `vrm_set_delta()`'s comment
+  "specified by user" should refer to the now-current remap lengths.
+
+Architecture/history: correct layer for charge delta is `mremap_to()`
+  after mutation of lengths and before `move_vma()` charges. Similar
+  known MREMAP_DONTUNMAP `VM_ACCOUNT`/locked_vm corrections from the
+  same historical refactor are distinct and not touched by this patch.
+Author tests: QEMU x86_64 defconfig; 1000 shrink/moves leaked 1 GiB
+  before, zero afterward (author-reported, not run here).
+Verification: source examined in mm/mremap.c, mm/vma.c, mm/mmap.c,
+  mm/util.c, and original Fixes commit. No build/runtime test.
+Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  Chris `d048f8742f6740c38833adf02e87901412d771ca`, checked
+  2026-10-17. Two sequential passes; no parallel subagents.
+Model: no (local derived-state and accounting arithmetic; no new
+  concurrency protocol).
+Next: request corrected changelog before taking; code itself sound.
+  Consider Cc stable due systemic overcommit regression. Await feedback.
+No new general workflow rule: current bug/fix/architecture and full
+  consumer inventory requirements cover the missed-state pattern.
 
 ## Methodology studies
 
@@ -441,6 +503,133 @@ Method change: architectural framing, safeguard provenance, whole-
   reasons between revisions. Do not label this as a prior false negative
   by our review: no earlier review of this v6 patch is recorded here.
 Upstream review prompts were not refreshed for a methodology-only study.
+
+### R-009
+
+Subject: ucount: take the rlimit reference before checking the limit
+Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-17.
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
+Fixes: `15bc01effefe` (verified introduction in 2021).
+Status: PENDING author/maintainer feedback; no introduced defect found.
+
+Findings:
+- R-009/F1: Old `inc_rlimit_get_ucounts()` increments a per-namespace
+  rlimit count before checking max, but takes the extra `get_ucounts()`
+  reference only after passing that check. A 0->1 increment failing
+  its limit while another override-rlimit charge increments to 2 can
+  leave an accepted positive count without its expected extra ref.
+  A later 1->0 decrement calls an unmatched `put_ucounts()`, risking
+  premature removal/free of a live ucounts and its pinned namespace.
+  The reverse interleaving can leak the extra reference.
+- R-009/F2: The patch takes `get_ucounts()` upon observing new==1 before
+  testing the limit, then uses `do_dec_rlimit_put_ucounts(ucounts,
+  iter->ns->ucounts, type)` to unwind the rejecting level inclusively.
+  The helper's stop argument is exclusive and caches `next` before
+  calling `put_ucounts()`. The no-reference-acquired `dec_unwind` case
+  remains unchanged. No new lock or blocking operation introduced.
+- R-009/F3: `kernel/signal.c` uses this API for SIGPENDING; ordinary
+  realtime signal queues enforce the limit while forced synchronous
+  signals can bypass it. Task credentials are read under RCU and the
+  namespace/ucounts chain supplies lifetime protection during lookup.
+  Other rlimit counter APIs use distinct rlimit types (NPROC, MEMLOCK,
+  MSGQUEUE), so no confirmed analogue of this reference-handoff bug.
+
+Verification: inspected kernel/ucount.c, kernel/signal.c,
+  include/linux/user_namespace.h, kernel/user_namespace.c,
+  include/linux/rcuref.h and introducing Fixes commit. A bounded
+  two-participant scheduler model reached both unmatched-put and
+  leaked-reference outcomes in the old ordering, and neither in the
+  patched ordering (48 old states, 58 patched states). This is a
+  simplified interleaving model, not a kernel test or formal proof.
+Architecture: fix belongs in the common rlimit increment/reference
+  handoff. The extra reference represents positive occupancy at each
+  hierarchy level, not a reference per queued signal. Caller-held
+  lifetime must cover the short interval from atomic increment to
+  conditional get; verified for the signal caller and parent chain.
+Tests: author reports a reproducer under KASAN/rcuref debug, but its
+  code and output were not supplied. No build/runtime test here.
+Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  Chris `d048f8742f6740c38833adf02e87901412d771ca`, checked
+  2026-10-17. Two sequential passes, no parallel review subagents;
+  Sashiko weekly refresh not due. No TLC/herd7 used.
+Reassessment (2026-10-17 PT; stable rules and user-impact gate):
+- impact-changelog: sufficient. The text identifies CONFIG_USER_NS,
+  privilege and signal-limit conditions, a concrete stale reference
+  outcome, and possible premature freeing/UAF or retained namespace.
+  These are source-supported possible harms, not known fleet incidents.
+- stable: prospective candidate upon mainline merge. A reproducible
+  harmful race needs no previously reported victims. Recommend
+  `Cc: stable@vger.kernel.org` in commit trailers, not just email Cc.
+  Author says KASAN/rcuref reproducer exists; code and diagnostic output
+  have not been supplied, and older-branch backports are not tested.
+- Concrete reachability refinement: ordinary signal delivery and
+  forced synchronous delivery both hold the target `sighand->siglock`.
+  Two threads sharing that sighand cannot execute those paths in
+  parallel. The cited scenario requires two distinct sighands sharing
+  one per-(user namespace,UID) ucounts (e.g. separate processes).
+  Request clarification of the author's reproducer, not a code change.
+- Fresh bounded two-actor scheduler check (one limit failure, one
+  accepted charge, both role orderings) found an unmatched put and a
+  leaked ref under old ordering (30 states per case); patched ordering
+  balanced both cases (38 states per case). Only a finite logical
+  interleaving test; assumes valid caller references and successful
+  get_ucounts(), not a kernel run, LKMM proof, or actual exploit.
+Next: take code; ask for distinct-sighand explanation and brief
+  before/after reproducer output; recommend stable trailer. Await
+  author/maintainer feedback.
+
+### R-010
+
+Subject: lib/buildid: reject file offsets that do not fit in pgoff_t
+Author: Nickolai Zeldovich. Version: [PATCH v1], 2026-10-17.
+Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
+Fixes: `de3ec364c3c3` (verified in 2024-09-11 introducing commit).
+Input: `Pasted text(20261018-014757).txt` (private security report).
+Status: PENDING author/security maintainers' feedback. Source review
+  supports the overflow and repair; no independent kernel test/build.
+
+Findings:
+- R-010/F1: On 32-bit, `file_off >> PAGE_SHIFT` (from 64-bit loff_t)
+  narrows to 32-bit pgoff_t for `filemap_get_folio`. An out-of-range
+  ELF64 header offset can select the wrong cached folio. `freader_fetch`
+  assumes it covers the requested offset; when it does not, the
+  cross-folio size subtraction underflows and the ensuing `memcpy`
+  can exceed the 64-byte on-stack buffer in `__build_id_parse`.
+  Author reports an i386 stack-protector panic, not reproduced here.
+- R-010/F2: Proposed guard in `freader_get_folio()` rejects negative
+  and above-MAX_LFS_FILESIZE file offsets before `filemap_get_folio`.
+  On 32-bit, MAX_LFS_FILESIZE bounds the page index representable by
+  pgoff_t; on 64-bit it is LLONG_MAX. Guard is also exercised for
+  subsequent folio fetches. The faultable __kernel_read path and
+  memory-backed reader are not changed. No introduced defect found.
+- R-010/F3: Perf hook in `kernel/events/core.c` uses the nofault build
+  ID reader when the global `nr_build_id_events` is nonzero. BPF
+  build-ID stack maps also reach it. Exposure depends on the presence
+  of an active build-ID perf event and perf/BPF access policies. The
+  author demonstrates the trigger with perf configured to permit his
+  test; do not imply every default configuration admits an unprivileged
+  event creation. This is changelog qualification, not code defect.
+
+Architecture: correct layer to validate an offset before converting to
+  pgoff_t; existing `freader_fetch()` copy-size precheck only ensures
+  the requested `sz` fits, not a computed `part_sz` after invalid folio
+  lookup. Avoid changing general page-cache APIs for a bad caller.
+Impact-changelog: sufficient for observed stack corruption and general
+  affected scope; consider clarifying the active perf-event prerequisite
+  and distinguish demonstrated panic from any exploitability claims.
+Stable: prospective candidate after upstream/security coordination;
+  severe source-supported corruption on 32-bit, tested per author;
+  verify stable targets and avoid a public stable trailer before the
+  security process permits publication. For unpublished vulnerability,
+  stable-kernel-rules documents `Cc: stable@kernel.org` privately.
+Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  Chris `d048f8742f6740c38833adf02e87901412d771ca`, checked
+  2026-10-17. Used MM folio, BPF, core, evidence, false-positive and
+  build guides. Sashiko weekly refresh not due. Sequential passes;
+  no formal model, live reproducer, build, KASAN or public disclosure.
+Next: take code; request only a precise note on build-ID perf event
+  prerequisites if author replies. Handle privately with recipients and
+  security team; do not redistribute supplied reproducer publicly.
 
 ## Maintenance reminder
 

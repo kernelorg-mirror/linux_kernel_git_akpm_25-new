@@ -340,22 +340,163 @@ its underlying bug pattern, not merely other calls to the changed helper.
   resolve it with actual source. Do not report defensive programming
   suggestions without a reachable failure.
 
-## Changelog and review standards
+## User-visible impact and changelog gate: mandatory for EACH bugfix
 
-- For EVERY bug fix, require a prominent, concrete statement of the
-  userspace-visible RUNTIME effects of the original bug. Do not stop at
-  internal mechanics, a warning, a counter or a missing lock if more
-  specific runtime consequences can be established.
-- Distinguish observed/reproduced effects, source-supported possible
-  effects, and speculation. Avoid claims of exploitation, disclosure,
-  corruption or crashes without a well-supported execution path.
-- Check trigger conditions, how the fix changes the observable outcome,
-  and whether regression tests actually exercise the original failure.
-- Review `Fixes:`, stable suitability, patch ordering, changelogging,
-  comments, API semantics, coding style, and both expected and unexpected
-  behavior changes. Favor concrete replacement wording over vague advice.
-- When evaluating a disputed result, review the exact runtime mechanism.
-  External AI reviews, human comments, and docs provide leads, not proof.
+Bugfix changelogs must answer "why should users care?" BEFORE spending
+most of their space on internal code mechanics. The changelog is a durable
+diagnostic and backporting resource for upstream, -stable, distro/vendor
+maintainers, and operators investigating affected deployed kernels.
+
+In BOTH review passes, independently determine and check:
+
+1. The observable failure: what a user, program, service, administrator,
+   or fleet sees (errno, wrong output, stale data, timeout, hang, crash,
+   data loss, performance/latency regression, resource exhaustion, etc.).
+   Identify the affected operation/workload, trigger and configuration.
+   Include a distinctive diagnostic signature (log, warning, trace,
+   metric, command or reproduction) where one is established. State when
+   a failure is silent and what measurement reveals it.
+2. Scope and impact: which users or systems can hit it, required privileges
+   and configuration, affected versions when verified, observed severity,
+   and credible worst-case consequences. Distinguish *observed* results,
+   source-supported possible outcomes and conjecture; never upgrade an
+   internal warning or hypothetical race into a claimed fleet crash or
+   exploitable security issue without an established path. Lack of any
+   reported incident does NOT make a real, attacker-triggerable bug
+   unimportant: an adversary can deliberately repeat a rare trigger.
+   For that case, identify the attacker's accessible entry point,
+   controllable inputs, required privilege/configuration, how repeated
+   attempts reach the defect, and the credible harmful consequence.
+   Distinguish demonstrated exploitation, source-supported attack paths,
+   and merely imagined exploits. Do not require known victims or a
+   reliable proof-of-concept when the harmful path is established.
+3. Expected improvement: what changes from the affected user's point of
+   view after applying the fix. Keep mechanism and fix explanation, but do
+   not let them substitute for the preceding user-facing information.
+4. Operational lookup: would someone with a report from a production
+   6.x.y kernel recognize that this fix applies? Check that the changelog
+   has enough conditions, symptoms and evidence to match the report and
+   decide whether a downstream backport is worth the regression risk.
+5. If NO userspace-visible runtime effect is known, require a concise,
+   explicit statement to that effect, justified by the paths reviewed.
+   If impact is unknown or has not been traced, say so: do NOT conflate
+   "not demonstrated" with "none". Investigate plausible consequences
+   yourself first, then request targeted author clarification if needed.
+   For a series, the [0/N] may summarize a proven no-effect conclusion,
+   but each bugfix still needs sufficient standalone explanation.
+
+Treat missing or weak impact description as a substantive changelog
+finding, even when the code fix is correct. Supply concrete replacement
+text or the exact question to ask the author, not just "more detail".
+The observed/possible/unknown distinction is part of the fix-proof gate.
+
+## Stable-backport eligibility gate: mandatory for EACH patch and series
+
+Source (read and verified 2026-10-17):
+Documentation/process/stable-kernel-rules.rst, Linux mainline
+https://www.kernel.org/doc/html/latest/process/stable-kernel-rules.html
+Also read Documentation/process/submitting-patches.rst, especially
+"Describe your changes", "Fixes:" and stable-tag instructions.
+Apply the following actual stable rules, not a generic preference for
+backporting all fixes:
+
+- A fix (or equivalent) must already be in mainline for actual -stable
+  inclusion. A proposed upstream patch can be a *prospective candidate*;
+  do not call it already eligible or reject its tag merely because it has
+  not yet landed.
+- The change must be obviously correct, tested, and at most 100 lines
+  WITH context, and follow submitting-patches.rst. Check evidence of
+  testing; an author's claim is not a test run performed by us. For
+  individual patches in a series, assess each commit independently.
+- The published rules cover real bugs with user benefit (or new
+  device IDs), including crashes, hangs, corruption, security issues,
+  build failures and hardware quirks. They also permit consideration
+  of otherwise theoretical races when the changelog explains how the
+  bug can be exploited, and reject trivial cleanups without benefit.
+  "Real security issue" and "some 'oh, that's not good' issue"
+  include demonstrated harmful failure paths not seen in production.
+  An attacker may deliberately repeat an improbable race. Explain the
+  accessible trigger, attacker control, repetition, and credible harm.
+  The rule rejecting an unexplained "theoretical race condition" does
+  not require a known victim, reliable reproduction, or weaponized
+  exploit where the harmful path is already established by evidence.
+  Keep the distinction between evidence and speculation explicit.
+  This interprets the published rules; it is NOT a separate exception.
+- A notable performance/interactivity issue reported by a distro user
+  is a narrow exception: the rules call for submission by a distro
+  kernel maintainer and an addendum with the bug report if available
+  and further user-visible impact evidence. Do not equate any measured
+  improvement with automatic stable suitability.
+- Check whether the fix is applicable to supported stable branches:
+  verify the introducing commit, relevant version/config scope,
+  backport dependencies, risks and conflicts where data is available.
+  Do not infer exact affected releases from a Fixes: tag alone. When
+  requesting option 2 or 3 for particular series, ensure newer supported
+  stable series also receive the fix or equivalent; avoid reintroducing
+  the problem when users upgrade.
+
+For every patch, report `stable: candidate / not justified / unresolved`
+with a brief reason and a separate `impact-changelog: sufficient /
+needs detail / no known effect (substantiated)`. An unexploited but
+credible attacker-triggerable failure counts as potential user-visible
+harm; absence of known incidents is not `no known effect`. For a series,
+report per-patch results and a compact overall assessment; do not let a
+cover letter replace each standalone commit message. If the code
+is correct but the changelog omits WHY stable recipients need it,
+explicitly request an impact description BEFORE recommending its stable
+submission. "Fixes:" and "Cc: stable" are routing metadata, not a
+substitute for that explanation.
+
+Use the documented submission routes correctly:
+
+- Preferred option 1: for a prospective upstream stable candidate, add
+  `Cc: stable@vger.kernel.org` in the commit trailer/sign-off area (NOT
+  merely the email header). `Fixes:` assists version selection but does
+  not replace the stable tag. Where an actual non-public disclosure is
+  being maintained, the rules document `Cc: stable@kernel.org` to avoid
+  exposing a fix through ordinary public mailing-list delivery.
+- Option 2: for an already mainlined fix, email stable@vger.kernel.org
+  with subject, commit ID, why it is needed and requested kernel series.
+- Option 3: for an adapted downstream backport, include the exact
+  upstream commit identification (`commit <sha> upstream.` or
+  `[ Upstream commit <sha> ]`), target series and justification for each
+  deviation from the upstream version.
+- When relevant, use documented stable-tag inline comments for version
+  bounds, prerequisite commits, delayed pickup or known adjustments.
+  Use `stable+noautosel@kernel.org` with a stated reason when explicitly
+  asking the stable tooling not to select a change automatically.
+
+Do not speculate that a patch meets the stable rules just because it
+has a Fixes: tag, or because it is correct. For `stable: unresolved`,
+name what is missing (impact, tests, mainline status, target versions,
+size or prerequisites). Do not submit anything to -stable on behalf of
+the user unless expressly instructed. For security issues, consult
+Documentation/process/security-bugs.rst instead of relying solely on
+normal stable review.
+
+Security/publication and stable timing: do not assume there is an
+embargo, coordinated-release schedule, or other separate security
+process merely because `security@kernel.org` is on the email. Respect
+actual confidentiality instructions and keep private material private.
+Once an upstream fix is public, the change may reveal enough about the
+bug for an attacker to target unpatched systems. Therefore recommend
+prompt -stable pickup of qualifying fixes, not waiting for undefined
+"security handling" to finish. Give the concrete impact, affected
+versions, prerequisites and stable routing steps; do not claim that an
+upstream merge alone protects deployed stable kernels. If a real
+coordination or disclosure constraint exists, state it specifically
+instead of inventing a generic prerequisite.
+
+## Other changelog and review standards
+
+- Verify Fixes: history, patch ordering, individual versus series scope,
+  comments, API semantics, coding style and any unexpected behavior
+  changes. Favor a precise corrected paragraph over vague advice.
+- Check regression tests actually exercise the old failure, and compare
+  the change against the userspace-visible outcome, not merely the
+  repaired helper's local behavior.
+- External AI reviews, human comments and docs offer leads, not proof:
+  verify disputed behavior against source and reachable call paths.
 
 ## Modeling and verification
 
@@ -399,11 +540,22 @@ override conflicting upstream style defaults.
   block, not a rich-text writing block or rendered Markdown list or
   blockquote. The text must copy AS IS, without inserted backslashes,
   formatting characters or altered bullets/quotes. Verify it first.
+- Every completed patch or patchset review MUST end with a short,
+  copy-ready email reply suitable for sending to the author or thread,
+  even when there are no objections. State take/revise/reject clearly;
+  mention only actionable findings, essential qualifications and, when
+  useful, the precise changelog or stable-tag request. Do not repeat the
+  full analysis or invent a positive Reviewed-by tag. Keep a private
+  security-thread reply private, without reproducer or exploit detail.
+  Do not defer -stable recommendations with vague "security handling"
+  language; name an actual restriction only when established. Draft only;
+  never imply the message was sent.
 - Refer to a numbered patch by its subject notation, e.g. `[1/2]` or
   `[2/3]`, not `patch 1` or `patch 2` in the email reply.
 - State the verdict and important defects first. For each material
   finding, give the patch, precise code site, triggering path, failure,
-  userspace impact, and a practical corrective action or test.
+  userspace impact, and a practical corrective action or test. Include
+  the concise impact-changelog and stable assessment for each bugfix.
 - Separate confirmed defects, unresolved concerns, and tests you merely
   recommend. No confidence inflation; source review is not a test run.
 - For patch series, account for defects present at patch N that a later
