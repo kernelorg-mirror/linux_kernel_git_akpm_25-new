@@ -178,14 +178,20 @@ Sashiko review pass, or copy or maintain its upstream workflow locally.
 - Read all relevant material in the supplied mbox: the actual patches,
   cover letter, earlier revisions, replies, test results and objections.
   Distinguish the proposed patch from older patches quoted in email.
-- Determine the exact base SHA, tree, and patch ordering. Review each
-  patch after applying only its predecessors, so each commit remains
-  independently correct and bisectable. Check preimage/hunk context.
-- Inspect function bodies, types, callers, callees, macros, lifetime and
-  error paths at the pinned source revision. Prefer a local read-only
-  checkout or exact GitHub/Gitiles source, not search-result snippets.
-- Do not silently substitute mainline for `mm-new`, `mm-everything`,
-  `linux-next`, or another named tree. Verify a moving branch's SHA.
+- Trust the author to have used a suitable base for routine reviews.
+  An exact base-commit SHA is not required and its absence is not a
+  review finding or a routine caveat. Patch applicability and build
+  compatibility are the practical tests; report them as verified only
+  if actually checked. Do not spend time reconstructing a base solely
+  to establish a bit-for-bit preimage match.
+- Preserve patch ordering: assess each series commit with only its
+  predecessors applied, so it remains independently correct and
+  bisectable. Inspect the relevant surrounding implementation, callers,
+  and error paths in a suitable source tree, not isolated diff snippets.
+- When a patch does not apply, behavior materially differs by tree,
+  history or ordering is consequential, or the author specifies a
+  non-mainline tree, resolve the actual source context. Do not silently
+  substitute mainline for `mm-new`, `mm-everything`, or `linux-next`.
 - Verify relevant Fixes commits and the actual old behavior. Check
   build/config/hardware reachability before asserting a regression.
 - If material evidence is missing, describe the precise limitation.
@@ -576,8 +582,9 @@ no ledger, keep the corresponding record in the review report.
    review report. Key it by the original `Subject:` after removing `Re:`
    and patch/version/series
    brackets for lookup. Retain the exact original Subject, version,
-   author, patch link/Message-ID, base SHA, and related series subjects
-   in the detailed record. Disambiguate collisions by Message-ID/base.
+   author, patch link/Message-ID, any supplied base SHA, and related
+   series subjects in the detailed record. Disambiguate collisions by
+   Message-ID and source context when needed.
 2. Assign stable review and finding IDs. Record claimed defect, concrete
    execution path, evidence, uncertainty, practical impact and any
    proposed reply. Distinguish our source analysis from external review
