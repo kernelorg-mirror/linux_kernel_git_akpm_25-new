@@ -118,6 +118,10 @@ such a subject, consult the named active record or archive FIRST.
   ACTIVE: [R-009](#r-009); v1 source-reviewed, code sound.
 - `lib/buildid: reject file offsets that do not fit in pgoff_t`
   ACTIVE: [R-010](#r-010); v1 sound, security coordination pending.
+- `mm/mempolicy: apply bind policies against the scoped allocation zone`
+  ACTIVE: [R-011](#r-011); source-reviewed, take as submitted.
+- `zram: redesign zcomp and rework backends`
+  ACTIVE: [R-013](#r-013); v5 source-reviewed; tests requested.
 - `mm: retry page faults once under the per-VMA lock`
   STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
@@ -630,6 +634,218 @@ Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
 Next: take code; request only a precise note on build-ID perf event
   prerequisites if author replies. Handle privately with recipients and
   security team; do not redistribute supplied reproducer publicly.
+
+### R-011
+
+Subject: mm/mempolicy: apply bind policies against the scoped allocation zone
+Author: Gregory Price (Meta). Version: [PATCH], 2026-10-17 PT.
+Diff preimage: `mm/mempolicy.c` blob `70298fded1b4a` (user supplied).
+Base commit not supplied; inspected equivalent policy, allocator, GUP and
+hugetlb code in upstream `master` at
+`58161ead29e50d70a317ea26b472e0c7508e69da` (Oct 17).
+The exact diff preimage was not independently resolved to a kernel tree.
+Fixes: `8e3560d963d2` (verified introducing `PF_MEMALLOC_PIN`
+`current_gfp_context()` behavior in 2021-05-05 commit).
+Status: PENDING author/maintainer feedback; no introduced defect found.
+
+Findings:
+- R-011/F1: `policy_nodemask()` tests the original `gfp_zone(gfp)`
+  when deciding whether `MPOL_BIND` to a movable-only node applies.
+  Long-term GUP under `memalloc_pin_save()` sets `PF_MEMALLOC_PIN`;
+  actual page allocator applies `current_gfp_context()` and strips
+  `__GFP_MOVABLE`, so no eligible zone intersects the retained mask.
+  Faulting previously untouched pages for long-term pins can fail.
+- R-011/F2: Using `gfp_zone(current_gfp_context(gfp))` when applying
+  the policy uses the same scoped zone as the buddy allocator. No
+  change for non-pin scopes, or where __GFP_MOVABLE is absent; preserves
+  the prior policy relaxation for ineligible zones. Covers base
+  page allocations, hugetlb `huge_node()`, and bulk mempolicy allocator.
+- R-011/F3: The analogous `policy_mbind_nodemask()` in mm/hugetlb.c
+  also tests the unscoped GFP zone, but is associated with hugetlb pool
+  reservation/resize, not established as a path running under long-term
+  GUP pin scope. No additional demonstrated bug; not a blocker.
+
+Impact-changelog: sufficient: QEMU/VFIO guest launch fails -ENOMEM;
+  io_uring registration/pinning of unfaulted pages fails; hugetlb
+  fault path may fail -EFAULT; movable-only NUMA binding is required.
+  Author reports after-fix qemu, VFIO, io_uring and 2 MB hugetlb tests.
+Stable: prospective candidate after upstream merge; real user-visible
+  failures; `Cc: stable@vger.kernel.org` already in commit trailers.
+  Target releases require branch verification, not attempted here.
+Architecture: correct decision-layer fix; existing `apply_policy_zone()`
+  deliberately relaxes bindings that cannot provide the required
+  allocation zone. No redesign or special treatment in GUP is needed.
+Model: no (single local GFP-zone policy decision; source control
+  flow and scoped context explain it). No kernel build or live test.
+Guidance: Tejun `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`;
+  Chris `d048f8742f6740c38833adf02e87901412d771ca`, verified
+  unchanged 2026-10-17. Applied code/allocator/folio, evidence,
+  description and false-positive guidance in separate sequential
+  pass; Sashiko refresh not due.
+Next: take patch; no changes requested. Author's testing not
+  independently reproduced. Email reply drafted, not sent.
+
+### R-012
+
+Subject: khugepaged: fix readahead lock inversion in collapse_file()
+Author: Lance Yang. Version: [PATCH v3 1/1], 2026-10-16 (+0800).
+Input: patch email supplied in chat, 2026-10-17 PT.
+Status: HUMAN FEEDBACK RECEIVED; v3 architectural concern reopened.
+Fixes: `730633f0b7f9` (2021-07-13; verified introducing the
+  invalidate_lock for read/readahead against truncation).
+
+Findings:
+- R-012/F1: Verified old inversion: collapse_file() held previous
+  source folio locks then entered page_cache_sync_readahead(), which
+  acquires mapping->invalidate_lock shared. Truncate holds that rwsem
+  exclusively while waiting on one of the source folio locks. The
+  syzbot trace shows both waits: ext4_write_end/truncate and
+  collapse_file/page_cache_ra_order. Public bug URL:
+  https://syzkaller.appspot.com/bug?extid=16bf7cd0ebeb1de93aa5
+- R-012/F2: v3's non-shmem preparation pass locks at most one folio
+  at once, releases before invoking any readahead, and completes
+  readahead calls before collecting locked source folios in the second
+  pass. Missing entries discovered in second pass cause rollback,
+  not readahead. Xarray locking and rollback ownership traced;
+  no code correctness blocker found.
+- R-012/F3: Notable change: the preparation pass uses blocking
+  filemap_lock_folio() even for resident cached folios; formerly the
+  second-pass cached-folio path used folio_trylock() and returned
+  SCAN_PAGE_LOCK promptly on contention. This can prolong
+  MADV_COLLAPSE or background khugepaged waits. Ask whether intended
+  or whether the preparation pass can trylock resident folios.
+- R-012/F4: v3 email does not report verification with original
+  truncate/readahead reproducer. Request before/after stress/syzbot
+  retest on this exact revision; do not claim independently run.
+
+Impact-changelog: sufficient: reproducible uninterruptible hung-task
+  lock cycle affecting file-backed collapse, truncate and writes,
+  observed syzbot and independent v2-era report. Authors' v2 reports
+  do not establish v3 testing.
+Stable: candidate; Fixes tag verified, author notes complex old-stable
+  branch differences and proposes individually reviewed backports;
+  don't presume the v3 diff applies unchanged to all stable versions.
+Architecture: two-pass scan preserves existing sync readahead semantics
+  rather than replacing with page_cache_ra_unbounded; shortens
+  invalidate_lock scope and avoids nesting with retained folio locks.
+  Changes between passes are tolerated by abort/rollback.
+Model: no full model; simple two-actor wait-for cycle removed by
+  reordering; no new lock primitive and no complex state protocol.
+Guidance: independent pass followed by Tejun
+  `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e` and Chris
+  `d048f8742f6740c38833adf02e87901412d771ca` guided pass;
+  current heads unchanged as checked for this review. Read
+  evidence/code, technical/false-positive, patch-review prompts.
+Validation: source-only GitHub master, introductory commit and syzbot
+  traces; no build, live reproducer, syzbot test or formal model.
+Next: ask Lance about blocking prep-pass folio locks and request
+  v3 reproduction test. Pending reply; not sent.
+
+Human follow-up, 2026-10-16 to 2026-10-18, from supplied mbox:
+- Pedro Falcato identified the more important design flaw: v3 makes
+  every non-shmem collapse do a full preliminary walk, lock/unlock
+  cached folios, and drain LRU even when no readahead is necessary.
+  Much of the read I/O started by this pass may still be in progress
+  when collapse resumes. He proposed readahead only AFTER a failed
+  scan has rolled back and released the source folio locks.
+- Lance accepted the on-demand idea and posted an exploratory
+  post-rollback readahead/retry sketch. It is NOT a submitted v4 or a
+  fully reviewed/tested change. This supersedes our premature
+  recommendation to take v3 as-is; request a revised design.
+- Baolin Wang suggested moving recovery to an existing outer retry
+  site (called collapse_pmd() in the thread; the examined mainline
+  equivalent is collapse_single_pmd()). Lance noted old stable trees
+  lack that outer retry. Baolin replied that clean upstream design
+  should not be constrained by backport architecture; David's
+  preference was still awaited in the supplied thread.
+- Baolin initially asked why xas_unlock_irq() was omitted, then
+  retracted the question. At the beginning of the preparation pass
+  the xarray lock was never acquired; there is nothing to unlock.
+- Baolin questioned PG_uptodate after taking the folio lock. Pedro
+  correctly explained that a folio is unlocked after failed I/O too;
+  locking does not imply Uptodate. The early check is nonetheless
+  duplicated by the real collapse scan, so Lance agreed it can go.
+- Baolin also asked for the long new code to become a helper. This
+  is readability feedback, distinct from the more consequential
+  proposal to avoid the entire unconditional preparation pass.
+- Original R-012/F3 blocking-lock concern is source-supported, but
+  the human follow-up did not specifically endorse it. Avoiding the
+  normal-path pass addresses that concern more structurally.
+- No v4, runtime retest or resolution from David is supplied. The
+  old deadlock and v3 lock-order cure are still source-supported;
+  the final upstream design remains under discussion.
+
+Methodological correction: review fast-path costs of exceptional-case
+preparation, compare deferred recovery after rollback, search for
+higher-level retry owners, separate check validity from necessity,
+track lock state at each new path, and favor upstream design over
+backport convenience. General lessons added to the AKPM workflow.
+
+### R-013
+
+Subject: zram: redesign zcomp and rework backends
+Author: Sergey Senozhatsky. Version: [PATCH v5 00/13], 2026-10-18
+  (+0900). Input: user-supplied mbox with all 13 patches and two older
+  v1 discussion replies, 2026-10-17 PT.
+Status: SOURCE REVIEW COMPLETE; no proven code defect; ask for
+  correctness/stress validation before taking the full series.
+
+Independent pass:
+- [01-08/13]: printk prefix, debugfs cleanup, dictionary and workspace
+  optimizations, and writeback reset inspected. No confirmed defect.
+- [09/13]: compression and decompression stream split preserves each
+  backend's mutable-context ownership; zstd/deflate retain exclusive
+  dctx, while LZO/LZ4/842 decompression is stateless. CPU hotplug
+  releases C/D contexts using their separate locks. No proven defect.
+- [10-11/13]: stateless decompression can use a read-held lifetime
+  semaphore; mutable dctx and the fallback local_copy require the
+  exclusivity mutex. Spanning objects use a GFP_NOWAIT bounce buffer
+  with serialized fallback. SG lifetime maintained. No proven defect.
+- [12/13]: wait_event() repeatedly scans online CPUs and acquires a
+  read pin plus exclusive mutex by trylock. Release wakes waiters;
+  bounce-buffer fallback also wakes. The online CPU stream is pinned
+  through hotplug teardown. No proven missed wake or UAF.
+- [13/13]: secondary compressors are used by recompress_store() under
+  dev_lock write; singleton compressor preserves independent per-CPU
+  decompressors for reads. Allocation and cleanup paths examined.
+- Although read_compressed_page() may sleep between
+  zs_obj_read_sg_begin/end(), current zsmalloc's counted reader pin
+  explicitly permits sleeping (its writer uses trylock); not a bug.
+
+Actionable feedback:
+- Large synchronization and allocation series warrants documented
+  round-trip/corruption and CPU hotplug/reset/failure-injection tests,
+  especially zstd/deflate dictionaries, lz4hc and multi-CPU exclusive
+  stream borrowing. Submitted benchmarks are performance evidence,
+  not an exhaustive correctness matrix; no tests run here.
+- [08/13] changelog should make the userspace symptom explicit:
+  reset of a reused zram device retained writeback limits/options,
+  potentially causing unexpected -EIO on later writeback when the
+  retained enabled limit is zero. Historical commit cited in prose;
+  assess Fixes/stable separately if a maintained branch is affected.
+- Older [00/10] replies request deferral until next -rc1; no
+  contradiction with current v5, and no request for immediate merge.
+
+Impact-changelog: [08/13] needs a concrete operational example for
+  downstream diagnosis; rest are principally performance or local
+  resource fixes. Stable: [08/13] possible standalone candidate,
+  requires affected-tree confirmation. Do not stable-tag 13-patch
+  performance redesign automatically.
+
+Guided review: Tejun HEAD
+  c8cc6a8bee854cf2850f44e0a61be581c19f1d4e; Chris HEAD
+  d048f8742f6740c38833adf02e87901412d771ca, checked 2026-10-17.
+  Inspected patch-review, evidence, kernel-idioms, technical,
+  false-positive, block, locking, allocator and build guidance;
+  no new source-supported defect from guided pass.
+Validation: source-only against submitted diffs, Linux mainline
+  backend implementation and public linux-next zsmalloc reference;
+  the zcomp SG conversion predates mainline snapshot and was supplied
+  as part of the patch preimage. No build, test, formal model or
+  independent performance benchmark performed.
+Next: request concise functional/stress coverage and strengthen the
+  [08/13] changelog; review follow-up before applying a tag. Reply
+  drafted, NOT SENT.
 
 ## Maintenance reminder
 
