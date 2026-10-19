@@ -224,6 +224,15 @@ headers or fabricate diffs**, especially after rewriting a proposed patch.
   Never claim success without executing the check.
 - Verify hunk contexts and filenames and show a concise diffstat. Keep
   patches 7-bit ASCII and lines generally within 75 columns in changelogs.
+- The local `hp2` patch queue may store `patches/<name>.patch` together
+  with the editable `txt/<name>.txt` changelog, `pc/<name>.pc` metadata
+  and `series`/`applied-patches`. Verify the actual destination format
+  and keep those representations consistent. In particular, `apatch` can
+  expect the `txt/` companion; do not treat successful `git apply --check`
+  as sufficient evidence that `apatch` will accept the result.
+- Preserve exactly one standalone `---` separator and all genuine test
+  notes beneath it when refreshing; never let tooling silently duplicate
+  separators, move metadata below the separator, or drop notes.
 - Never silently replace a file with a different implementation. Preserve
   testing provenance and note any untested revision.
 
@@ -252,16 +261,55 @@ current session** before linking it. Do not invent sandbox download links.
   `get_maintainer` output. For this case, **Daehyeon Ko and Tal Zussman**
   should have been considered for Cc because their contemporaneous changes
   intersect the issue. Verify addresses from headers/commits; don't invent.
-- Patch metadata: include `From:` and `Date:`, avoid `Signed-off-by:` in
-  generated patch metadata per user's standing preference, and place
-  `Assisted-by: LLM` after other trailers but before Cc trailers. `Cc: stable`
-  remains last, if appropriate. No mailing lists in Cc trailers; include
-  individual maintainers/reviewers instead.
+- Preferred changelog layout: `From:`, `Subject:`, `Date:`, then a
+  blank line, rationale and userspace-visible impact, a single blank
+  line and properly ordered trailers, followed by one standalone `---`
+  with temporary testing notes and the diffstat/diff. Plain 7-bit ASCII;
+  wrap changelog prose at roughly 75 columns.
+- Trailer order: `Link:`/`Fixes:` before any existing human signoff chain;
+  then `Reported-by:`, `Closes:`, review/test acknowledgements,
+  named human assistance, `Assisted-by: LLM`, and finally individual
+  `Cc:` recipients. Keep `Cc: stable` last if warranted. Do not invent
+  a `Signed-off-by:` or add one on the user's behalf. Preserve authentic
+  existing signoffs and review tags; never infer review from prose.
+- Do not Cc mailing lists *in the stored patch changelog*; lists used
+  when emailing a submission are a separate decision. Check `.mailmap`
+  when canonicalizing identities; use local `pc/people` only as
+  supplementary information where available. Inspect `git blame`,
+  related commits and nearby code for recent relevant contributors,
+  not only `get_maintainer.pl` output. Avoid duplicate/misplaced trailers.
+- Use a verified, normally 12-character abbreviated hash in `Fixes:`;
+  ensure it identifies the intended commit, not merely a similar
+  change. Check original bug reports and public mail threads for
+  exact `Reported-by:`, `Closes:` and related `Link:` metadata.
 - Put brief **actual testing notes below the `---` separator**, rather than
   burying them in the permanent changelog. Check how the local patch scripts
   process cover text and trailers.
 - Explicitly check interactions with active patch series, particularly
   changes to rejected-bio cleanup, and say what was and wasn't runtime tested.
+
+## Relevant maintainer workflow distinctions
+
+`hp2` uses a maintained patch queue, not merely standalone Git commits.
+Patches can be revised repeatedly as discussions, regression tests and
+dependencies change. Use the current queue position and source baseline;
+a patch that applies cleanly in isolation may conflict after earlier
+series patches. Prefer source edits and a refreshed machine-generated diff
+over manually repairing hunk headers. Never force through a reject
+without understanding the changed context; preserve the existing patch
+name when refreshing.
+
+When preparing mail or handling patches from a series, preserve the
+original author, the correct version and explicit acknowledgements from
+the relevant revision. Replies to a cover letter can apply to the
+whole series; patch-specific review belongs only to that patch. Do not
+silently carry trailers from older revisions. For the current bug-hunting
+scope, consult the original mailing-list thread and its replies rather
+than copying reviewers or provenance by guesswork.
+
+Keep the distinction between a *fix tested in a guest VM*, a *patch
+accepted into the local queue*, a *patch committed to an MM Git branch*,
+and a *patch sent or merged upstream*. None implies the next.
 
 ## Fresh-chat handoff
 
