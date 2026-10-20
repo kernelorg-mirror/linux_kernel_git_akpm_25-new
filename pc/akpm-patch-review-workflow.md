@@ -490,6 +490,19 @@ inventoried. Prevent a recurrence as follows:
    Do not claim exhaustive coverage if relevant paths remain unexamined.
 7. Apply the adversarial gate's full inverse-operation and handler
    checks to each newly reachable state.
+8. For state initialized on a multi-element object or range, verify
+   the granularity of the NEXT consumer before choosing the write set.
+   A helper accepting an order, length, or folio may consume metadata
+   only from the head, while splitting can later expose constituent
+   elements. Trace initialization, first consumption (including clearing
+   or resetting metadata), splitting, reuse and the next consumption.
+   Confirm that neither uninitialized heads nor stale tail metadata
+   can suppress warnings, duplicate accounting or contaminate reuse.
+   Compare superficially similar callers by their actual free/consume
+   helpers, not merely by the name of the initialization helper.
+   Search all entry contexts (including early boot, deferred init,
+   sanitizer-held resources and hotplug), not only the reported path.
+   An initial correct outcome does not establish safe later reuse.
 
 Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing
@@ -941,10 +954,11 @@ a verified discovery; preserve its uncertainty in the record.
   applicable review rule. Keep case-specific details out of policy
   unless they are a compact motivating example. Do not add repeated
   historical narrative or duplicate standing rules.
-- Verify changed Markdown and direct download paths before replying;
-  provide links to EVERY revised canonical file. If an authoritative
-  file is inaccessible or cannot be modified, say exactly which file
-  was not updated. Never claim the update happened if it did not.
+- Save detailed per-patch review reports to Library and verify the saved
+  path. When this workflow or the master ledger changes, provide actual
+  downloadable Markdown files, preserving canonical filenames. Always
+  resend `akpm-patch-review-workflow.md` after any update, without
+  waiting for a request. Never claim unverified storage or delivery.
 - Documentation updates do NOT authorize changing kernel code or any
   other production code. Respect the standing source-edit policy.
 
@@ -954,22 +968,48 @@ no new discoveries occurred; UNRESOLVED if required documentation was
 not updated. Do not retroactively alter a completed review's original
 compliance denominator simply because a new rule was added later.
 
+## Routine review delivery and canonical record ownership
+
+- Give the verdict, actionable findings and copy-ready LKML reply in
+  chat. Do not expose review machinery as routine user deliverables.
+- `akpm-patch-review-workflow.md` is user-held authoritative methodology.
+  ALWAYS supply a verified direct download link to its full, updated
+  canonical `.md` file whenever it changes, in that same response.
+- `review-activity.md` is the user-held master index and compact active
+  ledger, listing review IDs, findings, feedback, detailed-report Library
+  paths and next actions. On updates, deliver the revised canonical file
+  as a direct download; do not require users to hunt through Library.
+- Store ONLY detailed per-patch review histories in the persistent
+  ChatGPT Library under `/Kernel Patch Reviews/reports/`. Each report
+  retains its canonical `<topic>-review.md` basename. Update it as new
+  source findings, feedback or methodology corrections are discovered.
+- For per-patch reports, verify Library upload success and tell the user
+  which report was saved. Do not routinely send per-patch `.md` files.
+- In subsequent chats, retrieve a detailed report from the Library using
+  the path in `review-activity.md`; never assume `/mnt/data` persists.
+- Keep formal models, test logs and reproducers as supporting artifacts,
+  providing them only on request or when needed for validation. Do not
+  make these routine handoff downloads.
+- The Library is NOT the authoritative delivery mechanism for the
+  workflow or master ledger. Do not upload new versions of these two
+  files there. Provide user-held copies instead.
+- Never report a Library save or a download as successful unless it is
+  verified. If persistence fails, disclose the failure explicitly.
+
 ## Artifact delivery: mandatory
 
-- When creating or updating Markdown or other project files, provide
-  direct, verified, download-ready links for EACH resulting file.
-- Prefer the platform download tray when available. Never substitute
-  formatted file cards, decorative layouts or descriptive text for
-  actual download links.
-- Verify each exact generated file path exists before linking it. If
-  a file or tray delivery is unavailable, say so rather than claiming
-  it was delivered.
-- Never delete or replace a user file without authorization.
-- Preserve user-established canonical filenames exactly, including
-  case and extension. Never append dates, versions, suffixes or
-  other qualifiers to delivered filenames unless explicitly asked.
-- Temporary paths or staging directories must not change the
-  basename of the final downloadable file.
+- ALWAYS send the complete updated `akpm-patch-review-workflow.md` with
+  a verified direct download link whenever the workflow is modified.
+- Send updated `review-activity.md` as a direct download whenever it
+  changes; do not put the canonical master ledger in Library.
+- Store detailed per-patch report Markdown in Library and confirm its
+  exact location, without routine per-patch download links.
+- Prefer the download tray when available. Never invent a sandbox path.
+- Never delete or replace user files without authorization.
+- Preserve canonical filenames exactly, including case and extension.
+  Never append dates, versions or suffixes unless explicitly asked.
+- Temporary paths or staging directories must not change the basename
+  of the final downloadable file.
 
 ## Review activity, feedback and archive protocol
 

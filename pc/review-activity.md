@@ -1,6 +1,6 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-19 (America/Los_Angeles)
+Last updated: 2026-10-20 (America/Los_Angeles)
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
 modules; the old standalone S2 file is historical only).
@@ -14,7 +14,7 @@ short; detailed mail and diffs are retrieved by reference as needed.
 
 Repository: https://github.com/htejun/kernel-agent-workflows
 Upstream branch: `main`
-Last checked: 2026-10-19 (America/Los_Angeles)
+Last checked: 2026-10-20 (America/Los_Angeles)
 Checked HEAD: `cbb4478d0f73e15907335e70a2dc2fe54a9e7167`
 Previous HEAD: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`
 Change: `$MODEL_CHECKER` introduced in `UPGRADING.md`; default
@@ -46,7 +46,7 @@ when unchanged. Do not attribute this SHA to reviews R-001 through R-005.
 
 Repository: https://github.com/masoncl/review-prompts
 Upstream branch: `main`
-Last checked: 2026-10-19 (America/Los_Angeles)
+Last checked: 2026-10-20 (America/Los_Angeles)
 Checked HEAD: `d048f8742f6740c38833adf02e87901412d771ca`
 HEAD commit date: 2026-10-01 11:53:46 UTC
 HEAD subject: README: add pahole to the project lists
@@ -74,18 +74,17 @@ DO NOT infer they used the HEAD recorded above.
 
 Repository: https://github.com/sashiko-dev/sashiko
 Upstream branch: `main`
-Last checked: 2026-10-19 (America/Los_Angeles)
-Checked HEAD: `f6e2e172e1e669b6767a4c74fe91d062b41fd71c`
-Previous HEAD: `f4b72fa04f232fe5f2183d32d7cf9c09e5d735ec`
-Difference: pipeline prescreen/planner temperature propagation;
-seven analysis domains unchanged. Full manual track covered in R-016.
-HEAD commit date: 2026-10-19 21:20:55 UTC
-HEAD subject: docs: add LWN 7.3 development statistics article to PRESS.md
-Last comparison: 2026-10-19 (America/Los_Angeles)
-Comparison: advanced from prior SHA; reviewer verified latest diff is
-PRESS.md-only and earlier workflow changes carry temperatures to stages.
-Verified the pinned pipeline plus applicable core, specialist and
-false-positive sources at this SHA. Native Sashiko: not run.
+Last checked: 2026-10-20 (America/Los_Angeles)
+Checked HEAD: `026195ab58e2099e81017adbc6b97f33c509c8ba`
+Previous HEAD: `f6e2e172e1e669b6767a4c74fe91d062b41fd71c`
+Difference: three newer commits affect CLI benchmarking and project
+review prompts; core seven kernel review domains remain unchanged.
+HEAD commit date: 2026-10-20 01:11:09 UTC
+HEAD subject: cli: add sashiko benchmark subcommand and remove
+  standalone binary
+Last comparison: 2026-10-20 (America/Los_Angeles)
+Comparison: relevant pipeline and vendored kernel guides checked
+  in R-018; changes recorded there. Native Sashiko: not run.
 
 Accepted techniques: preserve substantive dismissed hypotheses with
 source evidence; independently verify disputed claims and dismissals;
@@ -137,12 +136,20 @@ such a subject, consult the named active record or archive FIRST.
   mail/changelog unavailable, so unconditional acceptance withheld.
 - `fs/proc/task_mmu: pin mm_users in do_pagemap_scan()`
   ACTIVE: [R-017](#r-017); fix sound; `!mm` masks Oops; tests needed.
+- `mm/hugetlb_cgroup: prevent use-after-free during cgroup offlining`
+  ACTIVE: [R-018](#r-018); lifetime fix sound; one redundant guard.
+- `mm/memcontrol: publish null pointer before dropping css reference`
+  ACTIVE: [R-019](#r-019); partial review, GCC-built stress tool;
+  exact source and kernel/formal testing unresolved.
 - `mm: retry page faults once under the per-VMA lock`
   STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
   DORMANT: A-001 in
   [review-activity-2026-10-16.md](review-activity-2026-10-16.md#a-001).
   A dormant review is not author-accepted or author-rejected.
+- `compat: Avoid double rounding in times()`
+  ACTIVE: [R-020](#r-020); source fix sound; kernel test pending.
+
 
 ## Active records
 
@@ -1221,6 +1228,185 @@ Next: await Ngoc's answer to AKPM's `!mm` diagnostic objection;
   request explicit user impact and before/after KASAN testing.
   Corrected LKML draft in report;
   it has NOT been sent. No Reviewed-by provided.
+
+### R-018
+
+Subject: mm/hugetlb_cgroup: prevent use-after-free during cgroup offlining
+Original: [PATCH] mm/hugetlb_cgroup: prevent use-after-free during
+  cgroup offlining
+Author: Daehyeon Ko <4ncienth@gmail.com>. Date: 2026-10-20.
+Matching source: AKPM mm-stable, mm/hugetlb_cgroup.c blob
+  3fb41311e4c7dcbbd26f7b230ebb1f8c7ce310fe.
+Fixes: da1def55919f4852c4759249a78d63a0c5d2d8f9 (2012-08-01).
+Status: CORE LIFETIME FIX SOUND; ONE NEW REDUNDANT GUARD.
+Report: `hugetlb-cgroup-review.md` (75-rule audit).
+Native model: `hugetlb-cgroup-formal-model.tar.gz`.
+
+Findings:
+- R-018/F1 (CONFIRMED original UAF): css_tryget() protects selected
+  hugetlb CSS during charge but the original normal path drops the ref
+  before folio commit. css_offline() scans active folios under the
+  hugetlb_lock and can finish BEFORE charge becomes visible. Commit
+  can then publish a pointer to a freed CSS, causing UAF in later
+  folio uncharge. Author reports 3/3 boots reproduced by KASAN.
+- R-018/F2 (source fix proof): Retained charge CSS ref spans buddy
+  allocator lock drop and commit/rollback; dying ancestor local
+  counters are canceled, retaining the already-charged ancestor
+  counts. Selected live CSS gets the folio and per-node usage under
+  hugetlb_lock; the active scan and commit serialize. Existing
+  reservation CSS ownership remains unchanged. Separately checked
+  hugetlb_reserve_pages() reservation CSS transfers to resv_map
+  and region_add(), plus its partial/full rollback css_put().
+- R-018/F3 (GUARD REDUNDANCY): The new
+  `if (!hugetlb_cgroup_disabled())` in uncharge after `if (!h_cg)`
+  is unneeded. Successful non-NULL h_cg implies enabled controller;
+  cgroup_disable() is a boot-time static-key setup. Remove guard and
+  call page_counter_uncharge() unconditionally for non-NULL h_cg.
+  G02's disabled check in commit is also redundant in the valid call
+  chain, but it is preexisting, not introduced by this patch.
+  Guard audit: 11 of 11 checked; 2 redundant (1 preexisting),
+  0 unresolved. No new Oops-to-quiet-errno masking found.
+- R-018/F4 (DISMISSED): No new ancestor charge needed: page_counter
+  already charges parents. No per-node transfer of an uncommitted
+  charge: usage first increments at commit on chosen live owner.
+  Root CSS is immortal; parent CSS protected by child CSS references.
+- R-018/F5 (native model): PlusCal -> SANY; TLC and tla-mctj old
+  protocol fail NoDeadCharge and NoDangling; patched 1,512 distinct
+  states, depth 31, no invariant violation in either checker.
+  1 allocator, 2 offliners, child->parent->root; sequentially
+  consistent bounded state, not a real-kernel KASAN or LKMM proof.
+- R-018/F6 (stable): Credible severe user-visible UAF, Cc stable
+  appropriate. Author reports patched 5,000 rmdir rounds and 2,000
+  controller-disable rounds with no sanitizer report. These rates
+  were not independently reproduced. Fixes is from 2012; modern
+  backports need tree-specific adaptation.
+
+Upstream guidance checked 2026-10-20:
+  Sashiko 026195ab58e2099e81017adbc6b97f33c509c8ba
+  Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167
+  Chris d048f8742f6740c38833adf02e87901412d771ca.
+Manual seven-stage Sashiko, independent and Tejun/Chris covered;
+  native Sashiko not run. Native TLC and tla-mctj did run.
+No kernel build, live KASAN, or herd7 check performed.
+Standing rules: 74 of 75 applied; 0 inapplicable; 1 unresolved.
+  Unresolved A47: native Sashiko not run.
+Next: ask Daehyeon to remove G10, review updated diff, then consider
+  Reviewed-by. LKML-ready reply drafted; NOT SENT.
+
+### R-019
+
+Subject: mm/memcontrol: publish null pointer before dropping css reference
+Author: Joshua Hahn. Submitted 2026-10-20.
+Status: PARTIAL SOURCE REVIEW; UNRESOLVED. No unconditional take.
+Report: `memcontrol-stock-review.md`.
+The ledger contains the actionable R-019 summary; the detailed report
+retains traces and verification artifacts without duplicating them here.
+Submission was retrieved as `memcontrol-stock-submission.patch` from the
+file library; preimage `e7d7db5718f9a` remains unlocated.
+
+- R-019/F1 (source-supported risk, not runtime-proven): both writers set
+  nr_pages to zero and, in old code, drop the stock CSS ref before
+  nulling cached. Reader is_memcg_drain_needed() reads cached then
+  nr_pages under RCU and traverses ancestry only with nonzero count.
+  Existence and harmful reachability of a stale count/pointer pairing
+  need LKMM validation; do not infer UAF solely from pointer lifetime.
+- R-019/F2 (proposed fix): pointer-before-put should exclude a new
+  post-release RCU read of a non-NULL stock pointer under the intended
+  publication assumptions. Full source/architecture proof pending.
+- R-019/F3: kernel reproduction NOT RUN. A bounded cgroup
+  migrate/offline/recreate, fault and reclaim stress harness has been GCC-built, not KASAN-tested.
+- R-019/F4: e1a366be5cb4f849ec4de170d50eebc08bb0af20 (2019)
+  verified as the RCU reader's historical introducing change.
+- R-019/F6: analogous obj stock already NULLs cached before
+  obj_cgroup_put, with an RCU-protected descendant reader; no sibling
+  defect established.
+- R-019/F5: no guard inserted; changed branch G01 consume zero count,
+  G02 drain non-NULL, G03 drain nonzero, G04 reader non-NULL and
+  G05 reader nonzero require complete producer/consumer auditing.
+
+Formal: library contained `akpm-tla-tools.tar(2).gz`, now retrieved.
+PlusCal translated, SANY succeeded; TLC and tla-mctj run natively.
+SC/current count: both old and fixed pass (103/108 states). With
+explicit stale count: old fails Safety (TLC 118*, mctj 101*),
+patched passes (137 states each); conditional counterexample NOT
+verified against LKMM. No native Sashiko, kernel runtime, KASAN,
+herd7 or complete pinned-stage review executed.
+Upstream SHA heads checked afresh: Sashiko advanced to
+b063c144377b569c39eb3c7d2f689478062fc4f1; Tejun remains
+cbb4478d0f73e15907335e70a2dc2fe54a9e7167 and Chris remains
+d048f8742f6740c38833adf02e87901412d771ca. Pinned guides and
+full independent/guided reconciliation remain pending.
+Next: exact matching tree, complete lifecycle and LKMM memory-order
+audit, full pinned guided methods, KASAN old-vs-new comparison.
+
+R-019 follow-up, 2026-10-20, four-message `grabbed(2)` LKML mbox:
+- R-019/F7 (human correction): Shakeel Butt notes consume_stock()
+  has a reference held by its caller; its stock CSS put is not final.
+  Joshua agreed. Earlier review overgeneralized this site as a
+  potential freeing path; the new draft explicitly corrects it.
+- R-019/F8 (remaining race candidate): Joshua identifies refill_stock()
+  slot eviction calling drain_stock() without the FLUSHING flag; the
+  remote is_memcg_drain_needed() RCU reader need not take local_lock.
+  Thus the flag does not exclude every concurrent drain/reader pair.
+- R-019/F9 (still unresolved): drain_stock zeroes nr_pages before its
+  final put, and the reader tests nr_pages before following ancestry.
+  A post-GP-entry stale nonzero observation is not yet proven under
+  LKMM. Native bounded SC/stale-choice models are not that proof.
+- Joshua reports later page_counter_stock series removes this site and
+  adjusts ordering; series applicability/merge status unverified.
+Next: LKMM memory-order litmus/source check; avoid sending older generic
+reply; exact preimage still absent. No kernel tests, Sashiko native run,
+or new formal checker run in this follow-up.
+
+
+
+### R-020
+
+Subject: compat: Avoid double rounding in times()
+Original: [PATCH] compat: Avoid double rounding in times()
+Author: Hungyu Lin <dennylin0707@gmail.com>; 2026-10-20.
+Base: f47d223627f80cb7a1eb14c585fe6cb35de5e984.
+Preimage kernel/sys.c: 35b538ba843c705dba5378f3626ce5610e9db0cf.
+Report: reports/compat-times-review.md.
+Status: SOURCE-LEVEL FIX SOUND; full guided review/runtime unverified.
+Finding R-020/F1: do_sys_times() already emits USER_HZ ticks; the
+compat helper converts back to jiffies then to COMPAT_USER_HZ. With
+HZ=250 and both rates 100, odd tick counts lose one extra tick (10ms).
+The new equal-rate direct-return branch avoids loss and leaves
+separate syscall return and unequal rates unchanged. G01 necessary.
+Arithmetic Python enumeration run, not kernel build or runtime test.
+Historical Fixes f06febc96ba8 verified; backports not checked.
+Stable: prospective candidate; changelog: sufficient.
+Next: optional compat 32-bit runtime validation and stable ancestry.
+
+### R-021
+
+Subject: mm/page_alloc: clear page tag refs when onlining hotplugged memory
+Author: Zenghui Yu. Posted 2026-10-21 +0800.
+Status: REVISE; previous favorable verdict withdrawn on Sashiko feedback.
+Detailed report: reports/page-alloc-hotplug-tag-review.md.
+F1: Original hotplug WARN supported: __free_pages_prepare() subtracts
+allocation tag from unallocated head with NULL reference.
+F2 (new, SOURCE VERIFIED): clear_page_tag_ref(p) on every base page
+marks all pages CODETAG_EMPTY, but pgalloc_tag_sub(page, order count)
+consumes only head marker. Tail markers survive into buddy and may
+suppress subsequent missing-tag diagnostics after splitting and an
+untagged allocation/free. Earlier claim that per-page marking was
+necessary for split buddies was wrong. Runtime manifestation untested.
+F3 (new): deferred_free_pages() and mm/kmsan/init.c:do_collection()
+call __free_pages_core(..., MEMINIT_EARLY) without an immediately
+preceding clear_page_tag_ref(). Configuration/boot reachability still
+to be completed. Prefer one head-only mark covering both contexts.
+F4: Previous comparison to free_reserved_pages() was misleading:
+that helper marks all base pages but uses __free_frozen_pages(), not
+the same __free_pages_prepare() consumer. CMA uses head-only mark.
+Source: base f47d223627f80cb7a1eb14c585fe6cb35de5e984. Submitted
+preimage e71e514ea18d still not matched exactly. No kernel tests.
+Independent source and external Sashiko claims reconciled, but no native
+Sashiko execution here; full guided tracks and testing still incomplete.
+Impact: hotplug warning; risk of masking future debug warnings.
+Stable: not recommended for current revision. Next: request v2 and test
+order-N free/split/untagged allocation/free plus MEMINIT_EARLY paths.
 
 ## Maintenance reminder
 

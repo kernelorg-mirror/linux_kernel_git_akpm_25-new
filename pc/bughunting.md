@@ -3,6 +3,8 @@
 This is the authoritative, reusable procedure for kernel bug reproduction,
 debugging and patch preparation in future chats. Prefer direct evidence and
 small, tested steps to speculation. Keep answers and commands concise.
+All drafted email, patch and review prose must be hard-wrapped at a
+maximum of 75 columns. This is a strict limit, not a guideline.
 
 ## Machines and workspace
 
@@ -223,7 +225,8 @@ headers or fabricate diffs**, especially after rewriting a proposed patch.
   a specified public source or reconstruction, **not** the user's checkout.
   Never claim success without executing the check.
 - Verify hunk contexts and filenames and show a concise diffstat. Keep
-  patches 7-bit ASCII and lines generally within 75 columns in changelogs.
+  patches 7-bit ASCII and hard-wrap all changelog prose at 75 columns
+  maximum.
 - The local `hp2` patch queue may store `patches/<name>.patch` together
   with the editable `txt/<name>.txt` changelog, `pc/<name>.pc` metadata
   and `series`/`applied-patches`. Verify the actual destination format
@@ -265,7 +268,7 @@ current session** before linking it. Do not invent sandbox download links.
   blank line, rationale and userspace-visible impact, a single blank
   line and properly ordered trailers, followed by one standalone `---`
   with temporary testing notes and the diffstat/diff. Plain 7-bit ASCII;
-  wrap changelog prose at roughly 75 columns.
+  hard-wrap all changelog prose at 75 columns maximum.
 - Trailer order: `Link:`/`Fixes:` before any existing human signoff chain;
   then `Reported-by:`, `Closes:`, review/test acknowledgements,
   named human assistance, `Assisted-by: LLM`, and finally individual

@@ -1,0 +1,67 @@
+From: Joanne Koong <joannelkoong@gmail.com>
+Subject: mm: unqueue deferred split folios outside the lruvec lock
+Date: Mon, 19 Oct 2026 16:06:46 -0700
+
+move_folios_to_lru(), folio_batch_move_lru() and folios_put_refs() call
+folio_unqueue_deferred_split() on folios where the refcount has dropped to
+zero.  In these paths, folio_unqueue_deferred_split() is called with the
+lruvec lock often held (move_folios_to_lru() always holds it and
+folio_batch_move_lru()/folios_put_refs() usually hold it for every folio
+in the batch except the first).  However, it's not needed to hold the
+lruvec lock.
+
+The lruvec lock protects folio->lru and the reclaim LRU lists whereas the
+deferred split queue lives on folio->_deferred_list in deferred_split_lru.
+The deferred_split_lru is a list_lru with its own per-memcg per-node
+lock.
+
+There are already other existing callers that call
+folio_unqueue_deferred_split() without holding the lruvec lock (eg
+__folio_put(), shrink_folio_list(), __folio_migrate_mapping(), ...).
+
+Add folio_batch_unqueue_deferred_split() and use it in
+move_folios_to_lru(), folio_batch_move_lru(), and folios_put_refs() to
+unqueue each batch of zero-refcount folios from the deferred split list
+after the lruvec lock is released and before mem_cgroup_uncharge_folios().
+This helps shorten the lruvec lock's critical sections, which run with
+IRQs disabled and are highly contended.
+
+This came out of the discussion on v2 of the mTHP shrinker series [1],
+where queueing small mTHP folios on the deferred split queue was found to
+regress Barry's fault microbenchmark.  With [1] applied and
+khugepaged/max_ptes_none=0 so that every folio is queued, perf lock
+contention showed that the extra cost came from waiting on the lruvec lock
+in the free path.
+
+Test setup: 2-socket Intel Skylake, 40 cores / 80 threads, memory bound to
+node 0 so that all threads contend on one lruvec, with each of 80 threads
+faulting in and unmapping 16 MB of anonymous memory 200 times.  With only
+16K mTHP enabled, this patch reduces the queueing cost from 15% runtime to
+noise, and lruvec lock wait time (summed across threads) drops from 491
+seconds to 38 seconds.  Most of the remaining contention moves to the
+deferred split list_lru lock, but runtime still drops back to the unqueued
+baseline.  This test uses a worst-case configuration ([1] is expected to
+only queue folios of 2M and larger).
+
+Link: https://lore.kernel.org/20261019230646.3510790-1-joannelkoong@gmail.com
+Link: https://lore.kernel.org/linux-mm/CAJnrk1a2PpUGTsCgS7jct2KET4K2zAL+_h+te8G1MaU9bXs99w@mail.gmail.com/ [1]
+Signed-off-by: Joanne Koong <joannelkoong@gmail.com>
+Reviewed-by: Lance Yang <lance.yang@linux.dev>
+Reviewed-by: Barry Song <baohua@kernel.org>
+Acked-by: David Hildenbrand (Arm) <david@kernel.org>
+Acked-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Muchun Song <muchun.song@linux.dev>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Hugh Dickins <hughd@google.com>
