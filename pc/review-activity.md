@@ -1,6 +1,6 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-17 (America/Los_Angeles)
+Last updated: 2026-10-19 (America/Los_Angeles)
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
 modules; the old standalone S2 file is historical only).
@@ -14,13 +14,16 @@ short; detailed mail and diffs are retrieved by reference as needed.
 
 Repository: https://github.com/htejun/kernel-agent-workflows
 Upstream branch: `main`
-Last checked: 2026-10-17 (America/Los_Angeles)
-Checked HEAD: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`
-HEAD commit date: 2026-10-17 17:19:05 UTC
-HEAD subject: README: Point to the repository on GitHub
-Last comparison: 2026-10-17 (America/Los_Angeles)
-Status: initial checkpoint; no earlier upstream SHA to compare.
-`UPGRADING.md` contains only its initial-version entry.
+Last checked: 2026-10-19 (America/Los_Angeles)
+Checked HEAD: `cbb4478d0f73e15907335e70a2dc2fe54a9e7167`
+Previous HEAD: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`
+Change: `$MODEL_CHECKER` introduced in `UPGRADING.md`; default
+`tla-mctj`. Other relevant module changes: formal-model guidance.
+HEAD commit date: 2026-10-18 06:22:24 UTC
+HEAD subject: Merge pull request #1 from htejun/overlay-flush
+Last comparison: 2026-10-19 (America/Los_Angeles)
+Status: compared current HEAD with previous recorded checkpoint.
+`UPGRADING.md` now adds `$MODEL_CHECKER`, default `tla-mctj`.
 
 Migrated from the read-only standalone `tj-patch-review-workflow.md`
 (S2). Reviewed the replacement `review/patchset-review.md`,
@@ -43,12 +46,12 @@ when unchanged. Do not attribute this SHA to reviews R-001 through R-005.
 
 Repository: https://github.com/masoncl/review-prompts
 Upstream branch: `main`
-Last checked: 2026-10-17 (America/Los_Angeles)
+Last checked: 2026-10-19 (America/Los_Angeles)
 Checked HEAD: `d048f8742f6740c38833adf02e87901412d771ca`
 HEAD commit date: 2026-10-01 11:53:46 UTC
 HEAD subject: README: add pahole to the project lists
-Status: initial version-tracking checkpoint; no previous pinned SHA.
-Last comparison: 2026-10-16 (America/Los_Angeles)
+Status: unchanged from previous verified prompt baseline.
+Last comparison: 2026-10-19 (America/Los_Angeles)
 Comparison: HEAD unchanged from the recorded checkpoint; no new diff.
 
 Recent upstream improvements already in this baseline:
@@ -71,22 +74,25 @@ DO NOT infer they used the HEAD recorded above.
 
 Repository: https://github.com/sashiko-dev/sashiko
 Upstream branch: `main`
-Last checked: 2026-10-16 (America/Los_Angeles)
-Checked HEAD: `f4b72fa04f232fe5f2183d32d7cf9c09e5d735ec`
-HEAD commit date: 2026-10-16 20:13:53 UTC
-HEAD subject: ingestor: restrict git protocols when bootstrapping archives
-Last comparison: 2026-10-16 (America/Los_Angeles)
-Comparison: HEAD matches the supplied initial reference; no upstream
-change to compare. Verified the vendored `mm-vma.md` and
-`false-positive-guide.md` paths at this SHA; no full workflow audit.
+Last checked: 2026-10-19 (America/Los_Angeles)
+Checked HEAD: `f6e2e172e1e669b6767a4c74fe91d062b41fd71c`
+Previous HEAD: `f4b72fa04f232fe5f2183d32d7cf9c09e5d735ec`
+Difference: pipeline prescreen/planner temperature propagation;
+seven analysis domains unchanged. Full manual track covered in R-016.
+HEAD commit date: 2026-10-19 21:20:55 UTC
+HEAD subject: docs: add LWN 7.3 development statistics article to PRESS.md
+Last comparison: 2026-10-19 (America/Los_Angeles)
+Comparison: advanced from prior SHA; reviewer verified latest diff is
+PRESS.md-only and earlier workflow changes carry temperatures to stages.
+Verified the pinned pipeline plus applicable core, specialist and
+false-positive sources at this SHA. Native Sashiko: not run.
 
 Accepted techniques: preserve substantive dismissed hypotheses with
 source evidence; independently verify disputed claims and dismissals;
 keep distinct failure mechanisms separate. These are local additions to
 the existing two-pass review, not a Sashiko review pipeline.
 
-Check HEAD at most weekly during active reviewing, at the next
-interaction after seven days. If advanced, inspect relevant deltas only
+Check HEAD at each substantive review. If advanced, inspect deltas
 and record the new SHA, comparison date and any useful general rules.
 Carry forward accepted techniques between checks. No background
 Sashiko monitoring has been scheduled.
@@ -109,7 +115,7 @@ such a subject, consult the named active record or archive FIRST.
 - `ipc/sem: account enlarged sops arrays to memcg`
   ACTIVE: [R-005](#r-005); review response drafted.
 - `mm/vmalloc: read vm_map_ram block regions from the requested offset`
-  ACTIVE: [R-006](#r-006); v2 resolves v1 issue; no new defect.
+  ACTIVE: [R-006](#r-006); v2 correct; maintainer asks simplify.
 - `proc/kcore: advance the vmalloc retry by the last copy, not the total`
   ACTIVE: [R-007](#r-007); v1 source-reviewed, no defect found.
 - `mm/mremap: do not charge a shrinking move twice`
@@ -120,6 +126,17 @@ such a subject, consult the named active record or archive FIRST.
   ACTIVE: [R-010](#r-010); v1 sound, security coordination pending.
 - `mm/mempolicy: apply bind policies against the scoped allocation zone`
   ACTIVE: [R-011](#r-011); source-reviewed, take as submitted.
+- `zram: redesign zcomp and rework backends`
+  ACTIVE: [R-013](#r-013); v5 source-reviewed; tests requested.
+- `mm/ksm: keep soft-dirty and uffd-wp when merging a page`
+  ACTIVE: [R-015](#r-015); zero-page soft-dirty case omitted.
+- `kasan: fix runtime shadow page table synchronization`
+  ACTIVE: [R-014](#r-014); v2 must be revised; shared-table bugs.
+- `mm/memory-tiers: reset demotion targets of nodes without memory`
+  ACTIVE: [R-016](#r-016); one-line code appears sound; original
+  mail/changelog unavailable, so unconditional acceptance withheld.
+- `fs/proc/task_mmu: pin mm_users in do_pagemap_scan()`
+  ACTIVE: [R-017](#r-017); fix sound; `!mm` masks Oops; tests needed.
 - `mm: retry page faults once under the per-VMA lock`
   STUDY: [L-001](#l-001); lessons integrated, no patch verdict.
 - `mm: various (urgent?) fixes`
@@ -326,8 +343,9 @@ V1 Message-ID: <20261017154120.795844-1-nickolai@csail.mit.edu>.
 V2 Message-ID: not supplied in this chat; v2 full patch supplied.
 Base: `70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56`.
 Fixes: `06c8994626d1` (verified introducing commit).
-Status: v2 source-reviewed, no additional change requested. PENDING
-  maintainer feedback; author tests not independently reproduced.
+Status: v2 behavior source-reviewed and correct; maintainer requests
+  clearer endpoint-based implementation. PENDING revised patch; author
+  tests not independently reproduced.
 
 Findings and v1-to-v2 resolution:
 - R-006/F1: v1 and v2 skip expired used-map runs and copy at the
@@ -366,8 +384,18 @@ Review: two sequential passes, no parallel subagents. Tejun
   `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`; Chris
   `d048f8742f6740c38833adf02e87901412d771ca` checked
   2026-10-17. Sashiko weekly refresh not due; prior methods applied.
-Next: take v2 as submitted; await feedback. Preserve the general
-  lesson of verifying iterator endpoint conventions against source.
+Maintainer feedback (2026-10-18, Uladzislau Rezki): simplify the
+  arithmetic to the payload [start, end) and current read addr.
+  Express skip as addr >= end; zero-fill before start; read from
+  addr for min(end - addr, remains), eliminating offset and size.
+  This is a clarity improvement, not a newly identified defect.
+  Compute end = start + ((re - rs) << PAGE_SHIFT); do not call
+  vmap_block_vaddr(va_start, re): at re == VMAP_BBMAP_BITS its
+  same-block BUG_ON would trigger at the exclusive end.
+Next: request/await a simplified revision, preserve v2 behavior
+  and half-open interval tests. No revised kernel code was built
+  or run. General lesson: verify correctness and then separately
+  ask whether the code expresses the invariant directly.
 
 
 ### R-007
@@ -778,6 +806,421 @@ preparation, compare deferred recovery after rollback, search for
 higher-level retry owners, separate check validity from necessity,
 track lock state at each new path, and favor upstream design over
 backport convenience. General lessons added to the AKPM workflow.
+
+### R-013
+
+Subject: zram: redesign zcomp and rework backends
+Author: Sergey Senozhatsky. Version: [PATCH v5 00/13], 2026-10-18
+  (+0900). Input: user-supplied mbox with all 13 patches and two older
+  v1 discussion replies, 2026-10-17 PT.
+Status: SOURCE REVIEW COMPLETE; no proven code defect; ask for
+  correctness/stress validation before taking the full series.
+
+Independent pass:
+- [01-08/13]: printk prefix, debugfs cleanup, dictionary and workspace
+  optimizations, and writeback reset inspected. No confirmed defect.
+- [09/13]: compression and decompression stream split preserves each
+  backend's mutable-context ownership; zstd/deflate retain exclusive
+  dctx, while LZO/LZ4/842 decompression is stateless. CPU hotplug
+  releases C/D contexts using their separate locks. No proven defect.
+- [10-11/13]: stateless decompression can use a read-held lifetime
+  semaphore; mutable dctx and the fallback local_copy require the
+  exclusivity mutex. Spanning objects use a GFP_NOWAIT bounce buffer
+  with serialized fallback. SG lifetime maintained. No proven defect.
+- [12/13]: wait_event() repeatedly scans online CPUs and acquires a
+  read pin plus exclusive mutex by trylock. Release wakes waiters;
+  bounce-buffer fallback also wakes. The online CPU stream is pinned
+  through hotplug teardown. No proven missed wake or UAF.
+- [13/13]: secondary compressors are used by recompress_store() under
+  dev_lock write; singleton compressor preserves independent per-CPU
+  decompressors for reads. Allocation and cleanup paths examined.
+- Although read_compressed_page() may sleep between
+  zs_obj_read_sg_begin/end(), current zsmalloc's counted reader pin
+  explicitly permits sleeping (its writer uses trylock); not a bug.
+
+Actionable feedback:
+- Large synchronization and allocation series warrants documented
+  round-trip/corruption and CPU hotplug/reset/failure-injection tests,
+  especially zstd/deflate dictionaries, lz4hc and multi-CPU exclusive
+  stream borrowing. Submitted benchmarks are performance evidence,
+  not an exhaustive correctness matrix; no tests run here.
+- [08/13] changelog should make the userspace symptom explicit:
+  reset of a reused zram device retained writeback limits/options,
+  potentially causing unexpected -EIO on later writeback when the
+  retained enabled limit is zero. Historical commit cited in prose;
+  assess Fixes/stable separately if a maintained branch is affected.
+- Older [00/10] replies request deferral until next -rc1; no
+  contradiction with current v5, and no request for immediate merge.
+
+Impact-changelog: [08/13] needs a concrete operational example for
+  downstream diagnosis; rest are principally performance or local
+  resource fixes. Stable: [08/13] possible standalone candidate,
+  requires affected-tree confirmation. Do not stable-tag 13-patch
+  performance redesign automatically.
+
+Guided review: Tejun HEAD
+  c8cc6a8bee854cf2850f44e0a61be581c19f1d4e; Chris HEAD
+  d048f8742f6740c38833adf02e87901412d771ca, checked 2026-10-17.
+  Inspected patch-review, evidence, kernel-idioms, technical,
+  false-positive, block, locking, allocator and build guidance;
+  no new source-supported defect from guided pass.
+Validation: source-only against submitted diffs, Linux mainline
+  backend implementation and public linux-next zsmalloc reference;
+  the zcomp SG conversion predates mainline snapshot and was supplied
+  as part of the patch preimage. No build, test, formal model or
+  independent performance benchmark performed.
+Next: request concise functional/stress coverage and strengthen the
+  [08/13] changelog; review follow-up before applying a tag. Reply
+  drafted, NOT SENT.
+
+
+### R-014
+
+Subject: kasan: fix runtime shadow page table synchronization
+Original Subject: [PATCH v2] kasan: fix runtime shadow page table
+  synchronization
+Author: Muchun Song <songmuchun@bytedance.com>
+Date: 2026-10-18 (message); reviewed 2026-10-17 PT.
+Source: `Pasted text(20261018-061334).txt`.
+Follow-up: user's Sashiko review of commit
+  84e267a96cb1eab3b9fd041e188f62b5f7899dd0.
+Base: 63562804f25cb5b6f5e4f5e3a9f0d1c3c6868596
+Fixes: 0207df4fa1a869281ddbf72db6203dbf036b3e1a
+Status: DO NOT MERGE v2; request a revised patch and tests.
+
+Original findings:
+- R-014/F1: Runtime KASAN zero-shadow population can add page tables
+  visible only to init_mm. Architecture-specific synchronization is
+  necessary. Historical Fixes commit introduced devm_memremap_pages()
+  zero-shadow add/remove. This root cause remains valid.
+- R-014/F2: The pgalloc tracking helpers and one final sync (including
+  partial-failure cases) are sound in principle. The aligned-entry
+  guards, however, missed the shared-template cases below.
+- R-014/F3: The original review treated retention as only a risk of
+  empty page-table allocations. That was an INCORRECT conclusion: v2
+  can also retain mapped shared static zero-shadow entries; see F6.
+- R-014/F4: The original review checked x86 masks but neglected
+  other architectures' *_none() definitions and early-shadow setup.
+  This coverage failure enabled F5 to escape both passes.
+
+Sashiko feedback, independently checked against the supplied base:
+- R-014/F5 CONFIRMED: LoongArch kasan_init() first calls
+  kasan_pgd_populate(..., early=true), then
+  kasan_populate_early_shadow() for VMALLOC..KFENCE. LoongArch
+  p4d_none()/pud_none()/pmd_none() compare against their respective
+  invalid_*_table, not the installed kasan_early_shadow_* table.
+  New `*_none()` tests fail for preexisting shared entries, so an
+  aligned fast path formerly skipped instead descends down to
+  zero_pte_populate(), repeatedly rewriting the shared static PTEs.
+  Excessive boot-time page-table work is a proven code consequence;
+  exact run time, crash, or early write-protect failure not reproduced.
+- R-014/F6 CONFIRMED conditional path: When an aligned early-shadow
+  entry lies at an ARCH_PAGE_TABLE_SYNC_MASK level, v2 installs a
+  static shared child and marks the level synchronized. During
+  kasan_remove_zero_shadow(), new `continue` skips the entry and does
+  not clear its valid zero-shadow PTE mapping. A later normal RAM
+  online in that shadow range has kasan_mem_notifier() check only
+  shadow_mapped(), which returns true for the stale zero PTE, thus
+  skipping real writable shadow allocation. This can lead to a KASAN
+  fault on access. The exact hotplug/arch configuration and runtime
+  reproduction were not established; mapping-retention mechanism is
+  source-proven, not merely an empty-table memory leak.
+- R-014/F7 DESIGN: Retain parent table storage if another mm might
+  reference it, but still remove the logically invalid leaf mapping.
+  Shared static tables can alias other virtual ranges, so clearing
+  their PTEs blindly is not safe either. A runtime-private table at a
+  synchronized level may be appropriate, but replacing a parent
+  already copied into other page tables requires architecture-safe
+  coordination; do not assert that a simple swap is sufficient.
+
+Disposition: Fix the shared-table classification in aligned paths;
+  correct the teardown semantics at synchronized levels; prove
+  add/remove/add and boot-time behavior on relevant architectures.
+  Stable: candidate for a corrected upstream fix, not v2.
+  Impact: hotplug-related shadow faults and possible boot slowdown;
+  observed versus potential effects must be distinguished.
+
+Reason previous review failed: assumed !*_none implied a private page
+  table that could be descended into, and treated retain-table-pages
+  as equivalent to retain-parent-mapping. Focused primarily on x86
+  runtime fix rather than all architecture boot states. This is a
+  fix-proof and architecture-coverage failure, not a flaw in proving
+  the original bug.
+
+Guided pass: Tejun HEAD
+  c8cc6a8bee854cf2850f44e0a61be581c19f1d4e; Chris HEAD
+  d048f8742f6740c38833adf02e87901412d771ca.
+Verification: source review of generic KASAN code, LoongArch
+  initialization, *_none() definitions, memory notifier and x86/ARM
+  sync-mask semantics; no compilation, live reproduction or model.
+Next: send revised reply to author; NOT SENT.
+
+### R-015
+
+Subject: mm/ksm: keep soft-dirty and uffd-wp when merging a page
+Original: [PATCH] mm/ksm: keep soft-dirty and uffd-wp when merging
+  a page
+Author: Samarth Narang <samarth.colleges@gmail.com>
+Date: 2026-10-18. Base: 48fe11c8d0f1e4e59426a3606f20ac1130b6d8dc
+Fixes: 292924b26024 (UFFD WP), 0f8975ec4db2 (soft dirty),
+  763f43865fc4 (UFFD RWP); subjects/SHAs checked in GitHub.
+Status: DO NOT MERGE; incomplete soft-dirty fix plus RWP unmerge
+  failures; request revised patch and cross-subsystem corrections.
+Review 2: 2026-10-18. Source-based re-review against base; no native
+  Sashiko runner or Rust compiler in current container and no outbound
+  DNS. Manual specialist analyses performed; NOT a native run and NOT
+  a claim of matching Sashiko's stochastic findings.
+
+R-015/F1 (VALID, NOT FULLY FIXED): The normal KSM page is built with
+  mk_pte(kpage, vma->vm_page_prot). write_protect_page() retains the
+  existing soft-dirty/uffd state in orig_pte, and replace_page()
+  verifies pte_same() under the page-table lock. Copying these flags
+  and restoring PAGE_NONE on an RWP VMA matches analogous PTE rewrites
+  in mm/memory.c and mm/migrate.c. The UFFD-WP/RWP logic appears
+  locally correct. Downstream KSM unmerging is unsafe for RWP;
+  see Sashiko-identified F5 and F6 below.
+R-015/F2 (INCOMPLETE FIX; PREEXISTING MECHANISM): When KSM
+  use_zero_pages is enabled, replace_page() initializes newpte using
+  pte_mkdirty(pte_mkspecial(...)). On x86, pte_mkdirty() sets both
+  _PAGE_DIRTY and _PAGE_SOFT_DIRTY. The patch sets soft-dirty when
+  orig_pte has it, but never clears the bit that the zero-page path
+  set when orig_pte lacks it. Reproducible input state: anonymous
+  mergeable zero page whose soft-dirty bit was cleared with
+  /proc/PID/clear_refs and which was not subsequently written.
+  A KSM zero-page replacement falsely sets pagemap's soft-dirty bit.
+  The logic covers all four combinations of zero vs ordinary KSM,
+  and orig_pte soft-dirty set vs clear; only zero + clear fails.
+  Ask for symmetric set/clear restoration of soft-dirty state, e.g.
+  else newpte = pte_clear_soft_dirty(newpte). The accounting sentinel
+  uses the distinct dirty/saved-dirty bits and is unaffected.
+R-015/F3 (REJECTED HYPOTHESIS): RWP's pte_modify(PAGE_NONE) does not
+  lose x86's KSM zero-page dirty accounting marker. On x86,
+  pte_mkdirty() moves the hardware dirty bit to SAVED_DIRTY if the
+  PTE is read-only; pte_modify() preserves the saved bit on its
+  read-only input; pte_dirty() sees both. No reported regression.
+R-015/F4 (REJECTED HYPOTHESIS): An RWP protnone PTE is not excluded
+  merely for being PROT_NONE: pagewalk's PTE path handles present
+  entries and vm_normal_page(). No proven special exclusion from KSM.
+
+Manual Sashiko goal: direct PTE reconstruction is the minimal repair,
+  but the intended metadata invariant needs preservation in both
+  directions and on both old/new zero-page states.
+Manual Sashiko implementation: F2 defeats full stated soft-dirty
+  preservation. PTE markers, RWP and the three Fixes subjects align.
+Manual Sashiko execution-flow: followed write_protect_page() through
+  try_to_merge_one_page() and replace_page() for normal/zero pages,
+  mismatch abort, pte_clear_flush and mapped-page replacement.
+Manual Sashiko resources/locking: no new ownership or serialization;
+  page-table lock, mmap read lock and PTE equality cover the rewrite;
+  references, counters and error paths unchanged by added flags.
+Manual Sashiko security/hardware: preserving UFFD protection prevents
+  losing intended write/access traps. Cross-checked x86/arm64 PTE
+  helpers. x86 zero-page soft-dirty set is confirmed; arm64
+  pte_mkdirty() does not itself set soft-dirty.
+Manual Sashiko verification (previous review): F2 code proof;
+  F3/F4 rejected, but inverse-operation KSM unmerging was missed.
+  Claims of complete execution-flow coverage were unwarranted.
+Tejun/Chris: current SHAs at redo, cbb4478d0f73e15907335e70a2dc2fe54a9e7167
+  and d048f8742f6740c38833adf02e87901412d771ca.
+Sashiko source: 27815bffd745c1e30e91bdd9d4f197ec7620d204.
+  Source prompts fetched from pinned SHA; native run unavailable.
+User-visible impact: lost soft-dirty history produces false negatives
+  for ordinary KSM; unprotected WP/RWP stops expected userfaultfd
+  faults; zero-page path still produces false positive in pagemap.
+  RWP unmerge can silently leave KSM pages shared after
+  MADV_UNMERGEABLE; asynchronous unmerge can consume RWP state.
+Stable: candidate after complete fix; stable tag already present.
+Testing: no author test in supplied patch; no real kernel build,
+  hardware execution or native Sashiko run. Four-way flag check was
+  a source-derived Boolean exercise, not a live-kernel test.
+Model: no new multi-actor protocol; page-table lock serializes PTE
+  replacement. TLA+ is not relevant to this incomplete state-copy.
+Next: request v2 for soft-dirty clear and RWP-aware KSM unmerge,
+  including synchronous and asynchronous cases and PTE unshare.
+  Require regression testing; email drafted, NOT SENT.
+
+
+R-015 Sashiko feedback, 2026-10-18:
+  External native Sashiko report for commit
+  a0c91d60795a1c981863694b2d5797c97c36486f was user-provided.
+  Its additional unmerge concerns were independently source-verified.
+  This was NOT a native Sashiko execution in our environment.
+R-015/F5 (CONFIRMED, synchronous RWP): break_ksm() calls
+  handle_mm_fault() with FAULT_FLAG_UNSHARE | FAULT_FLAG_REMOTE but
+  without FAULT_FLAG_ALLOW_RETRY. An RWP-armed protnone PTE is
+  dispatched by handle_pte_fault() into do_uffd_rwp() *before* the
+  UNSHARE flag check. In synchronous mode, handle_userfault() warns
+  (with CONFIG_DEBUG_VM) about missing ALLOW_RETRY, and returns
+  VM_FAULT_SIGBUS. break_ksm() exits and converts SIGBUS into a
+  zero (success) result. __ksm_del_vma() can then clear VM_MERGEABLE
+  without unmerging, and the global unmerge can release rmap items.
+R-015/F6 (CONFIRMED, asynchronous RWP): do_uffd_rwp() rewrites the
+  PTE to VMA protection and clears its UFFD marker during internal
+  UNSHARE. break_ksm() can retry and unshare, but RWP tracking was
+  consumed without any actual user access. Also, wp_page_copy()
+  preserves the uffd bit on its UNSHARE path yet fails to restore
+  PAGE_NONE; redirecting the fault to COW alone is not sufficient.
+  The paths can also be triggered on already RWP-marked KSM mappings
+  without this patch; preserving RWP through KSM merge makes their
+  incompatibility directly reachable in the proposed new behavior.
+Proposed repair (not code-tested): distinguish internal UNSHARE from
+  RWP access before userfault dispatch, ensure real unsharing, and
+  restore PAGE_NONE after PTE copy. Carefully preserve NUMA protnone
+  handling, existing userfault behaviors and accounting invariants.
+Review failure analysis: prior passes traced merge -> replacement, but
+  never tested replacement -> MADV_UNMERGEABLE -> internal fault ->
+  handler and cleanup. The earlier favorable UFFD verdict was wrong.
+  Workflow now mandates inverse-operation and internal-caller audits.
+No kernel runtime experiment, compilation, formal model or native
+  Sashiko execution was performed for this feedback analysis.
+
+
+### R-016
+
+Subject: mm/memory-tiers: reset demotion targets of nodes without memory
+Original: [PATCH] mm/memory-tiers: reset demotion targets of nodes
+  without memory
+Author: Gregory Price. Reviewed: 2026-10-19 (America/Los_Angeles).
+Full mail/Message-ID: not supplied; original complete changelog and
+  author tests not recovered. Diff: one-line `for_each_node_state(node,
+  N_MEMORY)` -> `for_each_node(node)` in disable_all_demotion_targets().
+Source: torvalds/linux 70dd4ee72eb2d5793c62e71c14e3aba78e5a4e56.
+Fixes: 6c542ab75714 (verified introducing commit).
+Status: REVIEW COMPLETE for supplied one-line code; NO UNCONDITIONAL
+  TAKE until the full posted mail and changelog are checked.
+Report: `memory-tiers-review.md` (full 66-rule evidence matrix).
+
+Findings:
+- R-016/F1 (source verified): the old reset skips a node immediately
+  after its N_MEMORY bit is cleared by last-memory hot-unplug. This
+  leaves stale per-node demotion preferred bits.
+- R-016/F2 (source verified): changing reset to N_POSSIBLE clears
+  memoryless entries. NULL pgdat is guarded; array is sized for
+  nr_node_ids, which covers N_POSSIBLE; only actual N_MEMORY nodes
+  are rebuilt. No new source-level defect proven.
+- R-016/F3 (no observed user effect): all in-tree demotion target
+  consumers are in mm/vmscan.c. Actual source folios prevent
+  test_pages_isolated() success; re-online rebuilds after setting
+  N_MEMORY. Treat as invariant cleanup, not a proven runtime regression.
+- R-016/F4 (hard case checked): lower-tier allowed mask and preferred
+  target are read in separate RCU sections. The existing non-atomic
+  snapshot may change during hotplug, but source folio isolation and
+  online/target guards revealed no regression from the new reset.
+
+Verification: source and historical Fixes commit inspected; Python
+  finite truth-table: 3900 masks, 2541 old stale-vs-new cases, all
+  active-node outcomes unchanged. No real kernel compile/runtime test,
+  native Sashiko, TLA+, TLC, tla-mctj or herd7 execution.
+SHA pins: Sashiko f6e2e172e1e669b6767a4c74fe91d062b41fd71c;
+  Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+  Chris d048f8742f6740c38833adf02e87901412d771ca.
+Model: no - no new multi-actor protocol; manual 3-actor analysis and
+  bounded executable mask enumeration suffice for introduced behavior.
+Impact-changelog: no known effect for in-tree users, substantiated;
+  original complete mail not available, so cannot confirm wording.
+Stable: not justified - no demonstrated user benefit/test data.
+Standing rules: 63 of 66 applied; 2 inapplicable; 1 unresolved.
+  Unresolved: original mail/changelog/replies/tests not recovered.
+Next: obtain full original mail and audit claimed testing, then decide
+  final unconditional take. LKML-ready reply drafted, NOT SENT.
+
+### R-017
+
+Subject: fs/proc/task_mmu: pin mm_users in do_pagemap_scan()
+Original: [PATCH] fs/proc/task_mmu: pin mm_users in do_pagemap_scan()
+Author: Ngoc Quy <ngocquy0700@gmail.com>. Date: 2026-10-14.
+Base: 24a19b953e2a3d0ea5a8c4951a0ab8f32720c907 (Linux 7.3-rc7).
+Source preimage: fs/proc/task_mmu.c blob
+  5c54aebe211824681a5c30e03464af51697b11ce.
+Fixes: 52526ca7fdb905a768a93f8faa418e9b988fc34b (verified).
+Status: CORE FIX SOUND; `!mm` masks impossible-state Oops; missed
+  in initial review. Remove guard; request impact and testing.
+Report: `task-mmu-review.md` (74-rule evidence matrix).
+Model: `task-mmu-mmusers-model.py` (executed Python checker).
+
+Findings:
+- R-017/F1 (source proof): proc_mem_open() pins mm_count, not
+  mm_users; exiting task may enter exit_mmap() under mmap_read_lock()
+  while PAGEMAP_SCAN also holds the read lock. unmap_vmas() invokes
+  hugetlb_zap_end(ZAP_FLAG_UNMAP); the VMA-specific rwsem can be freed
+  after a walker cached its address but before down_read(), yielding
+  a reachable UAF. An empty hugepage pool does not prevent the path
+  with a shared MAP_HUGETLB | MAP_NORESERVE mapping. User-side read
+  permission for target pagemap is still required.
+- R-017/F2 (fix proof): mmget_not_zero() at ioctl entry blocks the
+  final mmput() until all walks, copies and cleanup finish; every
+  new error goto releases the reference, and zero mm_users yields
+  -ESRCH. No code regression established on examined paths.
+- R-017/F3 (dismissals): Ordinary munmap() detaches VMAs before its
+  optional mmap_lock downgrade; exit_mmap() still exposes them
+  during the read-locked unmap. Clearing vm_private_data is not
+  protection against cached pointers; acquiring a hugetlb rwsem is
+  not an independent kref.
+- R-017/F4 (changelog): source-supported possible kernel crash or
+  corruption should lead the changelog. No live symptom, KASAN log
+  or before/after kernel test was supplied or independently run.
+
+- R-017/F6 (post-review correction, 2026-10-19): User challenged
+  failure to flag newly added `!mm`. Verified `pagemap_open()` rejects
+  NULL from `proc_mem_open()`. On success, `file->private_data`
+  cannot be NULL at `do_pagemap_cmd()`. No other caller or setter of the
+  ioctl private_data was established. Hence `!mm` is unreachable
+  on this path and redundant, although `mmget_not_zero(mm)` IS
+  necessary when mm_users hits zero. Proposed removal: use
+  `if (!mmget_not_zero(mm))`. The initial "no code change" verdict
+  was mistaken: the review followed the UAF but skipped a necessity
+  test for this guard. The new mandatory gate requires a per-clause
+  witness and explicit reachability/necessity conclusion. The
+  follow-up audited four added/behavior-changed decisions:
+  4 of 4 checked; 1 redundant; 0 unresolved. This is retrospective,
+  NOT proof that the original 74-rule review executed the new gate.
+- R-017/F7 (user diagnostic-contract clarification, 2026-10-19):
+  The objection to `!mm` is not merely redundant defensive coding.
+  A NULL `mm` would violate the guaranteed open/ioctl call chain.
+  Before the patch, such a programming error would Oops and demand
+  investigation. The new `!mm` turns it into quiet `-ESRCH`, hiding
+  a possible kernel defect. AKPM has already challenged the author
+  on this exact point. Remove `!mm` to preserve the existing
+  diagnostic behavior; do not add BUG_ON solely for this purpose.
+  General rule: every changed guard needs an old/new diagnostic
+  behavior check, distinguishing impossible internal invariant
+  violations from expected runtime or userspace failures.
+  Retrospective diagnostic audit: 4/4; G01 masks prior Oops, G02
+  converts reachable mm_users-zero race to ESRCH, G03/G04 retain
+  their original error codes while releasing the added reference.
+- R-017/F5 (native formal): PlusCal source was translated and parsed;
+  TLC and tla-mctj independently find a concrete UAF in the unpinned
+  model and no failure in the pinned two-scanner/one-exit model.
+  Separately tested pointer-check/load NULL race; original fails.
+  No kernel runtime/sanitizer experiment was run.
+
+Execution: Python 3 bounded scheduler with two scanners and one
+  exiting task: old 902 states, 2134 transitions, unsafe; patched
+  187 states, 380 transitions, no unsafe states under abstraction.
+  Native PlusCal -> SANY -> TLC and tla-mctj ran on 2026-10-19.
+  Old protocol violated NoUAF and NoNull in both model checkers:
+  mctj old/UAF 545* distinct states, depth 13; TLC 522*, depth 14;
+  mctj old/NULL 270*, depth 10; TLC 244*, depth 11.
+  *Counterexample found before complete enumeration of old graph.
+  Patched: 504 distinct states, depth 32, no invariant failures in
+  BOTH checkers. SC abstraction; not a kernel runtime test/LKMM proof.
+  TLC 2026.10.15.145915; tla-mctj 0.1.2. See task-mmu-review.md
+  and task_mmu_mmusers.tla plus three canonical .cfg instances.
+Guidance checked 2026-10-19: Sashiko
+  f6e2e172e1e669b6767a4c74fe91d062b41fd71c; Tejun
+  cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+  d048f8742f6740c38833adf02e87901412d771ca. Independent and
+  full applicable manual stage analysis performed, no native Sashiko.
+Impact-changelog: needs explicit user-facing harm and test evidence.
+Stable: prospective candidate after mainline and actual testing;
+  introducing commit is included from v6.7, not v6.6.
+Standing rules: 72 of 74 applied; 1 inapplicable; 1 unresolved.
+  Unresolved: native Sashiko not run (A47). Native model covered A57.
+  Not applicable: no new weak-memory protocol/herd7 (A58).
+Next: await Ngoc's answer to AKPM's `!mm` diagnostic objection;
+  request explicit user impact and before/after KASAN testing.
+  Corrected LKML draft in report;
+  it has NOT been sent. No Reviewed-by provided.
 
 ## Maintenance reminder
 

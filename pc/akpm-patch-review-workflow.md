@@ -4,7 +4,8 @@ Purpose: local review policy for future ChatGPT kernel patch reviews.
 This is the entry point. Tejun's current generic review workflow is at
 https://github.com/htejun/kernel-agent-workflows; fetch its relevant
 modules at a pinned commit. This file provides AKPM-specific additions
-and overrides. Chris Mason's prompts are a separate upstream source.
+and overrides. Chris Mason's prompts and Sashiko's full review
+coverage are separate upstream sources.
 
 The original `tj-patch-review-workflow.md` (S2) is a retired, read-only
 historical reference. Do not load it for routine reviews, modify it or
@@ -16,9 +17,10 @@ delete it without authorization. The older
 This file alone is sufficient as the review-policy handoff for a NEW
 patch or series. The reviewer must also have the submitted patch and
 access to its matching kernel source and public upstream review guides.
-Fetch Tejun's modules and Chris Mason's prompts by verified commit SHA
-as described below. No local Tejun copy or AKPM activity ledger is
-needed to perform the review.
+Fetch Tejun's modules, Chris Mason's prompts, and Sashiko's review
+instructions by verified commit SHA as described below.
+No local Tejun copy or AKPM activity ledger is needed to perform
+the review.
 
 `review-activity.md` contains AKPM's active cases, prior feedback and
 upstream version checkpoints, not additional review methodology. It is
@@ -31,35 +33,45 @@ dated archive) is needed to CONTINUE an existing AKPM review.
 AKPM's weekly Lore feedback monitor is not part of this file and does
 not automatically run for another reviewer.
 
-## Execution order: two separate review passes
+## Execution order: independent review plus two coverage tracks
 
-For every review, including single patches and mbox series:
+For EVERY review, including single patches and mbox series, cover the
+entire change by three distinct analyses and an evidence-based merge:
 
-1. First perform an independent, first-principles review of the entire
-   submitted change against the relevant kernel source. Do not consult
-   Tejun's instructions or Chris Mason's or Sashiko's prompts to choose
-   review questions or findings in this pass. Preserve the findings and
-   the paths checked before proceeding.
-2. Then read and apply Tejun's pinned `review/patchset-review.md`
-   module and its applicable dependencies as a separate pass. Use Chris
-   Mason's pinned prompts at https://github.com/masoncl/review-prompts.
-   Load core, technical, false-positive, build, and matching subsystem
-   guidance. Verify all leads against source code. A prompt's
-   declaration that something is wrong is not evidence by itself.
-3. Reconcile the two passes. Compare their path coverage, not just their
-   reported bugs. Investigate paths checked by only one pass, resolve
-   disagreements, eliminate false positives, and deliver ONE combined
-   judgment. Keep bug proof, fix proof and architectural suitability
-   distinct. Indicate the origin of a finding when informative.
+1. Perform and record an independent first-principles review against
+   relevant kernel source, without consulting Tejun, Chris Mason or
+   Sashiko prompts to choose questions or findings. Capture the paths
+   checked, hypotheses, dismissed concerns and supporting evidence.
+2. Perform the mandatory Sashiko coverage track specified below. Use
+   the current SHA-pinned Sashiko stage definitions and matching vendor
+   guides. Independently examine its core and applicable specialist
+   domains, retaining both candidate defects and rejected hypotheses.
+   Do not substitute familiarity with its README or another prompt set
+   for actually performing the analyses. Native Sashiko execution, when
+   available and authorized, is additional evidence, not a substitute
+   for checking its findings against source.
+3. Perform the Tejun- and Chris-Mason-guided track. Read Tejun's pinned
+   `review/patchset-review.md` and applicable dependencies, and all
+   triggered Chris prompts from a single pinned SHA. Independently
+   check their distinct questions and source paths.
+4. Reconcile ALL three tracks. Compare actual coverage, state classes,
+   assertions, candidates and dismissals, not just reported bugs.
+   Verify contradictions and unsupported dismissals; keep separate
+   judgments about bug proof, fix proof and architectural suitability.
+   Deliver one combined verdict with actionable findings.
 
-Both passes must use their own producer/consumer inventory and inspect
-all relevant paths. Do not simply relabel one pass as two. If the tools
-do not permit Tejun's suggested parallel reviewers, do two genuinely
-separate sequential analyses and disclose that limitation. Do not claim
-that subagents, builds, runtime tests, TLC, or herd7 ran unless they did.
+Retain meaningful intermediate results until reconciliation. Sequential
+analysis is acceptable when parallel models are unavailable, but do not
+call it a native multi-agent Sashiko run or independent model consensus.
+Do not claim an external analyzer, test, build or formal model was run
+unless it actually ran. Neither upstream tool's verdict has veto power
+and no review track may dismiss another's finding without code proof.
 
-The independent pass is required even when the prompt-guided pass is
-much deeper. Neither pass has veto power over the other.
+Sashiko-level coverage is a FLOOR, not a claim of matching its output:
+LLM analyses are nondeterministic. The final report must say whether
+native Sashiko ran, whether full applicable stage coverage was completed
+manually, and any missing guides, tests or unverified paths. Do not
+label a review "Sashiko-equivalent" if coverage is incomplete.
 
 ## Tejun upstream modules and upgrade tracking
 
@@ -133,45 +145,105 @@ report for standalone work; all external sources remain read-only.
 Refresh on reviews or explicit requests; do not claim
 continuous monitoring between reviews.
 
-## Selective Sashiko integration
+## Sashiko coverage floor: mandatory, not supplemental
 
-Chris Mason's `masoncl/review-prompts` remains the primary external
-prompt source. `sashiko-dev/sashiko` is supplemental: adopt useful MM
-review techniques, not its prompt set or multi-stage review pipeline.
-Sashiko vendors Chris's prompts and may alter them, notably
-`third_party/prompts/kernel/subsystem/mm-vma.md` and
-`third_party/prompts/kernel/false-positive-guide.md`. Treat categorical
-Sashiko-specific rules as hypotheses, not authority: some may hide bugs.
+Source: https://github.com/sashiko-dev/sashiko.
 
-During active reviews, check Sashiko's default-branch HEAD at most once
-per seven days (the next interaction after seven days, not a background
-process). Compare only if its SHA advanced, and inspect only relevant
-MM, concurrency, false-positive and methodology changes. Record the
-full SHA, check date, comparison date and adopted changes in the
-activity ledger if present, otherwise the review report. Without a
-prior checkpoint, record the initial SHA without claiming a comparison.
-Carry forward vetted techniques; do not redo an
-upstream methodology comparison for each patch.
+At the start of EACH substantive review, verify Sashiko's default-branch
+HEAD and pin ONE full SHA for the entire coverage track. Read the actual
+pipeline instructions from `src/workflows/linux_patch_review.rs`, plus
+its current prompt-selection and verification definitions. Read the
+applicable Sashiko-vendored core, technical, false-positive, subsystem
+and pattern guides at that SAME SHA. These may diverge from Chris's own
+prompts: never silently substitute one for the other. Reuse cached,
+fully verified files only if the SHA is unchanged. Compare new versions
+to the last known checkpoint when material, and record adopted changes.
+Do not mix Sashiko source from different revisions, and do not assume
+this document captures all future changes to its pipeline.
 
-Apply these refinements within the existing two-pass review:
+Sashiko currently has seven specialist analysis domains. Preserve their
+separate questions, with independent consideration before consolidation:
 
-- In BOTH passes retain substantive, plausible hypotheses that were
-  dismissed, with the exact source evidence, guard or precondition
-  supporting dismissal. Omit trivial or unsupported speculation.
-- If reviewers disagree, or dismissal depends on an unverified premise,
-  conduct a focused third examination. State arguments for and against,
-  frame the specific technical question, and trace source, callers,
-  callees, macros, configurations and lifecycle paths. Distrust both
-  the finding and its dismissal. Conclude `CONFIRMED`, `REJECTED` or
-  `UNRESOLVED` from evidence; never force an unresolved claim to be
-  confirmed. This technical assessment does not override the
-  author-feedback disposition policy below.
-- During reconciliation, deduplicate repeated reports, but preserve
-  distinct execution paths, lifecycle stages and consequences even if
-  they share a root cause.
+- GOAL: challenge architecture, compatibility, intended invariant,
+  alternative designs, system-wide costs and suitability of the layer.
+- IMPLEMENTATION: verify every claimed effect, changed interface,
+  contract, side effect, omitted caller, and valid input or object state.
+- EXECUTION-FLOW: trace all changed branches, loops, success, errors,
+  retries, cleanup, initialization and eventual observable outcomes.
+- RESOURCES: follow allocation, reference, ownership, publication,
+  asynchronous handoff, removal, reuse and teardown for every resource.
+- LOCKING: map actors, locks, memory ordering, races, CPU/hotplug states,
+  synchronization and lock inversions across callers and callbacks.
+- SECURITY: trace trust boundaries, attacker-controlled inputs,
+  bounds/overflow, disclosures, privilege and harmful failure paths.
+- HARDWARE: where relevant, trace architecture variants, page-table or
+  device contracts, DMA, barriers, interrupt and hardware state.
 
-Do not read Sashiko prompts in the independent pass, create a mandatory
-Sashiko review pass, or copy or maintain its upstream workflow locally.
+GOAL, IMPLEMENTATION and EXECUTION-FLOW are ALWAYS required. Evaluate
+all four specialist domains for every patch; perform each whenever a
+change may interact with its subject, even indirectly. Record a short
+source-grounded exclusion reason for any omitted specialist analysis.
+The pre-screen or author's subsystem label may not suppress relevant
+coverage. For architecture-dependent generic code, HARDWARE includes
+contrasting platform implementations, not only peripheral drivers.
+
+Apply Sashiko's two-stage verification discipline as well:
+
+1. Collect concrete concerns AND substantive dismissed concerns from
+   every analysis domain. Do not allow early positive impressions in
+   one domain to narrow or terminate another. Preserve distinct paths,
+   cleanup stages and failure effects when merging duplicates.
+2. Verify each finding and each dismissal. Demand positive code proof
+   to dismiss an issue, across all relevant callers, modes and states;
+   a typical caller, familiar architecture, happy path or an untested
+   assertion is not sufficient proof. Do not treat several reviewers
+   sharing an assumption as independent corroboration.
+3. Route contested, partly supported or assumption-based dismissals to
+   a focused HARD-CASE examination. Form a concrete verification
+   question, trace both sides with source, and conclude CONFIRMED,
+   REJECTED or UNRESOLVED. Revisit suspicious "harmless" side effects,
+   omitted restore/cleanup and relied-on-but-unproven preconditions.
+4. Check any candidate against the final state of a patch series before
+   deciding it is still present; retain the original affected patch
+   and bisectability assessment. Do not skip later hunks because an
+   earlier concern has already been found.
+
+A useful minimum counterexample search for each important new
+condition, early exit, fast path or cleanup decision is: find a valid
+state in which the check means something DIFFERENT from what the author
+assumes. Trace that state from its producer to the eventual consumer.
+For generic code, use contrasting implementations, configurations,
+boot/runtime phases and repeated create/destroy or rollback/retry.
+Establish the *final system state*, not just local branch correctness.
+Also compare how much work the patch adds to normal successful paths.
+These are general proof methods, not KASAN-specific rules.
+
+When a native Sashiko runner and a suitable source tree are available,
+run it for each authorized review. Obtain explicit approval before
+third-party data transfer, especially for nonpublic security reports.
+Read its findings and dismissals, verify each against source, and
+reconcile them with the other tracks.
+Do not assume a native Sashiko runner is present simply because its
+GitHub source can be read. Without a runner, carry out the pinned stage
+coverage manually and state "native Sashiko: not run". If any stage or
+source cannot be accessed, say exactly what is missing rather than
+claiming an unqualified coverage superset.
+
+When a Sashiko report is supplied, audit it finding by finding against
+our own candidates AND dismissals. For each valid additional finding,
+trace why all our review tracks missed it, then rerun the revised method
+on the missed case. Record the specific feedback in the activity ledger
+and only the generalizable lesson here. A new rule is not validated
+merely because it describes the missed bug: show how its review question
+would expose the counterexample without knowing the bug in advance.
+
+Our additional requirements remain mandatory ABOVE this floor:
+independent first-principles analysis, Tejun/Chris coverage, historical
+invariant reconstruction, source-verified bug/fix proofs, architectural
+alternatives, analogous-bug search, all significant producers and
+consumers, user-visible impact, stable suitability, and concise email
+replies. Sashiko prompts are hypotheses and review methods, not proof;
+evidence standards and AKPM delivery rules always still apply.
 
 ## Source integrity and review scope
 
@@ -203,11 +275,11 @@ Sashiko review pass, or copy or maintain its upstream workflow locally.
   fixes; use more research and modeling for subtle, consequential bugs.
   Tractability matters, but never replace required coverage with speed.
 
-## Architectural and historical framing: BOTH passes
+## Architectural and historical framing: ALL tracks
 
 Do not accept the patch's framing without checking it. Distinguish a
 real problem, a safe repair, and a suitable design. Use these questions
-within the existing passes, not as another full review pipeline:
+in every relevant track, not only after a defect is found:
 
 - Identify the actual workload, observable goal and bottleneck. Connect
   measurements to the proposed mechanism; distinguish synthetic stress,
@@ -247,6 +319,30 @@ within the existing passes, not as another full review pipeline:
   for existing recovery and bounded retry machinery. Prefer one clear
   owner of each retry, with established status codes and cleanup; prove
   the alternative's locking, object lifetime and forward progress too.
+- Treat each new branch, guard or cleanup decision as a claim about
+  reachable states. Search for a legal counterexample instead of only
+  confirming the motivating case. Check actual initial conditions,
+  producers and callers before deciding a counterexample is impossible.
+- Judge a repair by end-to-end observable state, not just local safety,
+  balanced references or successful return. Follow its effects through
+  later consumers and through cleanup, failure and subsequent reuse.
+  Retaining an object does not prove that its retained state is valid.
+- Apply the mandatory adversarial correctness gate below to state
+  persistence, inverse operations and internal handler dispatch.
+- For changes to generic code, examine contrasting implementations or
+  configurations selected because their behavior or initial state can
+  differ. Verify the relevant helper contracts in those environments;
+  do not generalize from the motivating platform or usual lifecycle.
+- Ask whether the new control flow can amplify work, change progress or
+  replace a cheap fast path with an expensive path for some valid
+  preexisting state. Check common-case and adverse-case costs at the
+  scale actually encountered by callers.
+- After establishing behavioral correctness, seek the simplest
+  expression of the operation and its invariant. Prefer direct
+  relationships between the actual inputs and outputs to derived
+  offsets, redundant intermediate values, or reconstructed state.
+  Compare clarity as a separate review dimension without requiring
+  cosmetic changes that do not materially improve understanding.
 - Choose a clean, maintainable UPSTREAM fix on its merits. Older stable
   branches may need separate adapted backports and validation; missing
   infrastructure there is not by itself a reason to complicate the
@@ -260,7 +356,7 @@ and chats do not restart a settled design discussion. Reopen a rejection
 when its premises change. Do not turn these examples into special rules
 for individual patches or treat maintainer recollection as proof.
 
-## Separate bug proof from fix proof: mandatory in BOTH passes
+## Separate bug proof from fix proof: mandatory in ALL tracks
 
 Demonstrating the old failure does not establish that the proposed fix
 is correct. Treat these as two separate proof obligations:
@@ -284,7 +380,85 @@ is correct. Treat these as two separate proof obligations:
 Apply this explicitly during reconciliation; keep the two proof results
 separate even when an author has supplied a convincing reproducer.
 
-## Mandatory impact-coverage gate, in BOTH passes
+## Added-guard reachability and necessity gate: EVERY patch
+
+A general instruction to "question new checks" did not prevent a missed
+redundant NULL test in an earlier review. This gate is a required
+artifact with per-condition evidence, not a statement of intent.
+
+1. During the first source/hunk walkthrough, inventory EVERY added or
+   behavior-changed guard: `if`, `?:`, `switch` decision, error test,
+   early return, fallback, bounds check, assertion or rejection. Split
+   each `&&` and `||` expression into individually justified clauses.
+   Include checks copied from nearby code, macros and helper wrappers.
+   Give each clause or changed branch a `G01`, `G02`, ... identifier and
+   a source location. Mark `none` only after checking every diff hunk.
+2. For each guard, trace BACKWARD from its input to all relevant
+   producers: file open, object creation, initial state, assignments,
+   callbacks, direct/indirect callers, error exits and concurrent
+   teardown. Verify the ACTUAL entry contract on the reviewed path,
+   not the apparent purpose of the helper or behavior of a neighbor.
+   In particular, determine whether a pointer can truly be NULL,
+   ERR_PTR, stale or freed at that site, and whether a counter/flag
+   can reach the value being rejected.
+3. Write down a concrete, legal path which makes each clause true at
+   that location. Name the upstream code and condition that permits
+   it. If no such path exists, prove why: locate the earlier guard,
+   successful-open guarantee, invariant or ownership rule excluding it.
+   Do not manufacture an invalid state just to justify a check.
+4. Establish INDEPENDENT NECESSITY: what distinct failure does this
+   clause prevent that is not already prevented by caller contracts,
+   another clause or an earlier guard? For compound conditions, test
+   each clause removed while the others remain. Trace both outcomes
+   through cleanup, errno, observable behavior and subsequent reuse.
+   A checked condition can be harmless yet unnecessary.
+5. Audit the DIAGNOSTIC CONSEQUENCE of each guard. Compare the
+   behavior of the original code and the patch if the condition is
+   true. Is it an expected userspace/runtime error, or a violation of
+   an upstream internal contract? If the contract makes the condition
+   impossible, an added error return or fallback may replace an Oops
+   or warning with quiet apparent success or an ordinary errno. This
+   masks a programming defect and weakens defect detection; report it
+   explicitly, not as merely cosmetic redundancy. Preserve the
+   visibility of impossible-state failures. Do not introduce new
+   BUG_ON/Oops sites merely to enforce this principle, or conflate
+   hostile input and legitimate error cases with internal invariants.
+6. Record exactly one conclusion for each entry:
+   - NECESSARY: a reachable true case or required external API contract,
+     with source evidence and its unique protective effect.
+   - REDUNDANT: a source-proven unreachable condition or duplicated
+     protection. Recommend its removal/simplification as an explicit
+     code-review observation, even if the patch is otherwise correct.
+   - UNRESOLVED: reachability or unique protection not established;
+     name the missing path or assumption rather than blessing the guard.
+   Do not demand removal on conjecture: public helper contracts,
+   alternate callers and legitimate hardening may justify a check.
+7. Before verdict, compare the `G` inventory against EVERY diff hunk.
+   Reconstruct one apparently necessary guard and one proposed
+   redundancy from the call graph without relying on comments or the
+   author's description (or challenge two necessary guards if none is
+   redundant). Record a compact table in the review report:
+
+   `ID | site/clause | precondition | reachable true path |`
+   `unique protection | old->new diagnostic effect | disposition`
+
+   Include the exact line:
+   `Guard audit: X of Y checked; R redundant; U unresolved`
+   Count distinct clauses and changed branch decisions, not just `if`
+   statements. If there are none, say `0 of 0` and cite the hunk walk.
+
+This is separate from bug proof: a patch can correctly repair a serious
+bug AND contain a redundant check. An invariant-masking guard can be
+more harmful than merely redundant: e.g., suppressing an existing Oops
+for a NULL pointer that the call chain guarantees cannot be NULL.
+Do not say "no code change needed" or issue an unqualified approval
+while redundant/unknown guards have been silently skipped.
+A proven redundancy can be a minor, nonblocking cleanup. A material
+UNRESOLVED premise blocks unconditional acceptance.
+The overall standing-rule audit cannot mark this gate APPLIED unless the
+per-guard evidence table and count actually exist.
+
+## Mandatory impact-coverage gate, in ALL tracks
 
 A small condition or bit change can alter behavior in distant code. The
 MGLRU `PG_active` review missed `evict_folios()` and
@@ -314,12 +488,146 @@ inventoried. Prevent a recurrence as follows:
 6. Before finishing each pass, compare the completed inventory against
    source searches for consumers and writers. Record gaps and guards.
    Do not claim exhaustive coverage if relevant paths remain unexamined.
+7. Apply the adversarial gate's full inverse-operation and handler
+   checks to each newly reachable state.
 
 Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing
 example of ONE failure path does not end the search for others.
 
-## Similar-bug search: mandatory in BOTH passes
+## Mandatory adversarial correctness gate: ALL tracks
+
+After the ordinary source review, make a distinct attempt to falsify the
+patch's safety and completion claims. This is additive to Sashiko's full
+applicable coverage, Tejun's and Chris's methods, and the independent
+review; no earlier stage is waived by a passing adversarial check.
+
+1. **Failure-state equivalence and ownership.** For every changed error,
+   cancellation, timeout, partial-success or retry path, inventory state
+   present on entry, state created by this invocation, and state removed
+   by its cleanup. Establish that failure preserves the pre-call external
+   state unless partial effects are documented and permitted. In
+   particular, cleanup must not destroy pre-existing state or duplicate
+   work still owned by a caller. If cleanup ownership moves between
+   layers, check all relevant callers, retries and inverse operations.
+2. **Hostile bounds.** Enumerate empty, smallest, largest, unaligned,
+   overflowing, partially valid and already-occupied inputs wherever
+   applicable. For fixed-step loops, prove termination, including when
+   the endpoint is not reachable by repeated increments. Check that
+   inputs rejected by the forward path cannot become dangerous inputs
+   to its rollback path; validate before destructive operations.
+3. **Architecture and configuration effects.** For a generic operation,
+   search architecture overrides, hooks and alternate configurations
+   affecting the changed path. Trace their real effects: a function
+   named `flush_cache_*`, for example, may synchronize a secondary
+   page-table or host mapping. Verify that rollback reverses every
+   externally visible effect, not only software state in the caller.
+4. **Context and transitive sleepability.** For each new call on a
+   changed path, trace reachable callees and all distinct callers.
+   Check scheduling, sleeping locks, allocation/reclaim and blocking
+   synchronization against the *actual* execution context. GFP flags
+   alone do not prove that a caller is in atomic context. Consider
+   whether formerly deferred cleanup has become synchronous.
+5. **Lifecycle, ownership, and lock-drop protocols.** Identify the
+   owner of allocate, initialize, publish, use, undo, remove, free,
+   and the corresponding callbacks. After every lock drop, establish
+   whether the caller still has exclusive ownership; reacquiring the
+   lock establishes mutual exclusion, not retained ownership. Distinguish
+   an object's validity or usability from the caller's authority to
+   modify, relocate, publish or free it. Trace the ownership transfer
+   and any generation or isolation state that proves that authority.
+   For shared objects, check whether another actor can acquire, publish
+   or transfer ownership while the original caller is unlocked. Follow
+   at least one complete reverse path for persistent state, including
+   internal handler flags, dispatch priority, retry and final state.
+6. **Independent counterexample pass.** Attempt concrete traces for
+   partial progress, repeated operations, invalid inputs, exhaustion,
+   architecture variations and undo; omit only demonstrably irrelevant
+   classes. For shared-state protocols, explore at least three actors
+   when a third actor can re-isolate, republish, free or otherwise
+   acquire an object during another actor's lock drop. Include traces
+   where the object is still usable but is no longer owned by the
+   resumed caller; check both successful and rejected validation paths.
+   Independently verify concerns and dismissals against the matching
+   source and guards. Record credible unresolved concerns explicitly.
+
+7. **Related-state snapshot consistency.** For each cached pointer,
+   cursor, index, flags word, generation or eligibility predicate that
+   depends on another mutable value, identify the relationship that must
+   hold between them. Verify that separate atomic/READ_ONCE reads still
+   describe one eligible object and its associated attributes after
+   concurrent replacement, filtering or a retry. A stable pointer is
+   not necessarily an eligible pointer; a validated loop candidate
+   does not validate a separately cached preferred/default object.
+   Trace all downstream users of both the candidate and cached state,
+   including accounting, statistics, locality and watermark checks.
+
+**Review completion is evidence-gated.** At the start of each review,
+create a coverage record with the seven adversarial classes above and
+all applicable Sashiko, Tejun and Chris stages. For each applicable
+class, cite specific inspected source paths and the invariant or
+counterexample checked; for inapplicable classes, state a source-based
+reason. Mark an unexamined or partially checked class UNRESOLVED.
+Before a take/accept recommendation, reread this record, reconcile
+all unresolved classes and test every assertion of "checked" against
+its cited evidence. Do not use a generic "manual coverage complete"
+statement in place of evidence. If material coverage remains unresolved,
+report the review as incomplete and do not issue an unconditional take
+recommendation. A second final pass must challenge at least one
+apparently safe dismissal and one derived-state relationship wherever
+applicable. Record executed tools separately from manual checks.
+
+## Standing-rule compliance report: mandatory before every verdict
+
+Use the standing-rule inventory as an execution gate, not a final
+self-assessment. Before reviewing a patch, enumerate every applicable
+mandatory obligation in this file, including the independent, Sashiko,
+Tejun/Chris, adversarial, similar-bug, model-decision and reporting
+requirements. Assign each obligation a stable identifier in the review
+record. Do not choose the denominator from the rules remembered later,
+and do not count a repeated statement as a second rule. A rule may be
+split into separately testable obligations only if this is done before
+reviewing, not to inflate the result afterward.
+
+Include the added-guard necessity gate as its own mandatory obligation.
+Its status is APPLIED only when the separate `G` inventory, per-clause
+reachability witnesses, old/new diagnostic effects and final count
+have been checked. A missing
+inventory or a merely asserted "all guards needed" is UNRESOLVED,
+even when the patch's main correctness argument is convincing.
+
+For each rule, record exactly one status:
+
+- APPLIED: performed, with specific inspected source or test evidence.
+  Reading a rule, planning a check or asserting that coverage is complete
+  is not evidence that the check was performed.
+- NOT APPLICABLE: bypassed with a concrete, source-grounded reason.
+  No rule may be marked inapplicable just because it is inconvenient or
+  a tool is missing.
+- UNRESOLVED: relevant but not performed or insufficiently verified.
+  Record what evidence is missing; tool unavailability is disclosed,
+  not silently treated as completion or inapplicability.
+
+Before composing the recommendation, independently recount the statuses
+against the original inventory. The final review must include the exact
+line `Standing rules: N of M applied; I inapplicable; U unresolved`,
+where M = N + I + U. Include brief reasons for *each* inapplicable
+or unresolved rule, referencing its identifier. The count must refer
+only to checks actually performed for THIS review; previous reviews,
+reviewer endorsements and promised tests do not count. State native
+Sashiko, build, tests and model execution separately, without crediting
+manual methodology as native execution.
+
+Any unresolved material correctness or mandatory coverage requirement
+prevents an unconditional take recommendation. Explain the consequence
+of non-executed external tools separately from source-analysis gaps;
+never report `M of M` if the record lacks evidence for a required rule.
+Keep the user-facing summary compact, but retain the per-rule evidence
+matrix in the review record so the numbers are auditable. If no ledger
+is available, include it in the review report. This gate may not be
+waived merely to keep the response short or improve latency.
+
+## Similar-bug search: mandatory in ALL tracks
 
 When reviewing an MM fix, search related MM code for other instances of
 its underlying bug pattern, not merely other calls to the changed helper.
@@ -340,7 +648,7 @@ its underlying bug pattern, not merely other calls to the changed helper.
 - Consider whether a narrow patch fixes only one manifestation of a
   broader issue. Report any verified siblings and recommend the smallest
   appropriate scope; avoid unnecessary refactoring.
-- Include the similar-code search in the two-pass coverage comparison,
+- Include the similar-code search in the cross-track coverage comparison,
   and explicitly say when it was limited by available source access.
 
 ## Independent pass: additional review obligations
@@ -349,6 +657,10 @@ its underlying bug pattern, not merely other calls to the changed helper.
   programs, the conditions that trigger it, and the expected correction.
 - Read every hunk and identify changed branches, checks, allocations,
   frees, locking transitions, ownership and object lifetime changes.
+- Execute the added-guard gate on this first pass, before adopting an
+  existing neighboring idiom as evidence. Separately justify every
+  Boolean clause; record non-reachability as a review result, not an
+  invitation to invent a failure.
 - Trace success, retry, signal, OOM, teardown, rollback and partial
   failure where relevant. Inspect call chains and preconditions rather
   than trusting helper names, comments or review summaries.
@@ -377,7 +689,7 @@ most of their space on internal code mechanics. The changelog is a durable
 diagnostic and backporting resource for upstream, -stable, distro/vendor
 maintainers, and operators investigating affected deployed kernels.
 
-In BOTH review passes, independently determine and check:
+In every relevant review track, independently determine and check:
 
 1. The observable failure: what a user, program, service, administrator,
    or fleet sees (errno, wrong output, stale data, timeout, hang, crash,
@@ -538,20 +850,32 @@ our review: model consequential multi-actor protocols and unresolved
 interleavings when warranted, not every routine arithmetic change.
 These local safeguards are additive:
 
-- Use PlusCal/TLC for a meaningful multi-actor shared-state protocol
+- Use PlusCal/TLA+ for a meaningful multi-actor shared-state protocol
   when appropriate, not mechanically for every change. The model must
-  represent the actual C paths and their assumptions; record exclusions.
+  represent the actual C paths and assumptions; record exclusions.
+- When isolation, publication, reuse or ownership spans a lock drop,
+  explicitly decide whether a three-actor model is needed. Check the
+  original owner, a competing acquirer, and a third actor that can
+  reclaim or transfer ownership before the original resumes. Record
+  the reason if a three-actor model is unnecessary. Distinguish
+  validity and usability invariants from exclusive-ownership ones.
+- Use Tejun's tla-mctj Rust checker by default after it has been
+  installed and validated. Use TLC for unsupported configurations,
+  uncertain verdicts, comparison checks and simulations. Do not claim
+  that either checker ran until its output has been inspected.
 - Falsify the model: the old or deliberately broken variant should
   exhibit the relevant invariant violation. A clean patched run without
   a failing reference model is weak evidence.
-- Record real TLC commands, configuration, bounds, state count and tool
-  version. A tiny passing model is not a proof of general correctness.
-  Translate counterexample steps back into reachable C operations.
+- Record the actual checker, version or source revision, command,
+  configuration, bounds, state count and wall time. A tiny passing
+  model is not a proof of general correctness. Replay counterexamples
+  against reachable C operations.
 - Use herd7/LKMM for claims about release/acquire, barriers or hardware
-  reordering. TLC's sequential-consistency model cannot verify them.
-- When a tool is unavailable, say so rather than implying it ran.
-  `model: no (reason)` is appropriate for local arithmetic, simple
-  finite conditions and changes protected by one lock.
+  reordering. Sequentially consistent models cannot verify them.
+- When a tool is unavailable, report the model check as NOT RUN and
+  explain why. Never mislabel unavailable tooling as a successful model
+  check. `model: no (reason)` is appropriate only when no model is needed,
+  not when a required check could not be executed.
 
 ## Reporting and email formatting: mandatory
 
@@ -590,9 +914,45 @@ override conflicting upstream style defaults.
   recommend. No confidence inflation; source review is not a test run.
 - For patch series, account for defects present at patch N that a later
   patch repairs. Note material changelog deficiencies and evidence gaps.
+- Report the guard-audit count. Mention proven redundant guards and
+  unresolved guard contracts as code-review observations, even when
+  they do not alter the substantive correctness verdict. Do not write
+  "no code changes requested" until the per-guard audit has passed.
 - Keep the final response compact and useful. Do not recite the review
   methodology or a checklist unless specifically requested. Provide
   plain-ASCII, 75-column, LKML-ready email text when asked.
+
+## Immediate discovery-to-Markdown update: mandatory
+
+Whenever a substantive new fact, missed path, incorrect previous
+finding, revised disposition or generalizable workflow lesson is
+established, update the relevant canonical project `.md` files in the
+SAME response cycle. Do not wait for a later handoff or for AKPM to
+ask for an update. This includes discoveries made in follow-up chat,
+not just during the original review. An unverified hypothesis is not
+a verified discovery; preserve its uncertainty in the record.
+
+- Update the specific review report with technical evidence, old and
+  new conclusions, and any corrected advice or LKML reply. Preserve
+  the earlier error visibly when important for auditability.
+- Update `review-activity.md` when it is available, tying the change
+  to the existing review/finding ID and updating the next action.
+- Update THIS workflow whenever the discovery yields a generally
+  applicable review rule. Keep case-specific details out of policy
+  unless they are a compact motivating example. Do not add repeated
+  historical narrative or duplicate standing rules.
+- Verify changed Markdown and direct download paths before replying;
+  provide links to EVERY revised canonical file. If an authoritative
+  file is inaccessible or cannot be modified, say exactly which file
+  was not updated. Never claim the update happened if it did not.
+- Documentation updates do NOT authorize changing kernel code or any
+  other production code. Respect the standing source-edit policy.
+
+For new reviews, precommit this update gate as its own audit obligation.
+Mark it APPLIED only if discoveries were recorded during the review or
+no new discoveries occurred; UNRESOLVED if required documentation was
+not updated. Do not retroactively alter a completed review's original
+compliance denominator simply because a new rule was added later.
 
 ## Artifact delivery: mandatory
 
@@ -605,6 +965,11 @@ override conflicting upstream style defaults.
   a file or tray delivery is unavailable, say so rather than claiming
   it was delivered.
 - Never delete or replace a user file without authorization.
+- Preserve user-established canonical filenames exactly, including
+  case and extension. Never append dates, versions, suffixes or
+  other qualifiers to delivered filenames unless explicitly asked.
+- Temporary paths or staging directories must not change the
+  basename of the final downloadable file.
 
 ## Review activity, feedback and archive protocol
 
@@ -641,27 +1006,31 @@ no ledger, keep the corresponding record in the review report.
    For confirmations or partial rejections, identify any missed paths or
    mistaken dismissals. Distill what a future independent review should
    do differently to prevent false positives and false negatives.
-5. Promote a lesson to THIS AKPM workflow only if it improves review
+5. For a missed review issue identified afterward, record it as a
+   new finding with the omitted code path and why the prior coverage
+   audit failed. Correct any stale verdict or proposed reply; do not
+   silently retain the earlier "no code changes" assessment.
+6. Promote a lesson to THIS AKPM workflow only if it improves review
    methodology across patches. Do not append a special rule for every
    bug, false positive, or argument. Do not edit upstream modules.
-6. Archive records which are resolved or sufficiently dormant to be
+7. Archive records which are resolved or sufficiently dormant to be
    removed from the active working set. Use one file per local close-off
    date, `review-activity-YYYY-MM-DD.md` (America/Los_Angeles). Several
    reviews may share that file. An archived `UNRESOLVED` review is
    *dormant*, not approved or rejected by its author.
-7. When archiving, MOVE the compact record out of the active section;
+8. When archiving, MOVE the compact record out of the active section;
    leave a Subject-to-filename mapping in the index. Retain the finding
    dispositions, counterarguments, durable lesson and source references
    in the archive. Remove superseded detail and transcript repetition.
    Archive files are snapshots: normally append to the day's file, but
    do not rewrite previous snapshots just to tidy the active index.
-8. When a topic resurfaces in another chat, consult the active/index
+9. When a topic resurfaces in another chat, consult the active/index
    file by normalized Subject and identify its exact archive filename.
    Read that archive before resuming; request that file if unavailable.
    Copy only the still-relevant state back to the active entry, preserve
    the archive link and finding IDs, and update the index to `ACTIVE`.
    On a later close-off, use that day's archive with a backlink.
-9. Periodically remove obsolete or uninteresting Subject mappings from
+10. Periodically remove obsolete or uninteresting Subject mappings from
    the active index. Do not silently erase unresolved findings or
    author feedback; historical dated archives may stay in the git tree.
 
@@ -675,7 +1044,7 @@ identified by its index, if any.
 
 For fresh reviews, attach only `akpm-patch-review-workflow.md`, plus
 the patch/mbox. After the independent pass, fetch the current pinned
-Tejun modules and Chris prompts as directed above. When continuing
+Sashiko, Tejun and Chris sources as directed above. When continuing
 AKPM's previous findings or feedback, also attach `review-activity.md`
 and only the relevant dated archive. Do not attach the historical
 `tj-patch-review-workflow.md` or `kernel-patch-review-workflow.md`.
