@@ -1,0 +1,99 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: profile: simplify /proc/profile read layout
+Date: Tue, 20 Oct 2026 15:29:00 -0700
+
+read_profile() is needlessly difficult to understand.  It copies the
+four-byte sampling-step header one byte at a time, then manufactures
+a pointer before prof_buffer so a file offset can be used as a
+counter-array offset.  Its signed byte counter, unsigned long file
+offset and repeated size calculations further obscure where each
+read starts and how many bytes it transfers.
+
+Treat the file as two consecutive regions: a four-byte header and
+the profiling counters.  Use size_t for byte positions and lengths,
+copy the bounded header in one operation, and address the counters
+relative to the start of prof_buffer.  Brief comments explain each
+region.
+
+Preserve the partial-read and fault semantics established by [1/2],
+including short copies within either region.  The unsigned int
+sampling-step field from Avi Weiss's big-endian fix is unchanged.
+No userspace-visible behavior change is intended.
+
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+
+ kernel/profile.c |   52 ++++++++++++++++++++++++++-------------------
+ 1 file changed, 31 insertions(+), 21 deletions(-)
+
+--- a/kernel/profile.c~profile-simplify-proc-profile-read-layout
++++ a/kernel/profile.c
+@@ -153,35 +153,45 @@ void profile_tick(int type)
+ static ssize_t
+ read_profile(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+ {
+-	unsigned long p = *ppos;
+-	ssize_t read;
+-	char *pnt;
++	const size_t header_size = sizeof(unsigned int);
++	const size_t file_size = (prof_len + 1) * sizeof(unsigned int);
+ 	unsigned int sample_step = (unsigned int)(1UL << prof_shift);
+-	size_t not_copied;
++	size_t pos = *ppos;
++	size_t done = 0;
++	size_t n, not_copied;
+ 
+-	if (p >= (prof_len+1)*sizeof(unsigned int))
++	if (pos >= file_size)
+ 		return 0;
+-	if (count > (prof_len+1)*sizeof(unsigned int) - p)
+-		count = (prof_len+1)*sizeof(unsigned int) - p;
+-	read = 0;
++	count = min(count, file_size - pos);
+ 
+-	while (p < sizeof(unsigned int) && count > 0) {
+-		if (put_user(*((char *)(&sample_step)+p), buf))
+-			goto out;
+-		buf++; p++; count--; read++;
++	/* Copy the four-byte sampling resolution. */
++	if (pos < header_size) {
++		n = min(count, header_size - pos);
++		not_copied = copy_to_user(buf, (u8 *)&sample_step + pos, n);
++		done += n - not_copied;
++		if (not_copied)
++			goto fault;
++		buf += n;
++		pos += n;
++		count -= n;
+ 	}
++
++	/* Copy raw counters using offsets relative to the counter array. */
+ 	if (count) {
+-		pnt = (char *)prof_buffer + p - sizeof(atomic_t);
+-		not_copied = copy_to_user(buf, pnt, count);
+-		read += count - not_copied;
++		not_copied = copy_to_user(buf,
++					(u8 *)prof_buffer + pos - header_size,
++					count);
++		done += count - not_copied;
+ 		if (not_copied)
+-			goto out;
++			goto fault;
+ 	}
+-	*ppos += read;
+-	return read;
+-out:
+-	*ppos += read;
+-	return read ? read : -EFAULT;
++	*ppos += done;
++	return done;
++fault:
++	*ppos += done;
++	if (!done)
++		return -EFAULT;
++	return done;
+ }
+ 
+ /* default is to not implement this call */
+_
