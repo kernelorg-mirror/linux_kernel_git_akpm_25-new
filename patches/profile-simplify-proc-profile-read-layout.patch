@@ -12,8 +12,9 @@ read starts and how many bytes it transfers.
 Treat the file as two consecutive regions: a four-byte header and
 the profiling counters.  Use size_t for byte positions and lengths,
 copy the bounded header in one operation, and address the counters
-relative to the start of prof_buffer.  Brief comments explain each
-region.
+relative to the start of prof_buffer.  Retain the full loff_t value
+for EOF and negative-offset checks before narrowing it to size_t.
+Brief comments explain each region.
 
 Keep the word-sized shift and explicit narrowing required by Avi
 Weiss's "profiling: fix sampling step on 64-bit big-endian systems".
@@ -21,26 +22,27 @@ Assign the header value separately and explain why the 32-bit ABI
 requires a narrowing conversion.
 
 Preserve the partial-read and fault semantics established by [1/2],
-including short copies within either region.  No userspace-visible
+including short copies within either region.  The full-width offset
+check also prevents 32-bit pread64() offsets from wrapping into earlier
+profile data.  No other userspace-visible
 behavior change is intended.
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Cc: Avi Weiss <thnkslprpt@gmail.com>
-Cc: Bradley Morgan <brads@mainlining.org>
----
-Tested the combined three-patch series on x86-64 QEMU/KVM, with
-CONFIG_PROFILING=y, CONFIG_PROC_FS=y and profile=12.
-profile-read-test.c: PASS (0 failures). Covered header decoding,
-short/unaligned and boundary reads, EOF, partial copy faults,
-return values and file-position updates.
-The 64-bit big-endian case was not tested. No per-patch or
-unpatched-versus-patched runtime comparison was reported.
 
- kernel/profile.c |   57 +++++++++++++++++++++++++++------------------
- 1 file changed, 35 insertions(+), 22 deletions(-)
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+---
+Tested the combined three-patch series on x86-64 and i686 QEMU/KVM
+guests with CONFIG_PROFILING=y and profile=12.
+profile-read-test.c: PASS (0 failures) on both architectures.
+Covered short and unaligned reads, header boundaries, EOF, partial
+user-copy faults, return values, file positions and retry behavior.
+The 64-bit big-endian sampling-step fix was not runtime tested.
+No separate per-patch or unpatched-versus-patched run was reported.
+
+ kernel/profile.c |   61 ++++++++++++++++++++++++++++-----------------
+ 1 file changed, 39 insertions(+), 22 deletions(-)
 
 --- a/kernel/profile.c~profile-simplify-proc-profile-read-layout
 +++ a/kernel/profile.c
-@@ -153,35 +153,48 @@ void profile_tick(int type)
+@@ -153,35 +153,52 @@ void profile_tick(int type)
  static ssize_t
  read_profile(struct file *file, char __user *buf, size_t count, loff_t *ppos)
  {
@@ -52,7 +54,8 @@ unpatched-versus-patched runtime comparison was reported.
 +	const size_t header_size = sizeof(unsigned int);
 +	const size_t file_size = (prof_len + 1) * sizeof(unsigned int);
 +	unsigned int sample_step;
-+	size_t pos = *ppos;
++	loff_t offset = *ppos;
++	size_t pos;
 +	size_t done = 0;
 +	size_t n, not_copied;
  
@@ -60,11 +63,14 @@ unpatched-versus-patched runtime comparison was reported.
 +	/* Keep the shift word-sized before narrowing to the 32-bit ABI. */
 +	sample_step = (unsigned int)(1UL << prof_shift);
 +
-+	if (pos >= file_size)
++	if (offset < 0)
++		return -EINVAL;
++	if (offset >= file_size)
  		return 0;
 -	if (count > (prof_len+1)*sizeof(unsigned int) - p)
 -		count = (prof_len+1)*sizeof(unsigned int) - p;
 -	read = 0;
++	pos = offset;
 +	count = min(count, file_size - pos);
  
 -	while (p < sizeof(unsigned int) && count > 0) {
