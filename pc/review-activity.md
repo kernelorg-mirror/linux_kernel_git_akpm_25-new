@@ -1408,6 +1408,23 @@ Impact: hotplug warning; risk of masking future debug warnings.
 Stable: not recommended for current revision. Next: request v2 and test
 order-N free/split/untagged allocation/free plus MEMINIT_EARLY paths.
 
+### R-019 v2 reassessment (2026-10-20)
+
+Joshua Hahn's [PATCH v2] keeps the same code and adds Shakeel Butt's
+PREEMPT_RT timeline (https://lore.kernel.org/all/atfMngq7nyZpt4u-@linux.dev/).
+On PREEMPT_RT the per-CPU stock lock remains preemptible and holds an
+RCU read-side section. After the last css_put() and before cached[i]
+is cleared, freeing may initiate a grace period. A later-started
+remote drain reader is not protected by that earlier grace period.
+This strengthens the potential UAF mechanism. However, the reader
+also requires a nonzero nr_pages observation, whereas drain_stock()
+clears nr_pages before css_put(). Source/LKMM confirmation of a stale
+count observation is still pending; no KASAN reproduction exists.
+Worst credible impact if reached: kernel UAF, oops/panic, system outage
+and possibly memory corruption, with indirect data loss. No proven
+privilege escalation or filesystem corruption. The reorder itself
+appears sound. Detail: reports/memcontrol-stock-review.md.
+
 ## Maintenance reminder
 
 When feedback arrives, update findings and dispositions here. Archive
@@ -1415,3 +1432,43 @@ resolved OR dormant reviews into that day's
 `review-activity-YYYY-MM-DD.md`, leaving the normalized Subject and
 filename above. Keep this file lean; retain durable lessons in the
 AKPM workflow only when broadly applicable.
+
+
+### R-022: profile: simplify /proc/profile read layout - Sashiko feedback
+
+Feedback on a8d18dfd81aa2aff9c918b03a5a93bd7b83ef000:
+The [2/2] cleanup narrowed loff_t *ppos into size_t before its EOF
+check.  On 32-bit kernels, pread64() at 0x100000000 could therefore
+return the first profile bytes rather than EOF.  Source-level finding
+verified; prior approval was incorrect.  [1/2] remains unchanged.
+Revised [2/2] retains loff_t until negative-offset and EOF checks,
+then assigns the known-in-range value to size_t.  The revised series
+was applied sequentially in a disposable fixture.  A 32-bit kernel
+runtime test has not been run.  A new workflow rule requires checks of
+full-width API inputs before any narrowing conversion.
+
+R-022 follow-up (2026-10-20): Reviewed uploaded three-patch series
+(Avi sampling-step, partial-copy, cleanup) in order against an
+upstream-source-equivalent fixture. All applied; no new code correctness
+blocker found. The new cleanup checks full-width loff_t before size_t.
+Model of 32/64-bit offsets and fault prefixes passed; no fresh
+in-kernel testing, native Sashiko or full guided review was run.
+Minor prose: [1/2] names Avi's prerequisite vaguely rather than by
+exact subject; recommend precise patch reference. Detailed notes in
+reports/profile-read-review.md.
+
+### R-019 follow-up: slot generation counterexample (2026-10-20)
+
+Corrects earlier overly narrow concern about observing a stale
+nonzero nr_pages. Following final css_put(old) in drain_stock(), an
+RCU reader can load cached[i]=old after G starts, then be preempted.
+The owner clears the slot and returns from its RT local lock; G ends,
+old is freed, and refill_stock(new) reuses the slot with a new positive
+nr_pages[i]. The reader resumes with the old pointer and NEW count,
+then dereferences old in mem_cgroup_is_descendant(). No stale count
+read or weak-memory behavior is required. This is source-replayable
+bounded interleaving reasoning, not a kernel test or herd7 execution.
+The patch's NULL-before-final-put order prevents this trace. The
+prior R-019 note demanding a stale read is superseded. Update the
+LKML reply accordingly. Detailed evidence in
+reports/memcontrol-stock-review.md.
