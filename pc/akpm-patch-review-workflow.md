@@ -847,6 +847,12 @@ instead of inventing a generic prerequisite.
 - Verify Fixes: history, patch ordering, individual versus series scope,
   comments, API semantics, coding style and any unexpected behavior
   changes. Favor a precise corrected paragraph over vague advice.
+- When referring to another patch, identify its author and exact quoted
+  Subject:, including a version suffix such as v2 when applicable.
+  If the change is already merged into mainline or mm-stable, use the
+  form `Author's abcdef123456 ("exact commit subject")`, with the
+  verified 12-character commit SHA. Check merge status rather than
+  guessing. Do not use vague references such as "the earlier fix".
 - Check regression tests actually exercise the old failure, and compare
   the change against the userspace-visible outcome, not merely the
   repaired helper's local behavior.
