@@ -1,6 +1,6 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-20 (America/Los_Angeles)
+Last updated: 2026-10-21 (America/Los_Angeles)
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
 modules; the old standalone S2 file is historical only).
@@ -128,7 +128,7 @@ such a subject, consult the named active record or archive FIRST.
 - `zram: redesign zcomp and rework backends`
   ACTIVE: [R-013](#r-013); v5 source-reviewed; tests requested.
 - `mm/ksm: keep soft-dirty and uffd-wp when merging a page`
-  ACTIVE: [R-015](#r-015); zero-page soft-dirty case omitted.
+  ACTIVE: [R-015](#r-015); zero-page objection withdrawn; v3 split.
 - `kasan: fix runtime shadow page table synchronization`
   ACTIVE: [R-014](#r-014); v2 must be revised; shared-table bugs.
 - `mm/memory-tiers: reset demotion targets of nodes without memory`
@@ -147,6 +147,12 @@ such a subject, consult the named active record or archive FIRST.
   DORMANT: A-001 in
   [review-activity-2026-10-16.md](review-activity-2026-10-16.md#a-001).
   A dormant review is not author-accepted or author-rejected.
+- `lib/firmware_table: validate subtable bounds`
+  ACTIVE: [R-023](#r-023); v2 admits terminal headers that can trigger
+  out-of-bounds reads in PRMT/CEDT handlers; request revision.
+- `delayacct: Preserve delay extrema when aggregating taskstats`
+  ACTIVE: [R-024](#r-024); source-reviewed, no code blocker; runtime
+  testing and full external-review stages outstanding.
 - `compat: Avoid double rounding in times()`
   ACTIVE: [R-020](#r-020); source fix sound; kernel test pending.
 
@@ -615,6 +621,21 @@ Next: take code; ask for distinct-sighand explanation and brief
   before/after reproducer output; recommend stable trailer. Await
   author/maintainer feedback.
 
+R-009 v2 reassessment (2026-10-21): Nickolai Zeldovich's
+[PATCH v2] uses base c03c1a14507dfaf8b856c2608f9ac216021fc222;
+verified kernel/ucount.c preimage ec8b1445e287. The new == 1
+get_ucounts() occurs before the limit check. The reject path passes
+iter->ns->ucounts as the exclusive end to
+ do_dec_rlimit_put_ucounts(), correctly including the rejecting level.
+The get_ucounts() failure path still decrements iter without a put
+and unwinds only preceding levels. No new reference imbalance found in
+these source paths. Author reports x86-64 QEMU/KASAN/rcuref forced
+interleaving: ~80000 original attempts with an imbalanced-put warning;
+~82000 patched attempts without warning or KASAN report. This is
+AUTHOR-REPORTED, not independently run. Alexey Gladkov Acked-by.
+Prospective stable candidate; target branches and runtime tests not
+independently checked. Native Sashiko/full methodology not executed.
+
 ### R-010
 
 Subject: lib/buildid: reject file offsets that do not fit in pgoff_t
@@ -971,8 +992,12 @@ Author: Samarth Narang <samarth.colleges@gmail.com>
 Date: 2026-10-18. Base: 48fe11c8d0f1e4e59426a3606f20ac1130b6d8dc
 Fixes: 292924b26024 (UFFD WP), 0f8975ec4db2 (soft dirty),
   763f43865fc4 (UFFD RWP); subjects/SHAs checked in GitHub.
-Status: DO NOT MERGE; incomplete soft-dirty fix plus RWP unmerge
-  failures; request revised patch and cross-subsystem corrections.
+Current status (2026-10-21): No zero-page objection to soft-dirty-only
+  v3. The exact-preservation/else request is WITHDRAWN following David's
+  explicit assessment of accepted over-indication. UFFD/RWP remains a
+  separate follow-up owned by Lance. Full independent audit is incomplete.
+Historical pre-v3 status: DO NOT MERGE the combined patch pending RWP
+  unmerge corrections. Earlier zero-page blocker was overstated.
 Review 2: 2026-10-18. Source-based re-review against base; no native
   Sashiko runner or Rust compiler in current container and no outbound
   DNS. Manual specialist analyses performed; NOT a native run and NOT
@@ -986,7 +1011,7 @@ R-015/F1 (VALID, NOT FULLY FIXED): The normal KSM page is built with
   in mm/memory.c and mm/migrate.c. The UFFD-WP/RWP logic appears
   locally correct. Downstream KSM unmerging is unsafe for RWP;
   see Sashiko-identified F5 and F6 below.
-R-015/F2 (INCOMPLETE FIX; PREEXISTING MECHANISM): When KSM
+R-015/F2 (HISTORICAL OBJECTION; WITHDRAWN AS CORRECTNESS BLOCKER): When KSM
   use_zero_pages is enabled, replace_page() initializes newpte using
   pte_mkdirty(pte_mkspecial(...)). On x86, pte_mkdirty() sets both
   _PAGE_DIRTY and _PAGE_SOFT_DIRTY. The patch sets soft-dirty when
@@ -1042,7 +1067,8 @@ Testing: no author test in supplied patch; no real kernel build,
   a source-derived Boolean exercise, not a live-kernel test.
 Model: no new multi-actor protocol; page-table lock serializes PTE
   replacement. TLA+ is not relevant to this incomplete state-copy.
-Next: request v2 for soft-dirty clear and RWP-aware KSM unmerge,
+Historical next action: request v2 for soft-dirty clear and RWP-aware
+  KSM unmerge,
   including synchronous and asynchronous cases and PTE unshare.
   Require regression testing; email drafted, NOT SENT.
 
@@ -1081,6 +1107,58 @@ Review failure analysis: prior passes traced merge -> replacement, but
 No kernel runtime experiment, compilation, formal model or native
   Sashiko execution was performed for this feedback analysis.
 
+
+
+R-015 v3 recheck (2026-10-21), Samarth Narang:
+- Subject: [PATCH v3] mm/ksm: keep soft-dirty when merging a page.
+  Base fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6;
+  mm/ksm.c preimage dbfb8f98b18925c729d0931760a18f491d0fb156.
+- R-015/F2: the zero-page false positive is PRE-EXISTING, unchanged by
+  v3. Earlier chat called it a new regression and demanded v4. That
+  classification and blanket merge objection were incorrect. V3 repairs
+  the distinct ordinary-page false negative; no new zero-page harm is
+  established. A separate false-positive fix is a valid option.
+- Suggested else pte_clear_soft_dirty(newpte) remains source-supported:
+  x86 clears only bit 11, preserving dirty/saved-dirty, special and PFN.
+  is_ksm_zero_pte() uses PFN plus pte_dirty(), not soft-dirty. Existing
+  remove_migration_pte() uses set/clear after pte_mkdirty() too.
+- Reachable case: write an anonymous private page with zeros, clear its
+  soft-dirty state via clear_refs=4, then allow KSM zero-page merging
+  without another write. A read-faulted shared zero page is not the test.
+  KSM mmap read lock excludes clear_refs mmap write lock; pte_same under
+  PTL checks the captured PTE. A later real COW write marks soft-dirty.
+- Executed GCC and Clang/UBSan userspace bit-model checks: 1,024 cases
+  each. Baseline FP=128/FN=128; v3 FP=128/FN=0; suggested FP=0/FN=0.
+  Models both x86 saved-dirty encodings and soft-dirty on/off. Not a
+  kernel build, i386 execution, KSM runtime, or TLA+/LKMM verification.
+- Stable: original false-negative repair remains a prospective
+  candidate; target-branch and runtime verification are outstanding.
+  No new corruption/crash follows from the zero-page false positive.
+- Next: send the corrected, non-regression wording; suggest adding the
+  else or addressing the existing false positive separately. Do not
+  withhold v3 solely on the mistaken regression claim. Full guided
+  audit remains incomplete; no unconditional Reviewed-by.
+  Details: /Kernel Patch Reviews/reports/ksm-soft-dirty-review.md.
+
+
+R-015 thread reconciliation (2026-10-21), grabbed(3):
+- Sashiko <sashiko-outbox-177114@kernel.org> raised the exact zero-page
+  soft-dirty question. David's October 19 reply
+  <efa6a28c-f0f9-4d1e-9cce-fec2c08e7d9f@kernel.org> explicitly says
+  over-indicating soft-dirty is generally not a problem. Lance agrees.
+- Our earlier advice did NOT incorporate that assessment. The bit-level
+  observation stands, but exact equality was an unproved stronger
+  requirement. Withdraw the request for else/v4 on correctness grounds.
+- Lance requests soft-dirty-only v3 and takes UFFD-WP/RWP separately;
+  Samarth complies. No new formal approval or v3 test is inferred.
+- Mohammed reports 8/8 before/after tests across two boots for Lance's
+  unshare fix, including a read RWP fault afterward. This is third-party
+  evidence about the separate UFFD path, not testing of the proposed else.
+- Next: do not send the old zero-page objection. No zero-page reason to
+  block v3; keep UFFD/RWP follow-up separate. No new tests run here.
+- Detailed report updated in /Kernel Patch Reviews/reports/:
+  ksm-soft-dirty-review.md. Workflow now distinguishes conservative
+  metadata contracts from exact-preservation model properties.
 
 ### R-016
 
@@ -1425,6 +1503,84 @@ and possibly memory corruption, with indirect data loss. No proven
 privilege escalation or filesystem corruption. The reorder itself
 appears sound. Detail: reports/memcontrol-stock-review.md.
 
+
+### R-023
+
+Subject: lib/firmware_table: validate subtable bounds
+Original: [PATCH v2] lib/firmware_table: validate subtable bounds
+Author: Jiale Yao <yaojiale02@163.com>. Date: 2026-10-21.
+Source: torvalds/linux lib/fw_table.c blob
+  16291814450ee39a2ad656f93c316bdc8f998939, matching the submitted
+  preimage. Fixes: 60574d1e05b094d222162260dd9cac49f4d0996a.
+Status: REVISE. Detailed record in reports/fw-table-review.md.
+R-023/F1 (new regression): Changing the generic-header admission
+  test from < to <= newly dispatches terminal records of exactly the
+  generic header's size. PRMT subtable_len=4, entry_len=4, remaining=4
+  passes v2 checks. ACPI_SUBTABLE_PRMT reports type 0 and init_prmt()
+  installs a handler for 0. acpi_parse_prmt() treats the 4-byte record
+  as struct acpi_prmt_module_info (38 bytes), first accessing
+  handler_info_count at offset 24. This was not dispatched previously.
+  CEDT CHBS also reads beyond its generic four-byte header in its
+  handler without a full typed-size guard. Malformed firmware can cause
+  kernel out-of-bounds reads and potentially boot/probe oops or panic.
+R-023/F2 (valid repair): New entry_len < subtable_len and
+  entry_len > remaining checks prevent the generic parser from
+  invoking handlers on too-short header envelopes or records beyond
+  the declared table end. Trailing bytes shorter than the generic
+  header remain ignored. Retain these two guards, but reconsider <=.
+R-023/F3 (related pre-existing issue): Some handlers do not check
+  typed payload size before accessing fields. PRMT, CHBS and CFMWS
+  paths deserve separate hardening beyond the generic header bounds.
+Tests: standalone source-mirrored C dispatch model (GCC/ASan+UBSan)
+  prints old_dispatch=0, v2_dispatch=1 for a final PRMT header;
+  separate ASan model detects a heap-buffer-overflow at offset 24 in
+  a four-byte allocation. No actual kernel build, KASAN boot or
+  runtime firmware injection. Native Sashiko not run. Guided review
+  sources pinned; complete all-stage coverage was not obtained.
+Guard audit: 3 of 3 checked; 0 redundant; 0 unresolved. The <=
+  decision is independently UNSAFE for the demonstrated state.
+Model: no new multi-actor synchronization; finite bounds model was
+  used rather than PlusCal/TLA+.
+Impact-changelog: needs detail about possible boot/probe failure.
+Stable: not this v2; corrected, tested candidate after mainline merge.
+Next: ask to retain strict < or validate actual handler requirements
+  before allowing exact-end generic-only records; add target tests.
+
+### R-024
+
+Subject: delayacct: Preserve delay extrema when aggregating taskstats
+Original: [PATCH] delayacct: Preserve delay extrema when aggregating
+  taskstats
+Author: Hungyu Lin <dennylin0707@gmail.com>. Date: 2026-10-21.
+Source: kernel/delayacct.c blob 479e860aff705ab4b89fd6b7860c37f912e3a17b.
+Fixes: 658eb5ab916ddc92f294dbce8e3d449470be9f86 and
+  f65c64f311ee2f1ddc1eb395ed8b20e6b9d14e85 (verified).
+Status: SOURCE-LEVEL FAVORABLE, not fully validated. Report in Library:
+  reports/delayacct-extrema-review.md.
+R-024/F1 (old bug confirmed): TGID aggregation overwritten max, min
+  and the corresponding max timestamp with the last thread's values.
+  Last thread with no delays could erase a positive prior peak while
+  retaining a nonzero aggregate delay total.
+R-024/F2 (fix correct in reviewed cases): conditional max with paired
+  timestamp and min_not_zero() across CPU and seven locked delay types
+  preserve valid extrema and ignore zero (unsampled) minima. PID fresh
+  zero result and previously aggregated exited-thread stats checked.
+  Equal maxima preserve the first maximum's timestamp.
+R-024/F3 (preexisting uncertainty): CPU sched_info snapshots may race
+  scheduler updates; no new locking or ownership path was introduced.
+Testing: GCC and Clang/UBSan standalone reducer model passed 32,768
+  three-task/category extrema combinations plus tie and retained-peak
+  cases. No real kernel build, getdelays test, KASAN or native Sashiko.
+Guard audit: 24 of 24 checked; 0 redundant; 0 unresolved.
+Model: no new multi-actor shared protocol; TLA+ not needed.
+Impact: misleading taskstats TGID maxima/minima/timestamps may hide
+  latency spikes from getdelays. Actual task execution unaffected.
+Impact-changelog: sufficient, but a getdelays -t example would improve
+  operational usefulness. Stable: candidate after testing and branch
+  applicability review; no unconditional approval at present.
+Next: request multi-threaded before/after runtime test; confirm stable
+  branches and complete pinned external guide coverage.
+
 ## Maintenance reminder
 
 When feedback arrives, update findings and dispositions here. Archive
@@ -1472,3 +1628,53 @@ The patch's NULL-before-final-put order prevents this trace. The
 prior R-019 note demanding a stale read is superseded. Update the
 LKML reply accordingly. Detailed evidence in
 reports/memcontrol-stock-review.md.
+
+
+### R-025
+
+Subject: [PATCH] mm/hugetlb: charge hugetlb cgroup and memcg in
+  alloc_hugetlb_folio_reserve()
+Author: Hongfu Li <lihongfu@kylinos.cn>. Reviewed: 2026-10-21.
+Base: 2887e63d2e8e0cf55402612d8996ce955a2c3e55.
+Status: REVISE/SEQUENCE AFTER R-018 cgroup CSS offlining lifetime fix.
+Detailed report: reports/hugetlb-reserve-charge-review.md.
+
+- R-025/F1 (cross-patch UAF): New use of
+  hugetlb_cgroup_charge_cgroup()/commit inherits the existing R-018
+  CSS ref lifetime race. An existing memfd reservation owned by A
+  does not protect B's usage CSS when another cgroup pins the page.
+  CPU0 acquires B CSS ref; CPU1 offlines B and scans zero usage BEFORE
+  CPU0 charges B; CPU0 then charges the dying B, drops the last ref,
+  and commits a stale CSS pointer. Source-replayable UAF risk. R-018
+  needed before adding this path. Current AKPM mm-stable still has
+  mm/hugetlb_cgroup.c blob 3fb41311e4c7dcbbd26f7b230ebb1f8c7ce310fe.
+  Do not incorrectly claim CSS offlining finishes if the counter was
+  already charged: hugetlb_cgroup_have_usage() checks that counter.
+- R-025/F2 (incorrect introducing Fixes): 26a8ea80929c changed the
+  allocation to alloc_hugetlb_folio_reserve(); the predecessor
+  alloc_hugetlb_folio_nodemask() was also uncharged. Use
+  Fixes: 89c1905d9c14 (original memfd_pin_folios commit).
+- R-025/F3 (valid main repair): matched hugetlb_alloc_folio() charge
+  and NR_HUGETLB accounting sequence; checked cgroup/memcg failure,
+  free_huge_folio rollback, restore_reserve, and memfd inode unreserve.
+  No standalone charge/rollback defect found in ordinary paths.
+- R-025/F4 (scope): memory.current/max only includes HugeTLB when
+  cgroup v2 has CGRP_ROOT_MEMORY_HUGETLB_ACCOUNTING. Author's values
+  demonstrate positive accounting change but not denial at limits.
+  Suggest one targeted cgroup-limit failure/rollback test; not run.
+
+Validation: mm/hugetlb.c preimage
+  b37d7d0db7fc94798a1e98af78853952ee989488;
+Fixes history 26a8 and 89c verified in GitHub. Caller scan: mm/memfd.c,
+mm/gup.c, drivers/dma-buf/udmabuf.c, IOMMUFD, and shmem-only
+live-update. Native Sashiko, kernel tests/build and current-case
+formal model: NOT RUN. Existing R-018 TLC/tla-mctj evidence reused
+as prior work, not newly run. Guard audit: 5 of 5 checked,
+0 redundant, 0 unresolved. Standing rules: 66 of 80 applied;
+4 inapplicable; 10 unresolved (see detailed report).
+Current upstream pin: Sashiko 780530cc1f894c9a18e3db206a99edf3bc09a70e;
+Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+Chris d048f8742f6740c38833adf02e87901412d771ca.
+Stable: prospective candidate after dependency and target-tree validation.
+Next: coordinate with Daehyeon's UAF repair; correct Fixes tag and
+memory.max qualification, then reconsider acceptance. No email sent.

@@ -380,6 +380,25 @@ is correct. Treat these as two separate proof obligations:
 Apply this explicitly during reconciliation; keep the two proof results
 separate even when an author has supplied a convincing reproducer.
 
+Before calling a finding a regression, compare the same reachable input
+against the unpatched baseline, the submitted revision, and any proposed
+reviewer change. Record whether the defect is introduced, newly exposed,
+partly repaired, or pre-existing and unchanged. A surviving older defect
+is not proof that a narrower fix is harmful. Separate an additional fix
+request from a merge blocker, and state why the older defect must be fixed
+in this patch rather than a follow-up. Apply the same before/after test to
+our own suggestions and do not treat a stronger desired invariant as an
+existing contract without source evidence.
+
+For conservative tracking metadata, establish whether the contract is
+exact equality or a one-sided guarantee such as not missing changes.
+Assess false positives and false negatives separately. A truth table
+that violates an exact-preservation invariant does not prove a bug if
+that stronger invariant is not required. Read relevant maintainer
+feedback before requesting symmetric set/clear handling. Distinguish
+accepted over-indication from lost information, and require a specific
+contract violation or evidenced cost before making precision a blocker.
+
 ## Added-guard reachability and necessity gate: EVERY patch
 
 A general instruction to "question new checks" did not prevent a missed
@@ -529,6 +548,11 @@ review; no earlier stage is waived by a passing adversarial check.
    the endpoint is not reachable by repeated increments. Check that
    inputs rejected by the forward path cannot become dangerous inputs
    to its rollback path; validate before destructive operations.
+   When changing the type of a file offset, position, index or length,
+   compare the full producer range with the destination type on 32-bit
+   and 64-bit systems.  Check EOF/bounds in the original signed and
+   full-width type before narrowing.  Test 2^32-wrap offsets, negative
+   positions, short reads, and the inverse/retry paths.
 3. **Architecture and configuration effects.** For a generic operation,
    search architecture overrides, hooks and alternate configurations
    affecting the changed path. Trace their real effects: a function
