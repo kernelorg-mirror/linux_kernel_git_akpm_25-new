@@ -1,0 +1,90 @@
+From: "Lorenzo Stoakes (ARM)" <ljs@kernel.org>
+Subject: mm: do not unintentionally overwrite atomic VMA flags
+Date: Fri, 23 Oct 2026 14:47:27 +0100
+
+Patch series "mm: avoid losing atomic VMA flags", v1.
+
+Since commit 2ab7f1bbafc9 ("mm/madvise: allow guard page install/remove
+under VMA lock"), VMA_MAYBE_GUARD_BIT can be set atomically under the VMA
+read lock.
+
+However, a number of places wrongly assume the flags are stable under the
+read lock, which can cause stale atomic VMA flags to overwrite existing
+valid ones.
+
+Additionally, one case in which VMA_SOFTDIRTY_BIT was overwritten is also
+addressed.
+
+This series addresses each of these, while keeping the logic inline with
+existing conventions.
+
+Each patch in this series is a hotfix.
+
+
+This patch (of 4):
+
+madvise, mlock and mprotect take a copy of a VMA's flags holding only the
+VMA read lock, later writing it back under the write lock (in
+madvise_update_vma(), mlock_fixup(), mlock_vma_pages_range() and
+mprotect_fixup()).
+
+This was done on the assumption that VMA flags cannot change with a read
+lock held.
+
+However this changed in commit 2ab7f1bbafc9 ("mm/madvise: allow guard page
+install/remove under VMA lock"), which allowed VM_ATOMIC_SET_ALLOWED
+flags (currently only VMA_MAYBE_GUARD_BIT) to be written concurrently under
+a VMA read lock.
+
+The actual write itself is safe as this is done under the VMA write lock
+at which point no further concurrent writes can occur, however at this
+point the stale flags mean that these callers can unintentionally overwrite
+atomic flags incorrectly.
+
+The consequences of this are significant - a missing VMA_MAYBE_GUARD_BIT
+could result in page tables not being copied on fork (the vma_needs_copy()
+check can return false) or being overwritten on file-backed THP
+collapse (the file_backed_vma_is_retractable() can return true).
+
+Resolve the issue by always taking care to retain existing atomic flags
+when overwriting VMA flags, replacing the inconsistently named
+vma_flags_reset_once() with vma_overwrite_flags() to do so, and always
+invoking it when flags are overwritten like this.
+
+Reads are a problem too - madvise, mlock and mprotect all compare VMA flags
+without a VMA write lock held via vma_flags_same_pair().
+
+This has more serious impact, as concurrent changes to atomic VMA flags can
+cause two sets of VMA flags to be wrongly considered different.
+
+For mprotect and madvise this causes a useless split, but mlock is impacted
+more seriously as it can result in mm->locked_vm underflow.
+
+Fix this by updating vma_flags_same_pair() to disregard
+VM_ATOMIC_SET_ALLOWED VMAs - VMA equality is the same as VMA mergeability,
+and atomic VMA flags are disregarded when comparing VMA flags for merge -
+so this is justified semantically.
+
+Additionally, remove the redundant vma_flags_same_mask() and the unused
+vma_flags_same() as part of the change, and replace VM_ATOMIC_SET_ALLOWED
+with VMA_ATOMIC_SET_ALLOWED, using the new VMA flag API.
+
+Finally, update userland VMA tests to reflect the changes.
+
+Link: https://lore.kernel.org/20261023-fix-vma-atomic-v1-0-8ff4fae1fc85@kernel.org
+Link: https://lore.kernel.org/20261023-fix-vma-atomic-v1-1-8ff4fae1fc85@kernel.org
+Fixes: 2ab7f1bbafc9 ("mm/madvise: allow guard page install/remove under VMA lock")
+Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Suggested-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Jann Horn <jannh@google.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Davidlohr Bueso <dave@stgolabs.net>
+Cc: SJ Park <sj@kernel.org>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Colin Cross <ccross@google.com>
+Cc: <stable@vger.kernel.org>

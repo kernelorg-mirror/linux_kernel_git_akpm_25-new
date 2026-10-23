@@ -33,6 +33,37 @@ dated archive) is needed to CONTINUE an existing AKPM review.
 AKPM's weekly Lore feedback monitor is not part of this file and does
 not automatically run for another reviewer.
 
+## Default AKPM source tree and Google mirror freshness
+
+Unless AKPM specifies a different tree, branch or revision, treat
+akpm/mm's `mm-unstable` branch as the intended source base for reviews.
+Use this Google Git mirror for read-only source inspection:
+
+https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
+
+At EACH substantive review and each mirror use, inspect the mirror's
+`refs/heads/mm-unstable` HEAD SHA, committer timestamp (not only author
+date), and current clock. Record the SHA, timestamp and check time in
+the review report or activity ledger. If the newest `mm-unstable` commit
+is more than 24 hours old, ALERT AKPM explicitly before relying on it.
+A fresh timestamp shows recent activity, not guaranteed synchronization
+with the authoritative gitolite repository. Do not assert synchronization
+unless the relevant ref/hash comparison was actually performed. If the
+mirror cannot be checked, say so and do not claim it is fresh.
+
+Use a full SHA to pin inspected files and trace complete relevant call
+chains, locking, resource lifetimes, error and rollback paths. Compare
+submitted patch context and any supplied `base-commit` against the
+chosen tree. If they differ, investigate the actual base/history or
+request the relevant source; never silently substitute mainline,
+`mm-new`, `mm-everything` or another branch. An explicit author/user
+base or tree overrides the default while still requiring verification.
+
+Historical mirror checkpoint (NOT a standing synchronization claim):
+Google `mm-new` matched authoritative gitolite at
+`fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6`, as verified by AKPM.
+That single old equality proves nothing about subsequent branch states.
+
 ## Execution order: independent review plus two coverage tracks
 
 For EVERY review, including single patches and mbox series, cover the
@@ -522,6 +553,14 @@ inventoried. Prevent a recurrence as follows:
    Search all entry contexts (including early boot, deferred init,
    sanitizer-held resources and hotplug), not only the reported path.
    An initial correct outcome does not establish safe later reuse.
+9. When a generic record parser changes its iteration or dispatch
+   boundary, distinguish a complete wire header from the larger data
+   structure each matching handler will read. Check newly admitted
+   exact-end records, including headers with no payload, against the
+   first field read in every consequential handler. A record fitting
+   within the table does not prove that its type-specific payload fits.
+   Verify any presumed firmware/transport prevalidation in code and
+   compare old and new handler reachability before relaxing `<` to `<=`.
 
 Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing
@@ -703,6 +742,22 @@ its underlying bug pattern, not merely other calls to the changed helper.
   than trusting helper names, comments or review summaries.
 - Check refcounts, RCU, locking, MMU/page-table lifecycle, address/PFN
   arithmetic, overflow, return values, ABI and all applicable Kconfigs.
+- For a post-release `struct page`/folio access, distinguish the stable
+  physical PFN-to-NUMA relationship from the lifetime of its `vmemmap`
+  metadata. Ordinary reallocation does not change the physical node, but
+  page offlining may poison the metadata, and memory removal may unmap it.
+  Check `get_online_mems()` and all other lifetime guards in the actual
+  callers, then trace pageblock isolation, buddy return, section offlining,
+  poisoning and vmemmap teardown before ruling out crash consequences.
+  Separate offlining, debug poisoning and actual metadata unmapping;
+  poison alone does not establish a crash if downstream checks handle it.
+  Verify the full caller's RCU/IRQ/preemption scope, the exact object each
+  grace period protects, and coverage of the removed metadata mapping.
+  Do not treat an adjacent `kfree_rcu()` as deferring all teardown, or
+  RCU-watching as an RCU read-side critical section. A callee's lock
+  cannot protect a dereference in an argument evaluated before entry.
+  State branch/mode gates and a concrete configuration for every proposed
+  crash schedule.
 - For concurrency, identify actors and shared data; show an explicit
   interleaving and test it against locks, references and barriers.
   Distinguish a state-machine interleaving from LKMM ordering.

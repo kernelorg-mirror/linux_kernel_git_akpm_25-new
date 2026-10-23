@@ -1,6 +1,9 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-21 (America/Los_Angeles)
+Last updated: 2026-10-23 (America/Los_Angeles)
+Recent additions: R-027 (zswap), R-028 (HugeTLB/UFFD), R-029
+(migration and hot-removal); R-030 (mixedmap mremap expansion).
+Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
 modules; the old standalone S2 file is historical only).
@@ -10,11 +13,31 @@ current understanding, NOT author acceptance. Messages, tests and later
 feedback not yet supplied are not presumed to exist. Keep each record
 short; detailed mail and diffs are retrieved by reference as needed.
 
+## AKPM Google mirror checkpoint
+
+Mirror: https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
+Policy: default review base is `mm-unstable` unless explicitly overridden;
+verify the relevant revision and patch context for each review. Inspect
+freshness at every mirror use; alert AKPM if `mm-unstable` HEAD's
+committer time is more than 24 hours old. Mirror activity alone does not
+prove gitolite synchronization.
+
+Checked: 2026-10-23 10:54 PDT (17:54 UTC), via Google Gitiles.
+`mm-unstable` HEAD: 2bba28e98578de622ef307d00875aa8f8bca3d10
+Committer: 2026-10-22 22:13:38 PDT. Age at check: about 12h 41m.
+`mm-new` HEAD: 3fdcce698abd9193752ee89fb1a440cdceb1b74a
+Committer: 2026-10-22 22:13:42 PDT. Age at check: about 12h 41m.
+Freshness alert: NO - less than 24 hours old at this check.
+Comparison: current mirror `mm-unstable` HEAD matches R-030's explicit
+base commit. No current gitolite-versus-mirror hash comparison was made.
+Historical user-verified gitolite/Google `mm-new` equality:
+fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6 (historical only).
+
 ## Tejun upstream workflow checkpoint
 
 Repository: https://github.com/htejun/kernel-agent-workflows
 Upstream branch: `main`
-Last checked: 2026-10-20 (America/Los_Angeles)
+Last checked: 2026-10-22 (America/Los_Angeles)
 Checked HEAD: `cbb4478d0f73e15907335e70a2dc2fe54a9e7167`
 Previous HEAD: `c8cc6a8bee854cf2850f44e0a61be581c19f1d4e`
 Change: `$MODEL_CHECKER` introduced in `UPGRADING.md`; default
@@ -22,7 +45,8 @@ Change: `$MODEL_CHECKER` introduced in `UPGRADING.md`; default
 HEAD commit date: 2026-10-18 06:22:24 UTC
 HEAD subject: Merge pull request #1 from htejun/overlay-flush
 Last comparison: 2026-10-19 (America/Los_Angeles)
-Status: compared current HEAD with previous recorded checkpoint.
+Status: fresh HEAD check unchanged during R-029 feedback verification.
+The previously recorded comparison with c8cc6a8 remains historical.
 `UPGRADING.md` now adds `$MODEL_CHECKER`, default `tla-mctj`.
 
 Migrated from the read-only standalone `tj-patch-review-workflow.md`
@@ -46,12 +70,12 @@ when unchanged. Do not attribute this SHA to reviews R-001 through R-005.
 
 Repository: https://github.com/masoncl/review-prompts
 Upstream branch: `main`
-Last checked: 2026-10-20 (America/Los_Angeles)
+Last checked: 2026-10-22 (America/Los_Angeles)
 Checked HEAD: `d048f8742f6740c38833adf02e87901412d771ca`
 HEAD commit date: 2026-10-01 11:53:46 UTC
 HEAD subject: README: add pahole to the project lists
 Status: unchanged from previous verified prompt baseline.
-Last comparison: 2026-10-19 (America/Los_Angeles)
+Last comparison: 2026-10-22 (America/Los_Angeles)
 Comparison: HEAD unchanged from the recorded checkpoint; no new diff.
 
 Recent upstream improvements already in this baseline:
@@ -74,17 +98,24 @@ DO NOT infer they used the HEAD recorded above.
 
 Repository: https://github.com/sashiko-dev/sashiko
 Upstream branch: `main`
-Last checked: 2026-10-20 (America/Los_Angeles)
-Checked HEAD: `026195ab58e2099e81017adbc6b97f33c509c8ba`
-Previous HEAD: `f6e2e172e1e669b6767a4c74fe91d062b41fd71c`
-Difference: three newer commits affect CLI benchmarking and project
-review prompts; core seven kernel review domains remain unchanged.
-HEAD commit date: 2026-10-20 01:11:09 UTC
-HEAD subject: cli: add sashiko benchmark subcommand and remove
-  standalone binary
-Last comparison: 2026-10-20 (America/Los_Angeles)
-Comparison: relevant pipeline and vendored kernel guides checked
-  in R-018; changes recorded there. Native Sashiko: not run.
+Last checked: 2026-10-23 (America/Los_Angeles)
+Checked HEAD: `867713d1c5e0005d04ea71c6691f39c8a69384a9`
+Previous checkpoint: `8a8cd0aafa00a3c5cf59a36d0d020efdf7d9df8c`
+HEAD commit date: 2026-10-23 15:59:07 UTC
+HEAD subject: release: bump version to 0.6.3
+Last comparison: 2026-10-23 (America/Los_Angeles)
+Comparison: 7 intervening commits change provider/runtime budgeting,
+  storage/compression and release metadata. None changes the kernel
+  review-stage definitions or vendored kernel MM prompts.
+The preceding 8a8cd0... checkpoint introduced explicit tracking of
+  pre-existing bugs already triggerable at the baseline, even when
+  a patch edits their function. The existing AKPM baseline policy
+  already requires that distinction, so no duplicate rule was added.
+Manual GOAL/IMPLEMENTATION/EXECUTION/RESOURCES/LOCKING/SECURITY/HARDWARE
+  coverage attempted for R-030; native Sashiko not run. Full dynamic
+  stage selection and every triggered vendored guide not certified.
+Earlier checkpoint 026195ab58e2099e81017adbc6b97f33c509c8ba and its
+  historical R-018 assessment remain recorded in the case history.
 
 Accepted techniques: preserve substantive dismissed hypotheses with
 source evidence; independently verify disputed claims and dismissals;
@@ -156,6 +187,28 @@ such a subject, consult the named active record or archive FIRST.
 - `compat: Avoid double rounding in times()`
   ACTIVE: [R-020](#r-020); source fix sound; kernel test pending.
 
+
+- `mm/vmalloc: reject overflowing vm_map_ram page counts`
+  ACTIVE: [R-026](#r-026); correct overflow fix, Clang W=1
+  warning warrants small revision.
+- `mm/page_alloc: mark pages freed by __free_pages_core() as not tagged`
+  FOLLOW-UP: [R-021](#r-021); v2 fixes v1 head/tail issue;
+  only Fixes-tag check completed here.
+- `mm/hugetlb: charge hugetlb cgroup and memcg in alloc_hugetlb_folio_reserve()`
+  ACTIVE: [R-025](#r-025); charging correct, cross-patch CSS lifetime
+  dependency and historical Fixes correction.
+- `mm/zswap: validate dlen and normalize comp_ret on compression success`
+  ACTIVE: [R-027](#r-027); accounting fix sound, HiSilicon warning
+  behavior needs targeted check.
+- `mm/hugetlb: disable PMD sharing for UFFD missing mode`
+  ACTIVE: [R-028](#r-028); poison marker may be shared after UFFD
+  unregister; source-supported follow-up concern.
+- `mm/migrate: snapshot the source nid before the misplaced migration`
+  ACTIVE: [R-029](#r-029); fix sound; hot-removal source-metadata
+  lifetime race supported by inspected paths, not reproduced.
+
+- `mm/vma: fix expansion of VMA_MIXEDMAP_BIT VMAs`
+  ACTIVE: [R-030](#r-030); fix source-favorable, impact prose requested.
 
 ## Active records
 
@@ -1486,6 +1539,17 @@ Impact: hotplug warning; risk of masking future debug warnings.
 Stable: not recommended for current revision. Next: request v2 and test
 order-N free/split/untagged allocation/free plus MEMINIT_EARLY paths.
 
+R-021 v2 note (2026-10-22): Zenghui Yu posted
+`mm/page_alloc: mark pages freed by __free_pages_core() as not tagged`.
+The new diff marks only the head, inside __free_pages_core() for both
+MEMINIT_EARLY and MEMINIT_HOTPLUG, and removes the now-duplicated
+memblock_free_pages() mark. This addresses the v1 structural concern.
+In a focused Fixes-tag check, recommend d224eb0287fb
+("codetag: debug: mark codetags for reserved pages as empty"),
+consistent with CMA correction 766c163c2068. v2 was NOT subjected
+to a complete new guided review or runtime test; previous v1
+REVISE verdict must not be misattributed to v2.
+
 ### R-019 v2 reassessment (2026-10-20)
 
 Joshua Hahn's [PATCH v2] keeps the same code and adds Shakeel Butt's
@@ -1678,3 +1742,638 @@ Chris d048f8742f6740c38833adf02e87901412d771ca.
 Stable: prospective candidate after dependency and target-tree validation.
 Next: coordinate with Daehyeon's UAF repair; correct Fixes tag and
 memory.max qualification, then reconsider acceptance. No email sent.
+
+## R-026
+
+Subject: mm/vmalloc: reject overflowing vm_map_ram page counts
+Author: Shubhang Kaushik (Ampere). Date: 2026-10-22.
+Status: REVISE; functional fix correct, 64-bit Clang W=1 warning.
+- R-026/F1: `count > ULONG_MAX >> PAGE_SHIFT` is always false
+  on 64-bit because count is unsigned int. Clang W=1 emits
+  `-Wtautological-constant-out-of-range-compare`, and a
+  W=1/CONFIG_WERROR build could fail. Prefer check_mul_overflow
+  ((unsigned long)count, PAGE_SIZE, &size).
+- R-026/F2: On 32-bit, input count 1048577 can create only
+  a 4KiB virtual mapping while returning success, exposing later
+  users of the mapping to faults/corruption. New guard returns
+  NULL. No direct userspace path independently proven.
+- Historical Fixes: db64fe02258f originally introduced
+  vm_map_ram with unchecked shift.
+- Matching preimage blob: bea9f76ed7e74247d4ce919250c2f02dd5c36483.
+- Source: vm_map_ram, vb_alloc, alloc_vmap_area,
+  vmap_pages_range, vm_unmap_ram, scripts/Makefile.warn.
+  Guard audit 1/1. GCC and Clang standalone expression checks,
+  no kernel build or actual runtime test.
+- Sashiko pin db5a447c7b3bdad217063b993863ba69155a61a8;
+  Tejun pin cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+  Chris pin d048f8742f6740c38833adf02e87901412d771ca.
+  Native Sashiko not run; full stage/manual 80-rule audit and
+  exhaustive caller scan not completed.
+- Detailed report: Library `/Kernel Patch Reviews/reports/
+  vm-map-ram-overflow-review.md`.
+
+
+## R-027
+
+Subject: mm/zswap: validate dlen and normalize comp_ret on compression success
+Author: Suseendran Bhaskaran <suseendranb@google.com>.
+Date: 2026-10-22. Historical Fixes: dca4437a5861.
+Status: SOURCE-LEVEL FAVORABLE, hardware status validation outstanding.
+- R-027/F1: On a successful crypto_acomp_compress() result of exactly
+  PAGE_SIZE bytes, existing writeback-disabled zswap rejects the page as
+  before, but comp_ret previously became -EINVAL and incremented
+  reject_compress_fail. Patch assigns -ENOSPC and increments
+  reject_compress_poor instead. /sys/kernel/debug/zswap counters change;
+  acceptance/rejection remains unchanged.
+- R-027/F2: Successful zero or oversized dlen now triggers
+  WARN_ON_ONCE and rejection. This introduces a possible panic under
+  panic_on_warn if any provider can legitimately yield such success.
+  HiSilicon ZIP accepts HZIP_NC_ERR as a success-like status and sets
+  dlen to hardware-reported produced bytes. The actual attainable
+  values of that status under PAGE_SIZE capacity were NOT validated.
+- R-027/F3: Real compressor error codes retain priority; dlen after
+  errors varies across zstd, 842, LZ4, deflate and hardware backends.
+  Longer-term Crypto API error-consistency cleanup should distinguish
+  insufficient destination capacity (-ENOSPC) from compressor errors.
+  Successful output of PAGE_SIZE is not itself a compressor error.
+- Preimage: mm/zswap.c blob 37f34e406c8e3bb00f3ba1479293d486fc9f64ec.
+  Looked at include/crypto/acompress.h, crypto/scompress.c,
+  crypto/zstd.c, crypto/lz4.c, crypto/deflate.c and hisi ZIP callback.
+- Impact: debugfs counter correction on writeback-disabled systems;
+  additional one-time kernel warning on invalid reported success,
+  possibly fatal under panic_on_warn. No normal-workload performance,
+  swap-content, or page-acceptance change shown.
+- Stable: unresolved pending provider behavior/target tree/testing.
+  Impact-changelog: needs explicit counter and warning description.
+- Review performed: focused first-principles source review only.
+  Native Sashiko, complete guided-stage coverage, kernel builds and
+  runtime tests NOT RUN. No author/maintainer feedback asserted.
+- Detail: /Kernel Patch Reviews/reports/zswap-acomp-dlen-review.md.
+
+## R-028
+
+Subject: mm/hugetlb: disable PMD sharing for UFFD missing mode
+Commit referenced: 5da87cbb6b8f2271fb75acc59e14e2d5860cb54c.
+Author: David Hildenbrand (Arm). Subject and diff supplied in chat.
+Status: SOURCE-SUPPORTED INCOMPLETE FIX, pending independent reproducer.
+- R-028/F1: New uffd_disable_huge_pmd_share() checks only the current
+  VMA's vm_userfaultfd_ctx.ctx, preventing PMD sharing while UFFD is
+  registered. UFFDIO_POISON can put a process-local marker into the
+  private HugeTLB page table, and unregister/release clears the context
+  and flags but preserves the PTE_MARKER_POISONED marker.
+- R-028/F2: Another process mapping the same shared hugetlbfs file can
+  later choose the unregistered VMA as a PMD table donor: page_table_shareable()
+  checks flags/alignment but not poison contents; huge_pmd_share() can
+  attach the table, and hugetlb_fault() returns VM_FAULT_HWPOISON_LARGE
+  for the second process (userspace SIGBUS).
+- R-028/F3: If the original process then unshares its PMD (such as via
+  mprotect), __huge_pmd_unshare() removes its PUD reference without
+  copying the poison marker into a replacement; the second process
+  retains the shared table and the originating process may lose its marker.
+- The new VM_WARN_ON_ONCE in hugetlb_mfill_atomic_pte() checks only at
+  insertion and cannot prevent a later share after UFFD unregister.
+- Source paths read: mm/userfaultfd.c:userfaultfd_clear_vma,
+  userfaultfd_unregister, release_all, registration; mm/hugetlb.c:
+  hugetlb_mfill_atomic_pte, page_table_shareable, huge_pmd_share,
+  __huge_pmd_unshare, hugetlb_fault. Exact submitted commit tree was
+  not independently fetched; supplied patch and available sources used.
+- Impact: second process may receive SIGBUS for a marker it never set;
+  original mapping may lose poison marker. Ordinary configured
+  mappings without UFFD poison unaffected.
+- Stable: unresolved; author response, correction design and runtime
+  registration -> poison -> unregister -> second fault test needed.
+- Review performed: focused source-level adjudication of Sashiko claim,
+  not native Sashiko and not a complete standalone multi-stage audit.
+- Detail: /Kernel Patch Reviews/reports/hugetlb-uffd-pmd-share-review.md.
+
+## R-029
+
+Subject: mm/migrate: snapshot the source nid before the misplaced migration
+Original: [PATCH] mm/migrate: snapshot the source nid before the misplaced
+  migration
+Author: Yafang Shao <laoar.shao@gmail.com>. Date: 2026-10-23 +0800
+  (2026-10-22 in America/Los_Angeles).
+Fixes: e39bb6be9f2b ("NUMA Balancing: add page promotion counter").
+Rechecked: 2026-10-22 PT; checker execution logs use 2026-10-23 UTC.
+Status: SOURCE-SUPPORTED hot-remove finding retained with narrower scope;
+  no reproduced kernel crash; full standalone review coverage incomplete.
+
+- R-029/F1: migrate_misplaced_folio() can inspect source metadata after
+  migrate_pages()/migrate_folio_done() released its final reference.
+  Snapshotting the integer nid before migration removes this late load.
+  No new allocation, lock, error path or migration decision is introduced.
+- R-029/F2: Ordinary reuse of a physical page does not normally change
+  its NUMA node. The changelog's reuse-based wrong-nid argument remains
+  unsubstantiated. Do not imply a routine allocator-reuse crash or a
+  demonstrated promotion-count error.
+- R-029/F3: Source-supported conditional x86 hot-remove fault. The old
+  read requires nr_succeeded > 0 AND memory-tiering mode. Delay the task
+  after migrate_pages() returns, then offline and actually remove an
+  otherwise-free removable source block. Keep other source-node memory,
+  destination memory and nonmovable kernel state outside that block.
+  Removal covering the source vmemmap leaf can clear its mapping and
+  flush TLBs before the task resumes the stale folio_nid() load. A kernel
+  fault/oops and possibly panic can result. No unprivileged removal
+  trigger or exploit has been demonstrated.
+- R-029/F3a (important refinement): Offlining != actual removal. DEBUG_VM
+  poisoning alone is not a proved crash: folio_nid() extracts node bits
+  and node_is_toptier() handles a NULL pgdat. The concrete fault route
+  retained here is a load from metadata that has actually been unmapped.
+  Do not claim that every partial removal clears the source metadata.
+- R-029/F3b (counterarguments checked): do_numa_page() and
+  do_huge_pmd_numa_page() drop PTL before migration. Outer VMA/mmap locks
+  do not pin the vacated source PFN. lock_vma_under_rcu() drops RCU before
+  returning. RCU-watching on exception entry is not an RCU read lock.
+  node_is_toptier() takes RCU only after folio_nid() has been evaluated
+  as its argument; that inner critical section cannot protect this load.
+  kfree_rcu(ms->usage) defers usage storage, not the vmemmap depopulation.
+  A pause after migration returns avoids relying on simultaneous source
+  page isolation or source allocator locks. No remaining source ref
+  blocks the free-page test; an extra-reference model control does block
+  it until the accounting step has finished.
+- R-029/F4: PGPROMOTE_SUCCESS is statistics, not the promotion rate-limit
+  input (PGPROMOTE_CANDIDATE). The patch does not freeze concurrent node
+  tier reconfiguration; do not claim perfect counter attribution across
+  every topology change. Its demonstrated repair is the metadata lifetime.
+
+Source pin: 864c07de0c7dcbca58b61625dfa2e461ae63b242.
+Matching mm/migrate.c blob: 15b45832bcfa7e93f768bea5f3115a2fb95aa5b5.
+Re-read: mm/migrate.c (1200, 2755); mm/memory.c (6288, fault dispatcher);
+mm/huge_memory.c (2320); mm/mmap_lock.c:lock_vma_under_rcu();
+arch/x86/mm/fault.c; mm/memory_hotplug.c (1955, 2291);
+mm/page_isolation.c (556, 605); mm/sparse-vmemmap.c (776);
+arch/x86/mm/init_64.c (1020-1295); include/linux/mm.h (2368-2420);
+mm/debug.c; mm/memory-tiers.c (275-301). Fixes commit fetched again.
+
+Executed validation:
+- PlusCal translation and SANY parsing succeeded.
+- Both TLC and tla-mctj ran all 8 bounded variants and agreed.
+- Old/remove: NoUnmappedRead violated, 30 distinct states (falsification).
+- Snapshot/remove: PASS, 32 distinct states, complete depth 13.
+- Old/offline-only: PASS, 32 states, no poisoning or removal.
+- Old/poison-only: NoPoisonedRead violated, 26 states; this is NOT a
+  kernel-crash assertion. Same variant's NoUnmappedRead check passed
+  with 38 states.
+- Old/tiering-disabled: PASS, 32 states.
+- Old/extra-reference-held-until-after-accounting: PASS, 20 states.
+- Snapshot/poison-only: PASS, 32 states.
+- Two actors, one successful migration/block, refs 0..2; sequential
+  consistency only. Model trace replayed against C. This checks the
+  specified abstraction, not arbitrary kernel/hardware behavior.
+- TLC 2026.10.15.145915 (rev 932d35e); supplied tla-mctj binary identified
+  by SHA256 in the model README. Exact commands, configs, wall times,
+  generated TLA+, trace and logs retained locally in r029-recheck/.
+- No kernel build, runtime hotplug/KASAN/QEMU test, native Sashiko or
+  LKMM run. No observed failure or author confirmation invented.
+
+Methodology pins checked afresh:
+Sashiko db5a447c7b3bdad217063b993863ba69155a61a8;
+Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+Chris d048f8742f6740c38833adf02e87901412d771ca.
+Core Sashiko domains/verification and Tejun formal-model guide applied
+in this focused recheck. Complete guided/vendored coverage, broad MM
+similar-bug search and stable-branch validation remain uncompleted.
+
+Standing rules: 64 of 86 applied; 6 inapplicable; 16 unresolved
+Guard audit: 4 of 4 checked; 0 redundant; 0 unresolved
+
+Impact-changelog: needs accurate post-release/removal conditions rather
+than ordinary-reuse changes to nid. Stable: unresolved pending target
+applicability and kernel validation; no submission or metadata change.
+Next action: use the refined email below, not the earlier implication
+that merely poisoning page metadata establishes a crash.
+
+Report path:
+/Kernel Patch Reviews/reports/migrate-misplaced-src-nid-review.md
+Persistence reconciliation (2026-10-22 PT): the previous Library
+write failure describes the earlier review session only. The detailed
+report and its formal-model archive are now verified in the Library.
+That report records an earlier 83-rule audit and model iteration
+(old/remove 42; fixed/remove 45 distinct states). This master ledger
+records the later 86-rule audit and eight-variant model recheck
+(old/remove 30; snapshot/remove 32 distinct states). They must not
+be confused as one execution. An addendum to the detailed report now
+records the later ledger's findings, without replacing earlier logs.
+The latest model-run artifacts were not independently recovered in
+this handoff, and no source or checker work was repeated. Historical
+A83 remains UNRESOLVED in the earlier 86-rule audit count; the Library
+report update was completed afterward.
+
+Copy-ready reply (unsent):
+
+```text
+The source-node snapshot looks correct. I rechecked the hot-remove
+case, including the outer fault-path locks and RCU protection.
+
+With memory-tiering mode enabled, a successful migration can release
+the source folio before the promotion-accounting folio_nid() read.
+If the task is delayed here, the source block can be offlined and
+removed, tearing down its vmemmap mapping before that read executes.
+On the inspected x86 path this can cause a kernel oops, and possibly
+a system panic. Merely offlining or poisoning the metadata does not
+by itself establish that outcome.
+
+Ordinary page reuse does not change the physical page's NUMA node.
+I'd describe the post-release metadata access and conditional
+hot-removal failure in the changelog instead.
+
+This is supported by source inspection and bounded model checking;
+I have not reproduced a crash on a running kernel.
+```
+
+Correction history: the first review called the hot-remove outcome
+unestablished. The next source pass identified metadata teardown. The
+prior report overstated poison-to-crash inference and omitted the
+memory-tiering branch restriction. This recheck retains actual-unmap
+faults, adds those qualifications and executes falsifiable model checks.
+
+### R-029 audit scope and limitations
+
+Fixed inventory: A01-A86 in the detailed recheck evidence; denominator
+was recorded before source revalidation. Applied 64; inapplicable 6;
+unresolved 16. Inapplicable: A28 no bounds changes, A58 no weak-memory
+claim, A77 no userspace reproducer authored, A79 no tracking-contract
+change, A80 no multi-element metadata write-set, A81 no record parser.
+
+Unresolved: A10 all counter consumers not re-fetched; A12 architecture
+exhaustiveness; A25/A35 broader MM pattern search; A26 kernel build and
+runtime compatibility; A37 full Sashiko selection pipeline; A38 full
+vendored guides; A47 native Sashiko unavailable; A49 full Tejun workflow
+and dependencies; A51 complete Chris prompts; A52 complete historical
+methodology diffs; A53 full three-track reconciliation; A64/A65/A66 full
+stable validation/routing; A83 Library write unavailable. These are
+coverage/storage limits, not observed defects in the snapshot change.
+
+Guard audit: G01 nr_succeeded gates this branch; G02 memory-tiering bit
+must be on for the old load; G03 source-tier predicate changes only the
+point where source nid is obtained; G04 destination-tier check is later
+and cannot protect G03. All four checked, none redundant or unresolved.
+No new conditional, rejection, allocation or lock is added by the patch.
+
+### R-029 maintainer feedback (2026-10-22 PT)
+
+Input: mbox(20261023-051302), four messages including the original patch.
+R-029/F2: human feedback CONFIRMS rejection of the ordinary-reuse
+rationale. Matthew Wilcox disputes changed physical nid after freeing;
+Yafang Shao agrees. Normal allocator flag masks and node-field layout were
+independently inspected. Original patch reports no real issue observed.
+
+R-029/F3 remains SOURCE-SUPPORTED and UNREPRODUCED, pending human feedback
+about actual hot-removal. Neither supplied maintainer/author reply
+discusses that mechanism. Andrew's later off-list message forwards an older
+AI draft and asks for verification; there is no reply to that question in
+this mbox. This is not independent confirmation of the AI claim.
+
+R-029/F3a correction retained: poisoning alone is not a demonstrated crash.
+Fresh source checks cover final source put, PTE/PMD callers, outer
+fault/VMA RCU scope, offlining versus removal, x86 PMD unmapping/TLB flush,
+and the callee's too-late RCU/NULL checks. Keep the successful-migration
+and memory-tiering restrictions, an actually removable metadata range, and
+other source-node memory.
+
+R-029/F4 remains unchanged: snapshotting nid does not snapshot the node's
+current tier. No new kernel build, runtime experiment, compiler test, TLC,
+tla-mctj, herd7 or native Sashiko run occurred. Historical model runs and
+the 83/86-rule audits remain distinct.
+
+Feedback Message-IDs:
+<atrUeGPZgoSACpOR@casper.infradead.org>
+<CALOAHbARy4pSrsDLmTfntdsWONETqPrGJM+g6jM27WWnc-bCAw@mail.gmail.com>
+<20261022221126.70238debd0c1c601bee952b5@linux-foundation.org>
+
+Standing rules: 38 of 50 applied; 2 inapplicable; 10 unresolved
+Guard audit: 4 of 4 checked; 0 redundant; 0 unresolved
+
+Scope: focused feedback verification, not full standalone acceptance.
+Outstanding B06/B09/B20: exhaustive caller, architecture and broader MM
+checks; B22/B23/B34/B36/B37: complete guided pipeline/dependency coverage
+and reconciliation; B32: native Sashiko; B43: full stable validation.
+
+Detailed report updated and Library upload/readback verified at /Kernel
+Patch Reviews/reports/migrate-misplaced-src-nid-review.md. The workflow is
+unchanged; its current rules already cover this feedback.
+
+Next: await the off-list hot-removal response, request corrected rationale
+and targeted old-versus-snapshot testing, and complete the outstanding
+full-review coverage before unconditional acceptance. Revised off-list
+email is drafted in the report, not sent.
+
+
+## R-030
+
+Subject: mm/vma: fix expansion of VMA_MIXEDMAP_BIT VMAs
+Original: [PATCH] mm/vma: fix expansion of VMA_MIXEDMAP_BIT VMAs
+Author: Lorenzo Stoakes (ARM) <ljs@kernel.org>. Date: 2026-10-23.
+Base: 2bba28e98578de622ef307d00875aa8f8bca3d10.
+Matching mm/vma.c blob: 1be613044b4a50cb8b1bbe6955755fac762dc80e.
+Matching VMA userspace dup.h: f449129ea97a9c85eaccf78a10f9a313b8e27b12.
+Fixes: ca3d76b0aa808a06997297d123b66d17b81e5285 (verified).
+Status: SOURCE-LEVEL FAVORABLE; full review-stage/test coverage incomplete.
+Detailed report: /Kernel Patch Reviews/reports/
+  vma-mixedmap-expansion-review.md.
+
+R-030/F1 (confirmed old regression): eligible mixedmap mremap() expansion
+  fails -ENOMEM even with free adjacent space. The old extension merge
+  helper rejects a nonmergeable VMA and its caller treats NULL as OOM,
+  without attempting MayMove fallback. Luiz Capitulino reported the
+  failure using vm_insert_page() in an external module. Lorenzo says the
+  reproducer and mm/VMA selftests pass after the fix; AUTHOR-REPORTED.
+R-030/F2 (fix proof): when vma_can_merge() is false, initialize
+  VMG start at original vm_start to retain file/anon offsets, rewind VMI,
+  keep next=NULL and call vma_expand() on the original target. Earlier
+  check_prep_vma() rejects PFNMAP/DONTEXPAND, align_hugetlb() rejects
+  HugeTLB expansion; thus the legal nonmergeable case is MIXEDMAP.
+  commit_merge() preallocates before mutation; failure returns -ENOMEM
+  and mremap uncharges. No new code blocker found.
+R-030/F3 (nonblocking redundancy): both new VM_WARN_ON_ONCE() assertions
+  are unreachable on legitimate current growth paths. They intentionally
+  check future contract violations, but do not protect a valid new path.
+  Guard audit: 5 of 5 checked; 2 redundant; 0 unresolved.
+R-030/F4 (changelog): explicitly describe false -ENOMEM, absence of
+  actual OOM, affected mixedmap applications, and failed MAYMOVE fallback.
+  impact-changelog: needs detail. Stable: prospective candidate, not
+  already eligible/merged; small tested-by-author fix with stable trailer.
+  Check supported target branches and their configurations separately.
+R-030/F5 (validation): source-mirrored C predicate/offset test compiled
+  with GCC and Clang, both ASan+UBSan, 64 flag/config combinations each;
+  all legal nonmergeable grow cases require MIXEDMAP. This is NOT an
+  in-kernel test. No kernel build, native Sashiko, VMA userland runner,
+  KASAN, TLC, tla-mctj or herd7 executed in this review.
+
+Pinned review methods checked 2026-10-23 PT:
+  Sashiko 867713d1c5e0005d04ea71c6691f39c8a69384a9
+  Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167
+  Chris d048f8742f6740c38833adf02e87901412d771ca.
+  Applied seven manual Sashiko domains and appropriate guided checks,
+  but full vendored guide/dependency coverage was not certified.
+  Standing rules: 52 of 67 applied; 3 inapplicable; 12 unresolved.
+  Inventory was not precommitted before the independent source pass;
+  it remains an explicitly unresolved procedural obligation.
+  Model: no, existing mmap/VMA lock protocol unchanged; finite Boolean
+  enumeration more appropriate than TLA+ for flag-classification logic.
+Next: ask Lorenzo for concrete -ENOMEM changelog wording; review any v2,
+  optional warning simplification and further tests. Await feedback;
+  no email sent or Reviewed-by given. No new workflow rule established.
+
+### R-031: mm: avoid losing atomic VMA flags (four-patch series)
+
+Date: 2026-10-23 PT. Source mbox(20261023-181024); cover change-id
+20261022-fix-vma-atomic-8c910fd66a28. Four patches; authors Lorenzo Stoakes
+and David Hildenbrand. Explicit base:
+5f980b2d53abf3950caff5d77b5c69dc6ebb19b6.
+
+Status: SOURCE FAVORABLE, NOT FULLY CERTIFIED. Source review identified
+three real guard-bit race mechanisms, an unsigned-locked_vm accounting
+hazard, and a SOFTDIRTY loss when renaming an anonymous VMA. Source review
+did not prove a new regression in patches 1-4. Ask for clearer userspace
+runtime impact in changelogs, especially the conditional RLIMIT_MEMLOCK
+bypass and wrong /proc soft-dirty reporting. No kernel build/stress tests
+or native Sashiko execution; no Reviewed-by issued.
+
+Google mirror currency check: mm-unstable HEAD
+2bba28e98578de622ef307d00875aa8f8bca3d10, committer 2026-10-22 22:13:38
+-0700. Fresh when checked on 2026-10-23 PT (<24 hours); no stale-mirror
+warning. Google mirror freshness does NOT certify gitolite synchronization.
+Base was resolved independently, and matching source blobs at both relevant
+revisions were inspected; author base was not silently replaced.
+
+R-031/F1 CONFIRMED pre-existing guard-loss race, FIX SOURCE-SUPPORTED:
+patch 1 replaces stale flag rewrites from mprotect/madvise/mlock with
+vma_overwrite_flags(), which preserves the current VMA_MAYBE_GUARD_BIT
+under VMA write locking. vma_flags_same_pair() ignores exactly allowed
+atomic flags.
+
+R-031/F2 CONFIRMED pre-existing munlock underflow, FIX SOURCE-SUPPORTED:
+when atomic guard only differs, mlock_fixup can decrement mm->locked_vm for
+an already-unlocked region. Unsigned underflow followed by do_mlock()
+additions can wrap the counter and bypass RLIMIT_MEMLOCK. Trigger: guard
+flag set while a concurrent munlock path used stale flags, the eligible VMA
+supports mlock, and subsequent mlock calls. Worst credible effects:
+over-limit unevictable memory, reclaim pressure, system-wide slowdown or
+OOM harm. Not runtime reproduced; no demonstrated kernel memory corruption
+or privilege escalation.
+
+R-031/F3 CONFIRMED pre-existing clone race, FIX SOURCE-SUPPORTED: patch 2
+moves vma_start_write(vma) before vm_area_dup() in __split_vma(), and
+asserts the writer lock in vm_area_dup(). Fork dup_mmap and mremap move_vma
+already lock before duplication. NOMMU assertion delegates to mmap write
+locking, not an introduced NOMMU WARN. Incomplete exhaustive
+all-callers/configuration search remains open.
+
+R-031/F4 CONFIRMED stale SOFTDIRTY overwrite, FIX SOURCE-SUPPORTED: patch 3
+skips post-vma_modify_name() stale flag rewrite, preserving sticky
+VMA_SOFTDIRTY_BIT acquired from merged neighboring VMAs. The earlier merge
+already schedules khugepaged if appropriate. Worst credible userspace
+effect: inaccurate soft-dirty bits in /proc/PID/pagemap, causing
+dirty-state consumers (including incremental checkpointing) to miss
+updates. No runtime reproduction.
+
+R-031/F5 CONFIRMED sticky-publication race, FIX SOURCE-SUPPORTED: patch 4
+collects sticky flags only after locking each contributing VMA and
+publishes their union inside commit_merge after vma_prepare but before
+vma_complete releases rmap locks. This avoids file-backed THP retraction
+observing an expanded VMA with a missing guard bit. Both merge-existing and
+expansion paths reviewed. Prealloc failure avoids partial mutation.
+
+Guard loss can skip copying guard PTE markers in fork or allow retraction
+on eligible file-backed THP mappings. Worst credible userspace behavior is
+loss of protected guard regions, possible undetected boundary access and
+application-level corruption/crash. No proof of kernel corruption or
+observed exploit. In all cases separate source reachability from runtime
+reproduction.
+
+Original bug introducing commits verified: guard-bit read-lock work
+2ab7f1bbafc927c69374d45578011c814c26ae2f and
+49e14dabed7a294427588d4b315f57fbfcab9990 (2025-11-20); anonymous naming
+9a10064f5625d5572c3626c1516e0bebc6c9fe9b (2022-01-15); sticky flags
+64212ba02e66e705cabce188453ba4e61e9d7325 (2025-11-20). Stable inclusion and
+target applicability NOT established; treat as prospective until upstream
+merge and branch testing.
+
+Executed a separate source-guided bounded Python interleaving check,
+/mnt/data/r031-flag-model.py: old/fixed guard rewrite 1/0 bad legal
+schedules (3 each); old/fixed split-copy 1/0 bad (6/1 schedules); old/fixed
+sticky publication 1/0 bad (2/1 schedules). Simulated unsigned counter wrap
+at 32 and 64 bits. Not a kernel runtime test, formal TLA run, or native
+Sashiko. No compilation or Linux selftest run in this review.
+
+Current method pins verified 2026-10-23: Sashiko
+1bc9441db7faf9f2e464cd74a9ac0f6c3219082a; Tejun
+cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+d048f8742f6740c38833adf02e87901412d771ca. Sashiko seven manual analysis
+domains and verification/post-verification questions checked, relevant
+Tejun/Chris guide modules read. Guide exhaustive stage/module coverage
+incomplete and native run unavailable.
+
+Standing rules: 55 of 70 applied; 4 inapplicable; 11 unresolved. Guard
+audit: 8 of 8 checked; 0 redundant; 0 unresolved. Inventory was assembled
+after independent source review began, so precommit policy C09 is
+explicitly UNRESOLVED. Other outstanding: complete all-callers search,
+kernel build/VMA tests/race-injection, full checker, full Tejun/Chris guide
+audit, native Sashiko, target -stable validation, full architecture sweeps
+and broader analogous-bug scan. No other review IDs, findings, or
+historical audit states modified.
+
+Detailed report stored in Library: /Kernel Patch
+Reviews/reports/r031-vma-atomic-flags-series-review.md. The tiny
+source-guided model archive is intended to reside alongside it. No source
+tree modification or email sent. Suggested email in detailed report;
+recommendation is source-favorable with changelog improvements and pending
+runtime validation, not an unconditional Reviewed-by.
+
+## R-032: memcg per-node cacheline contention, v3 [1/2]+[2/2]
+
+Date: 2026-10-23 PT. From: Joanne Koong.
+Source: mbox(20261023-215056); 13 messages, v1-v3 and Shakeel
+discussion; submitted base fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6.
+Status: SOURCE FAVORABLE, review coverage incomplete; no introduced
+correctness bug proven. No unconditional take/Reviewed-by.
+
+Mirror check on 2026-10-23 PT: mm-unstable
+2bba28e98578de622ef307d00875aa8f8bca3d10,
+committer 2026-10-22 22:13:38 -0700, less than 24 hours old.
+mm-new 3fdcce698abd9193752ee89fb1a440cdceb1b74a, committer 2026-10-22
+22:13:42 -0700. No stale-mirror alert. These timestamps do not
+establish synchronization with gitolite. Touched preimage blobs match:
+include/linux/memcontrol.h 69e1bcc67c588d2071a2cb64a5770458bd8ddaff;
+mm/memcontrol.c a05d9a8baa1b6bb9f9d95397543105f781a9f205.
+Entire fcec base tree history has not been reconstructed.
+
+R-032/F1 SOURCE-SUPPORTED [1/2] performance improvement: moving the
+cold group (orig_objcg/objcg_list) after read-mostly fields prevents
+direct same-object pairing with hot lruvec heads on 64B caches.
+Author-measured Skylake throughput: shmem 20-thread 4.74M->5.59M
+pages/s (+18%), shmem 80-thread 7.94M->8.66M (+9%), anon 20-thread
+3.04M->3.08M (+1%). No independent benchmark/perf c2c reproduction.
+
+R-032/F2 SOURCE-SUPPORTED [2/2] equivalent accounting: tracked and
+untracked folio/kmem routes still update global node once and the
+appropriate memcg/per-node state when tracked. Non-dying ancestor
+redirection, outer RCU protection and reparent child/parent totals
+retained. A 96-case synthetic accounting and 20-case reparent model
+ran with equal old/new outcomes; this is NOT a kernel test or proof.
+Incremental Skylake shmem gain author reports 5.59M->5.77M (+3%)
+at 20 threads, and 8.66M->8.82M (+2%) at 80 threads.
+
+R-032/F3 PERFORMANCE LIMITATION, NOT A PROVEN REGRESSION:
+SMP_CACHE_BYTES / SLAB_HWCACHE_ALIGN supply 64B-aligned groups for
+the described machine, not necessarily 128B-aligned slab objects.
+A read-mostly line at offset 64 mod128 can pair with an adjacent
+slab object rather than this object's cold line. Keep author claims
+scoped to its own hot lruvec and measured CPU; optional comment edit
+or field-offset/placement benchmark; no user-visible harm proven.
+
+R-032/F4 UNRESOLVED dependency: old mem_cgroup_lruvec() can lazily
+populate lruvec->pgdat. New stat-only routes no longer do so.
+Representative vmscan get_lruvec() initializes it independently;
+no failing consumer found, but all direct consumers not enumerated.
+Do NOT call this a proven NULL-dereference regression.
+
+R-032/F5 DISMISSED potential guard/root/race regressions:
+mem_cgroup_from_virt() returns NULL when disabled, objcg lookup
+remains under RCU, reparent uses the same nodeinfo positions,
+and the generic mod_lruvec_state node/memcg update is unchanged.
+No changed error/cleanup path or kernel/UAPI failure demonstrated.
+
+Prior v1/v2 history: Shakeel Butt suggested the cold rearrangement,
+requested an explanation comment, and acked both v2 changes. v3
+adds the comment and his Acked-by tags. Joanne reports no reproduced
+performance gain on arm64. Human acks not substituted for review.
+
+Current guidance SHAs checked: Sashiko
+d7c69ae77326a3ef39362897cdf0751a06068cf1; Tejun
+cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+d048f8742f6740c38833adf02e87901412d771ca.
+Seven manual Sashiko analysis domains and focused verification,
+source-guided Tejun/Chris checks applied. No native Sashiko, build,
+kernel tests, formal TLA+ check or actual perf experiment executed.
+Guide/comprehensive caller/config coverage remains incomplete.
+
+Standing rules: 57 of 73 applied; 3 inapplicable; 13 unresolved
+Guard audit: 4 of 4 checked; 0 redundant; 0 unresolved.
+Inventory assembled after independent review began, so precommit
+requirement A03 is UNRESOLVED; no historical audit altered.
+stable: not justified for performance-only change on this evidence.
+Worst concrete userspace effect of OLD code is lower memory fault/free
+throughput and elevated latency under reported Skylake contention.
+No observed Oops, corruption, denial of service or exploit claimed.
+
+Detailed Library report:
+/Kernel Patch Reviews/reports/memcg-lruvec-cacheline-review.md
+Next: inspect full lruvec pgdat consumer set, real layout/stride
+and Intel c2c data; run kernel builds and workload if available.
+No kernel source edited; reply only drafted, not sent.
+
+## R-033: memcontrol high_work on dying memcg
+
+Date: 2026-10-23 PT. From: T.J. Mercier.
+Subject: [PATCH] mm: memcontrol: fix NULL pointer deref in
+high_work_func() on dying memcg.
+Base: 2bba28e98578de622ef307d00875aa8f8bca3d10.
+Status: SOURCE FAVORABLE; real author-reported kernel KASAN Oops
+and old missing CSS lifetime ref verified from source; no
+introduced patch regression proven. NOT unconditional Reviewed-by.
+
+Mirror check: akpm/mm Google mm-unstable HEAD at base SHA,
+committer 2026-10-22 22:13:38 -0700, checked 2026-10-23 16:01 PDT
+(age 17h47m, NOT stale). Preimage matching base Git tree blob
+mm/memcontrol.c a05d9a8baa1b6bb9f9d95397543105f781a9f205.
+Google HTML source-view reports a different blob
+(aad0498a7bd6587a16df117b2a21fddef9e3798d), with minor
+preexisting stock css_put changes and shrinker init; reviewed
+high worker and CSS lifetime functions are identical. No mirror
+synchronization with gitolite inferred from timestamp alone.
+
+R-033/F1 CONFIRMED OLD DEFECT: high_work_func() performs reclaim_high
+without CSS reference. CSS release can unhash MGLRU list before
+worker's shrink_lruvec / lru_gen_rotate_memcg; author supplies
+KASAN GPF at NULL hlist pprev. cancel_work_sync in css_free is too
+late to exclude prior css_released and shrink_many unhashing.
+
+R-033/F2 SOURCE-VERIFIED FIX: css_tryget_online before reclaim
+allows either acquired ref delaying CSS release (and shrink_many
+unhash), or no work after CSS kill; css_put balances success.
+Offline itself may proceed but does not release MGLRU list.
+
+R-033/F3 SOURCE-VERIFIED POLICY FIX: memory.high and swap.high reset
+to PAGE_COUNTER_MAX at CSS offline. In try_charge_memcg non-task
+context, old dead-child mem_high branch breaks before live parent;
+the reset skips the dead child and continues ancestor checks.
+Task-context obsolete swap.high delays are also suppressed.
+
+R-033/F4 DISMISSED new ref leak or UAF: failed tryget returns
+without css_put; successful tryget has matching put; final work
+cancellation precedes memcg memory free; no new sleeping lock.
+
+R-033/F5 UNRESOLVED runtime: complete kernel config/architecture,
+teardown notifier, analog async work, full guide audit, kernel
+build/KASAN stress and -stable target validation remain undone.
+No source tree edit or email sent.
+
+Current review guide pins: Sashiko
+ d7c69ae77326a3ef39362897cdf0751a06068cf1; Tejun
+ cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+ d048f8742f6740c38833adf02e87901412d771ca.
+Seven Sashiko manual domains, verify and post-verify questions,
+focused Tejun/Chris methods manually applied; native Sashiko NOT RUN.
+Bounded Python scheduler model was RUN, corrected counts:
+old 70 valid/15 unsafe; patched 65 valid/0 unsafe. An earlier
+incorrect model criterion is superseded (35 old unsafe before fix).
+This is NOT native TLA+/TLC, a kernel test, nor a formal C proof.
+
+Standing rules: 27 of 40 applied; 2 inapplicable; 11 unresolved
+Guard audit: 1 of 1 checked; 0 redundant; 0 unresolved.
+Precommit inventory rule B01 UNRESOLVED. Full per-rule disposition
+and separate incomplete coverage in detailed Library report.
+Stable: candidate for kernels containing Fixes:
+f1cf8d2f36dc369688bbe61ce064fbd829dbc9e1, not yet verified
+on individual stable branches. Worst user-visible effect:
+kworker Oops or panic/reboot with interruption of applications,
+possible availability loss and unclean shutdown. Delegation or
+proper cgroup/charge workload required to trigger, not presumed
+unprivileged arbitrary memory corruption.
+
+Detailed Library report:
+/Kernel Patch Reviews/reports/memcontrol-high-work-dying-memcg-review.md
+Next: KASAN MGLRU worker/offline stress and checks of live ancestor
+high, PREEMPT_RT, -stable and analogous async memcg work.
