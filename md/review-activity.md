@@ -2632,3 +2632,75 @@ Gate manifest `/mnt/data/r035-gate.json` and actual check output
 `/mnt/data/r035-review/gate-check.txt` are included in this turn's
 ZIP. Workflow unchanged. Proposed reply is informational, not a
 Reviewed-by or take recommendation; no email was sent.
+
+
+## R-036: lib/group_cpus: snapshot cluster masks to keep grouping hotplug invariant
+
+Date 2026-10-24 Pacific. Author Vishal Badole; submitted v4
+2026-08-26; 1 file 85 insertions/2 deletions, 5 hunks.
+Source: last known AKPM mm-unstable
+`2bba28e98578de622ef307d00875aa8f8bca3d10`; original
+`lib/group_cpus.c` blob `e6e18d7a49bba6775e5984db681637c826ef1dec`
+matched submitted `index` prefix. Current live Google mirror HEAD could
+not be refreshed and the last observed SHA is >24 h old: freshness
+UNKNOWN, not asserted in sync. Fixes commit full SHA verified as
+`89802ca36c96b324829996ef05013f82ecc9b68a`.
+
+F1 SOURCE-PROVEN, UNFIXED: Snapshot starts unavailable if a device is
+first probed with some present CPUs offline, selecting sibling/plain
+spread. At subsequent all-online recomputation it switches to frozen
+cluster spread. Four-CPU/two-queue reduced source model reproduces
+0x03/0x0c -> 0x05/0x0a. Invariant fails on this case; not a new
+regression relative to the original online-dependent algorithm.
+
+F2 SOURCE-PROVEN, UNFIXED: Even after snapshot, final grouping uses
+`topology_sibling_cpumask()` in `grp_spread_init_one()`. x86 CPU
+offlining removes the dying CPU from remaining sibling masks. On a
+shared-L2 topology with two 4-thread SMT cores and two queue groups,
+all-online 0x55/0xaa becomes 0x2b/0xd4 when CPUs 2/4/6 offline.
+GCC+Clang reduced model reproduced; Intel Knights Landing supplies
+physically relevant shared-L2 multi-SMT-core topology. Not a newly
+introduced bug, but a material hole in stated invariance.
+
+F3 SOURCE-PROVEN NEW MODE DEPENDENCY: New `cpus_read_trylock()` and
+snapshot allocations may fail even when all present CPUs are online,
+using plain grouping; later capture success switches to cluster mode
+without any CPU online changes. Source model eight-CPU/two clusters
+0x33/0xcc -> 0x55/0xaa, reproduced GCC+Clang. Prior cluster
+algorithm had separate allocation-failure fallback, but this adds
+new failure sites, including CPU hotplug lock contention. Exact NVMe
+IRQ-loss consequence requires runtime reproduction.
+
+F4 SOURCE RISK: `cluster_snapshot_ready` is sampled separately for
+each NUMA node/stage, not once across `group_cpus_evenly()`. A
+concurrent or later successful capture after a prior failure can
+combine plain/cluster grouping within one call; no runtime race
+reproduction was performed.
+
+Dismissed: no evidence of published-snapshot UAF/torn initialization.
+The mutex serializes publication and the cpus_read_trylock pins
+cluster source masks; store-release/load-acquire publishes pointer.
+Failed per-CPU allocations unwind using zero-initialized array.
+CONFIG_SMP=n excludes new code; HOTPLUG_CPU=n trylock stub succeeds.
+Memory footprint increases O(nr_cpu_ids^2 bits). Hotadded CPUs not
+covered is disclosed scope limitation. All added guards audited for
+reachability, necessity and fallback consequences.
+
+Userspace: the reported original s2idle regression causes NVMe queue
+interrupt delivery mismatch, timeout-polled completion and about
+2-minute stalls/sluggish I/O. F1-F3 produce demonstrably divergent
+CPU/IRQ group masks; whether the specific new modeled scenarios cause
+actual NVMe timeout has not been confirmed. Worst plausible stalled
+storage I/O/hung processes until timeout; no corruption demonstrated.
+
+Gate v2 initialized BEFORE analysis with full SHA, 23 gates, 5 hunks
+and 24 standing sections. GCC and Clang reduced C models executed;
+not actual kernel build, IRQ/NVMe runtime, native Sashiko, external
+subagents, TLC/PlusCal, or full pinned whole-tree grep. Current mirror
+refresh failed. Sashiko/Tejun/Chris SHAs: `d7c69ae77326`,
+`cbb4478d0f73`, `d048f8742f67`. Native gate check: HOLD (missing
+mandatory source/build/architecture and formal evidence); therefore
+NO take or Reviewed-by recommendation. Source findings independently
+support requesting v5. Detailed report uploaded and read back from Library path
+`/Kernel Patch Reviews/reports/group-cpus-snapshot-r036-review.md`;
+workflow itself unchanged.
