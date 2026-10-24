@@ -13,6 +13,45 @@ current understanding, NOT author acceptance. Messages, tests and later
 feedback not yet supplied are not presumed to exist. Keep each record
 short; detailed mail and diffs are retrieved by reference as needed.
 
+## Review-gate v2 implementation checkpoint (process only)
+
+Date: 2026-10-23 PT. This is a review-workflow change, NOT a new patch
+review ID. The R-001..R-034 findings and dispositions remain unchanged.
+R-034 remains HOLD because of the confirmed LP64 KVM build regression.
+
+Files: `akpm-review-gate.py` (v2), `test_akpm_review_gate.py`,
+`akpm-review-gate-README.txt`; these accompany the updated
+`akpm-patch-review-workflow.md`. For each NEW review, ChatGPT should run
+`new` before source analysis and `check` before any acceptance verdict;
+use a review-specific JSON manifest and retain its evidence receipts.
+A missing manifest, missing mandatory evidence, changed patch/workflow,
+failed required command, or unresolved mandatory requirement means HOLD.
+Do not fabricate retroactive preflight on an older review.
+
+The new deterministic preflight parses patch paths/hunks and shared ABI
+triggers, freezes the source SHA and workflow checksum, and records
+section/hunk obligations. Command receipts are purpose-checked and
+source-tree searches must match the preflight SHA; generic commands do
+not satisfy source searches or builds. Shared API/ABI changes require
+whole-tree caller checks, an out-of-subsystem build, and both LP64 and
+ILP32 evidence. A separate same-model adversarial report is allowed but
+must not be misdescribed as an externally independent review.
+
+Executed: nine automated gate regression tests passed, including R-034
+shared-library trigger discovery and a real failing GCC LP64 typedef
+probe (the gate returned HOLD), missing evidence, modified requirement
+inventory, forged unrelated command, wrong section evidence, and a
+synthetic positive receipt case that reverted to HOLD on altered proof.
+No kernel build or full KVM selftest was executed by these gate tests.
+
+Limitation: the script can validate receipts, required categories and
+command metadata; it cannot establish the substantive completeness of
+an entire kernel source review, guarantee it was invoked in every chat,
+or independently control ChatGPT's wording. Its positive output means
+structurally ELIGIBLE_FOR_HUMAN_DECISION, never an automatic take. The
+full rule-by-rule source-grounded inventory remains required in addition
+to the script's 24 coarse workflow-section checks.
+
 ## AKPM Google mirror checkpoint
 
 Mirror: https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
@@ -2377,3 +2416,151 @@ Detailed Library report:
 /Kernel Patch Reviews/reports/memcontrol-high-work-dying-memcg-review.md
 Next: KASAN MGLRU worker/offline stress and checks of live ancestor
 high, PREEMPT_RT, -stable and analogous async memcg work.
+
+## R-034: cgroup keyed selftest counters to s64
+
+Date: 2026-10-23 PT. Author: Wilson Felipe Pereira.
+Subject: [PATCH] selftests/cgroup: convert cg_read_key_*() helpers
+         to s64. One standalone patch; explicitly rebased on mm-stable.
+Status: SUPERSEDED - HOLD / RESPIN REQUIRED (R-034/F7 KVM build).
+No proven introduced bug, no unconditional Reviewed-by; no native
+Sashiko, full build or actual ILP32 kselftest execution.
+
+AKPM mirror freshness: Google mm-unstable at
+2bba28e98578de622ef307d00875aa8f8bca3d10, committer
+2026-10-22 22:13:38 -0700, checked 2026-10-23 ~16:15 PDT;
+under 24 hours old, so NO STALE-MIRROR ALERT. Author's specified
+mm-stable HEAD is 2967f3ccdb5fae956f1b085370ec292bab5c7e25
+(committer 2026-10-12 21:29:59 -0700). The older mm-stable
+branch is explicitly selected; its age does not prove mirror stale.
+All 8 submitted preimage blobs match both mm-stable and
+mm-unstable at those SHAs; no branch conflict for the 8 files.
+
+R-034/F1 CONFIRMED OLD WIDTH DEFECT: cg_read_key_long() returned
+signed long and used atol(). On ILP32, counters exceeding LONG_MAX
+cannot be represented, creating false failures/test judgments.
+No running 32-bit kselftest reproduction claimed.
+
+R-034/F2 SOURCE-VERIFIED FIX: keyed read/poll, expected value,
+values_close and values_close_report, six test programs' 64-bit
+destinations and print format strings converted consistently.
+All C files remaining in the cgroup test directory checked for old
+helper references; none found. Error sentinel and poll cleanup remain.
+
+R-034/F3 NONBLOCKING TYPE NARROWING: test_cpu.c retains
+`long delta;` in overprovision_validate() while both usage operands
+are now s64; GCC -m32 and Clang i386 compile probes issued expected
+narrowing warnings. If a usage difference exceeded 2^31-1 usec on
+ILP32, the comparison could spuriously fail. Caller runs for only
+10 seconds and ordinary 32-bit CPU counts cannot produce the
+necessary difference. Suggest `s64 delta` for completeness, not a
+proven practical blocker or new user-visible regression.
+
+R-034/F4 CHANGELOG ACCURACY: saying atol() overflows and
+"wraps into negative numbers" is not a portable assertion. A native
+LP64 glibc overflow probe saturated at LONG_MAX with errno ERANGE.
+Say values above LONG_MAX cannot be represented and may cause false
+results. `cpu.stat` values are microseconds, not bytes.
+
+R-034/F5 DISMISSED: no missing old API calls in other cgroup C
+files; %lld matches signed long long; no changed resource lifetimes,
+locks, work or ABI. Existing cg_read_long() on single-key fields
+retains ILP32 limitations but is beyond the explicitly narrowed
+multi-key fix. Extreme s64 arithmetic overflows not reachable in
+reviewed fixed-duration test use cases; not a proven new bug.
+
+R-034/F6 USER IMPACT: 32-bit cgroup kselftests can give erroneous
+results on large counters; flaky/false CI reports can delay a valid
+kernel change or obscure a real defect. No kernel runtime effect,
+Oops, corruption or security exploit shown. stable: not applicable;
+tests-only change.
+
+Pinned methods (checked 2026-10-23): Sashiko
+ d7c69ae77326a3ef39362897cdf0751a06068cf1; Tejun
+ cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+ d048f8742f6740c38833adf02e87901412d771ca.
+Applied all seven Sashiko manual domains plus verification and
+post-verification, relevant current selftests/build/technical and
+false-positive guides, Tejun evidence/review and Chris core checks.
+Native Sashiko NOT run. GCC/Clang freestanding ILP32 width probes
+were executed; native glibc overflow probe was executed; no actual
+ILP32 libc or complete selftest build (32-bit libc headers absent).
+No complete architecture/consumer external to cgroup suite audit.
+Precommit rule inventory was not established before first source
+analysis, so that procedural requirement is UNRESOLVED.
+No production code edited and no email sent.
+
+Detailed report:
+/Kernel Patch Reviews/reports/cgroup-s64-review.md
+Recommended email: take patch, optionally widen test_cpu delta and
+replace changelog claim of negative wrap with unrepresentable-value
+language. Hard-wrap drafted replies to <=75 columns.
+
+## R-034: Tejun Heo review reconciliation and correction
+
+Date: 2026-10-23 PT. Tejun mail dated 10:05:11 -1000,
+subject Re: [PATCH] selftests/cgroup: convert cg_read_key_*()
+helpers to s64. His mail identifies the review as Claude-generated.
+Original R-034 favorable/takeable disposition is WITHDRAWN;
+the previous disposition is retained above for historical context.
+Current status: HOLD - DEFINITE LP64 KVM BUILD BREAK. Ask for respin.
+The earlier R-034/F2 broad-completeness and R-034/F5 no-build-problem
+assessments are superseded; old R-034/F1/F3/F4/F6 remain supported.
+
+R-034/F7 CONFIRMED BLOCKER: `kvm/Makefile.kvm` includes the cgroup
+library's make fragment; every common KVM test target links its
+`cgroup_util.o`. KVM builds with `-I tools/include`; there
+`linux/types.h` already declares `s64` as `int64_t` (= long on LP64),
+whereas the patch adds `typedef signed long long s64` to the shared
+`cgroup_util.h`. `cgroup_util.c` also includes clone3_selftests.h,
+which includes linux/types.h; `access_tracking_perf_test.c` includes
+both KVM types and cgroup_util.h. GCC and Clang LP64 compile-only
+probes BOTH fail with incompatible typedef diagnostics. Real full
+KVM selftest build was not executed; build graph and exact header
+and compiler evidence establish the defect. Use `int64_t` together
+with PRId64 formats (or equivalent compatible API), then build KVM.
+
+R-034/F8 CONFIRMED INCOMPLETE CONVERSION: `cg_check_freezetime()`
+returns s64 but test_freezer.c's `time_simple`, `time_populate`,
+`time_migrate`, `time_parent`, `time_child`, and `time_nested`
+consumers still use long values and %ld. On ILP32, 64-bit values can
+be silently narrowed. No large frozen-time live repro executed.
+R-034/F3 long `delta` in overprovision_validate() was already
+caught in the initial review; independently reconfirmed by Tejun.
+
+R-034/F9 REBASE DEPENDENCY: author mm-stable/mm-unstable preimages match;
+this does not imply compatibility with the separate cgroup tree.
+The verified commit eb69e955de7b touches test_memcontrol.c
+`tcp_client()` and shared test helpers and conflicts semantically
+with the submitted hunks. Tejun also observes the mm-stable zswap
+predependencies missing from then-mainline. Exact v7.4-rc1
+application/rebase was not executed; determine integration tree
+at the next respin.
+
+R-034/F10 LOW PRIORITY: the two unrelated blank-line removals and
+misaligned test_zswap format continuation are valid cleanup issues.
+Tejun independently confirms F4: glibc atol saturation instead of
+portable negative wrap; memory counters use bytes, CPU counters
+microseconds, events counts. cg_read_long/_fd remain 32-bit on ILP32,
+which was identified earlier but excluded from the narrow keyed
+helper conversion. No absolute proof that ALL tested workloads can
+never exceed LONG_MAX on a 32-bit machine was provided.
+
+ROOT CAUSE OF OUR MISSED BLOCKER: the review searched only cgroup
+selftest-local callers and only compiled ILP32 narrowing probes.
+It failed to enumerate linked KVM users, namespace conflicts in
+transitively included headers, all freezer return consumers and
+parallel cgroup-tree changes. Reading Tejun's or Sashiko's prompts
+did not mean those steps were executed. The workflow now requires a
+whole-tree shared-interface/build-dependency ABI gate.
+
+Executed THIS feedback audit: source-checked KVM Makefile and header
+chains, freezer consumers and cgroup conflict commit; GCC/Clang LP64
+typedef-conflict probes both failed as predicted; GCC/Clang ILP32
+narrowing probes warned. No complete KVM build, 32-bit runtime,
+native Sashiko, git apply to v7.4-rc1 or kernel boot was run.
+
+Detailed feedback audit:
+/Kernel Patch Reviews/reports/r034-tejun-feedback-review.md
+Updated earlier detailed report:
+/Kernel Patch Reviews/reports/cgroup-s64-review.md

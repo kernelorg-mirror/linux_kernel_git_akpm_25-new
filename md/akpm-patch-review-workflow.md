@@ -64,6 +64,51 @@ Google `mm-new` matched authoritative gitolite at
 `fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6`, as verified by AKPM.
 That single old equality proves nothing about subsequent branch states.
 
+## Automatic preflight and evidence gate in ChatGPT reviews
+
+For EVERY new review, before examining source or forming a verdict, run
+`akpm-review-gate.py new` with the submitted patch, this workflow, the
+review ID, a verified full 40-character source SHA, and a unique manifest
+path. The command executes in ChatGPT's own file/runtime environment;
+AKPM does not need to install software, invoke Codex, or run a separate
+review runner. Preserve the manifest and its SHA-bound evidence logs in
+the review artifacts. For a new chat, use the latest gate script supplied
+with the handoff; do not pretend a prior script execution carried over.
+
+Record inspected source anchors and independent first-pass analysis,
+per-hunk and reverse-consumer coverage, applicable Sashiko/Tejun/Chris
+reviews, source-build and architecture checks, analogous-path searches,
+and an explicit later adversarial analysis with recorded counterexamples
+or rejected hypotheses. The second pass may be a distinct ChatGPT pass
+and MUST be labeled same-model adversarial, not an external reviewer.
+If an actual external reviewer contributed, label that provenance
+separately and independently verify their findings and dismissals.
+
+Before composing ANY proposed `take`, `Reviewed-by:`, or other positive
+acceptance recommendation, execute `akpm-review-gate.py check` against
+that review's original preflight manifest. Include its actual result,
+evidence counts and unresolved mandatory items in the review report and
+activity ledger. Exit code 2, a missing manifest, a failed command, an
+unverified full source/base, or any missing required receipt means HOLD:
+findings and an emailable review may be delivered, but NO take/accept
+recommendation. The gate must be rerun after correcting evidence gaps.
+Never make up missing evidence retroactively. For older reviews without
+a genuine preflight, label the audit RETROSPECTIVE and HOLD, not PASS.
+
+The gate is a deterministic receipt/inventory validator, not a source
+reviewer or independent final-response controller. It cannot guarantee
+that searches found every relevant consumer, that a cited line proves a
+claim, or that ChatGPT invoked it without forgetting. Thus an
+`ELIGIBLE_FOR_HUMAN_DECISION` result means the structural minimums were
+met, NOT that the patch was proved safe, nor automatic approval. Any
+unresolved substantive concern still requires HOLD independently of the
+gate output. Do not convert tool unavailability into a passing check.
+
+The gate's section inventory is a coarse floor; the existing full
+standing-rule audit and all individual mandatory obligations remain
+binding. Neither a per-section receipt nor a successful command is a
+substitute for the source-grounded per-rule statuses in this document.
+
 ## Execution order: independent review plus two coverage tracks
 
 For EVERY review, including single patches and mbox series, cover the
@@ -275,6 +320,49 @@ alternatives, analogous-bug search, all significant producers and
 consumers, user-visible impact, stable suitability, and concise email
 replies. Sashiko prompts are hypotheses and review methods, not proof;
 evidence standards and AKPM delivery rules always still apply.
+
+## Cross-tree shared-interface and ABI build gate
+
+Any patch changing a shared header, typedef, library symbol, helper
+signature/return type, utility object, or build-visible API must pass
+the following checks BEFORE an unqualified `take` or `Reviewed-by`:
+
+1. Enumerate reverse dependencies across the ENTIRE relevant source
+   tree, not just the patch's directory: includes, callers, header
+   chains, common objects, Makefile includes, link rules, and tests.
+   Include consumers from other subsystems (e.g., KVM compiling a
+   cgroup shared library). A same-directory grep does not establish
+   consumer completeness.
+2. For each changed return type, inspect EVERY direct and indirect
+   consumer, including the old function name, unchanged wrappers,
+   destination variables, arithmetic temporaries, comparisons,
+   printf/scanf formats, and follow-on helpers. Renaming the source
+   function does not make all its consumers type-correct.
+3. For any new typedef, signed-width transition or numeric parse API,
+   check clashes with existing kernel/tools/libc typedefs and actual
+   include order, on LP64 AND ILP32. For int64_t, use matching
+   PRId64/SCNd64 macros or prove the platform's underlying type.
+   A compiler probe of the opposite ABI cannot catch an ABI-specific
+   defect; compile a representative real consumer on each ABI where
+   the toolchain is available.
+4. Audit the actual build graph: a shared object may be compiled under
+   another subsystem's CFLAGS, include ordering and header search
+   paths even when local tests build. Verify at least one real
+   out-of-subsystem consumer build where possible. Clearly record
+   when full builds have NOT been executed.
+5. Check the author's selected base and parallel integration branches
+   for overlapping edits (e.g., cgroup-next versus mm-stable), and
+   distinguish an intrinsic patch bug from rebase/apply conflicts.
+   Do not infer mainline compatibility merely from matching the
+   original AKPM preimage.
+
+This gate was added after R-034 missed a KVM compilation failure from
+an incompatible `s64` typedef in `cgroup_util.h` and left six freezer
+callers storing a widened `s64` return value into `long`. It is a
+specific instance of the mandatory all-consumer impact rule, not a
+waiver or replacement for that rule. Mark the gate UNRESOLVED if the
+cross-tree source or real consumer build could not be checked; do
+not report a clean whole-tree build without executing one.
 
 ## Source integrity and review scope
 
