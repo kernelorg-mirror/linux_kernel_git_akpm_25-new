@@ -1,0 +1,51 @@
+From: Eklavya Singh <eklavyasingh2106@gmail.com>
+Subject: ocfs2/heartbeat: serialize concurrent writes to a region's dev attribute
+Date: Wed, 21 Oct 2026 02:53:39 +0530
+
+o2hb_region_dev_store() checks reg->hr_bdev_file to see if the region
+is already started, but nothing stops two writers from doing that at
+the same time. configfs only serializes writes through the same open
+file, so two processes that each open the dev attribute can both get
+past the check:
+
+  A: hr_bdev_file is NULL, opens file A, sets hr_bdev_file = A
+  B: hr_bdev_file is NULL, opens file B, sets hr_bdev_file = B
+  A: start fails, fput(hr_bdev_file) drops B, sets it to NULL
+  B: start fails, fput(NULL)
+
+Both calls also use the same hr_slots, hr_slot_data and hr_tmp_block,
+so the error paths can free the slot data twice.
+
+syzbot hit the fput(NULL) with an unbound loop device, where every
+start fails with -EIO. With four threads doing the same thing on a
+KASAN kernel I get both crashes within a second:
+
+  BUG: KASAN: double-free in o2hb_unmap_slot_data+0x14d/0x2f0
+  BUG: kernel NULL pointer dereference, address: 0000000000000158
+
+Add a mutex to the region and hold it in dev_store(), in the
+block_bytes, start_block and blocks stores, and in dev_show(), since
+they all look at hr_bdev_file. dev_store() cleans up with goto, so it
+takes the mutex in a small wrapper rather than with guard(). The mutex
+is dropped while dev_store() waits for the heartbeat to become steady,
+which takes seconds, so a read of dev doesn't stall behind a start.
+hr_bdev_file is already set at that point, so other writers still get
+-EINVAL, and the cleanup after the wait retakes the mutex.
+
+With the patch the same test ran for 10 minutes with lockdep on and
+nothing was reported. So did a second one, with a working loop device,
+that interrupts starts during the wait while other threads read and
+write the attributes.
+
+Link: https://lore.kernel.org/20261020212339.46591-1-eklavyasingh2106@gmail.com
+Fixes: a7f6a5fb4bde ("[PATCH] OCFS2: The Second Oracle Cluster Filesystem")
+Signed-off-by: Eklavya Singh <eklavyasingh2106@gmail.com>
+Reported-by: <syzbot+5d4e96acd0febccb5e87@syzkaller.appspotmail.com>
+Closes: https://syzkaller.appspot.com/bug?extid=5d4e96acd0febccb5e87
+Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Deepanshu Kartikey <kartikey406@gmail.com>
+Cc: Cen Zhang <zzzccc427@gmail.com>
+Cc: <stable@vger.kernel.org>
