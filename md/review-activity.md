@@ -199,6 +199,9 @@ such a subject, consult the named active record or archive FIRST.
   ACTIVE: [R-013](#r-013); v5 source-reviewed; tests requested.
 - `mm/ksm: keep soft-dirty and uffd-wp when merging a page`
   ACTIVE: [R-015](#r-015); zero-page objection withdrawn; v3 split.
+- `mm/ksm: keep soft-dirty when merging a page` (v3)
+  HOLD: [R-035](#r-035); source-favorable, gate preflight invalid;
+  follow-up to R-015.
 - `kasan: fix runtime shadow page table synchronization`
   ACTIVE: [R-014](#r-014); v2 must be revised; shared-table bugs.
 - `mm/memory-tiers: reset demotion targets of nodes without memory`
@@ -2564,3 +2567,68 @@ Detailed feedback audit:
 /Kernel Patch Reviews/reports/r034-tejun-feedback-review.md
 Updated earlier detailed report:
 /Kernel Patch Reviews/reports/cgroup-s64-review.md
+
+
+## R-035: mm/ksm: keep soft-dirty when merging a page (v3)
+
+Date: 2026-10-23 Pacific. Continuing R-015; new gate-v2 review.
+Source: `mbox(20261024-050607)` with twenty messages.
+Author Samarth Narang; v3 Message-ID:
+<20261021182157.1873726-1-samarth.colleges@gmail.com>.
+Reviewed-by: Lance Yang (message 1, external endorsement for v3).
+Base `fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6`.
+`mm/ksm.c` preimage blob
+`dbfb8f98b18925c729d0931760a18f491d0fb156`, matching
+both author base and prior mm-unstable SHA `2bba28e98578...`.
+`Fixes: 0f8975ec4db2` verified at full SHA.
+
+R-035/F1, SOURCE-FAVORABLE: Ordinary KSM replacement PTE loses an
+existing positive soft-dirty bit in the old path; the new conditional
+copies the old bit into the new PTE before PTL-protected installation.
+No new rmap, reference, locking or failure-path effect identified.
+`write_protect_page()` captures the bit and `replace_page()` does
+`pte_same()` before replacing; pagemap reads it as userspace-visible
+soft-dirty status. Worst consequence of old false negative: an
+incremental checkpoint can omit a changed page.
+
+R-035/F2, NO NEW REGRESSION: x86 KSM zero-page construction already
+calls pte_mkdirty, setting SOFT_DIRTY and potentially causing a
+false positive despite the original PTE being clean. The v3 does not
+introduce or worsen it. The zero-page blocker previously proposed
+in R-015 was withdrawn after David's over-reporting assessment.
+
+R-035/F3, SEPARATE TRACK: The earlier combined v1/v2 UFFD/RWP
+unmerge regression remains documented as R-015/F5-F6. V3 drops
+those modifications at David's request; Lance undertook follow-up.
+Do not attribute the old RWP problem to v3.
+
+R-035/F4, VALIDATION: GCC and Clang UBSan source-mirrored 2,048-case
+Boolean PTE model both executed successfully; baseline false
+negatives/positives 512/512, v3 0/512. This is not a kernel build,
+actual KSM test, or runtime architecture test. No native Sashiko,
+no full formal checker run. Sashiko/Tejun/Chris current SHAs
+`d7c69ae77326`, `cbb4478d0f73`, `d048f8742f67` respectively.
+
+R-035/GATE v2: **HOLD**. Ran `new` before source analysis, recorded
+21 evidence gate categories, one diff hunk, 24 coarse sections; BUT
+passed `--source-ref` as descriptive text, not a pinned 40-character
+SHA. Gate `check` executed and failed with exit 2. The subsequent
+source inspection and compiler model do not retroactively repair
+an invalid initial manifest. No acceptance recommendation is issued.
+Also incomplete: refreshed live Google `mm-unstable` branch verification
+(Gitiles direct calls failed); whole-tree checkout/search and full
+caller/config checks; kernel build/reproduction; complete precommitted
+standing-rule inventory. The Oct 22 22:13:38 PDT previously verified
+mirror HEAD was 23h54m old around Oct 23 22:07 PDT, but current HEAD
+could not be refreshed; do not claim new gitolite synchronization.
+
+Coarse gate-section inventory: 0 of 24 recorded applied, 0
+inapplicable, 24 unresolved. This is not a full standing-rule audit;
+that denominator was not properly committed at preflight. No claim
+of review completeness or execution of native Sashiko is made.
+
+Full report: `/Kernel Patch Reviews/reports/ksm-softdirty-v3-r035-review.md`.
+Gate manifest `/mnt/data/r035-gate.json` and actual check output
+`/mnt/data/r035-review/gate-check.txt` are included in this turn's
+ZIP. Workflow unchanged. Proposed reply is informational, not a
+Reviewed-by or take recommendation; no email was sent.
