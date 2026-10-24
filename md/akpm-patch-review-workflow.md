@@ -1,6 +1,9 @@
 # AKPM kernel patch review workflow
 
 Purpose: local review policy for future ChatGPT kernel patch reviews.
+For Work-mode direct Git setup and historical verified remote checkpoints,
+see `kernel-git-access.md`. The Work clone path in that document is not
+persistent or guaranteed to exist in a new chat.
 This is the entry point. Tejun's current generic review workflow is at
 https://github.com/htejun/kernel-agent-workflows; fetch its relevant
 modules at a pinned commit. This file provides AKPM-specific additions
@@ -37,7 +40,13 @@ not automatically run for another reviewer.
 
 Unless AKPM specifies a different tree, branch or revision, treat
 akpm/mm's `mm-unstable` branch as the intended source base for reviews.
-Use this Google Git mirror for read-only source inspection:
+Use this Google Git mirror for read-only source inspection. In Work mode,
+prefer direct, read-only Git fetch/clone and local git show/grep/log/blame
+against the fetched immutable revision; follow `kernel-git-access.md`.
+The previous Work session proved HTTPS Git access, but each new session
+must test connectivity and establish whether its clone still exists.
+Do not depend on prior ChatGPT sandbox or Work scratch paths.
+
 
 https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
 
@@ -58,6 +67,19 @@ chosen tree. If they differ, investigate the actual base/history or
 request the relevant source; never silently substitute mainline,
 `mm-new`, `mm-everything` or another branch. An explicit author/user
 base or tree overrides the default while still requiring verification.
+
+Verified Work checkpoint, 2026-10-24 (NOT an always-current tip):
+Google and public kernel.org MM advertised `mm-unstable` at
+`d10295141a98938a767234e73d45b954a69c9a2f` and `mm-stable` at
+`183895979c441e52dbd651b388553b09eaa35cfa`. Linus's actual
+`master` was `5b0764a53235d3c77e1ed674e836e1b3fe1a4b1f`.
+The tested Gitolite SSH hostname could not resolve; public kernel.org
+agreement is not authenticated Gitolite verification. Check new refs
+before every review and preserve exact fetch timestamps, SHA, branch,
+preimage verification, and the actual comparison performed. Prefer
+complete ancestry for historical `Fixes:` attribution. If direct Git
+is blocked, use a proven source connector only for claims it supports;
+record the resulting whole-tree/history/build coverage gaps as HOLD.
 
 Historical mirror checkpoint (NOT a standing synchronization claim):
 Google `mm-new` matched authoritative gitolite at
@@ -1255,8 +1277,18 @@ identified by its index, if any.
 
 ## Handoff for subsequent chats
 
-For fresh reviews, attach only `akpm-patch-review-workflow.md`, plus
-the patch/mbox. After the independent pass, fetch the current pinned
+For a continuation of this project's Work-mode review workflow, attach
+`akpm-patch-review-workflow.md`, `review-activity.md`, and
+`kernel-git-access.md`. Attach `akpm-review-gate.py` as the executable
+companion; it is NOT embedded or run automatically merely because a
+Markdown policy was attached. Add `pull-sumary.md` for pull-request
+writing tasks. The new Work session must check its actual working
+repository and invoke the gate itself, rather than assume prior-session
+execution persists. Keep all review-side Git operations read-only.
+
+For fresh reviews, attach `akpm-patch-review-workflow.md`, the gate
+script if not already available in Work, and the patch/mbox. After the
+independent pass, fetch the current pinned
 Sashiko, Tejun and Chris sources as directed above. When continuing
 AKPM's previous findings or feedback, also attach `review-activity.md`
 and only the relevant dated archive. Do not attach the historical

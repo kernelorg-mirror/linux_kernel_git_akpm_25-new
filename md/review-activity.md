@@ -1,8 +1,8 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-23 (America/Los_Angeles)
-Recent additions: R-027 (zswap), R-028 (HugeTLB/UFFD), R-029
-(migration and hot-removal); R-030 (mixedmap mremap expansion).
+Last updated: 2026-10-24 (America/Los_Angeles)
+Latest recorded reviews: R-033 (memcg high_work), R-034 (cgroup s64),
+R-035 (KSM soft-dirty v3), R-036 (group_cpus hotplug invariance).
 Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
@@ -52,7 +52,39 @@ structurally ELIGIBLE_FOR_HUMAN_DECISION, never an automatic take. The
 full rule-by-rule source-grounded inventory remains required in addition
 to the script's 24 coarse workflow-section checks.
 
-## AKPM Google mirror checkpoint
+## Work Git-access checkpoint (2026-10-24; historical)
+
+Authoritative procedure: `kernel-git-access.md`. A separate Work session
+executed a full non-shallow Google `akpm/mm` bare clone (3.32 GiB),
+fetched Linus's actual master over HTTPS from kernel.org, and confirmed
+Google's `mm-stable` and `mm-unstable` SHA equality with public
+kernel.org. The previous Work scratch clone was at
+`/workspace/scratch/91741514aa81/mm.git`; this is a SESSION-SPECIFIC
+path, NOT a guaranteed checkout for the next chat.
+
+- `mm-unstable`: `d10295141a98938a767234e73d45b954a69c9a2f`,
+  committer 2026-10-24 02:05:50 PDT.
+- `mm-stable`: `183895979c441e52dbd651b388553b09eaa35cfa`,
+  committer 2026-10-24 01:56:43 PDT.
+- Linus `master`: `5b0764a53235d3c77e1ed674e836e1b3fe1a4b1f`,
+  committer 2026-10-23 21:29:02 PDT.
+- Exact complete ancestry `mm-stable...linus/master`: 213 MM-only
+  commits and 12,447 mainline-only commits at these checkpoint tips.
+  This is reachability, not patch-equivalence or an integration verdict.
+- Authenticated Gitolite SSH access was NOT obtained: name lookup for
+  `gitolite.kernel.org` failed. Do not promote public kernel.org ref
+  agreement into authenticated authoritative verification.
+- No builds, native Sashiko runs, kernel runtime tests or VM tests were
+  performed during the Git-access task.
+
+Use these as dated verification checkpoints, not live branch tips. On
+entering a new Work chat, test network and scratch persistence, refresh
+both Git remotes, pin exact SHAs, validate commit/tree connectivity and
+patch preimages, and rerun freshness checks before each review. The
+October 23 source-inspection checkpoint below is older and superseded
+for the HEAD values, but remains relevant to reviews performed then.
+
+## Earlier Google mirror checkpoint (2026-10-23; historical)
 
 Mirror: https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
 Policy: default review base is `mm-unstable` unless explicitly overridden;
@@ -71,6 +103,20 @@ Comparison: current mirror `mm-unstable` HEAD matches R-030's explicit
 base commit. No current gitolite-versus-mirror hash comparison was made.
 Historical user-verified gitolite/Google `mm-new` equality:
 fcec4f4bcc1101dbd7e3aff267856b3bbfe128c6 (historical only).
+
+## Upstream prompt HEAD recheck for Work handoff (2026-10-24)
+
+Checked public GitHub `main` ref identities from this chat:
+
+- Sashiko: `d7c69ae77326a3ef39362897cdf0751a06068cf1`.
+- Tejun: `cbb4478d0f73e15907335e70a2dc2fe54a9e7167`.
+- Chris Mason: `d048f8742f6740c38833adf02e87901412d771ca`.
+
+These are ref identities, not evidence that native analysis ran. The
+full Sashiko stage/prompt changes since the earlier recorded 867713...
+checkpoint were NOT compared in this handoff; the new Work chat must
+check changes before applying the current version. Historical sections
+below retain the earlier version-comparison provenance.
 
 ## Tejun upstream workflow checkpoint
 
@@ -251,6 +297,19 @@ such a subject, consult the named active record or archive FIRST.
 
 - `mm/vma: fix expansion of VMA_MIXEDMAP_BIT VMAs`
   ACTIVE: [R-030](#r-030); fix source-favorable, impact prose requested.
+
+- `mm: avoid losing atomic VMA flags`
+  ACTIVE: [R-031](#r-031); four-patch series, source and race review.
+- `mm/memcontrol: improve lruvec cacheline locality`
+  ACTIVE: [R-032](#r-032); performance review and dependency gaps.
+- `mm/memcontrol: prevent high_work on dying memcg`
+  ACTIVE: [R-033](#r-033); source-supported CSS lifetime correction.
+- `selftests/cgroup: convert cg_read_key_*() helpers to s64`
+  HOLD: [R-034](#r-034); LP64 KVM typedef/build blocker and incomplete
+  freezer conversions; prior acceptance recommendation withdrawn.
+- `lib/group_cpus: snapshot cluster masks to keep grouping hotplug invariant`
+  HOLD: [R-036](#r-036); counterexamples for the stated invariance;
+  actual kernel/NVMe reproducer outstanding.
 
 ## Active records
 
@@ -2704,3 +2763,52 @@ NO take or Reviewed-by recommendation. Source findings independently
 support requesting v5. Detailed report uploaded and read back from Library path
 `/Kernel Patch Reviews/reports/group-cpus-snapshot-r036-review.md`;
 workflow itself unchanged.
+
+## Work-mode transition note (2026-10-24; not a new review)
+
+The next chat is intended to run in ChatGPT Work. Attach the three
+master context documents `akpm-patch-review-workflow.md`,
+`review-activity.md`, and `kernel-git-access.md`, and the executable
+`akpm-review-gate.py`. Attach `pull-sumary.md` when doing pull summaries.
+Read and enforce these at the beginning of the new Work session.
+
+Read-only direct HTTPS Git, source history and Linus's current branch
+were demonstrated in an earlier Work session on October 24. DO NOT
+assume that session's clone persists or that its tips are still current.
+Prefer Google's MM mirror, independently compare the public kernel.org
+MM refs and use authenticated Gitolite only if it becomes reachable and
+authorized. `mm-unstable` is the default patch-review source unless an
+explicit base overrides it. Verify every relevant diff preimage and
+record immutable SHAs before analyzing source.
+
+For each *new* review, run `akpm-review-gate.py new` after validating the
+exact source SHA and BEFORE reviewing source; keep the original manifest
+and receipts. Complete the independent first-principles, applicable
+Sashiko, Tejun and Chris, and later adversarial passes. Run `check` and
+include the exact gate result. Missing/failed evidence means HOLD; no
+acceptance or Reviewed-by recommendation. Work must actually invoke
+these tools: merely loading a Markdown file does not invoke the gate.
+
+Latest numbered review R-036 is HOLD. R-035 is HOLD for invalid initial
+gate manifest despite favorable limited source findings. R-034 remains
+HOLD due to a confirmed LP64/KVM typedef conflict and six missed
+freezer caller conversions; the original favorable verdict was retracted.
+The R-036 kernel/IRQ model counterexamples were not demonstrated on
+real hardware. Refer to detailed per-patch reports indexed above.
+
+Unnumbered OCFS2 discussion (not a completed gated patch review):
+Joseph Qi's `[PATCH 1/6] ocfs2: read the xattr entry hash before
+ defragmenting the bucket` was assessed as likely behavior-preserving:
+rehashing slot positions after an unstable same-hash sort does not
+change the observed hash when the bucket was already hash-sorted.
+The distinct pre-existing retry-after-defrag issue may select a
+same-hash entry at the displaced `xs->here` slot and could corrupt
+xattr values; actual reachability and a kernel reproducer remain to
+be established. An earlier suggested `Fixes:` candidate should be
+verified using complete Git history and blame before use, not trusted
+as a confirmed attribution. Do not assign a new review ID or a take
+recommendation to this discussion.
+
+`pull-sumary.md` consolidates hotfix email and signed-tag series
+summary rules. Read it only when preparing pull-request text. No
+repository tags, sends, pushes or production edits were authorized.
