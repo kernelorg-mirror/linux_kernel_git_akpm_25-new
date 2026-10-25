@@ -1,8 +1,8 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-24 (America/Los_Angeles)
-Latest recorded reviews: R-033 (memcg high_work), R-034 (cgroup s64),
-R-035 (KSM soft-dirty v3), R-036 (group_cpus hotplug invariance).
+Last updated: 2026-10-25 (UTC)
+Latest numbered review: R-038 (page allocation tag initialization v2).
+R-034, R-035, R-036, R-037 and R-038 remain HOLD; see their records.
 Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
@@ -12,6 +12,82 @@ This ledger was seeded from recent review discussions. It records our
 current understanding, NOT author acceptance. Messages, tests and later
 feedback not yet supplied are not presumed to exist. Keep each record
 short; detailed mail and diffs are retrieved by reference as needed.
+
+## Work startup verification (2026-10-24 PDT)
+
+This is environment and continuity restoration, not a new patch review.
+The supplied October 25 02:44 UTC ledger stopped at R-036 despite the
+handoff naming R-037. Its earlier history is preserved. The surviving
+master differed only by its R-037 header and appended R-037/filemap
+records. Those records were recovered and checked against the current
+saved fat-write-failed-review.md and filemap-invalidate-errors-review.md.
+R-034, R-035, R-036 and R-037 remain HOLD. The filemap investigation is
+unnumbered; no submitted fix, acceptance or Btrfs corruption reproduction.
+
+The workflow's missing body-only-hunk and explicit-search-root lessons
+were restored from the surviving master. Its active handoff now spells
+pull-summary.md correctly. No other methodology or disposition changed.
+
+Executed in Work, 2026-10-24 19:45-19:51 PDT (October 25 UTC):
+- Existing bare clone survives at
+  /workspace/scratch/2787927c495b/mm.git.
+- HTTPS fetch of all Google MM heads and tags succeeded. The selected
+  MM tips matched public kernel.org before and after the fetch.
+- Linus's actual master was fetched from torvalds/linux at kernel.org;
+  remote HEAD explicitly names refs/heads/master.
+- Bare=true, shallow=false; no partial-clone/promisor configuration.
+  git fsck --connectivity-only --no-dangling exited 0 without diagnostics.
+  This is connectivity verification, not full content-hash verification.
+- No authenticated Gitolite access was established or implied.
+
+Fetched pins, checked at 2026-10-25 02:45:49..59 UTC:
+- mm-unstable: a2abad0d7f453cc9902fc8bf7b871db5563a652c
+  Committer: 2026-10-24 15:48:02 -0700. Age about four hours; no
+  24-hour freshness alert. Recheck before the next substantive review.
+- mm-stable: 183895979c441e52dbd651b388553b09eaa35cfa
+  Committer: 2026-10-24 01:56:43 -0700.
+- mm-nonmm-stable: b6232ca8d194c60ee603586e42b5ea584d4b7be9
+  Committer: 2026-10-24 00:46:53 -0700.
+- mm-hotfixes-stable: 80ce29104123be4d61b5912dae543c70af0fcb75
+  Committer: 2026-10-06 16:44:19 -0700.
+- torvalds/linux master: 330517c63aa9b48227b6ab45f01003effac77ae4
+  Committer: 2026-10-24 15:44:26 -1000 (18:44:26 PDT).
+
+Fresh default-branch checks/fetches at 02:48:20..46 UTC:
+- Sashiko: d7c69ae77326a3ef39362897cdf0751a06068cf1
+  Committer: 2026-10-23 13:38:00 -0700.
+- Tejun: cbb4478d0f73e15907335e70a2dc2fe54a9e7167
+  Committer: 2026-10-17 20:22:24 -1000.
+- Chris: d048f8742f6740c38833adf02e87901412d771ca
+  Committer: 2026-10-01 11:53:46 UTC.
+All match the latest prior review pins. This verifies availability and
+identity, not completion of the applicable methods for a new patch.
+
+Tool validation:
+- git 2.51.1, Python 3, OpenJDK 17.0.20, GCC and make are available.
+- The supplied gate executes its CLI. It is byte-identical to R-037's
+  archived script. No new patch manifest was invented for this startup.
+- Restored TLC 2026.10.15.145915 (rev 932d35e) and tla-mctj 0.1.2.
+  PlusCal translation and SANY parsing ran successfully on a disposable
+  copy of R-037's existing model. Both checkers reproduced the expected
+  old N=3/Keep=1 violation (298 distinct states, exit 12) and patched
+  N=5/Keep=1 success (1077 states, depth 50, exit 0). This checks the
+  tools and historical model; it does not close R-037's validation gaps.
+- Native Sashiko and herd7 are unavailable. No native Sashiko, LKMM,
+  kernel build, VM boot, runtime filesystem or hardware test ran here.
+  flex, bison, bc, pkg-config, Clang and QEMU are absent from PATH.
+- R-037's original manifest, final manifest, failed receipts and old
+  gate result were recovered without rewriting their contents or paths.
+  Its body-only limitation remains. The old acceptance gate was not
+  rerun or presented as passing.
+
+Current tool directory:
+/workspace/scratch/08622c88e80d/formal-tools/
+Startup logs and separate checker runs:
+/workspace/scratch/08622c88e80d/startup-evidence/
+These scratch paths are session-specific, not durable guarantees.
+The original R-037 evidence archive and saved reports remain the
+historical record. No kernel source edit, push, tag or mail send.
 
 ## Review-gate v2 implementation checkpoint (process only)
 
@@ -2812,3 +2888,303 @@ recommendation to this discussion.
 `pull-sumary.md` consolidates hotfix email and signed-tag series
 summary rules. Read it only when preparing pull-request text. No
 repository tags, sends, pushes or production edits were authorized.
+
+
+## R-037: FAT failed-write truncation locking (2026-10-24)
+
+Subject: [PATCH] fat: hold truncate_lock in fat_write_failed()
+Author: Matheus Alves de Almeida. Submitted message ID:
+`20261021162105.62525-1-matheus.aalmeida@inf.ufrgs.br`.
+All seven messages in the supplied mbox were read. One hunk, two added
+lock operations. Review source: freshly fetched mm-unstable
+`d10295141a98938a767234e73d45b954a69c9a2f`, matching public
+kernel.org at 2026-10-24T22:54:05Z. Tip committer time 09:05:50Z.
+Exact hunk preimage verified; author's complete blob was unavailable.
+
+Disposition: HOLD. No regression found in the added lock, but the
+mandatory executable gate cannot pass and kernel validation is missing.
+No acceptance or Reviewed-by. R-034, R-035 and R-036 remain HOLD for
+all previously recorded reasons; none is reopened or silently changed.
+
+F1: correct Fixes attribution for the demonstrated FIBMAP race to
+`16fab2015099a937e1a771f2785c5dd3445fe483`, whose subject is
+"fat: permit to return phy block number by fibmap in fallocated region".
+The submitted 459f6ed3b8c7 introduced the helper, but the old lookup
+remained EOF-bounded. The 2016 change admits allocated space past EOF.
+Full history, parent comparisons, blame and v4.4/v4.5 ancestry checked.
+
+F2: changelog lacks user-visible impact. A failed/short extending write
+can cut the FAT chain while FIBMAP walks an offset admitted by old
+i_blocks. This can emit "request beyond EOF", return a false hole and
+set the filesystem read-only by default; errors=panic can panic. A
+three-actor source/model trace also follows a reused cluster into another
+file's chain. These are source/model findings, not observed kernel
+failures or demonstrated on-disk corruption. FIBMAP needs CAP_SYS_RAWIO.
+
+Pedro's page-cache concern was independently rechecked and rejected:
+ordinary reads are bounded by i_size, and the containing partial cluster
+is retained. Three cleanup callers, other truncation/eviction users,
+DIO/AIO, nested expansion, flush/writeback, swap/ecryptfs and JBD2 paths
+were traced. All seven manual Sashiko domains, both verification stages,
+pinned Tejun/Chris coverage and a separate same-model adversarial pass
+were performed. No native Sashiko or external reviewers ran.
+
+Pins, unchanged from the prior checkpoints:
+Tejun `cbb4478d0f73e15907335e70a2dc2fe54a9e7167`;
+Chris `d048f8742f6740c38833adf02e87901412d771ca`;
+Sashiko `d7c69ae77326a3ef39362897cdf0751a06068cf1`.
+Fresh remote checks were at 22:59:17..24Z. Vendored prompt differences
+were read; identical guide reuse is hash-documented.
+
+Actual verification: 18 bounded three-actor tla-mctj runs (six old fail,
+six patched pass, six pre-2016 controls pass), three reference TLC checks
+with matching outcomes, and a separate old wrong-mapping TLC failure.
+TLC is 2026.10.15.145915, revision 932d35e. A compiled C arithmetic probe
+passed 19,584,640 samples; its missing-bound mutation failed 4096 times.
+No kernel race, lockdep or filesystem runtime test. Actual x86_64
+configuration stopped at missing flex before FAT compilation.
+
+The v2 preflight ran before analysis; original manifest preserved.
+Its body-only classifier recorded no function symbol and rejects the
+required all_callers search. Correct whole-tree searches are saved,
+but cannot substitute for that receipt. Three initial pathless rg
+commands failed and were corrected with successful git grep searches;
+all failed receipts remain. The failed build receipt also remains.
+Final executable check: HOLD, exit 2; nine audit issues across six
+of 21 gates. Fifteen gates have no structural audit errors; H001 is
+recorded and 22/24 coarse sections are applied, two unresolved. An
+initial blank source-line anchor was corrected with the actual i_blocks
+line; its original invalid receipt also remains. This does not change
+the valid hunk preimage/source verification or permit acceptance.
+
+Standing inventory: 40 precommitted obligations; 37 applied, 1 not
+applicable (shared ABI), 2 unresolved (build/runtime validation and
+executable gate). These delivery counts require successful artifact
+saving, verified in the completed response. Guard audit: 0/0.
+Stable: candidate after validation, changelog/Fixes correction and
+mainline inclusion. No particular stable backport was tested. The
+mm-nonmm-stable FAT allocation/rollback series does not include this
+fix; no dependency on that series was established.
+
+Detailed report:
+`/Kernel Patch Reviews/reports/fat-write-failed-review.md`.
+Supporting source/model/gate records: `fat-write-failed-evidence.tar.gz`.
+Next: request the changelog/Fixes corrections; complete a FAT-enabled
+build and runtime race/lockdep checks; address the gate's body-only-symbol
+limitation through a supported gate update without rewriting this audit.
+No kernel source edit, branch push, signed tag or email send.
+
+Context correction from AKPM: the pull policy filename is
+`pull-summary.md`, using the supplied attachment. The earlier
+`pull-sumary.md` spelling in historical transition notes is a typo;
+there is no instruction to retrieve that policy from GitHub.
+
+
+## Unnumbered: filemap_invalidate_inode error report (2026-10-25 UTC)
+
+Subject: filemap_invalidate_inode() - losing -EBUSY from
+invalidate_inode_pages2_range?
+Author: Saleh Mammadof. AKPM supplied the complete report, with no diff.
+Disposition: reported invalidation-error loss CONFIRMED; no patch
+acceptance verdict. R-034, R-035, R-036 and R-037 remain HOLD. No new
+numbered patch review is assigned; no preimage/gate evidence was invented.
+
+Current mm-unstable: a2abad0d7f453cc9902fc8bf7b871db5563a652c.
+Google and public kernel.org matched, rechecked at 00:48:28Z/31Z.
+A replacement complete bare clone was established in Work; 56 source
+files matched their Git blobs. Whole-tree caller searches, blame,
+parent diffs and release ancestry ran. Linus master was fetched from
+public kernel.org at 6fba331225f5040e93d0947d1027e9712238291f;
+the helper has the same discarded returns there.
+
+F1: mm/filemap.c:4614 discards invalidate_inode_pages2_range()'s
+return. filemap_check_errors() only consumes AS_ENOSPC/AS_EIO; the
+invalidation refusal path does not set them. Thus -EBUSY can become
+zero while a folio remains. A laundering callback's own negative
+errno is also discarded, not necessarily translated to -EBUSY.
+
+CIFS clears CIFS_INO_INVALID_MAPPING before invalidation and restores
+it only on error. False success therefore loses its retry indication.
+A buffered write can dirty an existing folio after the writeback pass;
+CIFS revalidation does not take the write path's inode lock, and the
+writer does not take invalidate_lock for that existing folio. This is
+a source-reachable refusal witness, not an executed filesystem race.
+Surviving old uptodate data can yield stale buffered reads. Direct/
+strict-without-read-lease paths and cache=singleclient differ.
+
+Btrfs's final invalidation is after cloning extents, not a pre-clone
+abort. A particular refusal trigger under its existing guards remains
+unresolved. Do not claim rollback or reproduced reflink corruption.
+An early ENOMEM hypothesis was withdrawn: current extent-state clear
+retries allocation failure despite the release helper's old comment.
+Seven direct calls were checked, including Btrfs relocation, netfs DIO
+and AFS. AFS already ignores the helper result; return propagation
+alone does not change that caller. Netfs DIO completion also attempts
+invalidation, so a surviving pre-write folio need not survive forever.
+
+Correct Fixes for F1: c26096ee0278c5e765009c5eee427bbafe6dc090,
+"mm: Fix filemap_invalidate_inode() to use
+invalidate_inode_pages2_range()". That commit replaced void truncation
+with the error-returning invalidator and discarded its result. It is
+in v6.11, not v6.10. The separately ignored writeback return predates it:
+74e797d79cf131d9b1a54001cf64a0b492a83e60 introduced that behavior in
+v6.10. Current WB_SYNC_ALL retries ENOMEM; do not use a naive allocation
+failure as proof of a separate writeback error. Preserve mapping-error
+reporting/consumption and lock release in any proposed fix.
+
+Independent pass, seven manual Sashiko domains, both verification
+stages, pinned Tejun/Chris questions and a separate same-model
+adversarial pass were recorded, including unresolved caller triggers.
+Pins unchanged and freshly checked at 00:37:55Z:
+Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+Chris d048f8742f6740c38833adf02e87901412d771ca;
+Sashiko d7c69ae77326a3ef39362897cdf0751a06068cf1.
+No native Sashiko or external reviewers. No kernel build, runtime,
+lockdep, xfstests or formal model. A compiled exact-helper/stub C probe
+passed seven return/flag/lock assertions; this is not a kernel test.
+Model decision: no, for sequential error propagation with no protocol
+change. The mandatory patch new/check gate was not run without a patch.
+
+Detailed report:
+`/Kernel Patch Reviews/reports/filemap-invalidate-errors-review.md`.
+Supporting records: `filemap-invalidate-errors-evidence.tar.gz`.
+Next: obtain a focused patch with the corrected Fixes attribution and
+a retained-folio/runtime regression test; run the complete patch gate
+before acceptance. A validated fix is a stable candidate; no specific
+backport was examined. No source edits, pushes, tags or email send.
+
+
+## R-038: page allocation tag initialization, v2
+
+Date: 2026-10-25 UTC. Author: Zenghui Yu (Huawei). Subject: mm/page_alloc:
+mark pages freed by __free_pages_core() as not tagged Status: HOLD under
+the mandatory evidence gate; source analysis found no introduced v2 runtime
+regression. Continuation of R-021. Prior findings, errors and dispositions
+remain intact; R-034 through R-037 stay HOLD.
+
+Fresh mm-unstable: a2abad0d7f453cc9902fc8bf7b871db5563a652c. Google/public
+kernel.org MM tips match at 03:23 UTC; base age under 24h. Queued change:
+7429b17714d5984cd4918ce1f44ecfe5f800d223. Parent:
+96b0bbc2cffab725866c118288cb883e977753f6. Parent forward and current
+reverse apply-check pass, as does stable patch-id matching. Submitted
+whole-blob prefixes differ; exact blob identity is not claimed. Linus
+actual master 330517c63aa9b48227b6ab45f01003effac77ae4 and mm-stable still
+have the old path.
+
+Correct Fixes origin: dcfe378c81f72f146890ce1dcfdcc742d3b66924, "lib:
+introduce support for page allocation tagging", in v6.10. d224eb0287fb is a
+later incomplete boot-path fix and the tag already queued with v2. Backward
+history through the real free hook establishes the earlier hotplug failure.
+This supersedes R-021's limited attribution. Prospective Cc:
+stable@vger.kernel.org is justified by debug onlining WARN/taint and the
+panic_on_warn consequence; no corruption reproduced. Both current 6.12.y
+and 6.18.y have the bug and pass forward apply-check. No tested stable
+backport or mainline integration is claimed.
+
+Correction to R-021: the head marker must precede lazy acceptance's early
+return. __accept_page later calls __free_pages_ok directly. The earlier
+advice preferring placement after the return was wrong. V2's one-head
+granularity and placement survive all checked callers.
+
+Seven manual Sashiko domains plus verification/post-verification, pinned
+Tejun/Chris checks and a later same-model adversarial pass were performed
+after the independent source pass. Native Sashiko and external reviewers:
+not run. Method pins: Sashiko d7c69ae77326a3ef39362897cdf0751a06068cf1;
+Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167; Chris
+d048f8742f6740c38833adf02e87901412d771ca.
+
+Extracted tag-helper debug/nondebug probes passed 1152 scenarios and 18426
+balanced tagged cycles. Old hotplug, late placement and v1 tail controls
+failed as expected. Actual W=1 x86_64 affected-object builds passed with
+profiling off/on/debug and enabled hotplug, deferred init and unaccepted
+memory. Tool/target failures remain in the evidence. No full link, kernel
+hotplug runtime, sanitizer or formal check ran. Model: no protocol change;
+existing ownership excludes a third actor across lazy acceptance's lock
+drop. LKMM: no new ordering claim. Guard audit: 0 of 0 checked; 0
+redundant; 0 unresolved
+Standing rules: 85 of 90 applied; 4 inapplicable; 1 unresolved
+
+HOLD: 7 missing/invalid/unresolved checks - all_callers: missing evidence
+kind whole-tree-search - standing_rule_inventory: S11 unresolved: Mandatory
+impact-coverage gate, in ALL tracks - standing_rule_inventory: missing
+evidence kind sections - test_and_build_scope: executed command failed -
+test_and_build_scope: executed command failed - test_and_build_scope:
+executed command failed - test_and_build_scope: executed command failed
+
+Gate evidence: 21 gates; 46 registered receipts; 2 of 2 hunks.
+Sections: 23 applied, 1 unresolved. Four failed command receipts
+remain; later successful builds are recorded separately. Receipt
+counts include repeated commands, not independent correctness proofs.
+
+The original gate symbols=[] inventory and rejected all_callers attempt
+remain unchanged. Manual whole-tree coverage cannot manufacture the missing
+command receipt; failed build receipts also remain recorded. No acceptance
+recommendation is made.
+
+Separate existing C8: free_reserved_pages marks tails then frees one
+high-order block, leaving EMPTY refs. Higher-order x86/s390 callers and
+d79db3f39684 history are verified. The later missing-tag-allocation witness
+needed for a lost diagnostic remains open. No v2 regression or corruption
+claim is made from this finding.
+
+Detailed canonical report: `/Kernel Patch
+Reviews/reports/page-alloc-hotplug-tag-review.md`. Supporting evidence:
+page-alloc-tag-v2-r038-evidence.tar.gz. Next: obtain a supported gate
+revision without erasing original evidence, confirm v2 debug hotplug, and
+revise Fixes/stable/changelog metadata. No kernel source edit, push, signed
+tag or mail send was performed.
+
+
+## R-038 follow-up: tools and delivery (2026-10-25 UTC)
+
+AKPM's instruction: do not stop when flex is missing; find it and
+continue. R-038 did obtain flex 2.6.4, bison, bc, m4 and libelf during
+the same review, then successfully built the affected x86_64 objects
+with W=1 in profiling-off, enabled and debug configurations. The first
+missing-flex attempt is historical evidence, not the final build status.
+No new build or hotplug runtime execution is claimed in this follow-up.
+The staged tools remain under the R-038 build-tools/root directory in
+this Work workspace; check their availability again before reuse.
+
+The R-038 verdict, findings, Fixes/stable assessment, validation and next
+actions were already added to this ledger. Sending the separate detailed
+report as a routine download was contrary to the delivery preference.
+Keep the substantive review result here and use the separate report as
+a supporting record. The workflow now states tool recovery and ledger
+ownership explicitly. No previous evidence or disposition is rewritten.
+
+## Pull-summary singleton headings (2026-10-25 UTC)
+
+Retrieved the latest mm-stable-summary.txt and
+mm-nonmm-stable-summary.txt, both at saved version 2 before this edit.
+Added one heading before each existing singleton roundup:
+
+SUmmary of the 65 singletons in this merge:
+SUmmary of the 87 singletons in this merge:
+
+The requested capitalization is preserved. All existing series and
+singleton prose is byte-identical after removing the inserted heading
+and blank line. The totals cover every singleton in the respective
+merge; the prose continues to omit trivial changes with no useful
+runtime effect.
+
+The historical comparison revision for these existing drafts is
+5b0764a53235d3c77e1ed674e836e1b3fe1a4b1f. The exact tips are:
+
+- MM: 183895979c441e52dbd651b388553b09eaa35cfa.
+  213 commits, 24 series containing 148 commits, 65 singletons.
+- Non-MM: b6232ca8d194c60ee603586e42b5ea584d4b7be9.
+  134 commits, 17 series containing 47 commits, 87 singletons.
+
+Counts were rechecked from Git and matched against every series heading
+in the retrieved drafts. Shared submission IDs identify series without
+cover text. The bootconfig cover says four patches, but only two are in
+this non-MM merge range; the count uses those two, not the cover total.
+These are the existing drafts' ranges, not a new merge against a moving
+Linus branch.
+
+AKPM flagged the attached pull-summary.md filename as wrong. No new
+policy filename was inferred and no policy was fetched from GitHub.
+The output filenames remain mm-stable-summary.txt and
+mm-nonmm-stable-summary.txt. This is a documentation update, not a new
+numbered patch review or a change to any HOLD disposition.

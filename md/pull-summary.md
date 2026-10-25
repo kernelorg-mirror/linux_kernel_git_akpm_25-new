@@ -150,11 +150,35 @@ Follow the prior pull's layout:
   `Make`, `Remove`, `Give`, `Teach`, `Separate`, `Avoid`, etc.
 - Do not begin with padding such as "This series aims to" or
   "The patches introduce".
-- Ordinarily use one three- or four-line explanatory paragraph per
-  series; allow a second short paragraph for a genuinely complex series.
+- Use one two- or three-line explanatory paragraph per series. Keep
+  enough detail to explain the important result and its qualifications.
 - Explain the engineering result and why the previous behavior was
   undesirable. Preserve important interfaces and qualifications.
 - Avoid item-by-item narration of a long patch series.
+
+### Round up significant singletons
+
+Append two or three prose paragraphs after the series bullets, totaling
+20-30 hard-wrapped lines. Use this closing roundup for important standalone
+patches, including an important lone patch from a series when no companion
+commit occurs in the selected range. Do not turn them into series bullets.
+
+- Immediately exclude trivial changes with no meaningful runtime effect:
+  cleanups, comments, documentation, metadata and test-only changes.
+- Read the remaining changelogs and relevant diffs. Select changes for
+  significant userspace-visible effects, especially useful speedups and
+  fixes for data loss, memory corruption, crashes, hangs or serious leaks.
+  A small patch can be more important than a large series.
+- Group related effects into connected prose. Do not itemize patch names,
+  commit IDs or authorship, and do not repeat changes already covered by
+  the series descriptions.
+- State the visible consequence, not just the internal code change.
+  Preserve architecture, configuration and workload qualifications which
+  materially limit the claim. Attribute benchmark numbers to reported
+  tests; do not present them as general speedups or as tests run here.
+- Keep the roundup selective. There is no need to mention every singleton
+  or add minor changes to fill space. Apply the serious-failure and
+  triggerability rules above during analysis.
 
 ### Signed-tag delivery check
 
@@ -163,13 +187,20 @@ Follow the prior pull's layout:
 3. Titles and author attributions match the original series.
 4. Each description matches the commits included in this pull.
 5. Bullet order agrees with the summed additions plus deletions.
-6. Paragraphs begin with an imperative and are mostly three to four
-   lines, with exceptions only when useful.
-7. The output omits the heading and boilerplate, contains only ASCII,
+6. Each series description begins with an imperative and occupies two
+   or three lines.
+7. The closing singleton roundup has two or three paragraphs across
+   20-30 lines, selects significant runtime effects, and omits trivial
+   no-effect changes, patch titles, authorship and repeated series content.
+8. Every highlighted singleton is in the selected range. Its described
+   effect, benchmark numbers and material qualifications match the
+   changelog and source evidence.
+9. The output omits the heading and boilerplate, contains only ASCII,
    and is hard-wrapped at no more than 75 columns.
-8. Compare the tone and layout with the supplied example pull.
-9. Save the standalone tag body, e.g. `pull-tag-summary.txt`, ready
-   for insertion into `git tag -s`.
+10. Compare the tone and layout with the supplied example pull.
+11. Save the standalone tag body as `mm-stable-summary.txt` for
+    `mm-stable`, or `mm-nonmm-stable-summary.txt` for
+    `mm-nonmm-stable`, ready for insertion into `git tag -s`.
 
 ## Provenance and scope
 

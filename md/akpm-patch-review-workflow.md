@@ -97,6 +97,28 @@ review runner. Preserve the manifest and its SHA-bound evidence logs in
 the review artifacts. For a new chat, use the latest gate script supplied
 with the handoff; do not pretend a prior script execution carried over.
 
+For body-only hunks, check that the preflight identified the enclosing
+changed function. If the supplied classifier leaves its symbol inventory
+empty and rejects the real caller search, preserve that failure. Do not
+alter the patch, gate script or immutable manifest to manufacture a pass.
+Document the manually verified caller coverage and retain HOLD until a
+supported gate revision can represent it. A corrected command does not
+erase an earlier failed receipt from the original audit trail.
+
+Check build prerequisites before starting a required build. If a tool
+such as flex, bison or bc is missing, find an existing installation or
+retrieve and stage the needed tool in Work, then retry the blocked
+command. Do not stop at the first missing executable or ask AKPM to
+install it locally. Preserve failed attempts and distinguish them from
+the successful retry. Leave a required check unexecuted only after
+reasonable recovery attempts fail; do not alter receipts or weaken the
+acceptance gate to hide an environment problem.
+
+Whole-tree searches must explicitly select the repository root or tracked
+files. In a noninteractive process, a pathless search can read empty stdin
+instead of traversing the tree. A no-match result is not evidence of no
+callers: verify a known hit and use an explicit path or git grep.
+
 Record inspected source anchors and independent first-pass analysis,
 per-hunk and reverse-consumer coverage, applicable Sashiko/Tejun/Chris
 reviews, source-build and architecture checks, analogous-path searches,
@@ -1174,6 +1196,9 @@ compliance denominator simply because a new rule was added later.
   ledger, listing review IDs, findings, feedback, detailed-report Library
   paths and next actions. On updates, deliver the revised canonical file
   as a direct download; do not require users to hunt through Library.
+  Put the actionable review result, Fixes/stable assessment and actual
+  validation status in this ledger. A separate per-patch report is a
+  supporting record, not a substitute for updating review-activity.md.
 - Store ONLY detailed per-patch review histories in the persistent
   ChatGPT Library under `/Kernel Patch Reviews/reports/`. Each report
   retains its canonical `<topic>-review.md` basename. Update it as new
@@ -1281,10 +1306,14 @@ For a continuation of this project's Work-mode review workflow, attach
 `akpm-patch-review-workflow.md`, `review-activity.md`, and
 `kernel-git-access.md`. Attach `akpm-review-gate.py` as the executable
 companion; it is NOT embedded or run automatically merely because a
-Markdown policy was attached. Add `pull-sumary.md` for pull-request
-writing tasks. The new Work session must check its actual working
-repository and invoke the gate itself, rather than assume prior-session
-execution persists. Keep all review-side Git operations read-only.
+Markdown policy was attached. For edits to existing pull summaries,
+retrieve the latest `mm-stable-summary.txt` and
+`mm-nonmm-stable-summary.txt`. AKPM flagged `pull-summary.md` as the wrong
+attachment name; do not guess a replacement policy filename or retrieve
+that policy from GitHub. The new Work session must check its actual
+working repository and invoke the gate itself, rather than assume
+prior-session execution persists. Keep review-side Git operations
+read-only.
 
 For fresh reviews, attach `akpm-patch-review-workflow.md`, the gate
 script if not already available in Work, and the patch/mbox. After the
