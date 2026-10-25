@@ -1302,6 +1302,11 @@ identified by its index, if any.
 
 ## Handoff for subsequent chats
 
+For pull summaries, introduce the singleton roundup with this heading:
+`Summary of the NNN singletons in this merge:`
+Replace NNN with the verified singleton count for that merge. Use
+`Summary`, with only the initial S capitalized.
+
 For a continuation of this project's Work-mode review workflow, attach
 `akpm-patch-review-workflow.md`, `review-activity.md`, and
 `kernel-git-access.md`. Attach `akpm-review-gate.py` as the executable
