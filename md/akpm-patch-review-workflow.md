@@ -90,8 +90,9 @@ That single old equality proves nothing about subsequent branch states.
 
 For EVERY new review, before examining source or forming a verdict, run
 `akpm-review-gate.py new` with the submitted patch, this workflow, the
-review ID, a verified full 40-character source SHA, and a unique manifest
-path. The command executes in ChatGPT's own file/runtime environment;
+review ID, a verified full 40-character source SHA, a unique manifest
+path, and the Git repository containing that commit (`--repo` in v3).
+The command executes in ChatGPT's own file/runtime environment;
 AKPM does not need to install software, invoke Codex, or run a separate
 review runner. Preserve the manifest and its SHA-bound evidence logs in
 the review artifacts. For a new chat, use the latest gate script supplied
@@ -104,6 +105,22 @@ alter the patch, gate script or immutable manifest to manufacture a pass.
 Document the manually verified caller coverage and retain HOLD until a
 supported gate revision can represent it. A corrected command does not
 erase an earlier failed receipt from the original audit trail.
+
+Gate v3 derives enclosing definitions from verified source and the
+in-memory postimage, including body-only and multiline-signature hunks.
+Hunk-header names are hints, not authority. Its inventory also records
+helper calls introduced or removed by the diff for consumer searches.
+If an affected symbol is missed, `new --symbol H001:NAME` can supplement
+the inventory only when NAME occurs in the verified hunk code or an
+overlapping definition signature. This is an explicit review obligation,
+not a waiver. An unresolved inventory remains HOLD. Source parsing is
+conservative; still inspect every hunk and verify the real call graph.
+
+Keep old gate versions with their review evidence. The v3 checker reads
+v2 manifests under the original rules and does not mutate them. Test a
+gate repair using separate, clearly labeled regression manifests. Those
+tests cannot retroactively supply a before-analysis preflight, erase
+failed receipts or change a prior review's acceptance disposition.
 
 Check build prerequisites before starting a required build. If a tool
 such as flex, bison or bc is missing, find an existing installation or
@@ -496,6 +513,10 @@ in every relevant track, not only after a defect is found:
   configurations selected because their behavior or initial state can
   differ. Verify the relevant helper contracts in those environments;
   do not generalize from the motivating platform or usual lifecycle.
+  When adding core work to an existing notifier, verify that its
+  registration, configuration dependencies and initialization failures
+  match the new responsibility. An optional administrative interface
+  must not silently control an otherwise enabled core feature.
 - Ask whether the new control flow can amplify work, change progress or
   replace a cheap fast path with an expensive path for some valid
   preexisting state. Check common-case and adverse-case costs at the
@@ -1134,6 +1155,12 @@ override conflicting upstream style defaults.
   Do not defer -stable recommendations with vague "security handling"
   language; name an actual restriction only when established. Draft only;
   never imply the message was sent.
+- Include materially different failure modes and source-supported
+  similar-bug findings in the emailable reply, not only in chat or the
+  detailed report. Briefly state the trigger, userspace effect and
+  evidence limits. Label separate pre-existing bugs as separate
+  follow-ups; do not silently omit them to shorten the reply or imply
+  that the submitted patch introduced them.
 - Refer to a numbered patch by its subject notation, e.g. `[1/2]` or
   `[2/3]`, not `patch 1` or `patch 2` in the email reply.
 - State the verdict and important defects first. For each material

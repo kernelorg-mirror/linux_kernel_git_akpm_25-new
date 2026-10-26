@@ -1,8 +1,8 @@
 # Review activity - AKPM
 
 Last updated: 2026-10-25 (UTC)
-Latest numbered review: R-038 (page allocation tag initialization v2).
-R-034, R-035, R-036, R-037 and R-038 remain HOLD; see their records.
+Latest numbered review: R-039 (automatic interleave hotplug refresh).
+R-034 through R-039 remain HOLD; see their individual records.
 Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
@@ -3188,3 +3188,367 @@ policy filename was inferred and no policy was fetched from GitHub.
 The output filenames remain mm-stable-summary.txt and
 mm-nonmm-stable-summary.txt. This is a documentation update, not a new
 numbered patch review or a change to any HOLD disposition.
+
+
+## R-039 - automatic interleave hotplug refresh (2026-10-25 PDT)
+
+Subject: [PATCH] mm/mempolicy: recompute automatic interleave weights on
+memory hotplug
+Author: Gregory Price (Meta) <gourry@gourry.net>
+Posted: 2026-10-24 13:04:15 -0400; single unnumbered-version patch.
+Record: /Kernel Patch Reviews/reports/mempolicy-auto-hotplug-review.md
+Disposition: HOLD/revise. No introduced runtime regression found; the
+normal success path repairs the reported ratios, but configuration and
+failure-path coverage remain incomplete. No author feedback yet.
+
+Source and history:
+- Fresh Google/public kernel.org agreement before/after fetch:
+  mm-unstable a2abad0d7f453cc9902fc8bf7b871db5563a652c;
+  mm-stable 183895979c441e52dbd651b388553b09eaa35cfa.
+  Checked 2026-10-25 17:34-17:46 UTC; unstable committer time was
+  2026-10-24 15:48:02 -0700, under 24 hours old. No Gitolite claim.
+- Complete bare clone restored at
+  /workspace/scratch/08622c88e80d/mm.git; non-shallow/non-promisor,
+  final connectivity fsck passed. Old /2787927c495b clone was absent.
+  A shallow bootstrap was used only while the full clone transferred.
+- Actual Linus master fetched:
+  21a7f44fd0765fcc5194130b28767786eba1d1e7.
+- Exact mm/mempolicy.c preimage blob:
+  0884c629670dd669bedd31ed2e29c9a5c1aaef29. All 3 hunks apply-check.
+  In-memory postimage matches ffb293a4cc56. Kernel source stays clean.
+- Fixes verified correct:
+  e341f9c3c841 ("mm/mempolicy: Weighted Interleave Auto-tuning").
+  Full SHA e341f9c3c8412e57fe0042a33a2640245ecdf619; absent v6.15,
+  present v6.16. The older sysfs hotplug support is not the origin.
+- stable: candidate after revision/mainline; retain existing
+  Cc: stable@vger.kernel.org. 6.18.y at
+  2926d88bb7fc4608fd942453d929c39e4e5ec006 remains affected and needs
+  allocation/RCU helper adaptation. No stable build/backport was made.
+- impact-changelog: needs a sentence on skewed application allocation
+  proportions and possible bandwidth loss. No measured speedup claimed.
+
+Findings (PENDING external feedback; source analysis is not endorsement):
+- R-039-C1: the refresh callback and registration are inside SYSFS and
+  successful sysfs setup. NUMA/HMAT/automatic allocation are not. A real
+  SYSFS=n configuration compiles with the perf setter and allocator but
+  without the notifier. It retains stale weights after re-online.
+  A supplemental SYSFS=n build also enables ACPI_HOTPLUG_MEMORY and
+  automatic onlining. Firmware eject uses device_offline(), and re-add
+  uses __add_memory(); neither requires a sysfs write. Both ACPI driver
+  objects build. This closes a gap in the initial config witness,
+  which had core hotplug enabled but not the ACPI memory driver.
+  Sysfs init failure also prevents registration. This is an incomplete
+  repair of the old bug, not a newly introduced regression. Separate
+  the core refresh notifier from optional sysfs setup before taking.
+- R-039-C2: new notifier drops refresh -ENOMEM; successful hotplug can
+  leave stale weights indefinitely. auto=1 is a no-op when already auto;
+  a later event/report or 0->1 toggle is needed. Source and fault-injected
+  extracted helper confirm it. Residual best-effort limitation, not new
+  corruption. Request explicit handling/diagnostic; do not pretend
+  returning failure from a success notification rolls hotplug back.
+- R-039-C3: separate pre-existing reducer race, also originating in
+  e341f9c3c841. Sysfs auto-store holds wi_state_lock but not the hotplug
+  lock. Its first N_MEMORY scan can sum zero across unreported resident
+  nodes; a previously removed node with saved positive bandwidth can
+  rejoin before the second scan. The second scan then divides by zero.
+  The hotplug notifier arrives after setting membership and cannot
+  prevent this race. x86 can take a kernel divide error; panic_on_oops
+  can turn that into a panic. Models and exact extracted C expose the
+  failure in old AND submitted versions. No kernel crash reproduced.
+  Keep as a separate fix; use a stable mask across passes or another
+  justified serialization design, avoiding recursive hotplug locking.
+- Dismissals independently checked: lock-drop does not overwrite manual
+  state or use a stale bandwidth pointer; detached bandwidth ownership
+  and RCU/SRCU retirement remain valid; success notifier ordering and
+  sleepability are correct. No new data corruption or exploit claimed.
+
+Executed validation and limits:
+- Staged flex/bison/bc/m4 were found and actually used. Eight ORIGINAL
+  x86_64 W=1 object builds passed: four objects with SYSFS=y and SYSFS=n.
+  Two further ACPI objects passed with SYSFS=n and ACPI memory hotplug
+  enabled, for ten original-source object builds in total.
+  This is configuration/source-context validation, not patched-kernel
+  compilation. Exact old/new helper extraction compiles with strict
+  warnings and UBSan; all ten expected scenario outcomes checked.
+- Three-actor PlusCal lock-drop model ran under native tla-mctj 0.1.2
+  and TLC 2026.10.15.145915: fixed 1199 states, failure-enabled 1765,
+  both depth 24, pass. Deliberately broken cached-state control fails.
+- Two-actor membership model fails on live-mask code in both checkers;
+  stable-mask control passes 25 states/depth 9. SC, bounded models;
+  no RCU implementation/weak-memory/hardware proof. No herd7 required.
+- No VM/hotplug runtime, full kernel link, arm64 build, native Sashiko
+  or external reviewer. Complete applicable manual coverage used the
+  same freshly verified Sashiko/Tejun/Chris SHAs as R-038; separate
+  independent, guided, later adversarial and hard-case records retained.
+- Gate new ran before source review; original manifest SHA256:
+  a9ec6b0dae2d56412ff3abff2bb6d95a1115f986475b4a8ca22b91f54716a4ed.
+  Original per-rule inventory retained, including an inherited R-021
+  continuity reminder marked inapplicable to this unrelated review.
+- Final executable gate check exited 0: ELIGIBLE_FOR_HUMAN_DECISION.
+  21 requirements, 37 receipts (9 commands, 8 source, 20 analysis),
+  3/3 hunks and 24/24 sections covered. This is structural evidence
+  validation only; C1/C2 retain HOLD. No acceptance recommended.
+  Earlier rejected hunk registrations and initial failed tool attempts
+  are retained; no original receipt or frozen phase report was rewritten.
+- Guard audit: 7 of 7 checked; 0 redundant; 0 unresolved.
+- Standing rules: 86 of 90 applied; 4 inapplicable; 0 unresolved.
+  A04: unrelated R-021 continuation; A33/A34: no changed shared ABI/type;
+  A74: no new weak-memory claim requiring LKMM. These are coverage
+  results, not proof the patch meets its functional goal.
+
+Next action: author revision for independent core notifier registration,
+explicit refresh-failure handling and impact wording; pursue C3 as a
+separate reducer fix. No source edit, push, tag or mail authorized/run.
+The workflow now explicitly checks whether reused notifier registration
+and configuration match its added core responsibility. Existing R-034
+through R-038 dispositions and all prior case records are preserved.
+
+
+## R-039-C3 follow-up: standalone reducer fix (2026-10-25 PDT)
+
+AKPM requested a patch for the separate reducer race. Draft:
+mempolicy-stabilize-interleave-node-set.patch
+Subject: mm/mempolicy: use one node set for interleave weights
+This is development on R-039-C3, not a new numbered author submission.
+R-039 and its C1/C2 findings remain HOLD, along with earlier HOLD cases.
+
+The reducer now records exactly the nodes visited while summing their
+bandwidth, then uses that set for scaling and GCD normalization. Changes
+during collection are allowed; an atomic topology snapshot is unnecessary
+for the arithmetic invariant. No allocation, new lock or error path.
+The patch changes one function, 10 insertions/3 deletions, and has an
+x86 divide-error/panic impact paragraph, verified Fixes and stable Cc.
+Source edits were explicitly authorized by the patch request; isolated
+worktree only, no commit, push, tag or mail. Sign-off fields are drafts.
+
+Base: mm-unstable a2abad0d7f453cc9902fc8bf7b871db5563a652c, freshly
+fetched and matched between Google/public kernel.org. Actual Linus
+master 21a7f44fd0765fcc5194130b28767786eba1d1e7 also fetched.
+Original mempolicy blob 0884c629670dd669bedd31ed2e29c9a5c1aaef29;
+postimage 80c693c6d693602171b4f9db010bde18430b51bd.
+Fixes: e341f9c3c841 ("mm/mempolicy: Weighted Interleave Auto-tuning").
+Commit/parent provenance rechecked; introduced in v6.16.
+stable: candidate after approval/mainline. The standalone diff applies
+unchanged to v6.16 and checked 6.18.y, unlike Gregory's helper refactor.
+Both orders with Gregory's patch produce identical source. No stable
+kernel build or actual backport commit was made.
+
+Executed validation:
+- Three PATCHED x86_64 W=1 mempolicy builds pass: SYSFS=y, SYSFS=n,
+  and 1024-node config. Largest mask is 128 bytes; no frame warning.
+- Strict extracted C/UBSan compiles pass. 436,240 fixed scenarios agree
+  with old arithmetic over a stable captured set; node 1023 also passes.
+  Old divide-by-zero control fails as expected. An additional old-code
+  control exposes weight 0 for a node entering only the final pass;
+  the fix leaves unvisited slots at 1. This is the same C3 set mismatch,
+  not a newly introduced defect or reproduced application corruption.
+- New per-node PlusCal model: two actors, three nodes, bw 0..2, one
+  resident node and two hotplug toggles. Native TLC and tla-mctj both
+  pass 17172 states/depth 18. Old controls violate NoZeroDivisor.
+  SC/bounded control-flow only; actual arithmetic checked separately in C.
+- Forward apply checks pass on current checked MM/mainline, v6.16 and
+  6.18.y. Checkpatch --strict: 0 errors, 0 warnings.
+- Fresh Sashiko/Tejun/Chris pins unchanged; 51 previously read guide
+  files verified, full applicable manual passes and later same-model
+  adversarial check completed. No native Sashiko/external reviewer.
+- No running-kernel crash/hotplug test, full link or non-x86 kernel build.
+
+Guard audit: 2 of 2 checked; 0 redundant; 0 unresolved
+Standing rules: 87 of 90 applied; 3 inapplicable; 0 unresolved
+A33/A34: no changed shared interface/type or ABI; A74: no new weak-memory
+claim. These counts describe checks performed, not gate eligibility.
+
+Gate new ran on the draft before independent verification, preserving
+the original manifest and all receipts. Its body-only classifier again
+records symbols=[] and rejects genuine caller/consumer queries. Both
+were separately executed with explicit repository roots and preserved.
+Final gate result is recorded below; no acceptance recommendation.
+
+Detailed history remains in:
+/Kernel Patch Reviews/reports/mempolicy-auto-hotplug-review.md
+Supporting archive: mempolicy-interleave-node-set-fix-evidence.tar.gz.
+No new workflow rule is needed; existing rules cover this failure mode.
+
+Final gate check: exit 2, HOLD. Of 21 requirements, two lack accepted
+whole-tree-search receipts: all_callers and cross_tree_consumers. Both
+queries ran successfully outside the gate, but its immutable empty
+symbol list rejects registration. 28 accepted receipts (5 command,
+4 source, 19 analysis), 2/2 hunks and 24/24 sections are recorded.
+No patch, manifest or gate rewrite was made to manufacture eligibility.
+No take/Reviewed-by recommendation. The patch is delivered as a draft.
+
+
+## R-040 - move_pages query untagging (2026-10-25 PDT)
+
+Subject: [PATCH] mm/migrate: untag addresses when querying page nodes
+Author: Hungyu Lin <dennylin0707@gmail.com>
+Posted: 2026-10-25 22:32:26 +0000; single unnumbered-version patch.
+Record: /Kernel Patch Reviews/reports/move-pages-untag-review.md
+Disposition: HOLD for acceptance; no introduced source defect found.
+All finding feedback PENDING. No author/external confirmation claimed.
+
+Fresh source and history:
+- mm-unstable a2abad0d7f453cc9902fc8bf7b871db5563a652c, Google and
+  public kernel.org agree before/after review. Tip over 24 hours old;
+  user alerted before source analysis. Full non-shallow bare Git and
+  staged flex/bison/bc/m4 verified; no Gitolite claim.
+- Actual fetched Linus master:
+  21a7f44fd0765fcc5194130b28767786eba1d1e7.
+- Submitted blob 7e3a81f06974 exists. Pinned migrate.c differs only in
+  unrelated comments; the one hunk applies unchanged. Source stayed
+  read-only and clean. No kernel edit, commit, push, tag or mail.
+- Fixes verified: 057d3389108e ("mm: untag user pointers passed to
+  memory syscalls"). Full 057d3389108eda8a20c7f496f011846932680d88.
+  That commit enabled the ABI but omitted query mode; first in v5.4.
+- stable: candidate after approval/mainline; retain existing stable Cc.
+  Remote helper 428e106ae1ad first appears in v6.4. Earlier affected
+  trees need branch-specific untagged_addr/context adaptation.
+  Current MM/mainline and fetched 6.18.y source apply checks pass;
+  no stable kernel build, runtime test or backport commit was made.
+- impact-changelog: sufficient. Explicit aggregate return 0 wording
+  would make the per-entry failure easier to diagnose.
+
+Findings and userspace impact:
+- R-040-C1: move_pages(nodes=NULL) can return 0 with status[i]=-EFAULT
+  for a valid tagged pointer. The raw key misses vma_lookup even though
+  the corresponding untagged address has a populated ordinary page.
+  Mixed arrays can return real node IDs alongside these failures.
+  NUMA placement discovery/verification is broken for affected entries.
+  Application fallback, abort or performance effects depend on its
+  error handling; none was observed. Query mode itself moves no page
+  and writes no page data. No crash or corruption is established.
+- R-040-C2: on RISC-V Sv57 with supported PMLEN16, a high VMA created
+  before enabling masking can match the raw tagged value. Old query
+  can then report that other mapping's node instead of the intended
+  low mapping. Source chain and extracted two-VMA case establish the
+  conditional wrong-node result; no RISC-V hardware reproduction.
+- The submitted line fixes C1/C2 by normalizing with the target mm
+  under mmap_read_lock before both VMA and page-table lookup. Caller
+  buffer and target addresses have distinct ownership. Permissions,
+  mm references, PTL lifetime, normal errors and compat path checked.
+- R-040-C3: separate old remap_file_pages tagged-start omission can
+  yield EINVAL for an otherwise valid ordinary shared-file mapping.
+  Source-supported follow-up, not a defect introduced here. No kernel
+  reproduction or dedicated Fixes attribution yet. The later pass
+  visibly corrects its earlier no-sibling-found statement. Keep separate.
+
+Executed validation and limits:
+- Two ORIGINAL x86_64 W=1 migrate.o builds pass with ADDRESS_MASKING
+  off/on and NUMA_MIGRATION enabled. No patched-kernel build.
+- Exact-body old/new query and wrapper extraction, with architecture
+  definitions and mocked kernel infrastructure: 72,531 sweep cases
+  plus explicit remote/disabled/alias/chunk/copyfault/compat tests pass.
+  Old control returns 0/status=-14 and fails the expected-node test.
+  First compile's unchanged sign-comparison warning is preserved;
+  kernel-compatible suppression used; shift UBSan explicitly excluded.
+- Corrected checkpatch --strict: 0 errors, 0 warnings. Initial missing
+  Git-context warning preserved. Apply checks are source checks only.
+- No tagged-address hardware/VM run, full kernel link or arm64 build.
+  Full applicable manual Sashiko coverage, Tejun/Chris guidance and
+  distinct later same-model adversarial pass completed. Native Sashiko
+  and external reviewers were not run. Linked report inaccessible;
+  its contents and endorsement are not credited.
+- Fresh method pins: Sashiko d7c69ae77326a3ef39362897cdf0751a06068cf1;
+  Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167;
+  Chris d048f8742f6740c38833adf02e87901412d771ca.
+- Model: no, pure address normalization inside an existing lock, no
+  new ownership/lock-drop protocol. Native TLC/tla-mctj availability
+  verified, but no formal model or herd7 run claimed for this review.
+- Gate new ran before analysis. Original manifest SHA256:
+  96af0b8b0d0ff8a8e9e86b970fb2c56db8e7312077f7bd1b63e1da5e5c4565f0.
+  Body-only hunk again produces symbols=[]; real root-wide queries
+  succeeded outside the gate. Their rejected registrations remain.
+  An initial integration query failed using a checkout without the
+  fetched Linus object; corrected bare-repo query passed. Both remain.
+- Guard audit: 4 of 4 checked; 0 redundant; 0 unresolved.
+- Standing rules: 86 of 90 applied; 4 inapplicable; 0 unresolved.
+  A33/A34: no changed shared interface/type or ABI. A73: no formal
+  protocol trigger. A74: no new weak-memory claim. These are coverage
+  counts, not acceptance eligibility or a proof of correctness.
+
+Next action: address gate evidence limitations before acceptance; ask
+for local/remote tagged-versus-untagged query regression coverage.
+Pursue C3 separately with history and an arm64 shared-file test.
+Workflow unchanged; existing rules already cover these findings.
+Earlier HOLD dispositions and all original ledger bytes are preserved.
+
+
+Final executable gate check: exit 2, HOLD; three checks remain:
+- all_callers: missing accepted whole-tree-search receipt.
+- cross_tree_consumers: missing accepted whole-tree-search receipt.
+- parallel_tree: retained initial failed command, despite corrected
+  successful query. The gate does not supersede failed receipts.
+There are 33 recorded receipts: 18 analysis, 9 source and 6 command
+(one failed command retained); 1/1 hunk and 24/24 sections recorded.
+Real caller/consumer searches succeeded but cannot register against
+symbols=[]. No original evidence or classifier was rewritten to pass.
+No acceptance recommendation or Reviewed-by is given.
+Evidence archive: move-pages-untag-r040-evidence.tar.gz.
+
+
+## Gate maintenance: body-only symbol coverage (2026-10-25 PDT)
+
+AKPM requested a fix for the evidence-gate classifier. Delivered gate
+v3 in akpm-review-gate.py; this is tooling work, not a new kernel review.
+The v2 detector considered only added/removed function declarations.
+It ignored body-only enclosing functions, then refused caller receipts
+whose subject was absent from its immutable empty symbol inventory.
+
+The v3 new command requires --repo and reads the exact source-ref Git
+objects. It verifies hunk preimages, resolves enclosing definitions in
+old source and the in-memory postimage, and records helper-call symbols
+for consumer searches. Header hints alone cannot invent a function.
+Multiline signatures, renamed/new/deleted functions and unique hunk
+line offsets are covered. --symbol H001:NAME provides an explicit,
+source-bound supplement; unrelated identifiers are rejected. Unresolved
+inventories still HOLD. This is a conservative inventory aid, not a
+complete C parser or proof that caller analysis is exhaustive.
+
+Validation:
+- 30 executable regression tests pass. They include the old body-only
+  failure, actual command receipts, incomplete/complete synthetic reviews,
+  altered evidence, bad source/preimage/header/subject/manifest cases,
+  failed compilation, mandatory report structure and section mappings.
+- The actual R-040 and R-039-C3 patches each register caller and consumer
+  searches successfully through v3: four real searches accepted. Four
+  v2 controls reject the same subjects. Separate regression manifests
+  retain HOLD for their other unpopulated review requirements.
+- Historical R-038, R-039, R-039-C3 and R-040 check outputs and exits are
+  identical under old and new checkers. v2 manifests are read-only in
+  v3. All 76 hashed original manifest/input/receipt files are unchanged.
+- R-038's proposed new v3 preflight rejects a mismatched preimage: the
+  selected source already contains that change. This is a negative
+  source-integrity check, not a new acceptance review.
+- No kernel source change, Git ref push, signed tag or mail. Existing
+  HOLD dispositions and the original R-040 failed integration receipt
+  are preserved. The tool repair does not turn past reviews into passes.
+
+The workflow documents --repo, explicit symbol supplements and the
+separation between gate regression testing and a genuine new preflight.
+Test source, logs and notes accompany the gate in
+akpm-review-gate-v3-tests.tar.gz. The canonical gate filename remains
+akpm-review-gate.py. No native Sashiko or formal model execution is
+claimed for this Python tooling change.
+
+
+## R-040 reply correction (2026-10-25 PDT)
+
+The original emailable reply omitted two already-recorded findings.
+AKPM requested that both be visible in the reply:
+- R-040-C2: conditional silent wrong-node report on RISC-V Sv57 with
+  PMLEN16 when the raw tagged value matches another VMA. The submitted
+  patch fixes it. Source and extracted two-VMA evidence; no hardware
+  reproduction. The revised email requests changelog coverage.
+- R-040-C3: separate pre-existing remap_file_pages() missing untagging,
+  producing EINVAL for a valid tagged arm64 shared-file address. Source
+  inspection only; no kernel reproduction or verified Fixes attribution.
+  The revised email asks for separate follow-up, without widening this
+  patch or attributing the sibling bug to it.
+
+The revised unsent draft is appended to move-pages-untag-review.md.
+It supersedes the earlier email text but preserves that text for audit.
+The now-stale gate-registration complaint is removed from the draft.
+Original acceptance HOLD, finding feedback and all receipts remain.
+No new review, runtime test, kernel edit or mail sending is claimed.
+Workflow updated: include materially different failure modes and
+source-supported sibling bugs in the email, with evidence limits.

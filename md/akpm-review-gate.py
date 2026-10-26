@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AKPM patch-review evidence gate (v2), executed inside ChatGPT.
+"""AKPM patch-review evidence gate (v3), executed inside ChatGPT.
 
 No separate runner or local installation is required. The assistant must invoke
 'new' before analyzing a patch and 'check' before writing the recommendation.
@@ -22,7 +22,7 @@ import shlex
 import subprocess
 import sys
 
-VERSION = 2
+VERSION = 3
 WORKFLOW = pathlib.Path(__file__).resolve().with_name("akpm-patch-review-workflow.md")
 
 # Evidence types are deliberately NOT interchangeable. A receipt for a source
@@ -108,7 +108,7 @@ def save(path, obj):
     temp.replace(path)
 
 
-def classify(raw):
+def classify_v2(raw):
     s = raw.decode("utf-8", "replace")
     files, hunks, changes = [], [], []
     path = None
@@ -147,6 +147,214 @@ def classify(raw):
     return {"files": files, "hunks": hunks, "shared": shared, "abi": abi, "async": async_life, "tests": tests, "symbols": sorted(symbols)}
 
 
+IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+C_WORDS = {"if", "for", "while", "switch", "return", "sizeof", "typeof",
+           "__typeof__", "_Alignof", "__alignof__", "__attribute__",
+           "__attribute", "__section", "__aligned", "__printf", "__scanf",
+           "asm", "__asm__", "void", "int", "long", "short", "char",
+           "struct", "union", "enum", "typedef", "static", "inline",
+           "extern", "const", "unsigned", "signed", "volatile",
+           "restrict", "case", "default", "do", "else", "break",
+           "continue", "goto", "_Generic", "_Static_assert"}
+HUNK_HEADER = re.compile(
+    r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: (.*))?$")
+
+
+def c_code(text):
+    """Blank comments, literals and directives without moving line numbers."""
+    def blank(match):
+        return re.sub(r"[^\n]", " ", match.group(0))
+    text = re.sub(r'/\*[\s\S]*?\*/|//[^\n]*|"(?:\\[\s\S]|[^"\\])*"'
+                  r"|'(?:\\[\s\S]|[^'\\])*'", blank, text)
+    lines, continuation = [], False
+    for line in text.splitlines(keepends=True):
+        directive = continuation or line.lstrip().startswith("#")
+        continuation = directive and line.rstrip("\r\n").endswith("\\")
+        lines.append(re.sub(r"[^\n]", " ", line) if directive else line)
+    return "".join(lines)
+
+
+def c_blocks(text):
+    """Conservative C definition inventory, not a preprocessor or C parser.
+
+    Keep the complete signature for explicit supplements when the automatic
+    name heuristic cannot recognize a declaration. Missing coverage holds.
+    """
+    code = c_code(text)
+    depth, parens, boundary, active = 0, 0, 0, None
+    blocks = []
+    for pos, char in enumerate(code):
+        if depth == 0:
+            if char == "(":
+                parens += 1
+            elif char == ")":
+                parens -= 1
+            elif char == ";" and parens == 0:
+                boundary = pos + 1
+            elif char == "{":
+                signature = code[boundary:pos]
+                candidates, nesting = [], 0
+                for match in re.finditer(r"[A-Za-z_]\w*|[()]", signature):
+                    token = match.group(0)
+                    if token == "(":
+                        nesting += 1
+                    elif token == ")":
+                        nesting -= 1
+                    elif (nesting == 0 and token not in C_WORDS and
+                          re.match(r"\s*\(", signature[match.end():])):
+                        candidates.append(token)
+                # '=' denotes a global initializer, not a function body.
+                if "(" in signature and "=" not in signature:
+                    first = boundary + len(signature) - len(signature.lstrip())
+                    active = {"name": candidates[-1] if candidates else None,
+                              "signature": signature,
+                              "start": code.count("\n", 0, first) + 1,
+                              "body": code.count("\n", 0, pos) + 1}
+                depth = 1
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                if active:
+                    active["end"] = code.count("\n", 0, pos) + 1
+                    blocks.append(active)
+                active, boundary, parens = None, pos + 1, 0
+    return blocks
+
+
+def diff_hunks(raw):
+    """Read actual hunk bodies; mail trailers and header hints are not code."""
+    parsed, path, current = [], None, None
+    old_left = new_left = 0
+    for line in raw.decode("utf-8").splitlines():
+        if line.startswith("diff --git "):
+            if old_left or new_left:
+                raise ValueError("truncated diff hunk")
+            match = re.fullmatch(r"diff --git a/(.*?) b/(.*?)", line)
+            if not match:
+                raise ValueError("unsupported quoted diff path")
+            path, current = match.group(2), None
+            rel = pathlib.PurePosixPath(path)
+            if rel.is_absolute() or ".." in rel.parts:
+                raise ValueError("diff path escapes source tree")
+        elif line.startswith("@@ "):
+            if old_left or new_left:
+                raise ValueError("truncated diff hunk")
+            match = HUNK_HEADER.fullmatch(line)
+            if not match or not path:
+                raise ValueError("invalid diff hunk header")
+            old_left = int(match[2]) if match[2] is not None else 1
+            new_left = int(match[4]) if match[4] is not None else 1
+            current = {"id": f"H{len(parsed)+1:03d}", "file": path,
+                       "old_start": int(match[1]), "old_count": old_left,
+                       "new_count": new_left, "old": [], "new": [],
+                       "changed": [], "hint": match[5] or ""}
+            parsed.append(current)
+        elif current and (old_left or new_left):
+            if line.startswith("\\ No newline at end of file"):
+                continue
+            if not line or line[0] not in " +-":
+                raise ValueError("invalid diff hunk body")
+            if line[0] in " -":
+                current["old"].append(line[1:])
+                old_left -= 1
+            if line[0] in " +":
+                current["new"].append(line[1:])
+                new_left -= 1
+            if line[0] in "+-":
+                current["changed"].append(line[1:])
+            if min(old_left, new_left) < 0:
+                raise ValueError("hunk body exceeds declared line count")
+    if old_left or new_left:
+        raise ValueError("truncated diff hunk")
+    return parsed
+
+
+def git_text(repo, *args):
+    cp = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                        check=False)
+    if cp.returncode:
+        raise ValueError("pinned source unavailable: " + cp.stderr.decode(errors="replace").strip())
+    # Preserve source bytes on the UTF-8 path; unsupported encodings fail
+    # closed rather than silently replacing characters in evidence hashes.
+    return cp.stdout.decode("utf-8")
+
+
+def classify(raw, repo, source_ref, supplements=()):
+    if not re.fullmatch(r"[0-9a-f]{40}", source_ref or ""):
+        raise ValueError("source revision must be a full 40-character SHA")
+    if git_text(repo, "rev-parse", "--verify", source_ref + "^{commit}").strip() != source_ref:
+        raise ValueError("source revision is not the pinned commit")
+    cl = classify_v2(raw)
+    parsed = diff_hunks(raw)
+    declared = {}
+    for item in supplements:
+        hid, sep, name = item.partition(":")
+        if (not sep or not IDENTIFIER.fullmatch(name) or name in C_WORDS or
+                hid not in {h["id"] for h in parsed}):
+            raise ValueError("--symbol must identify a real hunk as H001:function_name")
+        declared.setdefault(hid, set()).add(name)
+    symbols, consumers, evidence, sources = set(), set(), {}, {}
+    for path in cl["files"]:
+        hunks = [h for h in parsed if h["file"] == path]
+        entry = git_text(repo, "ls-tree", source_ref, "--", path).strip()
+        if entry:
+            original = git_text(repo, "show", source_ref + ":" + path)
+        elif all(h["old_count"] == 0 and h["old_start"] == 0 for h in hunks):
+            original = ""
+        else:
+            raise ValueError("changed file absent from pinned source: " + path)
+        sources[path] = {"sha256": digest(original.encode()), "tree_entry": entry}
+        old_lines, post, cursor = original.splitlines(), [], 0
+        for h in hunks:
+            old = h["old"]
+            start = max(0, h["old_start"] - (1 if old else 0))
+            if old_lines[start:start + len(old)] != old:
+                matches = [i for i in range(len(old_lines) - len(old) + 1)
+                           if old_lines[i:i + len(old)] == old]
+                if len(matches) != 1:
+                    raise ValueError("preimage missing or ambiguous for " + h["id"])
+                start = matches[0]
+            if start < cursor or start > len(old_lines):
+                raise ValueError("overlapping/out-of-order hunk " + h["id"])
+            post.extend(old_lines[cursor:start])
+            h["old_range"] = (start + 1, start + max(len(old), 1))
+            h["new_range"] = (len(post) + 1, len(post) + max(len(h["new"]), 1))
+            post.extend(h["new"])
+            cursor = start + len(old)
+        post.extend(old_lines[cursor:])
+        old_blocks, new_blocks = c_blocks(original), c_blocks("\n".join(post))
+        for h in hunks:
+            touched = []
+            for side, blocks in (("old", old_blocks), ("new", new_blocks)):
+                start, end = h[side + "_range"]
+                touched.extend({**b, "side": side} for b in blocks
+                               if b["start"] <= end and b["end"] >= start)
+            found = {b["name"] for b in touched if b["name"]}
+            # Explicit supplements must occur in the verified hunk code or
+            # an overlapping definition signature, never elsewhere in a file.
+            binding = c_code("\n".join(h["old"] + h["new"]))
+            binding += "\n" + "\n".join(b["signature"] for b in touched)
+            for name in declared.get(h["id"], set()):
+                if not re.search(r"\b" + re.escape(name) + r"\b", binding):
+                    raise ValueError("supplemental symbol not bound to " + h["id"] + ": " + name)
+                found.add(name)
+            changed = c_code("\n".join(h["changed"]))
+            consumers.update(n for n in re.findall(r"\b([A-Za-z_]\w*)\s*\(", changed)
+                             if n not in C_WORDS)
+            evidence[h["id"]] = {"symbols": sorted(found), "header_hint": h["hint"],
+                                  "old_range": list(h["old_range"]), "new_range": list(h["new_range"]),
+                                  "supplements": sorted(declared.get(h["id"], set())),
+                                  "definitions": [{k: b[k] for k in ("name", "start", "body", "end", "side")}
+                                                  for b in touched]}
+            symbols.update(found)
+    cl.update(symbols=sorted(symbols), consumer_symbols=sorted(consumers | symbols),
+              symbol_evidence=evidence, source_files=sources,
+              unresolved_hunks=[hid for hid, item in evidence.items() if not item["symbols"]])
+    return cl
+
+
 def expected_specs(cl):
     items = dict(BASE)
     # Parallel tree always applies. We must inspect base selection for each patch.
@@ -173,16 +381,22 @@ def section_plan(wf_text):
             for i, h in enumerate(selected, 1)}
 
 
-def plan_data(patch, workflow, review_id, source_ref):
+def plan_data(patch, workflow, review_id, source_ref, schema=VERSION,
+              repo=None, supplements=()):
     raw = patch.read_bytes()
-    cl = classify(raw)
+    cl = (classify_v2(raw) if schema == 2 else
+          classify(raw, repo, source_ref, supplements))
     specs = expected_specs(cl)
     secs = section_plan(workflow.read_text())
-    return {"schema": VERSION, "patch_path": str(patch.resolve()), "patch_sha256": digest(raw),
+    plan = {"schema": schema, "patch_path": str(patch.resolve()), "patch_sha256": digest(raw),
             "workflow_path": str(workflow.resolve()), "workflow_sha256": digest(workflow.read_bytes()),
             "review_id": review_id, "source_ref": source_ref,
             "classification": cl, "requirements": {x: list(y) for x, y in specs.items()},
             "section_headings": {k: v["heading"] for k, v in secs.items()}}
+    if schema >= 3:
+        plan.update(source_repo=str(pathlib.Path(repo).resolve()),
+                    supplemental_symbols=sorted(set(supplements)))
+    return plan
 
 
 def init(args):
@@ -193,7 +407,11 @@ def init(args):
         raise SystemExit("HOLD: manifest already exists; refusing to overwrite preflight")
     if not args.review_id.strip():
         raise SystemExit("review ID required")
-    plan = plan_data(p, w, args.review_id, args.source_ref)
+    try:
+        plan = plan_data(p, w, args.review_id, args.source_ref,
+                         repo=args.repo, supplements=args.symbol)
+    except (ValueError, OSError) as exc:
+        raise SystemExit("HOLD: " + str(exc))
     o = {"plan": plan, "plan_sha256": digest(canonical(plan)), "created_utc": now(),
          "checks": {gate: [] for gate in plan["requirements"]},
          "sections": section_plan(w.read_text()), "hunks": {h["id"]: None for h in plan["classification"]["hunks"]},
@@ -203,13 +421,17 @@ def init(args):
           f"hunks={len(o['hunks'])} workflow_sections={len(o['sections'])} HOLD")
     if plan["classification"]["shared"] or plan["classification"]["abi"]:
         print("Triggered: whole-tree reverse dependencies, LP64+ILP32, external consumer build")
+    if plan["classification"]["unresolved_hunks"]:
+        print("HOLD: unresolved symbol inventory for",
+              ", ".join(plan["classification"]["unresolved_hunks"]),
+              "(use source-bound --symbol H001:name in a separate preflight)")
 
 
 def valid_manifest(m, require_existing=True):
     errors = []
     p = m.get("plan", {})
-    if p.get("schema") != VERSION:
-        return ["unknown or old gate manifest schema (v2 required)"]
+    if p.get("schema") not in (2, VERSION):
+        return ["unknown gate manifest schema (v2 or v3 required)"]
     if digest(canonical(p)) != m.get("plan_sha256"):
         errors.append("preflight plan digest changed")
     patch = pathlib.Path(p.get("patch_path", ""))
@@ -221,7 +443,12 @@ def valid_manifest(m, require_existing=True):
         errors.append("patch changed after preflight")
     if digest(wf.read_bytes()) != p.get("workflow_sha256"):
         errors.append("workflow changed after preflight; create a fresh review")
-    expected = plan_data(patch, wf, p.get("review_id"), p.get("source_ref"))
+    try:
+        expected = plan_data(patch, wf, p.get("review_id"), p.get("source_ref"),
+                             schema=p["schema"], repo=p.get("source_repo"),
+                             supplements=p.get("supplemental_symbols", ()))
+    except (ValueError, OSError, TypeError) as exc:
+        return errors + ["cannot revalidate pinned preflight: " + str(exc)]
     if p != expected:
         errors.append("preflight requirements, source, hunks or sections altered")
     if not re.fullmatch(r"[0-9a-f]{40}", p.get("source_ref") or ""):
@@ -243,6 +470,9 @@ def get(args):
     issues = valid_manifest(m)
     if issues:
         raise SystemExit("HOLD: " + "; ".join(issues))
+    if m["plan"]["schema"] != VERSION:
+        raise SystemExit("HOLD: historical v2 manifest is read-only in v3; "
+                         "preserve it and create a separate v3 preflight")
     return m
 
 
@@ -378,8 +608,8 @@ def run(args):
     if args.purpose == "whole-tree-search" and args.gate == "all_callers" and args.subject not in cl["symbols"]:
         raise SystemExit("HOLD: whole-tree caller query must use a detected changed function; missing symbols may be added to a new preflight")
     if args.purpose == "whole-tree-search" and args.gate == "cross_tree_consumers":
-        combined = " ".join(cl["files"] + cl["symbols"])
-        if args.subject not in combined and args.subject not in {"Makefile", "libcgroup.mk", "include"}:
+        subjects = set(cl["files"] + cl["symbols"] + cl.get("consumer_symbols", []))
+        if args.subject not in subjects and args.subject not in {"Makefile", "libcgroup.mk", "include"}:
             raise SystemExit("HOLD: consumer query must mention a changed interface or build graph")
     cp = subprocess.run(argv, cwd=args.cwd or None, capture_output=True,
                         text=True, errors="replace", check=False, timeout=args.timeout)
@@ -498,6 +728,8 @@ def audit(m):
     errors = valid_manifest(m)
     if errors:
         return errors, {}
+    errors.extend("all_callers: unresolved symbol inventory for " + hid
+                  for hid in m["plan"]["classification"].get("unresolved_hunks", []))
     counts = {}
     for gate, purposes in m["plan"]["requirements"].items():
         receipts = m["checks"][gate]
@@ -586,6 +818,11 @@ def main():
     new.add_argument("--workflow", default=str(WORKFLOW))
     new.add_argument("--review-id", required=True)
     new.add_argument("--source-ref", default="unverified")
+    new.add_argument("--repo", required=True,
+                     help="Git repository containing the pinned source commit")
+    new.add_argument("--symbol", action="append", default=[],
+                     metavar="H001:NAME",
+                     help="supplement inventory with a symbol in verified hunk code or its enclosing definition")
     new.set_defaults(func=init)
     inspect_p = sub.add_parser("inspect", help="record real file/line source evidence")
     inspect_p.add_argument("--manifest", required=True)
