@@ -3552,3 +3552,292 @@ Original acceptance HOLD, finding feedback and all receipts remain.
 No new review, runtime test, kernel edit or mail sending is claimed.
 Workflow updated: include materially different failure modes and
 source-supported sibling bugs in the email, with evidence limits.
+
+
+## R-041: hugetlbfs F_SEAL_EXEC setattr review
+
+Disposition: HOLD / needs revision. The reported bug is real, but the
+new read of info->seals reaches an uninitialized mount-root field.
+This review does not give an acceptance recommendation or Reviewed-by.
+
+R-041-C1, existing bug: a hugetlb memfd carrying F_SEAL_EXEC still permits
+execute-bit changes through chmod. A non-executable MFD_NOEXEC_SEAL file
+can regain those permission bits. On Work's running x86_64 Linux 6.18.55,
+the focused zero-length hugetlb memfd test changed 0666 to 0777. The
+equivalent shmem case returned EPERM. Explicit F_ADD_SEALS cases gave
+the same contrast. No huge pages were allocated, file data executed,
+sysctls changed, or full upstream memfd selftest suite run.
+
+R-041-C2, introduced regression: hugetlbfs_setattr is also installed on
+the directory inode operations. hugetlbfs_get_root leaves info->seals
+uninitialized, unlike hugetlbfs_get_inode. The common allocator and VFS
+initializers do not initialize this member. A reused cache object can
+retain F_SEAL_EXEC. Changing a mount root's search permission bits then
+returns EPERM. Even an authorized owner/admin cannot perform that chmod
+through this path. This can prevent tightening or loosening directory
+access as intended. No kernel crash or data corruption is established.
+
+Initialize seals for the root as well, preferably in an allocation path
+which runs for every hugetlbfs inode. Do not put the reset only in the
+one-time slab constructor. Its timing does not cover object reuse.
+The extracted root-initializer/old-new-setattr test confirms the failure
+with an injected retained bit; an initialization control succeeds.
+The regression has not been reproduced on a patched running kernel.
+
+## Source and history
+
+GATE:base_and_preimage
+Default-base preflight ran before analysis against mm-unstable:
+1eb36316305767b54fac2cd40b88b3499791bdf2.
+Google and public kernel.org mm-unstable/mm-stable tips agreed at entry.
+The selected commit was less than 24 hours old. The old historical bare
+clone was absent; a new complete, non-shallow bare clone was established.
+Current mm-stable was 183895979c441e52dbd651b388553b09eaa35cfa.
+Linus's actual master was fetched separately from torvalds/linux:
+d135ab453a7400a34930bdda1ef4bdc8acfac80e.
+Public kernel.org master agreed. No Gitolite access is claimed.
+
+The cover letter subsequently supplied this explicit author base:
+21a7f44fd0765fcc5194130b28767786eba1d1e7.
+Its inode.c blob is 6656807ce437724c228daa3afa7a881bbf197067,
+an exact match to the submitted index preimage. Separate actual apply
+checks pass on that extracted base and on current mm-unstable. Current
+mm-unstable has unrelated differences, including idmap constification;
+its whole inode.c blob does not match the submitted index. The original
+default-base manifest is preserved, not retroactively rebased.
+
+GATE:parallel_tree
+GATE:stable_and_integration
+The helper is introduced in [04/16], "mm/shmem: honour F_SEAL_EXEC when
+an ACL is set", by Chris Mason. It is absent from the selected MM base.
+That is a normal series dependency, not an independent defect in [05].
+The cover letter changes inode.c only through these eight added lines;
+it does not include a root-seals initialization fix. The root path was
+also inspected on the author's exact base and fetched Linus master.
+
+Git history verifies the supplied attribution:
+Fixes: 6fd7353829ca ("mm/memfd: add F_SEAL_EXEC")
+Full commit: 6fd7353829cafc4067aad9eea0dc95da67e7df16.
+It accepts F_SEAL_EXEC for memfd backends but adds the mode check only
+to shmem. It is in v6.3 and not v6.2. The original omission starts there.
+The stable rules were read from the current pinned source. A corrected
+fix merits Cc: stable@vger.kernel.org: this restores a real user-visible
+seal guarantee. Do not backport the submitted regression. Older trees
+need the helper prerequisite or an equivalent self-contained check.
+No stable-branch backport or build was executed, and no specific current
+stable branch is represented as tested or integration-ready.
+
+## Source analysis and guard audit
+
+GATE:independent_source_pass
+The preserved independent-pass.md preceded method reading. It correctly
+identified the missing seal check and same-inode locking. Its blanket
+ordinary-inode initialization statement is corrected by the later root
+finding; the original text remains as an auditable intermediate result.
+
+GATE:all_callers
+GATE:cross_tree_consumers
+Whole-tree searches enumerate hugetlbfs_setattr in both regular-file and
+directory inode operation tables. chmod/fchmod/fchmodat go through
+chmod_common, notify_change and this method. Generic VFS mode changes
+can also reach it. Permission checks do not enforce the memfd seal.
+fs/Kconfig selects MEMFD_CREATE with HUGETLBFS; fs/hugetlbfs/Makefile
+builds inode.o into hugetlbfs.o. The prerequisite header supplies an
+inline, architecture-neutral helper. No exported ABI layout changes.
+The include and mode-check hunks are assessed separately below.
+
+GATE:lifecycle_and_errors
+Live inode and dentry lifetimes are held by VFS. chmod_common holds
+inode i_rwsem through notify_change; memfd_add_seals takes the same
+lock. The change allocates nothing, takes no new lock and drops none.
+Successful mode changes use setattr_copy and mark_inode_dirty. Rejected
+mode/size combinations return before hugetlb_vmtruncate or copying attrs.
+setattr_prepare retains its existing permission/LSM behavior, so this
+does not claim that every VFS error path has no possible side effects.
+Object destruction returns storage through RCU and hugetlbfs_free_inode
+to the same slab cache. That does not clear filesystem seals. Reuse is
+the important inverse operation; lack of a reset invalidates C2 safety.
+
+GATE:guard_audit
+Four semantic clauses were audited, including the prerequisite helper:
+G1 ATTR_MODE: size-only setattr has no valid ia_mode; skipping the mode
+test is independently necessary. The finite test covers both branches.
+G2 F_SEAL_EXEC: unsealed files must retain ordinary chmod behavior. A
+sealed regular memfd is a valid witness, but the new root read is unsafe.
+G3 changed 0111 mask: unchanged execute bits and read/write or special-bit
+changes remain allowed. Individual execute-bit changes must be rejected.
+G4 helper error return: propagates EPERM before mode/size updates. The
+old control demonstrates that ignoring rejection permits the violation.
+No redundant guard found. Four examined; one unresolved safety premise
+(initialized seals for every inode) is disproved by R-041-C2.
+
+HUNK:H001
+Adding linux/memfd.h declares the helper introduced by [04/16]. Include
+guards protect repetition; fcntl constants come from that prerequisite.
+The gate classifies this include-only hunk as an unresolved function
+inventory. Preserve that original limitation; do not manufacture a
+function association or revise the precommitted manifest to pass.
+
+HUNK:H002
+The check is placed after setattr_prepare and before trace/truncate and
+attribute copying. This is right for initialized regular-file seals,
+but expands the read to mount roots. The needed initialization change
+is missing. Merely passing the exhaustive scalar truth table does not
+prove that the state supplied to the predicate is valid.
+
+GATE:config_and_arch
+With HUGETLBFS disabled the changed implementation is absent. Enabled
+HUGETLBFS selects MEMFD_CREATE; that disabled-helper combination is not
+realizable in this tree. The prerequisite helper is also outside the
+MEMFD_CREATE conditional. umode_t and 0111 are word-size independent.
+PMD-sharing layout differences leave seals outside the embedded inode.
+Automatic slab initialization excludes this constructor-bearing cache.
+No huge-page-size-dependent behavior or hotplug protocol is changed.
+
+GATE:negative_verification
+The separate adversarial report verifies the root finding and revisits
+the rejected locking, privilege-bit, non-mode, config and NULL-ACL cases.
+In particular, posix_acl_equiv_mode(NULL, ...) returns zero: the possible
+NULL-ACL concern against [04/16] is dismissed, not reported as a defect.
+
+GATE:similar_bug_search
+The whole-tree seal/mode search and direct sibling inspection identify
+shmem ACL mode mutation as the related pre-existing omission already
+covered by [04/16]. Hugetlbfs provides no POSIX ACL setter in these inode
+operation tables. This review supplies no new sibling-syscall bug count.
+The earlier broad tagged-address ABI audit remains separate and pending.
+R-040's prior candidate is not promoted to a confirmed ABI bug here.
+
+## Method provenance and tests
+
+GATE:sashiko_stages
+Sashiko pinned current HEAD:
+4e21ccac9066d5a8eadcf15b07464628450444a8.
+Its Linux workflow defines goal, implementation, execution-flow,
+resources, locking, security and hardware stages, with later verification.
+This revision replaces the older vendored prompts with source notes.
+Goal: enforce the existing seal across both memfd backends.
+Implementation: predicate and placement work for initialized files;
+root initialization violates the predicate's input contract.
+Execution: caller dispatch, normal/error returns and combined attrs traced.
+Resources: no new allocation; inode cache reuse reveals C2.
+Locking: same-inode writers serialize; this cannot repair initialization.
+Security: execute-bit immutability is the contract; no W^X claim follows.
+Hardware: scalar predicate and struct initialization, not an MMU protocol.
+Candidate verification uses real-source anchors and executable controls.
+Native Sashiko was not run. Complete applicable guide coverage is NOT
+certified: some long guide reads were truncated. This remains mandatory
+unfinished work; seven-domain notes cannot stand in for that coverage.
+
+GATE:tejun_method
+Tejun pinned HEAD: cbb4478d0f73e15907335e70a2dc2fe54a9e7167.
+Evidence discipline separates the runtime old-bug test from extracted
+fix logic. The later adversarial pass challenges the supposedly safe
+directory case and finds C2. Model: no, because the change is a scalar
+check under existing inode locking, with no new ownership transfer or
+weak-memory claim. Native TLC and tla-mctj help/version ran successfully;
+no formal model was run. herd7 was unavailable and not required here.
+Some applicable module reads were incomplete; full method completion is
+not claimed. No external reviewers or subagents were invoked.
+
+GATE:chris_method
+Chris Mason pinned HEAD: d048f8742f6740c38833adf02e87901412d771ca.
+Caller/locking/VFS checks were applied, including implicit ATTR_MODE,
+setattr preparation and header/config dependencies. The search follows
+initializers and inverse paths beyond the changed function. Long guide
+reads were partly truncated; full applicable prompt coverage remains
+unresolved rather than credited on the strength of this finding.
+
+GATE:test_and_build_scope
+Executed: actual old-kernel zero-length memfd test, exact extracted helper
+and old/new setattr tests over 67,108,864 mode/seal/ATTR_MODE states,
+combined mode/size rejection and size-only control, and ILP32 syntax.
+Executed later: extracted root initializer with retained-seal input,
+old success versus submitted EPERM, and explicit-initialization control.
+These are finite executable tests, not TLA+/PlusCal or patched kernels.
+No patched-kernel build, full kernel build, full memfd_test run or new
+kernel boot is claimed. The first extracted compile failed because the
+generator accidentally renamed a trace helper; its receipt remains.
+After correcting the generator the build/test passed. The original
+runtime script also encountered missing Python fcntl constants; the
+successful script uses source-verified numeric constants instead.
+No missing flex failure occurred in this review; an actual future build
+should use the available staged tools rather than stop at PATH lookup.
+
+GATE:userspace_effects
+The old bug changes observable fchmod success/failure and permission
+bits. It defeats the promised immutability of execute bits on hugetlb
+memfds, including MFD_NOEXEC_SEAL. Actual executable-file loading was
+not tested. F_SEAL_EXEC does not itself forbid executable mmap. Do not
+claim arbitrary privilege escalation, kernel corruption or a W^X bypass.
+The new regression makes an ordinary mount-root chmod intermittently
+fail depending on recycled inode contents. Mention both in the reply.
+
+GATE:emailable_verdict
+The unsent email below reports the actionable regression and the old
+runtime result. It keeps correct Fixes/stable advice conditional on a
+corrected patch and names the existing helper dependency.
+
+```text
+This needs one more initialization fix. hugetlbfs_setattr() is also
+used for directories, but hugetlbfs_get_root() does not initialize
+info->seals. The allocator and inode constructor do not clear it.
+
+A reused inode can therefore retain F_SEAL_EXEC, and the new check
+can make chmod of the hugetlbfs mount root fail with EPERM when its
+search bits change. Please initialize seals for the root too, or in
+the common allocation path on every allocation.
+
+I verified that path in the source and with an extracted-code test
+using a retained seal bit, not on a patched running kernel.
+
+The original bug is real: on 6.18.55, fchmod changed a hugetlb memfd
+created with MFD_NOEXEC_SEAL from 0666 to 0777. The shmem control
+returned EPERM. Please mention that loss of the execute-bit seal
+guarantee in the changelog, alongside the selftest failure.
+
+The Fixes tag is correct, and a corrected fix merits the stable Cc.
+Backports need the helper from [04/16] or an equivalent local check.
+```
+
+GATE:report_and_ledger
+Append R-041 to the latest recovered review-activity master, preserving
+all prior bytes and HOLD dispositions. The workflow itself is unchanged.
+Provide complete current copies of both masters, not a substitute review
+document. Keep original preflight, failed receipts, tests and source
+anchors in the evidence archive. Record the actual final gate output
+separately; this text does not assert a passing gate or complete review.
+
+
+### R-041 evidence and continuity checkpoint
+
+Final pre-delivery gate check returned exit 2 (HOLD), with nine reported
+issues: include-only H001 has no function inventory; the retained first
+stable source anchor points at a blank line; S02-S05 method completion
+is unresolved; S23 delivery was pending at check time; section evidence
+is therefore incomplete; and the first failed harness compile remains.
+A corrected nonblank stable-rule anchor was added without deleting the
+original. The successful later harness build also remains alongside
+its original failure. Neither issue is silently superseded.
+
+There are 37 receipts: 19 analysis, 9 source and 9 executed command
+receipts. One command failed. Both hunks have reports. Nineteen of
+24 section statuses are APPLIED and five are UNRESOLVED at check time.
+The 90-rule audit records 74 APPLIED, seven NOT_APPLICABLE, and nine
+UNRESOLVED. Applied means examined, not that the patch is correct.
+
+Four guard clauses were examined. The new seals read lacks a valid
+initialization premise for mount roots. No acceptance or Reviewed-by.
+The pending guide and target-backport checks remain necessary before
+any later acceptance review. Successful saving after the check does
+not retroactively alter that check's delivery status.
+
+Final fresh Google/public kernel.org checks still agree on the pinned
+MM tips. Original manifest and all receipts are preserved. Evidence:
+hugetlbfs-seal-r041-evidence.tar.gz. Workflow bytes are unchanged.
+All previous ledger entries and HOLD dispositions are preserved.
+
+The tagged-address interface audit remains pending. Its remit is ABI
+promises actually violated, not a raw count of untagging omissions.
+No earlier candidate is promoted by this review. No kernel source edit,
+Git ref push, signed tag, email, or patched-kernel run was performed.
