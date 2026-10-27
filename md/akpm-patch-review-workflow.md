@@ -210,6 +210,26 @@ native Sashiko ran, whether full applicable stage coverage was completed
 manually, and any missing guides, tests or unverified paths. Do not
 label a review "Sashiko-equivalent" if coverage is incomplete.
 
+### Standing authorization for parallel reviewers
+
+AKPM authorizes parallel reviewers for all kernel patch and series
+reviews whenever useful and available. This is a standing instruction;
+do not ask for permission again for each review. It also applies in
+future chats that load this workflow and does not require Ultra mode.
+
+Complete and record the independent first-principles pass before
+starting delegated review work. Then assign bounded, complementary
+scopes, such as caller and lifetime coverage, history, architecture
+checks or searches for similar bugs elsewhere. Give each reviewer the
+same pinned source revision, relevant patch state and evidence rules.
+
+Verify delegated findings and dismissals against the source before
+merging conclusions. Preserve the separate, later adversarial pass
+and all mandatory coverage and gate requirements. Agent agreement is
+not proof, and delegation does not count as native Sashiko execution
+or an external human review. Record which agents actually ran; use
+sequential analysis when delegation is unavailable or adds no value.
+
 ## Tejun upstream modules and upgrade tracking
 
 Tejun's current workflow is
@@ -527,6 +547,12 @@ in every relevant track, not only after a defect is found:
   offsets, redundant intermediate values, or reconstructed state.
   Compare clarity as a separate review dimension without requiring
   cosmetic changes that do not materially improve understanding.
+- When comparison normalizes values, verify that hashes, indexes,
+  skip tables and cached keys use the same equivalence relation.
+  Do not assume a normalizer is invertible or idempotent. Inspect its
+  full domain and test exceptional values; exhaust small domains when
+  practical. A prefilter must not skip an exact original-value match
+  because it uses a different representation.
 - Choose a clean, maintainable UPSTREAM fix on its merits. Older stable
   branches may need separate adapted backports and validation; missing
   infrastructure there is not by itself a reason to complicate the
@@ -714,6 +740,18 @@ inventoried. Prevent a recurrence as follows:
    within the table does not prove that its type-specific payload fits.
    Verify any presumed firmware/transport prevalidation in code and
    compare old and new handler reachability before relaxing `<` to `<=`.
+
+10. When adding a UAPI flag or seal, search independently maintained
+    acceptance masks and serialization/restore formats, not just the
+    main syscall validator. Check compatibility-version requirements
+    and round-trip preservation of the new state. A runtime guard can
+    work while its advertised live-update or restore use rejects it.
+11. Distinguish object lifetime from membership in a file or container.
+    A pin or reference may retain storage after removal. For a claimed
+    retention guarantee, trace ordinary-operation rollback as well as
+    explicit removal, and check synchronization separately for every
+    pinning caller. A caller holding an inode lock does not prove that
+    a different caller shares that protection.
 
 Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing

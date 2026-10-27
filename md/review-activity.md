@@ -1,8 +1,8 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-25 (UTC)
-Latest numbered review: R-039 (automatic interleave hotplug refresh).
-R-034 through R-039 remain HOLD; see their individual records.
+Last updated: 2026-10-26 (PDT)
+Latest numbered review: R-042 (memfd F_SEAL_PUNCH_HOLE series).
+R-034 through R-042 remain HOLD; see their individual records.
 Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
@@ -3841,3 +3841,501 @@ The tagged-address interface audit remains pending. Its remit is ABI
 promises actually violated, not a raw count of untagging omissions.
 No earlier candidate is promoted by this review. No kernel source edit,
 Git ref push, signed tag, email, or patched-kernel run was performed.
+
+
+## Unnumbered investigation: Boyer-Moore ignore-case misses
+
+Date: 2026-10-26 PDT. Report from Lennart Finke, subject
+"Bug in the Boyer-Moore search in lib/ts_bm.c".
+Detailed report: /Kernel Patch Reviews/reports/ts-bm-ignorecase-review.md.
+Supporting archive: ts-bm-ignorecase-evidence.tar.gz.
+
+Confirmed bug; no submitted patch or patch acceptance. Current verified
+mm-unstable is 1eb36316305767b54fac2cd40b88b3499791bdf2. Google and
+public kernel.org MM tips agree. Linus master is
+ d135ab453a7400a34930bdda1ef4bdc8acfac80e;
+its ts_bm.c is identical. Existing non-shallow clone survived and both
+MM and Linus were fetched. No authenticated Gitolite claim.
+
+BM-ICASE-C1: with TS_IGNORECASE, comparison folds the text but the
+bad-character lookup uses raw bytes. Kernel upper(ff)=df and
+upper(df)=bf, while the lower-case aliases do not cover these raw keys.
+For pattern ff,41 in 42,ff,41, original BM returns UINT_MAX instead of
+1. The same holds with df. It can also skip the first occurrence and
+return a later one: 4 instead of 1 in 42,ff,41,51,ff,41.
+
+The proposed key normalization fixes all executed cases. Lower-case
+aliases then become redundant; a submitted cleanup should also remove
+compute_prefix_tbl's unused flags parameter. Do not change the global
+ctype mapping merely to repair this local lookup inconsistency.
+
+Userspace: xt_string exposes selectable BM with IGNORECASE. A missed
+match skips a positive rule or spuriously satisfies an inverted rule;
+final ACCEPT/DROP/logging effects depend on the configured ruleset.
+No live packet-path test or universal firewall bypass claim. em_text
+and the Amanda helper do not enable IGNORECASE. KMP controls pass;
+FSM rejects IGNORECASE. This is separate from BM's documented inability
+to match across blocks and from the existing resume-offset patch thread.
+
+History verifies 3b76d08190e6b420ed3f5534aa99ee29d82d731f,
+"textsearch: ts_bm: support case insensitive searching in Boyer-Moore
+algorithm", first present in v2.6.27. A corrected upstream patch merits
+that Fixes attribution and Cc: stable@vger.kernel.org. No stable-branch
+backport build or patch acceptance has occurred.
+
+Executed exact-source extraction with the actual kernel ctype table:
+34,396,544 differential cases per run, covering all two-byte patterns
+and preceding bytes in both modes, exhaustive short exceptional-byte
+strings, and deterministic random offsets/block layouts. Original BM
+has 132,801 disagreements; lookup-only and combined suggestions have
+zero, as does KMP. Normal and unsigned-char runs pass. ASan/UBSan also
+pass with leak checking disabled: the original LeakSanitizer run failed
+because it could not inspect the Work process/task environment.
+A separate later counterexample and all-byte alias-invariant test pass.
+Its initial misleading-indentation compile error was corrected. No
+kernel build, KUnit, module load, boot or kernel runtime test is claimed.
+
+Model: no, deterministic mapping/skip invariant without a concurrency
+protocol. No formal checker or herd7 execution. Later same-model
+adversarial verification challenged the ASCII-only/block-boundary
+excuses, non-idempotent folding, aliases, KMP, signedness and lifetimes.
+One proposed added condition, TS_IGNORECASE, checked in both branches.
+No native Sashiko, external reviewer, or complete method coverage claim.
+Sashiko HEAD advanced to 104fc7f77fbdcbe565001b50c3ad0606dbab6614;
+Tejun and Chris pins remain those recorded for R-041. Some guide output
+was truncated, so full mandatory patch-review coverage remains pending.
+
+Gate new ran before source analysis on the actual report, rejecting it
+as having no parseable diff. No artificial patch/manifest was created.
+A later check of the absent manifest failed (exit 1). Original rejection
+and check logs are preserved. This confirms a bug report; any future
+patch acceptance still requires its own genuine preflight and evidence.
+
+Next action: ask for a patch with df/ff regressions and case-sensitive
+and KMP controls. The unsent draft is in the detailed report. Workflow
+now explicitly checks normalization consistency across comparison and
+indexes/skip tables, including non-invertible/non-idempotent mappings.
+The ledger header was brought current to R-041; all previous findings
+and dispositions are unchanged. The tagged-address audit remains pending.
+
+
+## R-042: F_SEAL_PUNCH_HOLE
+
+Disposition: HOLD / needs revision. Two substantive findings: an omitted
+live-update seal capability and an existing rollback race which defeats
+the cover's stronger page-membership claim. No Reviewed-by is offered.
+
+## Submission and base
+
+Samiullah Khawaja, [PATCH 0/2] mm/memfd: add F_SEAL_PUNCH_HOLE,
+Message-ID 20261026220546.3114241-1-skhawaja@google.com, 2026-10-26.
+Both actual patches were reviewed, including all six selftest hunks.
+The explicit base is 7bf01f16a4d05028fbeff4d90bab40df25142a24.
+The unmodified, complete, non-shallow bare clone survived. Fresh Google
+and public kernel.org MM tips agreed; actual torvalds/linux master was
+queried and fetched. Exact observations are in refs.json and the final
+freshness receipt. Historical checkpoints were not treated as current.
+
+Both patches pass git apply --check against the stated base. Four of
+five full preimage blob identities match the mail's index prefixes.
+The hugetlbfs index prefix e8a05d3de327 is not in the fetched repository;
+the base blob is ab1e4dec3f77b87c95fc324dd91a345cc041154e. The hunk's
+actual old lines match and apply cleanly. This is a whole-file preimage
+mismatch, not evidence that the changed lines fail to apply. Its exact
+unsubmitted antecedent remains unknown. The author's separate hugetlbfs
+SEAL-EXEC dependency does not constitute acceptance of R-041.
+
+Original gate v3 manifests were created separately for [1/2] and [2/2]
+before source analysis, and immutable copies are retained. The gate
+cannot resolve the macro-only new-constant hunks. No evidence was
+rewritten to manufacture a pass. Gate checks are preserved separately.
+
+## R-042-C1: live update rejects the new seal
+
+Confirmed integration omission in [1/2], still present after [2/2].
+Severity: medium; a requested live-update operation fails cleanly.
+
+include/linux/kho/abi/memfd.h:63 defines MEMFD_LUO_ALL_SEALS without
+0x0040. mm/memfd_luo.c:283 rejects any unsupported seal with
+-EOPNOTSUPP in memfd_luo_preserve(). The retrieve side makes the same
+check at line 530. Adding the new bit to F_ALL_SEALS only changes the
+fcntl acceptance mask; it does not change the live-update mask.
+
+Concrete path, with CONFIG_LIVEUPDATE_MEMFD and an active LUO session:
+LIVEUPDATE_SESSION_PRESERVE_FD -> luo_session_preserve_fd() ->
+luo_preserve_file() -> memfd_luo_preserve(). A shmem memfd with
+F_SEAL_PUNCH_HOLE is rejected. luo_preserve_file propagates the error
+back to the ioctl; the serializer is freed and shmem_freeze is undone.
+No silent seal stripping, resource leak or data corruption was found
+on this rejection path. Hugetlbfs is not supported by this memfd LUO
+handler: memfd_luo_can_preserve requires shmem_file and zero links.
+
+The ABI header expressly requires adding supported seals and bumping
+MEMFD_LUO_FH_COMPATIBLE, currently "memfd-v2". Update the mask and
+compatibility handling together, with preservation/retrieval coverage.
+Do not merely drop the unknown bit when serializing: that would lose
+a userspace protection across the update.
+
+Positive proof: the exact mask rejects every one of the 64 combinations
+containing the new bit; the diagnostic amended-mask control accepts
+those combinations. This is an extracted arithmetic check, not a live
+kexec test. The existing whitelist is intentional forward-compatibility
+protection. The omission is failing to extend it for the newly advertised
+live-update use, not claiming that rejecting unknown seals was itself
+an old bug. History: 8a552d68a86ef0e6fb2ff4af13031a5e82c0f1d0,
+"mm: memfd_luo: preserve file seals".
+
+## R-042-C2: ordinary fallocate rollback can detach an iommufd pin
+
+Source-confirmed pre-existing race, not introduced by the new local
+hole-punch guards. It invalidates the cover's claim that the two seals
+alone guarantee continued file membership. Conditional userspace effect:
+the device continues using a pinned folio while reads or new mappings
+of the memfd see a hole or replacement folio. Device writes can therefore
+be absent from the file, and file writes absent from the device buffer.
+A future live-update optimization must not skip membership verification
+on the strength of these seals alone. No live DMA, guest corruption or
+kexec corruption was reproduced.
+
+Concrete scenario: pre-size a sparse shmem memfd, then install both
+F_SEAL_SHRINK and F_SEAL_PUNCH_HOLE. Use an ordinary fallocate range
+inside i_size, so neither shrink nor hole punching is requested.
+
+1. shmem_fallocate() holds inode->i_rwsem and allocates an order-0 folio
+   through shmem_get_folio(..., SGP_FALLOC). A new folio is deliberately
+   left !uptodate (mm/shmem.c:2751-2761), then marked dirty and unlocked.
+2. The iommufd file mapping path reaches pin_memfd_pages() and
+   memfd_pin_folios() without acquiring that inode lock. It obtains the
+   folio through filemap_get_folios_contig() and try_grab_folio(FOLL_PIN).
+   Neither checks uptodate, locks the folio, nor establishes continued
+   page-cache membership. The lookup's ordinary reference protects its
+   lifetime before the FOLL_PIN reference is acquired.
+3. A later allocation in fallocate fails, or the fallocating task gets
+   a fatal signal. shmem_fallocate() calls shmem_undo_range(..., true)
+   for the prefix already instantiated (mm/shmem.c:3943-3951).
+4. That undo removes !uptodate folios via truncate_inode_folio(), which
+   calls filemap_remove_folio(). An outstanding pin does not prohibit
+   removal. The pin holder retains the old folio, now outside the file.
+
+The iommufd chain was traced through iommufd_ioas_map_file(),
+iopt_map_file_pages(), iopt_map_common()/domain population,
+pfn_reader_user_pin(), pin_memfd_pages() and memfd_pin_folios(). Its
+IOAS and pages locks do not serialize with shmem_fallocate. A normal
+ZONE_NORMAL folio can pass the long-term pinnability checks without
+migration. CONFIG_MIGRATION=n also has a success-returning stub.
+The case needs a populated hardware domain or another actual pinning
+consumer; merely registering an IOAS with no pinning demand is not a
+runtime reproducer.
+
+All three in-tree memfd_pin_folios callers were considered. udmabuf
+holds inode_lock_shared across its seal check and pin. memfd LUO holds
+the inode lock across freezing and pinning. Those callers exclude this
+particular concurrent-fallocate rollback schedule. Do not generalize
+this race to them from the shared helper alone. A subsequent fallocate
+on a previously fallocated !uptodate folio initializes it before undo,
+so the important window is the initial, still-running fallocate.
+
+History was checked: 89c1905d9c140372b7f50ef48f42378cf85d9bc5 introduced
+memfd_pin_folios(); 92687c793644c01aa4ca961a5f2cb93ac20a27f0 introduced
+the iommufd file pfn reader. These are verified historical origins,
+not a finalized Fixes attribution for an unsubmitted correction.
+
+## Formal model and counterexample validation
+
+Model decision for [1/2]: yes for the stronger pin-membership claim.
+The two local seal guards themselves are serialized by the existing
+inode lock and need only a finite mask check. The uncovered multi-actor
+rollback/pinning protocol required a separate bounded model.
+Model decision for [2/2]: no separate model; sequential test helper
+refactoring and syscall assertions introduce no concurrent protocol.
+
+Native PlusCal translation and SANY parsing succeeded. Both native
+TLC and tla-mctj found PinStillInFile violated in the submitted-tree
+model. tla-mctj: 36 distinct states, depth 7; TLC: 44 distinct states,
+reported search depth 9, an eight-state counterexample. Differences
+in explored counts come from parallel exploration, not different
+properties. Both diagnostic serialized-pin controls passed: 18 distinct
+states, depth 10. Full logs and invocation times are preserved.
+
+The model has two actors, one pre-sized shmem range, one fallocate
+failure, and two possible folio identities. A lookup reference is
+represented by the retained identity, not by a full refcount. Migration,
+reclaim, DMA and the allocator are not modeled; the counterexample uses
+an ordinary long-term-pinnable order-0 folio. The seal bits are already
+installed, and ordinary fallocate is permitted in both versions.
+
+The failing trace maps to actual C: FStart takes inode_lock; FAlloc
+publishes a !uptodate folio; PLookup takes a page-cache reference;
+PPin adds FOLL_PIN; FRollback removes the cache entry; PReturn retains
+the pin. TLC also finds removal between lookup and pin, protected from
+freeing by the lookup reference. There is no use-after-free claim.
+
+The PinLock=true control represents taking the inode lock for pinning.
+It is a diagnostic control only: no such kernel fix was written, built,
+or checked for lock ordering. Do not interpret its 18-state pass as
+verification of a kernel fix. Sequential consistency is assumed.
+The failing schedule does not require weak ordering; no herd7 claim
+is made. Formal tools were verified by actual execution in this turn.
+
+## Hunk and guard review
+
+[1/2] H001: hugetlbfs_punch_hole checks before partial zeroing, unmapping
+or removing pages, while holding inode_lock. Its caller supports only
+KEEP_SIZE/PUNCH_HOLE and the VFS validates regular file/write access.
+H002: new UAPI bit 0x40 has no collision with existing seal bits;
+LP64/ILP32 external-header consumers compile. H003: F_ALL_SEALS accepts
+the bit while F_SEAL_SEAL and writable-fd validation retain their roles.
+H004: the added comment describes the limited operation accurately.
+H005: shmem_fallocate's new guard precedes all punch-side mutations and
+exits through the existing inode unlock. MADV_REMOVE funnels into this
+same vfs_fallocate path after retaining a file reference.
+
+[2/2] H001: fallback define agrees with UAPI. H002/H003: splitting
+mfd_assert_write preserves its original write/mmap/mprotect and punch
+order. The variable r remains used by mprotect. H004: both new failure
+checks demand EPERM; the mapping is writable/shared, so MADV_REMOVE's
+preconditions are met. H005: the two tests distinguish PUNCH alone from
+PUNCH|SHRINK; shrinking is intentionally allowed in the former. H006:
+main invokes both tests. Hugetlb sizes use two actual hugepages, not
+the shmem default. The old helper still exercises unsealed punching.
+
+Added-guard audit: two new kernel bit predicates, both necessary and
+reachable; zero redundant new kernel guards found. Also checked the
+selftest's feature-definition guard and three error checks. The tests
+could be stronger by retaining a writable mapping across seal addition
+and verifying nonzero data survives a refused punch. That is suggested
+coverage, not evidence that these local guards corrupt data.
+
+## Manual guided coverage and negative verification
+
+Independent source analysis preceded the current guided pass. Its
+written note was saved after the first Tejun guide read; do not claim
+that the written note predates every guide read. No external reviewer
+or independent-model consensus is claimed. A separate later adversarial
+pass challenged both findings and the substantive dismissals.
+
+Pinned current methodology sources:
+- Tejun: cbb4478d0f73e15907335e70a2dc2fe54a9e7167.
+- Chris: d048f8742f6740c38833adf02e87901412d771ca.
+- Sashiko: 104fc7f77fbdcbe565001b50c3ad0606dbab6614.
+
+The Sashiko pipeline, current stage/verification definitions, callstack,
+locking and false-positive guides were read. Chris core, technical,
+callstack, false-positive, build, syscall, selftest, VFS, KHO, folio,
+largepage and reclaim guides were considered. Exact differences between
+Chris and Sashiko callstack/locking/false-positive guides were read;
+they were not assumed identical. The current 7.3 shmem, hugetlb and
+iommufd notes were checked against source where relevant. Tejun's
+review, evidence, validation, wait, description, comments, cover-letter,
+idiom and model rules informed the review. Source inspection used Git
+and text tools, not semcode. Native Sashiko was not run.
+
+GOAL: new opt-in seal is coherent as an operation prohibition; the
+stronger live-update optimization claim fails C1/C2. No speedup was
+measured and neither driver is changed by the submitted series.
+IMPLEMENTATION: all hunks, masks, serialization and inverse operations
+checked; C1 is the missed inverse consumer.
+EXECUTION-FLOW: new EPERM exits release the inode lock without starting
+mutation; allocation rollback exposed C2. Tests stop on unsupported new
+seal on the old kernel, as observed; that is not a patch runtime pass.
+RESOURCES: refs preserve lifetime but not cache identity. File refs keep
+inodes alive; no new allocation or refcount changes in the patch.
+LOCKING: existing inode locks serialize seal-add and explicit punch;
+iommufd does not share the fallocate lock. No lock ordering changed.
+SECURITY: writable-fd and seal permanence rules remain; no new writable
+access grant, bounds arithmetic, or copy-to-user path is introduced.
+HARDWARE: DMA can remain on the old physical folio in C2; no changed
+register, IRQ, cache-coherency or barrier protocol. x86 LP64/ILP32 header
+checks ran; no arm64/RISC-V kernel build or hardware execution occurred.
+
+Challenge: does a pin prevent truncate, or does the contig lookup wait
+for uptodate? Attempt: inspect filemap_get_folios_contig, try_grab_folio,
+truncate_inode_folio, and all memfd_pin_folios callers. Result: C2 holds;
+only udmabuf and memfd LUO have the relevant inode exclusion.
+Challenge: does the existing-file fallocate initialization remove the
+window? Attempt: trace SGP_FALLOC's new/existing distinction and rollback
+bounds. Result: the first in-flight allocation remains !uptodate.
+Challenge: does the new seal already reach the serializer? Attempt:
+whole-tree mask search plus 128-combination executable check. Result:
+C1 holds; [2/2] changes tests only.
+Challenge: does a different operation already block MADV_REMOVE, or
+is the new check redundant? Attempt: trace shared writable mapping to
+vfs_fallocate and compare F_SEAL_SHRINK-only masks. Result: no; both
+new predicates add a meaningful refusal.
+
+Similar-path inventory includes truncate, explicit punch, rollback,
+eviction, reclaim, hugetlb preallocation and internal GPU/XFS shmem
+users. Internal helper search hits are not themselves confirmed bypasses.
+The complete provenance/ownership audit of every GPU/XFS internal file
+and a full cross-configuration kernel build remain incomplete; therefore
+no exhaustive all-consumer or full mandatory methodology pass is claimed.
+The tools/perf copied fcntl header also lacks the new printable seal name;
+that is a follow-up header synchronization item, not this runtime bug.
+
+## Executed checks and limitations
+
+- Both original diff preimages apply-check successfully.
+- Submitted selftest postimage hash matches 095c5eb255af exactly.
+- Selftest compilation succeeds. Extra compiler warnings match baseline.
+- On host kernel 6.18.55, existing shmem tests reach the new case, where
+  adding 0x40 returns EINVAL and the test aborts as expected.
+- All 128 seal combinations pass the extracted decision/control checks.
+- Explicit -m64 and -m32 UAPI consumer compilations succeed.
+- Native TLC/tla-mctj checks executed as described above.
+
+No patched kernel build, boot, hugetlb runtime test, live DMA test,
+kexec test, native Sashiko run or external review was executed. The
+submitter's QEMU results are the submitter's report, not our execution.
+Original failed/rejected tool calls and gate receipts remain preserved.
+
+## Stable and integration
+
+This is a new userspace API feature, followed by its tests. Do not add
+Fixes or Cc: stable to this series merely because an old pinning issue
+motivates it. A separate narrow correction for C2 needs its own patch,
+verified introducing-path attribution, regression test and stable review.
+C1 should be addressed before integrating the intended live-update use.
+The separately posted SEAL-EXEC fix remains R-041 HOLD; this review does
+not silently accept it as a test dependency.
+
+## Standing-rule completion
+
+APPLIED: current base selection and freshness; original preflights;
+independent source pass; per-hunk and guard reasoning; both findings'
+userspace effects; inverse/error-path investigation; bounded model and
+failing/control runs; later adversarial verification; stable decision;
+plain-ASCII unsent reply; preservation of earlier dispositions.
+UNRESOLVED: macro-only gate symbol inventory; exhaustive reverse-consumer
+coverage and cross-configuration kernel builds; full acceptance evidence.
+Gate check must remain HOLD. A completed bug finding is not a completed
+patch acceptance. No production kernel source was edited; no refs were
+pushed.
+
+## Executed final gate checks
+
+Both checks returned exit 2 (HOLD). These include missing acceptance
+evidence and gate limitations; they do not invalidate the two source
+findings. Failed searches for newly added functions in the old base
+are preserved as failed receipts, not described as runtime bugs.
+
+Patch 1:
+
+```text
+HOLD: 17 missing/invalid/unresolved checks
+ - all_callers: unresolved symbol inventory for H002
+ - cross_tree_consumers: missing evidence kind build-graph
+ - external_consumer_build: no receipts
+ - external_consumer_build: missing evidence kind consumer-build
+ - parallel_tree: missing evidence kind integration-search
+ - shared_header_abi: missing evidence kind whole-tree-search
+ - similar_bug_search: missing evidence kind whole-tree-search
+ - standing_rule_inventory: S03 unresolved: Tejun upstream modules and upgrade tracking
+ - standing_rule_inventory: S04 unresolved: Chris Mason prompt version pinning and update tracking
+ - standing_rule_inventory: S05 unresolved: Sashiko coverage floor: mandatory, not supplemental
+ - standing_rule_inventory: S06 unresolved: Cross-tree shared-interface and ABI build gate
+ - standing_rule_inventory: S07 unresolved: Source integrity and review scope
+ - standing_rule_inventory: S11 unresolved: Mandatory impact-coverage gate, in ALL tracks
+ - standing_rule_inventory: S13 unresolved: Standing-rule compliance report: mandatory before every verdict
+ - standing_rule_inventory: S14 unresolved: Similar-bug search: mandatory in ALL tracks
+ - standing_rule_inventory: S23 unresolved: Artifact delivery: mandatory
+ - standing_rule_inventory: missing evidence kind sections
+```
+
+Patch 2:
+
+```text
+HOLD: 26 missing/invalid/unresolved checks
+ - all_callers: unresolved symbol inventory for H001
+ - all_callers: executed command failed
+ - all_callers: executed command failed
+ - all_callers: executed command failed
+ - all_callers: executed command failed
+ - all_callers: executed command failed
+ - all_callers: missing whole-tree consumer search for __mfd_assert_write
+ - all_callers: missing whole-tree consumer search for mfd_assert_punch_hole
+ - all_callers: missing whole-tree consumer search for mfd_fail_punch_hole
+ - all_callers: missing whole-tree consumer search for test_seal_punch_hole
+ - all_callers: missing whole-tree consumer search for test_seal_punch_hole_shrink
+ - cross_tree_consumers: missing evidence kind whole-tree-search
+ - cross_tree_consumers: missing evidence kind build-graph
+ - parallel_tree: missing evidence kind integration-search
+ - similar_bug_search: missing evidence kind whole-tree-search
+ - standing_rule_inventory: S03 unresolved: Tejun upstream modules and upgrade tracking
+ - standing_rule_inventory: S04 unresolved: Chris Mason prompt version pinning and update tracking
+ - standing_rule_inventory: S05 unresolved: Sashiko coverage floor: mandatory, not supplemental
+ - standing_rule_inventory: S06 unresolved: Cross-tree shared-interface and ABI build gate
+ - standing_rule_inventory: S07 unresolved: Source integrity and review scope
+ - standing_rule_inventory: S11 unresolved: Mandatory impact-coverage gate, in ALL tracks
+ - standing_rule_inventory: S13 unresolved: Standing-rule compliance report: mandatory before every verdict
+ - standing_rule_inventory: S14 unresolved: Similar-bug search: mandatory in ALL tracks
+ - standing_rule_inventory: S23 unresolved: Artifact delivery: mandatory
+ - standing_rule_inventory: missing evidence kind sections
+ - test_matrix: missing evidence kind build-or-test
+```
+
+
+## Unsent review reply
+
+```text
+There are two things to address here.
+
+[1/2] also needs to update MEMFD_LUO_ALL_SEALS. As it stands,
+memfd_luo_preserve() rejects a memfd carrying F_SEAL_PUNCH_HOLE with
+-EOPNOTSUPP. The retrieve path rejects it too. The ABI header requires
+bumping MEMFD_LUO_FH_COMPATIBLE when adding support for another seal.
+Please include that support and a preservation/retrieval test.
+
+There is also an existing hole in the page-membership argument.
+Consider a pre-sized sparse shmem memfd with both seals already set:
+
+- Ordinary fallocate() installs a new !uptodate folio.
+- iommufd pins it through memfd_pin_folios(), which neither takes the
+  inode lock nor checks uptodate on the page-cache lookup path.
+- A later allocation fails and shmem_undo_range(..., true) removes
+  that folio. The pin keeps it alive, but it is no longer in the file.
+
+The device can then keep accessing the old folio while the memfd sees
+zeroes or a replacement folio. Writes through one cease to be visible
+through the other. F_SEAL_SHRINK and F_SEAL_PUNCH_HOLE don't prevent
+this ordinary-fallocate rollback.
+
+This predates your patch and needs a separate fix. udmabuf holds the
+inode lock across pinning, so this particular race does not apply to
+that caller. I checked the source path and a small PlusCal model with
+TLC and tla-mctj; I haven't reproduced it on a running kernel.
+
+The two new hole-punch checks look properly placed, but the seals
+aren't sufficient grounds to drop the iommufd membership walk yet.
+The new UAPI itself isn't a stable candidate.
+```
+
+## Timing checkpoint
+
+```text
+22:14:06-22:16:27 UTC   140.6s
+  Read submission and establish review scope
+
+22:16:27-22:20:37 UTC   249.9s
+  Independent source and caller analysis
+
+22:20:37-22:22:14 UTC    97.5s
+  Guided methods, history and integration checks
+
+22:22:14-22:23:08 UTC    53.8s
+  Build and executable validation
+
+22:23:08-22:25:01 UTC   112.7s
+  Guided coverage and caller verification
+
+22:25:01-22:29:49 UTC   287.8s
+  Adversarial rollback investigation and formal check
+
+22:29:49-22:30:55 UTC    66.7s
+  Final adversarial verification
+
+22:30:55-22:41:12 UTC   616.1s
+  Evidence gate, master documents and delivery
+
+Packaging and save confirmation continue after this checkpoint.
+The final chat table includes their measured elapsed time.
+```
