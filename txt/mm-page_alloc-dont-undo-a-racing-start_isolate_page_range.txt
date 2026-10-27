@@ -1,0 +1,76 @@
+From: Josef Bacik <josef@toxicpanda.com>
+Subject: mm/page_alloc: don't undo a racing start_isolate_page_range()
+Date: Tue, 27 Oct 2026 16:46:27 +0100
+
+Patch series "mm, page_alloc: several stable fixes", v1.
+
+A bunch of fixes from Josef, filtered for page allocator by David.
+
+They seem worthy of Cc: stable to me, but IMHO don't need to be sent
+urgently as the issues mostly need root actions (memory offline) to
+trigger and/or CONFIG_DEBUG_VM to result in a denial of service.
+
+I have tweaked some commit logs and a comment in one case.
+
+
+This patch (of 9):
+
+start_isolate_page_range() fails with -EBUSY if one of the pageblocks is
+already isolated, i.e. if somebody else is working on it. It restores
+the pageblocks which it has isolated itself before it returns, as its
+kernel-doc says:
+
+  We then clean up by restoring the migration type on pageblocks we may
+  have modified and return -EBUSY to caller. This prevents two threads
+  from simultaneously working on overlapping ranges.
+
+alloc_contig_frozen_range() nevertheless calls undo_isolate_page_range()
+for the whole range in this case, which clears every isolated pageblock
+it finds. The only ones left at this point belong to the other user of
+the range:
+
+  CPU0 offline_pages()                CPU1 alloc_contig_frozen_range()
+  start_isolate_page_range(A)
+    pageblock X: isolated
+  migrate ...
+                                      start_isolate_page_range(B)
+                                        X is isolated: -EBUSY
+                                        (own pageblocks restored)
+                                      undo_isolate_page_range(B)
+                                        X: not isolated any more
+  test_pages_isolated(A): -EBUSY
+  (again and again)
+
+offline_pages() repeats the migration and test_pages_isolated() until the
+latter succeeds, which is now impossible and the task spins until it gets
+a signal, while the free pages of X are handed out by the allocator again.
+
+If X is released after the last test_pages_isolated(),
+__offline_isolated_pages() takes pages which are accounted as free off
+the free lists as MIGRATE_ISOLATE. Thus NR_FREE_PAGES stays too high, or
+hits BUG_ON(!PageBuddy(page)) if one of them has been allocated.
+
+For another alloc_contig_frozen_range() or cma_alloc() the result is a
+spurious -EBUSY.
+
+Return the error, like the function did until it was reworked.
+
+Link: https://lore.kernel.org/20261027-pgalloc-ai-hotfixes-v1-0-9c7d1aca801e@kernel.org
+Link: https://lore.kernel.org/20261027-pgalloc-ai-hotfixes-v1-1-9c7d1aca801e@kernel.org
+Fixes: b2c9e2fbba32 ("mm: make alloc_contig_range work at pageblock granularity")
+Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Reviewed-by: Gregory Price (Meta) <gourry@gourry.net>
+Tested-by: Gregory Price (Meta) <gourry@gourry.net>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Assisted-by: LLM
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Brendan Jackman <brendan.jackman@linux.dev>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: <stable@vger.kernel.org>

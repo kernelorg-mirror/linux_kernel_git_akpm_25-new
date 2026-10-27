@@ -918,6 +918,59 @@ its underlying bug pattern, not merely other calls to the changed helper.
 - Include the similar-code search in the cross-track coverage comparison,
   and explicitly say when it was limited by available source access.
 
+### Related mailing-list search: six-month default
+
+For every patch review, perform a targeted mailing-list search in addition
+to the source and Git-history searches. Default to the preceding six
+calendar months, ending at the current review date. For example, a review
+on 2026-10-27 starts its search window at 2026-04-27.
+
+- Preserve the independent first-principles pass before reading external
+  review conclusions. Then search linux-mm and relevant subsystem lists,
+  including the lists receiving the submitted patch; do not restrict a
+  non-MM patch to linux-mm. Search the subject, changed functions/files,
+  failure mechanism, Fixes commit and useful author/series combinations.
+- Look for existing fixes, newer versions, overlapping series, related
+  failures, rejected approaches and substantive review objections. Read
+  the relevant messages and surrounding thread, not just search snippets.
+  Follow thread roots, dependencies and cited discussions beyond six
+  months when necessary. Keep the submitted revision distinct from later
+  revisions; do not silently review a replacement patch instead.
+- Try public archive alternatives when the preferred route fails. Lore,
+  the GNUweeb public mirror and Spinics are candidate routes, not promises
+  of availability or freshness. Verify actual message dates. A failed
+  feed, blocked query or empty search-engine result does not establish
+  that messages are unavailable or that no related patch exists.
+- Record the requested date range, queries, lists, archive routes and
+  retrieval times in compact evidence. State material access/coverage
+  gaps. The newest observed message is not a proven completeness cutoff;
+  search-engine crawl dates are not message dates. Source-verify relevant
+  claims before treating them as findings or dismissals.
+- Include consequential related patches or prior objections in the
+  concise review/email. Retain links and Message-IDs in the evidence.
+  Do not add a long mailing-list narrative to routine review output.
+
+### Reusable mail cache
+
+Maintain an on-demand cache of retrieved public messages and thread
+metadata in Work's execution environment. Deduplicate by Message-ID,
+retain source URLs, actual retrieval times and content hashes, and label
+rendered extracts separately from complete raw messages. Record query
+coverage separately from cached message content. A cache miss is not
+evidence that no message exists, and a partial cache is not a full mirror.
+
+Refresh relevant threads and the newest search interval when starting
+each review: old threads can acquire new replies. Preserve the snapshots
+used by completed reviews. Reuse unchanged message bodies and existing
+search evidence where its scope still applies; record new gaps honestly.
+Checkpoint reusable cache data/indexes durably so a wiped scratch area
+does not require repeating retrieval. Verify a restored checkpoint and
+its coverage before use. No continuously running/background collection is
+implied; refresh happens during active review work unless separately set
+up. Do not download every message from six months of every list merely
+to perform a targeted related-patch search. Record scan time separately
+so its real cost can be measured and the cache policy adjusted.
+
 ## Independent pass: additional review obligations
 
 - Start from the intended userspace behavior: what the bug does to real
