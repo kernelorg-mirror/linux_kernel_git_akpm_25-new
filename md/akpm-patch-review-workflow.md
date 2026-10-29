@@ -1339,6 +1339,11 @@ These requirements apply to ALL user-facing replies, review summaries,
 suggested changelogs and proposed emails. These AKPM preferences
 override conflicting upstream style defaults.
 
+- Prominently display the patch's exact Subject in review responses,
+  including the opening progress message and final verdict. Preserve
+  the supplied PATCH/version/series notation and wording; do not replace
+  the subject with a paraphrase. For a series, display the exact cover
+  subject and identify individual findings by the affected patch subject.
 - Plain 7-bit ASCII only. No curly quotes, Unicode punctuation,
   decorative bullets, typographic quotation bars, or special symbols.
 - Hard-wrap all authored text at 75 columns, including quote prefixes,
