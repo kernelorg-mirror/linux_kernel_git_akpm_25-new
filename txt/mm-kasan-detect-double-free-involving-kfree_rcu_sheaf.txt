@@ -1,0 +1,95 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Subject: mm/kasan: detect double-free involving kfree_rcu_sheaf().
+Date: Wed, 28 Oct 2026 19:39:19 +0000
+
+Patch series "mm/kasan: Detect double-free involving kfree_rcu_sheaf().",
+v3.
+
+Recently, syzbot has reported several weird use-after-free splats.
+
+What they have in common is that "Freed by" points to rcu_free_sheaf(),
+whereas the object shown in "Call Trace:" and "Allocated by" is never
+supposed to be freed via kfree_rcu().
+
+This means the object was a victim of a double-free somewhere else and
+was silently poisoned by rcu_free_sheaf() after being reallocated.
+
+This happens because kfree_rcu_sheaf() queues an object into the RCU
+sheaf without invoking any KASAN hooks.
+
+This series enables KASAN to detect double-free involving
+kfree_rcu_sheaf() immediately and adds KUnit tests for it.
+
+
+This patch (of 2):
+
+syzbot reported a weird use-after-free splat. [0]
+
+In the report, an object in the kmalloc-64 cache was freed via
+rcu_free_sheaf() while it was still in use, even though the
+object should always be freed with kfree() (in xfrm_hash_free()),
+implying that the object was a victim of a double-free involving
+kfree_rcu() somewhere else.
+
+When kvfree_call_rcu() frees an object via kfree_rcu_sheaf() and
+queues it into pcs->rcu_free, debug facilities are skipped, e.g.,
+kasan_slab_pre_free(), kasan_record_aux_stack(),
+debug_rcu_head_queue(), etc.
+
+As a result, KASAN cannot detect the double-free at the call site.
+
+If the object is still in the KASAN quarantine when the sheaf is
+flushed, KASAN can detect the double-free in rcu_free_sheaf(), but
+with no trace of the suspect.
+
+Worse yet, once the object is evicted from the quarantine and
+reallocated before the sheaf is flushed, rcu_free_sheaf() silently
+poisons the live object, resulting in a false-positive use-after-free
+report on the new user.
+
+If __kfree_rcu_sheaf() simply calls kasan_slab_pre_free(), we
+can detect the second kfree_rcu(), but only while the object is
+poisoned in the KASAN quarantine after the first free:
+
+  kfree()     --(poisoned)--------------------> kfree_rcu()
+  kfree_rcu() -> rcu_free_sheaf() -(poisoned)-> kfree_rcu()
+
+An object queued in pcs->rcu_free remains unpoisoned until the
+sheaf becomes full and rcu_free_sheaf() runs after the RCU
+grace period, so a subsequent kfree_rcu() or kfree() before
+rcu_free_sheaf() cannot be detected by shadow bytes alone:
+
+  kfree_rcu() -(unpoisoned)-> kfree_rcu() -> rcu_free_sheaf() (too late!)
+  kfree_rcu() -(unpoisoned)-> kfree()     -> rcu_free_sheaf() (too late!)
+
+These cases can be detected if we call debug_rcu_head_queue()
+before kfree_rcu_sheaf(), but ODEBUG splat only shows the second
+free.
+
+To detect these cases with KASAN, we just need a 1-bit flag
+to indicate the state, which can reuse an unused bit in struct
+kasan_track.pid. (PID_MAX_LIMIT is 1<<22)
+
+The bit is marked along with recording the stack trace when
+deferring slab frees in kfree_rcu_sheaf() and checked in
+check_slab_allocation() so that any double-free pattern above
+can be detected immediately.
+
+Link: https://lore.kernel.org/20261028194014.3671161-1-kuniyu@google.com
+Link: https://lore.kernel.org/20261028194014.3671161-2-kuniyu@google.com
+Link: https://lore.kernel.org/all/6ac959ee.70ed5d86.2ac85.007d.GAE@google.com/ #[0]
+Fixes: ec66e0d59952 ("slab: add sheaf support for batching kfree_rcu() operations")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Acked-by: Vlastimil Babka (SUSE) <vbabka@kernel.org>
+Tested-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Alexander Potapenko <glider@google.com>
+Reviewed-by: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Hao Li <hao.li@linux.dev>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: <stable@vger.kernel.org>

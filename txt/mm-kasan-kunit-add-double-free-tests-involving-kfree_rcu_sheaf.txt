@@ -1,0 +1,103 @@
+From: Kuniyuki Iwashima <kuniyu@google.com>
+Subject: mm/kasan/kunit: add double-free tests involving kfree_rcu_sheaf().
+Date: Wed, 28 Oct 2026 19:39:20 +0000
+
+The new test cases verify that KASAN immediately detects all
+three combinations of double-free involving kfree_rcu_sheaf():
+
+  1. kmem_cache_free() -> kfree_rcu()
+  2. kfree_rcu()       -> kmem_cache_free()
+  3. kfree_rcu()       -> kfree_rcu()
+
+Each test also evicts the object from the KASAN quarantine and
+reallocates it as a victim object before flushing the RCU sheaf
+to ensure the live victim object is not poisoned by the rejected
+double-free.
+
+Without the patch, all tests fail to detect the 2nd free, and
+the victim is poisoned:
+
+  # kmem_cache_double_free_rcu_1: EXPECTATION FAILED at mm/kasan/kasan_test_c.c:1096
+  KASAN failure expected in "kfree_rcu(p, rcu)", but none occurred
+  ... <splat below is logged here>
+  # kmem_cache_double_free_rcu_1: EXPECTATION FAILED at mm/kasan/kasan_test_c.c:1156
+  Expected (<...snipped READ_ONCE()...>&(victim->i)); }) == 42, but
+      <...snipped READ_ONCE()...>victim->i == 117729280 (0x7046800)
+
+  # kasan: pass:0 fail:3 skip:0 total:3
+  # Totals: pass:0 fail:3 skip:0 total:3
+  not ok 1 kasan
+
+In all cases, KASAN logs a false-positive use-after-free splat at
+READ_ONCE(victim->i), and it has no information about the suspect;
+the two stack traces ("Call Trace:" and "Allocated by") are of the
+live victim, and "Freed by" is of the RCU task.
+
+  BUG: KASAN: slab-use-after-free in __kmem_cache_double_free_rcu+0x9ee/0xaf0
+  Read of size 4 at addr ffff8881076c2938 by task kunit_try_catch/513
+  ...
+  Freed by task 0:
+   ...
+   __rcu_free_sheaf_prepare+0xf6/0x240
+   rcu_free_sheaf_nobarn+0x31/0xe0
+   rcu_core+0x75e/0x16b0
+
+With the patch, all tests can detect the 2nd free immediately and
+prevent the victim from being poisoned:
+
+  # kasan: pass:3 fail:0 skip:0 total:3
+  # Totals: pass:3 fail:0 skip:0 total:3
+  ok 1 kasan
+
+All the stack traces point to the same object for double-free,
+and the two free traces are shown in "Call Trace:" and "Freed by"
+(or "Last potentially related work creation:" in the 2nd/3rd test
+cases).
+
+  BUG: KASAN: double-free in kvfree_call_rcu+0xb6/0x3c0
+  Free of addr ffff888108495938 by task kunit_try_catch/511
+  ...
+  Call Trace:
+   <TASK>
+   ...
+   check_slab_allocation+0x10d/0x120
+   __kfree_rcu_sheaf+0x1c/0x2d0
+   kvfree_call_rcu+0xb6/0x3c0
+   __kmem_cache_double_free_rcu+0x310/0xaf0
+
+  Allocated by task 511:
+   ...
+   kmem_cache_alloc_noprof+0x14f/0x3c0
+   __kmem_cache_double_free_rcu+0x152/0xaf0
+
+  Freed by task 511:
+   ...
+   kmem_cache_free+0x14f/0x3c0
+   __kmem_cache_double_free_rcu+0x2c6/0xaf0
+
+Notably, in the 2nd/3rd test cases, we can detect the 2nd free
+before the object is poisoned:
+
+  Memory state around the buggy address:
+   ffff888106dc7800: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+   ffff888106dc7880: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+  >ffff888106dc7900: fc fc fc fc fc fc fc 00 00 00 fc fc fc fc fc fc
+                                          ^
+  ...
+      ok 2 kmem_cache_double_free_rcu_2
+
+Link: https://lore.kernel.org/20261028194014.3671161-3-kuniyu@google.com
+Fixes: ec66e0d59952 ("slab: add sheaf support for batching kfree_rcu() operations")
+Signed-off-by: Kuniyuki Iwashima <kuniyu@google.com>
+Reviewed-by: Alexander Potapenko <glider@google.com>
+Cc: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+Cc: Hao Li <hao.li@linux.dev>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: <stable@kernel.orgg>
