@@ -15,6 +15,26 @@ historical reference. Do not load it for routine reviews, modify it or
 delete it without authorization. The older
 `kernel-patch-review-workflow.md` is also superseded.
 
+Standing override, 2026-10-27 (AKPM): compilation checks are handled by
+others. Do not run kernel, object, consumer, cross-architecture or full
+builds merely to check whether a patch compiles, unless AKPM explicitly
+requests them. Do not recover build prerequisites for that purpose.
+
+Retain source-level caller, type, ABI, configuration and build-graph
+analysis. Retain focused behavioral tests, reproducers and applicable
+formal-model checks; compiling a test harness needed to execute such a
+test is permitted. Distinguish these from compilation-only validation.
+Do not assume that anybody else's build succeeded or claim it as ours.
+
+This override supersedes compilation requirements in older workflow
+text and upstream review guides. Record compilation-only obligations as
+NOT APPLICABLE under this explicit user policy, not as performed or as
+missing mandatory evidence. Other source/test/model requirements remain.
+If a legacy executable gate still mandates a compilation receipt, update
+and validate its policy support transparently for future reviews before
+using it. Never fabricate a build receipt or change historical manifests
+and dispositions to satisfy the new policy.
+
 ## Standalone handoff
 
 This file alone is sufficient as the review-policy handoff for a NEW
@@ -122,14 +142,10 @@ gate repair using separate, clearly labeled regression manifests. Those
 tests cannot retroactively supply a before-analysis preflight, erase
 failed receipts or change a prior review's acceptance disposition.
 
-Check build prerequisites before starting a required build. If a tool
-such as flex, bison or bc is missing, find an existing installation or
-retrieve and stage the needed tool in Work, then retry the blocked
-command. Do not stop at the first missing executable or ask AKPM to
-install it locally. Preserve failed attempts and distinguish them from
-the successful retry. Leave a required check unexecuted only after
-reasonable recovery attempts fail; do not alter receipts or weaken the
-acceptance gate to hide an environment problem.
+When AKPM explicitly requests a build, check its prerequisites and
+recover missing tools such as flex, bison or bc in Work. Preserve failed
+attempts and successful retries; do not ask AKPM to run local tools.
+Routine reviews do not require compilation checks or their setup.
 
 Whole-tree searches must explicitly select the repository root or tracked
 files. In a noninteractive process, a pathless search can read empty stdin
@@ -138,7 +154,7 @@ callers: verify a known hit and use an explicit path or git grep.
 
 Record inspected source anchors and independent first-pass analysis,
 per-hunk and reverse-consumer coverage, applicable Sashiko/Tejun/Chris
-reviews, source-build and architecture checks, analogous-path searches,
+reviews, source-level ABI/configuration checks, analogous-path searches,
 and an explicit later adversarial analysis with recorded counterexamples
 or rejected hypotheses. The second pass may be a distinct ChatGPT pass
 and MUST be labeled same-model adversarial, not an external reviewer.
@@ -169,6 +185,104 @@ The gate's section inventory is a coarse floor; the existing full
 standing-rule audit and all individual mandatory obligations remain
 binding. Neither a per-section receipt nor a successful command is a
 substitute for the source-grounded per-rule statuses in this document.
+
+## Explicit command-retry resolution: 2026-10-28 correction
+
+A failed command remains part of the review history. It need not block
+forever after a verified successful retry satisfies the same obligation.
+This corrects the older blanket failed-command HOLD wording below.
+
+- Use gate v4.1 `resolve-retry` to link the exact failed and successful
+  command receipts. Supply a concrete explanation and a separate JSON
+  resolution file; never delete or edit either receipt or the manifest.
+- The replacement must occur later in the same review and gate, with
+  matching purpose, scope, subject and working directory. It must pass
+  the ordinary command/evidence checks. A resolved failure supplies no
+  evidence itself; the successful command must satisfy the obligation.
+- An unchanged command can be retried. For changed arguments, v4.1 only
+  supports Git diff commit-name corrections with executed evidence that
+  both spellings identify the same commits. Paths, options, search
+  patterns and test targets cannot be weakened through this mechanism.
+- Run `check --resolutions FILE` explicitly. The sidecar binds the exact
+  manifest and original plan. Missing, modified or inconsistent evidence,
+  unresolved command failures and unrelated successes still mean HOLD.
+- Preserve the old gate, original HOLD result and all original evidence.
+  Record a new, dated reassessment after the corrected gate actually
+  runs. Do not relabel the earlier result as a pass or infer that a gate
+  success establishes source correctness.
+- This mechanism cannot repair missing pre-analysis execution, change an
+  immutable coverage inventory, waive a substantive finding, or upgrade
+  a legacy v2/v3 preflight. Those outstanding requirements remain HOLD.
+
+The user explicitly requested this correction after R-050's successful
+exact-SHA retry remained blocked by its earlier missing symbolic ref.
+The old R-050 evidence is preserved; its new assessment is separate.
+
+## Incremental evidence and short closure: 2026-10-28 override
+
+Record evidence during the review so final closure does not reconstruct
+work already completed. This overrides older requirements to rewrite
+master documents immediately or include delivery proof in the archive
+being delivered. It does not weaken source coverage, review independence,
+formal-model decisions, behavioral checks, or acceptance requirements.
+
+- Run the original preflight before source analysis. Resolve failed
+  source/preimage or symbol-inventory checks before proceeding with that
+  patch. Preserve failures and retries. If analysis has already started,
+  record the chronology gap and HOLD; never manufacture an earlier pass.
+- Create the stable obligation IDs before analysis, and the numbered
+  per-clause guard inventory during the first source walkthrough. Check
+  these ordering requirements at the time, not only at final closure.
+- Maintain one evidence index keyed by review, patch, obligation, guard
+  and finding IDs. Attach each source anchor, command receipt, decision
+  and elapsed time when the work completes. Refer to raw evidence once;
+  do not copy it into several overlapping narratives.
+- Delegated tracks return their evidence references and obligation
+  coverage with their findings and dismissals. Reconcile these as tracks
+  finish, while retaining the separate later adversarial pass. Delegation
+  must not precede the independent first-principles pass.
+- Generate counts, timing tables and the compact report from that index.
+  Automation handles bookkeeping; the reviewer must still decide whether
+  the cited evidence satisfies each rule and verify the original IDs and
+  denominator independently. A recorded command is not proof of coverage.
+- At closure, inspect outstanding obligations, contradictions and changed
+  conclusions. Do not repeat completed checks or re-express their evidence
+  unless new information requires it. Retain genuine failures and gaps.
+
+Separate review validation from delivery accounting. Complete the review
+evidence and execute the substantive gate before any positive acceptance
+recommendation. Freeze the report and evidence package, then upload each
+artifact once in an ordered batch. Record the actual upload result in a
+separate delivery receipt that identifies the artifact, version and hash.
+The package need not contain proof of its own upload. Do not rebuild or
+upload it again solely to include that receipt. A content correction is
+a legitimate new version; an upload retry must respect unknown outcomes.
+
+Delivery remains mandatory. Verify the save before claiming persistence;
+disclose a failed or uncertain save separately from the technical verdict.
+The two records together provide review evidence and delivery evidence.
+Gate tooling must represent this separation explicitly and be validated
+before use. A legacy gate failure is still a failure: preserve it and do
+not fabricate a delivery receipt or silently bypass its requirements.
+Do not change historical manifests or HOLD dispositions under this rule.
+
+For routine reviews, record new facts and corrected findings immediately
+in the individual review record and retain it durably. Consolidate master
+documents in the agreed daily batch, or sooner when AKPM explicitly asks.
+Daily consolidation is not a prerequisite for delivering that review.
+Keep the review ID, dispositions, next actions and pending consolidation
+items available so batching cannot lose a finding. This overrides the
+older same-response master-update wording below. It does not imply that
+a scheduled job exists or permit postponing correction of a wrong reply.
+
+Aim for one or two minutes of final closure and measure the result over
+subsequent reviews. This is an unproven target, not a deadline that permits
+skipping review work. Report source analysis, test/model preparation,
+actual execution, evidence closure and saving separately. Show overlap
+between parallel tracks; do not sum their elapsed times as wall time or
+claim a speedup without a suitable comparison. If closure runs long,
+identify the actual cause and improve the recording/tooling path instead
+of lowering reasoning effort or reducing defect-detection coverage.
 
 ## Execution order: independent review plus two coverage tracks
 
@@ -402,7 +516,7 @@ consumers, user-visible impact, stable suitability, and concise email
 replies. Sashiko prompts are hypotheses and review methods, not proof;
 evidence standards and AKPM delivery rules always still apply.
 
-## Cross-tree shared-interface and ABI build gate
+## Cross-tree shared-interface and ABI source gate
 
 Any patch changing a shared header, typedef, library symbol, helper
 signature/return type, utility object, or build-visible API must pass
@@ -423,14 +537,13 @@ the following checks BEFORE an unqualified `take` or `Reviewed-by`:
    check clashes with existing kernel/tools/libc typedefs and actual
    include order, on LP64 AND ILP32. For int64_t, use matching
    PRId64/SCNd64 macros or prove the platform's underlying type.
-   A compiler probe of the opposite ABI cannot catch an ABI-specific
-   defect; compile a representative real consumer on each ABI where
-   the toolchain is available.
+   Trace representative real consumers on each affected ABI in source;
+   check actual widths and include contexts without requiring a build.
 4. Audit the actual build graph: a shared object may be compiled under
    another subsystem's CFLAGS, include ordering and header search
-   paths even when local tests build. Verify at least one real
-   out-of-subsystem consumer build where possible. Clearly record
-   when full builds have NOT been executed.
+   paths. Inspect representative out-of-subsystem consumer contexts in
+   source. Compilation checks are delegated to others under the standing
+   override; do not report an unexecuted build as successful.
 5. Check the author's selected base and parallel integration branches
    for overlapping edits (e.g., cgroup-next versus mm-stable), and
    distinguish an intrinsic patch bug from rebase/apply conflicts.
@@ -442,8 +555,9 @@ an incompatible `s64` typedef in `cgroup_util.h` and left six freezer
 callers storing a widened `s64` return value into `long`. It is a
 specific instance of the mandatory all-consumer impact rule, not a
 waiver or replacement for that rule. Mark the gate UNRESOLVED if the
-cross-tree source or real consumer build could not be checked; do
-not report a clean whole-tree build without executing one.
+cross-tree source could not be checked. Omitted compilation is not an
+unresolved requirement under the standing override. Do not report a
+clean whole-tree build without executing one.
 
 ## Source integrity and review scope
 
@@ -1271,6 +1385,10 @@ override conflicting upstream style defaults.
   plain-ASCII, 75-column, LKML-ready email text when asked.
 
 ## Immediate discovery-to-Markdown update: mandatory
+
+For routine reviews, the incremental-evidence override above requires
+immediate review-record updates and permits daily master consolidation.
+Explicit requests to update this workflow or the ledger are handled now.
 
 Whenever a substantive new fact, missed path, incorrect previous
 finding, revised disposition or generalizable workflow lesson is

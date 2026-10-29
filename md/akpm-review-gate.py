@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AKPM patch-review evidence gate (v3), executed inside ChatGPT.
+"""AKPM patch-review evidence gate (v4.1), executed inside ChatGPT.
 
 No separate runner or local installation is required. The assistant must invoke
 'new' before analyzing a patch and 'check' before writing the recommendation.
@@ -9,7 +9,9 @@ whether searches were exhaustive, or whether the model obeyed the invocation
 rule. It never authorizes 'take' or a Reviewed-by tag. An unresolved mandatory
 requirement always results in HOLD. Never manufacture retroactive receipts.
 
-Commands: new, inspect, run, report, hunk, section, external, check, status.
+Commands: new, inspect, run, report, hunk, section, external, resolve-retry,
+check, status. Retry resolutions are separate, explicit, hash-bound records;
+they never remove receipts or change a preflight manifest.
 Run --help for an individual command's arguments.
 """
 import argparse
@@ -22,7 +24,8 @@ import shlex
 import subprocess
 import sys
 
-VERSION = 3
+VERSION = 4
+TOOL_VERSION = "4.1"  # Retains the immutable v4 plan/schema.
 WORKFLOW = pathlib.Path(__file__).resolve().with_name("akpm-patch-review-workflow.md")
 
 # Evidence types are deliberately NOT interchangeable. A receipt for a source
@@ -355,7 +358,7 @@ def classify(raw, repo, source_ref, supplements=()):
     return cl
 
 
-def expected_specs(cl):
+def expected_specs(cl, compilation_policy="required"):
     items = dict(BASE)
     # Parallel tree always applies. We must inspect base selection for each patch.
     items["parallel_tree"] = CONDITIONAL["parallel_tree"]
@@ -366,6 +369,11 @@ def expected_specs(cl):
         items["async_lifetime"] = CONDITIONAL["async_lifetime"]
     if cl["tests"]:
         items["test_matrix"] = CONDITIONAL["test_matrix"]
+    if compilation_policy == "delegated" and "shared_header_abi" in items:
+        # Compilation-only checks are delegated by explicit user policy.
+        # Source/ABI analysis, searches and behavioral tests remain required.
+        items["shared_header_abi"] = ("whole-tree-search", "analysis")
+        items["external_consumer_build"] = ("analysis",)
     return items
 
 
@@ -382,11 +390,22 @@ def section_plan(wf_text):
 
 
 def plan_data(patch, workflow, review_id, source_ref, schema=VERSION,
-              repo=None, supplements=()):
+              repo=None, supplements=(), compilation_policy="required"):
+    if compilation_policy not in {"required", "delegated"}:
+        raise ValueError("unknown compilation policy")
+    if schema < 4 and compilation_policy != "required":
+        raise ValueError("historical manifests retain original compilation policy")
+    if compilation_policy == "delegated":
+        policy = workflow.read_text()
+        if not all(part in policy for part in (
+                "compilation checks are handled by\nothers.",
+                "Do not run kernel, object, consumer, cross-architecture or full\nbuilds",
+                "Retain source-level caller, type, ABI, configuration and build-graph\nanalysis.")):
+            raise ValueError("delegated compilation requires explicit AKPM workflow override")
     raw = patch.read_bytes()
     cl = (classify_v2(raw) if schema == 2 else
           classify(raw, repo, source_ref, supplements))
-    specs = expected_specs(cl)
+    specs = expected_specs(cl, compilation_policy)
     secs = section_plan(workflow.read_text())
     plan = {"schema": schema, "patch_path": str(patch.resolve()), "patch_sha256": digest(raw),
             "workflow_path": str(workflow.resolve()), "workflow_sha256": digest(workflow.read_bytes()),
@@ -396,6 +415,8 @@ def plan_data(patch, workflow, review_id, source_ref, schema=VERSION,
     if schema >= 3:
         plan.update(source_repo=str(pathlib.Path(repo).resolve()),
                     supplemental_symbols=sorted(set(supplements)))
+    if schema >= 4:
+        plan["compilation_policy"] = compilation_policy
     return plan
 
 
@@ -409,7 +430,8 @@ def init(args):
         raise SystemExit("review ID required")
     try:
         plan = plan_data(p, w, args.review_id, args.source_ref,
-                         repo=args.repo, supplements=args.symbol)
+                         repo=args.repo, supplements=args.symbol,
+                         compilation_policy=args.compilation_policy)
     except (ValueError, OSError) as exc:
         raise SystemExit("HOLD: " + str(exc))
     o = {"plan": plan, "plan_sha256": digest(canonical(plan)), "created_utc": now(),
@@ -420,7 +442,11 @@ def init(args):
     print(f"CREATED {manifest} required_gates={len(o['checks'])} "
           f"hunks={len(o['hunks'])} workflow_sections={len(o['sections'])} HOLD")
     if plan["classification"]["shared"] or plan["classification"]["abi"]:
-        print("Triggered: whole-tree reverse dependencies, LP64+ILP32, external consumer build")
+        if args.compilation_policy == "delegated":
+            print("Triggered: whole-tree reverse dependencies and source ABI coverage; "
+                  "compilation delegated by explicit user policy")
+        else:
+            print("Triggered: whole-tree reverse dependencies, LP64+ILP32, external consumer build")
     if plan["classification"]["unresolved_hunks"]:
         print("HOLD: unresolved symbol inventory for",
               ", ".join(plan["classification"]["unresolved_hunks"]),
@@ -430,8 +456,8 @@ def init(args):
 def valid_manifest(m, require_existing=True):
     errors = []
     p = m.get("plan", {})
-    if p.get("schema") not in (2, VERSION):
-        return ["unknown gate manifest schema (v2 or v3 required)"]
+    if p.get("schema") not in (2, 3, VERSION):
+        return ["unknown gate manifest schema (v2, v3 or v4 required)"]
     if digest(canonical(p)) != m.get("plan_sha256"):
         errors.append("preflight plan digest changed")
     patch = pathlib.Path(p.get("patch_path", ""))
@@ -446,7 +472,8 @@ def valid_manifest(m, require_existing=True):
     try:
         expected = plan_data(patch, wf, p.get("review_id"), p.get("source_ref"),
                              schema=p["schema"], repo=p.get("source_repo"),
-                             supplements=p.get("supplemental_symbols", ()))
+                             supplements=p.get("supplemental_symbols", ()),
+                             compilation_policy=p.get("compilation_policy", "required"))
     except (ValueError, OSError, TypeError) as exc:
         return errors + ["cannot revalidate pinned preflight: " + str(exc)]
     if p != expected:
@@ -471,8 +498,8 @@ def get(args):
     if issues:
         raise SystemExit("HOLD: " + "; ".join(issues))
     if m["plan"]["schema"] != VERSION:
-        raise SystemExit("HOLD: historical v2 manifest is read-only in v3; "
-                         "preserve it and create a separate v3 preflight")
+        raise SystemExit("HOLD: historical v2/v3 manifest is read-only in v4; "
+                         "preserve it and create a separate v4 preflight")
     return m
 
 
@@ -724,10 +751,178 @@ def check_receipt(rec, gate, valid_purposes):
     return errors
 
 
-def audit(m):
+def receipt_id(rec):
+    """Bind the whole receipt, including its timestamp and evidence digest."""
+    return digest(canonical(rec))
+
+
+def resolve_revision(repo, token):
+    # Restrict corrections to commit names, never options or path arguments.
+    if not token or token.startswith("-"):
+        raise ValueError("not a revision argument")
+    argv = ["git", "-C", str(repo), "rev-parse", "--verify",
+            "--end-of-options", token + "^{commit}"]
+    cp = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    value = cp.stdout.strip()
+    if cp.returncode or not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise ValueError("cannot resolve commit: " + token)
+    return {"argv": argv, "exit": cp.returncode, "stdout": cp.stdout,
+            "stderr": cp.stderr, "commit": value}
+
+
+def retry_pair(m, gate, failed_id, replacement_id):
+    if m["plan"]["schema"] != VERSION:
+        raise ValueError("retry resolution requires a genuine v4 preflight")
+    receipts = m.get("checks", {}).get(gate, [])
+    old = [(i, r) for i, r in enumerate(receipts)
+           if receipt_id(r) == failed_id]
+    new = [(i, r) for i, r in enumerate(receipts)
+           if receipt_id(r) == replacement_id]
+    if len(old) != 1 or len(new) != 1:
+        raise ValueError("both receipts must uniquely belong to this gate")
+    oi, failed = old[0]
+    ni, replacement = new[0]
+    purposes = m["plan"]["requirements"][gate]
+    if failed.get("kind") != "command" or replacement.get("kind") != "command":
+        raise ValueError("only executed command receipts can be resolved")
+    # Only the nonzero exit is waivable. Corrupt/missing/invalid evidence is not.
+    if check_receipt(failed, gate, purposes) != ["executed command failed"]:
+        raise ValueError("failed receipt has other errors or did not fail")
+    if check_receipt(replacement, gate, purposes):
+        raise ValueError("replacement must be a valid successful receipt")
+    for key in ("purpose", "scope", "subject", "cwd"):
+        if failed.get(key) != replacement.get(key):
+            raise ValueError("retry changed " + key)
+    try:
+        ft = dt.datetime.fromisoformat(failed["recorded_utc"])
+        rt = dt.datetime.fromisoformat(replacement["recorded_utc"])
+        if ni <= oi or rt <= ft:
+            raise ValueError("replacement must follow the failed command")
+    except (KeyError, TypeError) as exc:
+        raise ValueError("missing retry chronology") from exc
+    return failed, replacement
+
+
+def retry_differences(failed, replacement):
+    a, b = failed["argv"], replacement["argv"]
+    if a == b:
+        return []
+    # Corrections may only spell the SAME git-diff commit operands differently.
+    # Changed search patterns, pathsets, flags, tests or executables need a new
+    # review, not a convenient unrelated success with the same purpose label.
+    if (len(a) != len(b) or a[:2] != ["git", "diff"] or
+            b[:2] != ["git", "diff"] or "--" not in a or "--" not in b):
+        raise ValueError("retry changes command beyond supported ref correction")
+    boundary = a.index("--")
+    if boundary != b.index("--") or a[boundary:] != b[boundary:]:
+        raise ValueError("retry changes diff path coverage")
+    differences = [i for i in range(len(a)) if a[i] != b[i]]
+    if any(i < 2 or i >= boundary or a[i].startswith("-") or
+           b[i].startswith("-") for i in differences):
+        raise ValueError("retry changes command flags or scope")
+    return differences
+
+
+def retry_resolutions(m, document):
+    """Validate an optional additive sidecar; never trust a mere pass label."""
+    if document is None:
+        return set(), []
+    try:
+        if (document.get("schema") != 1 or
+                document.get("manifest_sha256") != digest(canonical(m)) or
+                document.get("plan_sha256") != m["plan_sha256"]):
+            raise ValueError("resolution sidecar does not bind this manifest")
+        resolved = set()
+        for entry in document["resolutions"]:
+            gate, fid, rid = entry["gate"], entry["failed"], entry["replacement"]
+            if fid in resolved or len(entry.get("reason", "").strip()) < 60:
+                raise ValueError("duplicate resolution or inadequate explanation")
+            failed, replacement = retry_pair(m, gate, fid, rid)
+            differences = retry_differences(failed, replacement)
+            proof = entry["proof"]
+            path = pathlib.Path(proof["path"])
+            raw = path.read_bytes()
+            if len(raw) != proof["size"] or digest(raw) != proof["sha256"]:
+                raise ValueError("retry proof missing or modified")
+            data = json.loads(raw)
+            if data["failed"] != fid or data["replacement"] != rid:
+                raise ValueError("retry proof names different receipts")
+            pairs = data["revisions"]
+            if [p["index"] for p in pairs] != differences:
+                raise ValueError("missing revision equivalence proof")
+            for pair in pairs:
+                for key, rec in (("old", failed), ("new", replacement)):
+                    result = pair[key]
+                    token = rec["argv"][pair["index"]]
+                    argv = result["argv"]
+                    if (len(argv) != 7 or argv[:2] != ["git", "-C"] or
+                            argv[3:] != ["rev-parse", "--verify",
+                                         "--end-of-options", token + "^{commit}"] or
+                            result["exit"] != 0 or
+                            not re.fullmatch(r"[0-9a-f]{40}", result["commit"]) or
+                            result["stdout"].strip() != result["commit"]):
+                        raise ValueError("invalid revision resolution receipt")
+                if pair["old"]["commit"] != pair["new"]["commit"]:
+                    raise ValueError("retry changed the compared commit")
+            resolved.add(fid)
+        return resolved, []
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        return set(), ["retry resolution: " + str(exc)]
+
+
+def resolve_retry(args):
+    m = get(args)
+    try:
+        failed, replacement = retry_pair(m, args.gate, args.failed,
+                                         args.replacement)
+        differences = retry_differences(failed, replacement)
+        pairs = []
+        for i in differences:
+            old_token, new_token = failed["argv"][i], replacement["argv"][i]
+            try:
+                old = resolve_revision(failed["cwd"], old_token)
+            except ValueError:
+                if not args.ref_repo:
+                    raise
+                old = resolve_revision(args.ref_repo, old_token)
+            new = resolve_revision(replacement["cwd"], new_token)
+            if old["commit"] != new["commit"]:
+                raise ValueError("retry changed the compared commit")
+            pairs.append({"index": i, "old": old, "new": new})
+        target = pathlib.Path(args.resolutions).resolve()
+        if target == pathlib.Path(args.manifest).resolve():
+            raise ValueError("resolution sidecar cannot overwrite manifest")
+        if target.exists():
+            document = load(target)
+            _, errors = retry_resolutions(m, document)
+            if errors:
+                raise ValueError("; ".join(errors))
+        else:
+            document = {"schema": 1, "manifest_sha256": digest(canonical(m)),
+                        "plan_sha256": m["plan_sha256"], "resolutions": []}
+        proof_path = target.with_name(target.name + "." + args.failed[:16] + ".proof.json")
+        if proof_path.exists():
+            raise ValueError("retry proof already exists; refusing overwrite")
+        save(proof_path, {"failed": args.failed, "replacement": args.replacement,
+                          "revisions": pairs, "recorded_utc": now()})
+        document["resolutions"].append({"gate": args.gate, "failed": args.failed,
+            "replacement": args.replacement, "reason": args.reason.strip(),
+            "proof": receipt_file(proof_path), "recorded_utc": now()})
+        _, errors = retry_resolutions(m, document)
+        if errors:
+            raise ValueError("; ".join(errors))
+        save(target, document)
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        raise SystemExit("HOLD: " + str(exc))
+    print("RESOLVED retry; original failed receipt and manifest unchanged")
+
+
+def audit(m, resolutions=None):
     errors = valid_manifest(m)
     if errors:
         return errors, {}
+    resolved, retry_errors = retry_resolutions(m, resolutions)
+    errors.extend(retry_errors)
     errors.extend("all_callers: unresolved symbol inventory for " + hid
                   for hid in m["plan"]["classification"].get("unresolved_hunks", []))
     counts = {}
@@ -738,6 +933,10 @@ def audit(m):
             errors.append(gate + ": no receipts")
         for rec in receipts:
             issue = check_receipt(rec, gate, purposes)
+            if issue == ["executed command failed"] and receipt_id(rec) in resolved:
+                # A resolved failure supplies no evidence. Only its separately
+                # validated successful replacement can meet a requirement.
+                continue
             if issue:
                 errors.extend(gate + ": " + x for x in issue)
                 continue
@@ -797,7 +996,11 @@ def audit(m):
 
 def status(args):
     m = load(args.manifest)
-    errors, count = audit(m)
+    try:
+        resolutions = load(args.resolutions) if args.resolutions else None
+    except (OSError, ValueError) as exc:
+        raise SystemExit("HOLD: cannot read retry resolutions: " + str(exc))
+    errors, count = audit(m, resolutions)
     if errors:
         print(f"HOLD: {len(errors)} missing/invalid/unresolved checks")
         for x in errors[:150]:
@@ -807,6 +1010,8 @@ def status(args):
         raise SystemExit(2)
     print("ELIGIBLE_FOR_HUMAN_DECISION: receipts meet minimum structural checks")
     print("NOT A SOURCE-CORRECTNESS OR EXHAUSTIVENESS CERTIFICATION")
+    if resolutions:
+        print("Resolved failed command receipts retained:", len(resolutions["resolutions"]))
 
 
 def main():
@@ -820,6 +1025,9 @@ def main():
     new.add_argument("--source-ref", default="unverified")
     new.add_argument("--repo", required=True,
                      help="Git repository containing the pinned source commit")
+    new.add_argument("--compilation-policy", choices=["required", "delegated"],
+                     default="required",
+                     help="delegated requires explicit AKPM no-compilation workflow override")
     new.add_argument("--symbol", action="append", default=[],
                      metavar="H001:NAME",
                      help="supplement inventory with a symbol in verified hunk code or its enclosing definition")
@@ -868,11 +1076,22 @@ def main():
     ex.add_argument("--report", required=True)
     ex.add_argument("--reviewer", required=True)
     ex.set_defaults(func=external)
+    rr = sub.add_parser("resolve-retry", help="record explicit retry resolution without changing original evidence")
+    rr.add_argument("--manifest", required=True)
+    rr.add_argument("--gate", required=True)
+    rr.add_argument("--failed", required=True, help="SHA256 of canonical failed receipt")
+    rr.add_argument("--replacement", required=True, help="SHA256 of canonical successful receipt")
+    rr.add_argument("--reason", required=True)
+    rr.add_argument("--resolutions", required=True, help="separate additive resolution JSON")
+    rr.add_argument("--ref-repo", help="repository resolving a missing symbolic ref to the same commit")
+    rr.set_defaults(func=resolve_retry)
     ch = sub.add_parser("check", help="fail closed on missing or invalid evidence (exit 2)")
     ch.add_argument("--manifest", required=True)
+    ch.add_argument("--resolutions", help="explicit retry-resolution sidecar")
     ch.set_defaults(func=status)
     stat = sub.add_parser("status", help="show current hold/eligibility and missing evidence")
     stat.add_argument("--manifest", required=True)
+    stat.add_argument("--resolutions", help="explicit retry-resolution sidecar")
     stat.set_defaults(func=status)
     args = ap.parse_args()
     args.func(args)
