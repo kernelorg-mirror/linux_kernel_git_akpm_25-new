@@ -1,0 +1,70 @@
+From: Mani Tofigh <mt4022@columbia.edu>
+Subject: mm/shmem: fix swapin livelock on a mismatched large swap cache folio
+Date: Tue, 27 Oct 2026 16:33:32 -0400
+
+On a SWP_SYNCHRONOUS_IO swap device, a large shmem folio can be left in
+the swap cache over swap slots that another file now uses.  Reading that
+other file then loops forever in shmem_get_folio_gfp():
+shmem_swapin_folio() finds the large folio, rounds the index and the swap
+entry down to the folio's size, finds no matching entry in the file and
+returns -EEXIST, and the retry finds the same folio again.  Since the task
+keeps the mapping locked, a munmap() of the same mapping waits forever.
+
+The folio is left behind when the slots are freed and reused while the
+swapin is still allocating it:
+
+  Task A (reads X)                      Task B
+  ----------------                      ------
+  shmem_swapin_folio()
+    allocate a large folio
+    for X's slots
+                                        punch a hole in X
+                                        /* X's slots freed */
+                                        swap out file Y
+                                        /* Y reuses those slots */
+    add the folio to the swap
+    cache over those slots
+    shmem_confirm_swap() fails
+    /* -EEXIST, the folio stays
+       in the swap cache */
+
+  Task C (reads Y)
+  ----------------
+  shmem_swapin_folio()
+    finds the large folio
+    rounds down to its start,
+    where Y has no entry
+    /* -EEXIST, retried forever */
+
+Before commit c246d236b18b ("mm/shmem: never bypass the swap cache for
+SWP_SYNCHRONOUS_IO"), a direct swapin that failed this way freed its folio
+instead of leaving it in the swap cache.
+
+do_swap_page() already drops a large swap cache folio that does not fit
+for anonymous memory.  Do the same in shmem_swapin_folio() and on a
+-EEXIST, remove a large folio that is not anonymous/dirty/under-writeback
+from the swap cache so that the retry swaps in a folio that fits.
+
+The reproducer below fills a small brd swap device so that a 64K shmem
+folio and the 4K pages of another file land in the same slots, and races a
+read of the first file with a hole punch and a swapout of the second. 
+This bug was identified and confirmed with the help of a deterministic
+hypervisor currently under development, but the non-deterministic C
+reproducer can typically trigger it in the 2-4s time range.  With the fix,
+nothing is triggered after 600 seconds.
+
+Link: https://lore.kernel.org/20261027-shmem-swapin-mismatch-v1-1-84e30aa3b9e5@columbia.edu
+Fixes: c246d236b18b ("mm/shmem: never bypass the swap cache for SWP_SYNCHRONOUS_IO")
+Signed-off-by: Mani Tofigh <mt4022@columbia.edu>
+Reviewed-by: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Chris Li <chrisl@kernel.org>
+Cc: Kemeng Shi <shikemeng@huaweicloud.com>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Youngjun Park <youngjun.park@lge.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Tal Zussman <tz2294@columbia.edu>
+Cc: <stable@vger.kernel.org>
