@@ -1,0 +1,80 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: introduce shared decompression streams
+Date: Sun, 25 Oct 2026 11:18:28 +0900
+
+Currently, per-CPU decompression streams use a mutex, but most of the
+time there is nothing to protect.  Many backends have stateless
+decompression and don't modify decompression context, so those can be
+used concurrently.  The mutex is only needed for backends that do
+modify decompression context (zstd, deflate) and for compressed
+objects that span across physical pages, which zcomp linearises using
+stream's ->local_copy buffer before decompression.  That buffer,
+clearly, cannot be used concurrently.
+
+Serializing all Readers because of that also creates Reader vs Reader
+priority inversion - a low priority Reader that holds the stream mutex
+can get preempted, and a higher priority Reader that then needs the
+same per-CPU stream sleeps on that mutex until the scheduler runs the
+low priority Reader again.
+
+Switch zcomp_dstrm to permit parallel usage.  Give zcomp_dstrm two
+locks:
+- ->lock (rw_semaphore) pins the stream against CPU hotplug teardown.
+  Every decompression request takes it in read mode, and only
+  zcomp_cpu_dead() takes it in write mode.
+- ->excl_lock (mutex) serializes access to mutable stream state
+  (->local_copy and ->ctx).
+
+When the backend has no per-stream decompression context (stateless)
+and zsmalloc object fits in a single page (zcomp_shared_decomp()),
+the request touches neither ->local_copy nor ->ctx, so it only takes
+->lock in read mode (ZCOMP_DSTRM_SHARED).  Otherwise, when ->local_copy
+is needed or the backend has a decompression context (zstd, deflate),
+additionally take ->excl_lock (ZCOMP_DSTRM_EXCLUSIVE) so exclusive
+requests serialize only against each other without blocking shared
+readers.
+
+A quick synthetic fio test for Reader vs Reader inversion on 24 CPUs
+(preempt=full, lz4, 48 low priority (nice 19) readers, 24 normal
+priority (nice 0) CPU hogs and 24 high priority (nice -19) readers),
+fg reader results, average of 3 runs:
+
+  Metric           Base               Patched
+  ----------------------------------------------------------
+  Read IOPS        972k               1,466k        (+1.5x)
+  Read clat avg    11.56 us           3.29 us       (-3.5x)
+  Read clat stdev  2,739 us           16.6 us       (-165x)
+  Read clat max    2,204,467 us       6,442 us      (-342x)
+
+Reader vs Reader with CONFIG_SCHED_PROXY_EXEC=y in both kernels,
+21 runs each:
+
+                          Base                    Patched
+  ------------------------------------------------------------------
+  lz4      Read IOPS      1,456k (+-22k)          1,472k (+-4k)
+           Read clat p50  3.3 us                  3.3 us
+           Read clat p99  6.0 us                  5.9 us
+           Read clat max  2.8 ms - 951 ms         2.8 - 7.4 ms
+
+  Welch's t-test on IOPS, 21 runs each (patched vs base):
+                          diff        95% CI              p
+  ------------------------------------------------------------------
+  lz4                     +1.1%       [+7k, +26k]         0.004
+
+  Runs with max read latency over 100 ms / over 1 s:
+                          Base                    Patched
+  ------------------------------------------------------------------
+  lz4                     15 of 21 / 0 of 21      0 / 0
+
+Proxy execution closes the throughput gap, but shared streams don't
+block in the first place, so the worst case is still much better.
+
+Link: https://lore.kernel.org/20261025021839.1542805-13-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Suggested-by: Brian Geffon <bgeffon@google.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Bo Zhang <zhangbo0325@gmail.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Richard Chang <richardycc@google.com>
+Cc: Bo Zhang <zhangbo56@xiaomi.com>
+Cc: Hillf Danton <hdanton@sina.com>

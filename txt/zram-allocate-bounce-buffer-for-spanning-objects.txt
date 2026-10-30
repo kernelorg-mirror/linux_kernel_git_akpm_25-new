@@ -1,0 +1,51 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: allocate bounce buffer for spanning objects
+Date: Sun, 25 Oct 2026 11:18:29 +0900
+
+zsmalloc objects that span two physical pages need to be linearized
+before decompression, which zcomp does using stream's ->local_copy
+buffer.  That buffer cannot be used concurrently, so such reads take
+the stream in exclusive mode, even when the backend has stateless
+decompression.  And spanning objects are not rare: Bo Zhang measured
+23.3% of reads on lzo-rle going through the exclusive path, causing
+contention on ->excl_lock of up to 72-96 ms [1].
+
+Allocate a temporary bounce buffer for spanning objects instead, so
+that backends with stateless decompression can always use shared mode.
+If the allocation fails we fall back to ->local_copy under ->excl_lock.
+
+Per-request bounce buffer fixes the remaining tail latency, as was
+measured by Bo Zhang [2]:
+
+  Metric          Base      kmalloc bounce
+  ----------------------------------------
+  read contended  ~1,959    0
+  shared          76.7%     100%
+
+A quick synthetic fio test for Reader vs Reader inversion on 24 CPUs
+(lz4, 48 low priority (nice 19) readers, 24 normal priority CPU hogs
+and 24 high priority readers), average of 3 runs.  Base is the
+previous patch (shared streams without bounce buffer):
+
+  Metric           Base               Patched
+  ----------------------------------------------------------
+  Read IOPS        1,452k             1,466k        (+1.0%)
+  Read clat avg    3.46 us            3.30 us       (-4.9%)
+  Read clat stdev  165 us             15.69 us      (-10.5x)
+  Read clat max    306,679 us         7,060 us      (-43.4x)
+
+An alternative approach is to vm_map_ram() scattered objects
+(two pages), which fixes the tail latency in the same way,
+but deferred TLB flushes add more cost, so it was rejected.
+
+Link: https://lore.kernel.org/20261025021839.1542805-14-senozhatsky@chromium.org
+Link: https://lore.kernel.org/linux-kernel/20261014153603.1365617-1-zhangbo56@xiaomi.com [1]
+Link: https://lore.kernel.org/linux-kernel/20261016134847.1620103-1-zhangbo0325@gmail.com [2]
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Cc: Brian Geffon <bgeffon@google.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Bo Zhang <zhangbo0325@gmail.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Richard Chang <richardycc@google.com>
+Cc: Bo Zhang <zhangbo56@xiaomi.com>
+Cc: Hillf Danton <hdanton@sina.com>

@@ -1,0 +1,84 @@
+From: Sergey Senozhatsky <senozhatsky@chromium.org>
+Subject: zram: split zcomp into separate R/W streams
+Date: Sun, 25 Oct 2026 11:18:27 +0900
+
+Split struct zcomp_strm into separate compression (Write zcomp_cstrm)
+and decompression (Read zcomp_dstrm) streams, and split zcomp_ops
+context creation/destruction into create_cctx/destroy_cctx and
+optional create_dctx/destroy_dctx callbacks.
+
+Read and Write paths share no state - compression only uses the
+compression context and scratch buffer, decompression only uses the
+decompression context and local_copy buffer - so a unified per-CPU
+stream serializes them against each other for no reason.  The split
+keeps memory usage the same, but lets us treat Read and Write streams
+differently: decompression is stateless for many backends, so Read
+streams can be shared, and recompression is single-threaded, so
+secondary compressors need only one Write stream.  Both are done in
+follow-up patches.
+
+An immediate benefit is that Readers and Writers no longer wait for
+each other's streams.  A low priority Writer that holds the stream
+mutex can be preempted, and a high priority Reader that then needs
+the same per-CPU stream sleeps on that mutex until the scheduler runs
+the Writer again, which can take a long time when there are other
+runnable tasks (Writer vs Reader priority inversion).  Priority
+inheritance would only shorten that wait; separate streams remove it.
+
+A quick synthetic fio test for Writer vs Reader inversion on 24 CPUs
+(preempt=full, lz4, 48 low priority (nice 19) writers, 24 normal
+priority (nice 0) CPU hogs and 24 high priority (nice -19) readers),
+fg reader results, average of 3 runs:
+
+  Metric           Base               Patched
+  ----------------------------------------------------------
+  Read IOPS        642k               1,472k        (+2.3x)
+  Read clat avg    23.97 us           3.28 us       (-7.3x)
+  Read clat stdev  4,304 us           14.85 us      (-290x)
+  Read clat max    2,393,767 us       5,711 us      (-419x)
+
+Writer vs Reader with CONFIG_SCHED_PROXY_EXEC=y in both kernels,
+21 runs each:
+
+                          Base                    Patched
+  ------------------------------------------------------------------
+  lz4      Read IOPS      1,444k (+-27k)          1,467k (+-10k)
+           Read clat max  2.8 ms - 1.07 s         2.8 - 8.4 ms
+  zstd-3   Read IOPS      932k (+-260k)           1,174k (+-7k)
+           Read clat max  3.1 ms - 2.09 s         2.9 - 7.6 ms
+  zstd-12  Read IOPS      902k (+-269k)           1,154k (+-47k)
+           Read clat max  2.9 ms - 2.26 s         2.8 - 7.8 ms
+
+  Welch's t-test on IOPS, 21 runs each (patched vs base):
+                          diff        95% CI              p
+  ------------------------------------------------------------------
+  lz4                     +1.6%       [+11k, +35k]        0.001
+  zstd-3                  +25.9%      [+136k, +353k]      < 0.001
+  zstd-12                 +27.9%      [+142k, +367k]      < 0.001
+
+  Runs with max read latency over 100 ms / over 1 s:
+                          Base                    Patched
+  ------------------------------------------------------------------
+  lz4                     17 of 21 / 1 of 21      0 / 0
+  zstd-3                  17 of 21 / 11 of 21     0 / 0
+  zstd-12                 17 of 21 / 12 of 21     0 / 0
+
+Proxy execution helps, but the Reader still has to wait for the
+Writer, and the worst case is still hundreds of milliseconds.  With
+zstd, where compression takes longer, patched is 26-28% faster even
+with proxy execution, at level 3 and at level 12.  The real worst
+case is direct reclaim in zs_malloc() under stream lock, which this
+test does not show.
+
+This is, of course, an extreme synthetic test; the point of the split
+is that the Reader has nothing to wait for, not that it waits less.
+
+Link: https://lore.kernel.org/20261025021839.1542805-12-senozhatsky@chromium.org
+Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+Suggested-by: Barry Song <baohua@kernel.org>
+Acked-by: Brian Geffon <bgeffon@google.com>
+Cc: Bo Zhang <zhangbo0325@gmail.com>
+Cc: Minchan Kim <minchan@kernel.org>
+Cc: Richard Chang <richardycc@google.com>
+Cc: Bo Zhang <zhangbo56@xiaomi.com>
+Cc: Hillf Danton <hdanton@sina.com>
