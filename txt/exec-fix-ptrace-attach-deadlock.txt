@@ -1,0 +1,84 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: exec: wait for zombie reaping outside exec locks
+Date: Mon, 02 Nov 2026 22:11:25 +0000
+
+A tracer can hang in PTRACE_ATTACH when the target is executing a new
+program and has a traced zombie sibling. Exec holds cred_guard_mutex while
+de_thread() waits for the tracer to reap the sibling. The tracer is waiting
+for that mutex, so it cannot reach waitpid().
+
+Split the wait into two phases. Wait for the other threads to reach
+exit_notify() before changing the execution context, but defer waiting for
+their reaping until setup_new_exec() has released the exec locks. Keep both
+waits killable, serialize their counters with tasklist_lock, and clear
+group_exec_task on failure. Update the remaining zombies when a non-leader
+takes over the process identity.
+
+Keep signal-table unsharing and handler reset before the credential hooks.
+SELinux can reset handlers in bprm_committed_creds(), so postponing
+unsharing until after that hook would also affect unrelated CLONE_SIGHAND
+users. Move the remaining zombies to the new sighand together with the
+execing thread, preserving a common siglock for their signal_struct until
+they are reaped.
+
+Prevent threads killed by exec from stopping again in PTRACE_EVENT_EXIT.
+Otherwise the exit phase can still wait for the same blocked tracer. This
+changes the exit-stop behavior of those threads.
+
+Update the attach selftest to expect success, replace its sleeps with pipe
+and waitid synchronization, and cover non-leader exec and TRACEEXIT.
+Continue both the attach stop and the legacy exec SIGTRAP before checking
+normal exit.
+
+This reworks Oleg Nesterov's November 2025 RFC, retaining its exit/reaping
+split and exit-stop handling. The sighand migration, locked counter waits
+and regression tests are new.
+
+Link: https://patchew.org/linux/aRDL3HOB21pMVMWC@redhat.com/
+Fixes: cad81bc2529a ("ptrace: ptrace_attach: fix the usage of ->cred_exec_mutex")
+Suggested-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Bernd Edlinger <bernd.edlinger@hotmail.de>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Paul Moore <paul@paul-moore.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+---
+RFC for review and VM testing; not a runtime-validated fix. Prepared with
+Codex assistance from the reported timeout, the source and Oleg's RFC. No
+human signoff or testing endorsement has been added.
+
+Base: akpm/mm mm-unstable, 7ab241d93d6904354022e80b58fd4e449e95fbde. This
+is not the reporter's exact 1f1d65217052 checkout. The Fixes tag follows
+source comparison with cad81bc2529ab and its parent, not a historical
+runtime bisection.
+
+Built with GCC 13.3 on x86-64: fs/exec.o, kernel/exit.o, kernel/signal.o,
+fs/binfmt_elf.o and fs/compat_binfmt_elf.o. The ptrace selftest directory
+also builds after generating the matching UAPI headers. No compiler
+warnings. ELF-FDPIC and FLAT were not compiled; no full kernel link or
+guest boot was performed.
+
+Ran the supplied configure-kernel.sh before the kernel object build. Its
+final check rejects an omitted CONFIG_DEBUG_INFO_BTF line when
+BPF_SYSCALL=n makes that option unavailable. Independently checked all
+requested configuration states, including KASAN and DWARF5 enabled and BTF,
+KCOV and the ftrace startup test disabled. The project script was not
+changed.
+
+Local runtime testing is blocked: PTRACE_TRACEME returns EPERM. The local
+attach test consequently failed in setup, before reaching the regression.
+The previously supplied VM timeout remains reporter-provided evidence from
+the unfixed kernel; it is not evidence of this patch working.
+
+Before use, boot a kernel with this patch after running configure-kernel.sh
+and building it. Rebuild and copy vmaccess into that guest, then run
+attach, attach_nonleader and attach_exit individually and repeatedly. Also
+test SIGKILL during both exec waits and exec with an unrelated
+CLONE_SIGHAND sharer, including SELinux credential transitions. Those cases
+have not been run here.
+
+Validation: strict checkpatch with --no-signoff, git diff --check and git
+apply --check --whitespace=error against clean copies of the base files.

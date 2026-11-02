@@ -1,0 +1,667 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: exec: wait for zombie reaping outside exec locks
+Date: Mon, 02 Nov 2026 22:11:25 +0000
+
+A tracer can hang in PTRACE_ATTACH when the target is executing a new
+program and has a traced zombie sibling. Exec holds cred_guard_mutex while
+de_thread() waits for the tracer to reap the sibling. The tracer is waiting
+for that mutex, so it cannot reach waitpid().
+
+Split the wait into two phases. Wait for the other threads to reach
+exit_notify() before changing the execution context, but defer waiting for
+their reaping until setup_new_exec() has released the exec locks. Keep both
+waits killable, serialize their counters with tasklist_lock, and clear
+group_exec_task on failure. Update the remaining zombies when a non-leader
+takes over the process identity.
+
+Keep signal-table unsharing and handler reset before the credential hooks.
+SELinux can reset handlers in bprm_committed_creds(), so postponing
+unsharing until after that hook would also affect unrelated CLONE_SIGHAND
+users. Move the remaining zombies to the new sighand together with the
+execing thread, preserving a common siglock for their signal_struct until
+they are reaped.
+
+Prevent threads killed by exec from stopping again in PTRACE_EVENT_EXIT.
+Otherwise the exit phase can still wait for the same blocked tracer. This
+changes the exit-stop behavior of those threads.
+
+Update the attach selftest to expect success, replace its sleeps with pipe
+and waitid synchronization, and cover non-leader exec and TRACEEXIT.
+Continue both the attach stop and the legacy exec SIGTRAP before checking
+normal exit.
+
+This reworks Oleg Nesterov's November 2025 RFC, retaining its exit/reaping
+split and exit-stop handling. The sighand migration, locked counter waits
+and regression tests are new.
+
+Link: https://patchew.org/linux/aRDL3HOB21pMVMWC@redhat.com/
+Fixes: cad81bc2529a ("ptrace: ptrace_attach: fix the usage of ->cred_exec_mutex")
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Suggested-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Bernd Edlinger <bernd.edlinger@hotmail.de>
+Cc: Kees Cook <kees@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Paul Moore <paul@paul-moore.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+---
+RFC for review and VM testing; not a runtime-validated fix. Prepared with
+Codex assistance from the reported timeout, the source and Oleg's RFC. No
+human signoff or testing endorsement has been added.
+
+Base: akpm/mm mm-unstable, 7ab241d93d6904354022e80b58fd4e449e95fbde. This
+is not the reporter's exact 1f1d65217052 checkout. The Fixes tag follows
+source comparison with cad81bc2529ab and its parent, not a historical
+runtime bisection.
+
+Built with GCC 13.3 on x86-64: fs/exec.o, kernel/exit.o, kernel/signal.o,
+fs/binfmt_elf.o and fs/compat_binfmt_elf.o. The ptrace selftest directory
+also builds after generating the matching UAPI headers. No compiler
+warnings. ELF-FDPIC and FLAT were not compiled; no full kernel link or
+guest boot was performed.
+
+Ran the supplied configure-kernel.sh before the kernel object build. Its
+final check rejects an omitted CONFIG_DEBUG_INFO_BTF line when
+BPF_SYSCALL=n makes that option unavailable. Independently checked all
+requested configuration states, including KASAN and DWARF5 enabled and BTF,
+KCOV and the ftrace startup test disabled. The project script was not
+changed.
+
+Local runtime testing is blocked: PTRACE_TRACEME returns EPERM. The local
+attach test consequently failed in setup, before reaching the regression.
+The previously supplied VM timeout remains reporter-provided evidence from
+the unfixed kernel; it is not evidence of this patch working.
+
+Before use, boot a kernel with this patch after running configure-kernel.sh
+and building it. Rebuild and copy vmaccess into that guest, then run
+attach, attach_nonleader and attach_exit individually and repeatedly. Also
+test SIGKILL during both exec waits and exec with an unrelated
+CLONE_SIGHAND sharer, including SELinux credential transitions. Those cases
+have not been run here.
+
+Validation: strict checkpatch with --no-signoff, git diff --check and git
+apply --check --whitespace=error against clean copies of the base files.
+
+ fs/binfmt_elf.c                           |    4 
+ fs/binfmt_elf_fdpic.c                     |    4 
+ fs/binfmt_flat.c                          |    4 
+ fs/exec.c                                 |  167 +++++++++++---------
+ include/linux/binfmts.h                   |    2 
+ include/linux/sched/signal.h              |    2 
+ kernel/exit.c                             |   11 -
+ kernel/signal.c                           |    6 
+ tools/testing/selftests/ptrace/vmaccess.c |  149 ++++++++++++++---
+ 9 files changed, 240 insertions(+), 109 deletions(-)
+
+--- a/fs/binfmt_elf.c~exec-fix-ptrace-attach-deadlock
++++ a/fs/binfmt_elf.c
+@@ -1021,7 +1021,9 @@ out_free_interp:
+ 	if (!(current->personality & ADDR_NO_RANDOMIZE) && snapshot_randomize_va_space)
+ 		current->flags |= PF_RANDOMIZE;
+ 
+-	setup_new_exec(bprm);
++	retval = setup_new_exec(bprm);
++	if (retval)
++		goto out_free_dentry;
+ 
+ 	/* Do this so that we can load the interpreter, if need be.  We will
+ 	   change some of these later */
+--- a/fs/binfmt_elf_fdpic.c~exec-fix-ptrace-attach-deadlock
++++ a/fs/binfmt_elf_fdpic.c
+@@ -359,7 +359,9 @@ static int load_elf_fdpic_binary(struct
+ 	if (elf_read_implies_exec(&exec_params.hdr, executable_stack))
+ 		current->personality |= READ_IMPLIES_EXEC;
+ 
+-	setup_new_exec(bprm);
++	retval = setup_new_exec(bprm);
++	if (retval)
++		goto error;
+ 
+ 	set_binfmt(&elf_fdpic_format);
+ 
+--- a/fs/binfmt_flat.c~exec-fix-ptrace-attach-deadlock
++++ a/fs/binfmt_flat.c
+@@ -512,7 +512,9 @@ static int load_flat_file(struct linux_b
+ 
+ 	/* OK, This is the point of no return */
+ 	set_personality(PER_LINUX_32BIT);
+-	setup_new_exec(bprm);
++	ret = setup_new_exec(bprm);
++	if (ret)
++		goto err;
+ 
+ 	/*
+ 	 * calculate the extra space we need to map in
+--- a/fs/exec.c~exec-fix-ptrace-attach-deadlock
++++ a/fs/exec.c
+@@ -920,42 +920,68 @@ static void exec_mm_put_old(struct mm_st
+ 	mmput(old_mm);
+ }
+ 
++/*
++ * Negative notify_count counts threads which have not reached exit_notify().
++ * Positive notify_count counts zombies still waiting to be reaped.
++ * tasklist_lock serializes both waits with exit_notify() and __exit_signal().
++ */
++static int wait_for_notify_count(struct task_struct *tsk)
++{
++	struct signal_struct *sig = tsk->signal;
++	int err = 0;
++
++	read_lock(&tasklist_lock);
++	while (sig->notify_count) {
++		set_current_state(TASK_KILLABLE);
++		if (__fatal_signal_pending(tsk)) {
++			err = -EINTR;
++			break;
++		}
++		read_unlock(&tasklist_lock);
++		schedule();
++		read_lock(&tasklist_lock);
++	}
++	read_unlock(&tasklist_lock);
++	__set_current_state(TASK_RUNNING);
++	return err;
++}
++
++static void clear_group_exec_task(struct task_struct *tsk)
++{
++	struct signal_struct *sig = tsk->signal;
++
++	read_lock(&tasklist_lock);
++	spin_lock_irq(&tsk->sighand->siglock);
++	WRITE_ONCE(sig->group_exec_task, NULL);
++	sig->notify_count = 0;
++	spin_unlock_irq(&tsk->sighand->siglock);
++	read_unlock(&tasklist_lock);
++}
++
+ static int de_thread(struct task_struct *tsk)
+ {
+ 	struct signal_struct *sig = tsk->signal;
+-	struct sighand_struct *oldsighand = tsk->sighand;
+-	spinlock_t *lock = &oldsighand->siglock;
++	int err = -EINTR;
+ 
+ 	if (thread_group_empty(tsk))
+ 		goto no_thread_group;
+ 
+-	/*
+-	 * Kill all other threads in the thread group.
+-	 */
+-	spin_lock_irq(lock);
+-	if ((sig->flags & SIGNAL_GROUP_EXIT) || sig->group_exec_task) {
+-		/*
+-		 * Another group action in progress, just
+-		 * return so that the signal is processed.
+-		 */
+-		spin_unlock_irq(lock);
+-		return -EAGAIN;
++	/* Wait for other threads to exit, but not for their tracers. */
++	read_lock(&tasklist_lock);
++	spin_lock_irq(&tsk->sighand->siglock);
++	if (!(sig->flags & SIGNAL_GROUP_EXIT) && !sig->group_exec_task) {
++		WRITE_ONCE(sig->group_exec_task, tsk);
++		sig->notify_count = -zap_other_threads(tsk);
++		err = 0;
+ 	}
++	spin_unlock_irq(&tsk->sighand->siglock);
++	read_unlock(&tasklist_lock);
+ 
+-	sig->group_exec_task = tsk;
+-	sig->notify_count = zap_other_threads(tsk);
+-	if (!thread_group_leader(tsk))
+-		sig->notify_count--;
+-
+-	while (sig->notify_count) {
+-		__set_current_state(TASK_KILLABLE);
+-		spin_unlock_irq(lock);
+-		schedule();
+-		if (__fatal_signal_pending(tsk))
+-			goto killed;
+-		spin_lock_irq(lock);
+-	}
+-	spin_unlock_irq(lock);
++	if (err)
++		return err;
++	err = wait_for_notify_count(tsk);
++	if (err)
++		return err;
+ 
+ 	/*
+ 	 * At this point all other threads have exited, all we have to
+@@ -963,26 +989,10 @@ static int de_thread(struct task_struct
+ 	 * and to assume its PID:
+ 	 */
+ 	if (!thread_group_leader(tsk)) {
+-		struct task_struct *leader = tsk->group_leader;
+-
+-		for (;;) {
+-			cgroup_threadgroup_change_begin(tsk);
+-			write_lock_irq(&tasklist_lock);
+-			/*
+-			 * Do this under tasklist_lock to ensure that
+-			 * exit_notify() can't miss ->group_exec_task
+-			 */
+-			sig->notify_count = -1;
+-			if (likely(leader->exit_state))
+-				break;
+-			__set_current_state(TASK_KILLABLE);
+-			write_unlock_irq(&tasklist_lock);
+-			cgroup_threadgroup_change_end(tsk);
+-			schedule();
+-			if (__fatal_signal_pending(tsk))
+-				goto killed;
+-		}
++		struct task_struct *leader = tsk->group_leader, *t;
+ 
++		cgroup_threadgroup_change_begin(tsk);
++		write_lock_irq(&tasklist_lock);
+ 		/*
+ 		 * The only record we have of the real-time age of a
+ 		 * process, regardless of execs it's done, is start_time.
+@@ -1015,8 +1025,8 @@ static int de_thread(struct task_struct
+ 		list_replace_rcu(&leader->tasks, &tsk->tasks);
+ 		list_replace_init(&leader->sibling, &tsk->sibling);
+ 
+-		tsk->group_leader = tsk;
+-		leader->group_leader = tsk;
++		for_each_thread(tsk, t)
++			t->group_leader = tsk;
+ 
+ 		tsk->exit_signal = SIGCHLD;
+ 		leader->exit_signal = -1;
+@@ -1036,23 +1046,12 @@ static int de_thread(struct task_struct
+ 		release_task(leader);
+ 	}
+ 
+-	sig->group_exec_task = NULL;
+-	sig->notify_count = 0;
+-
+ no_thread_group:
+ 	/* we have changed execution domain */
+ 	tsk->exit_signal = SIGCHLD;
+ 
+ 	BUG_ON(!thread_group_leader(tsk));
+ 	return 0;
+-
+-killed:
+-	/* protects against exit_notify() and __exit_signal() */
+-	read_lock(&tasklist_lock);
+-	sig->group_exec_task = NULL;
+-	sig->notify_count = 0;
+-	read_unlock(&tasklist_lock);
+-	return -EAGAIN;
+ }
+ 
+ 
+@@ -1068,25 +1067,34 @@ static int unshare_sighand(struct task_s
+ 
+ 	if (refcount_read(&oldsighand->count) != 1) {
+ 		struct sighand_struct *newsighand;
+-		/*
+-		 * This ->sighand is shared with the CLONE_SIGHAND
+-		 * but not CLONE_THREAD task, switch to the new one.
+-		 */
++		struct task_struct *t;
++		int nr_threads;
++
++		/* Exclude CLONE_SIGHAND tasks outside this thread group. */
+ 		newsighand = kmem_cache_alloc(sighand_cachep, GFP_KERNEL);
+ 		if (!newsighand)
+ 			return -ENOMEM;
+ 
+-		refcount_set(&newsighand->count, 1);
+-
+ 		write_lock_irq(&tasklist_lock);
+ 		spin_lock(&oldsighand->siglock);
+ 		memcpy(newsighand->action, oldsighand->action,
+ 		       sizeof(newsighand->action));
+-		rcu_assign_pointer(me->sighand, newsighand);
++		/*
++		 * Other threads have exited, but a tracer may still own their
++		 * zombies. Keep one siglock for the entire signal_struct until
++		 * those threads are reaped. tasklist_lock pins the thread list;
++		 * the old siglock excludes users of the signal state while we
++		 * publish the replacement sighand.
++		 */
++		nr_threads = me->signal->nr_threads;
++		refcount_set(&newsighand->count, nr_threads);
++		for_each_thread(me, t)
++			rcu_assign_pointer(t->sighand, newsighand);
+ 		spin_unlock(&oldsighand->siglock);
+ 		write_unlock_irq(&tasklist_lock);
+ 
+-		__cleanup_sighand(oldsighand);
++		while (nr_threads--)
++			__cleanup_sighand(oldsighand);
+ 	}
+ 	return 0;
+ }
+@@ -1157,7 +1165,7 @@ int begin_new_exec(struct linux_binprm *
+ 	 */
+ 	io_uring_task_cancel();
+ 
+-	/* Make this the only thread in the thread group */
++	/* Make this the only live thread in the thread group. */
+ 	retval = de_thread(me);
+ 	if (retval)
+ 		goto out;
+@@ -1347,6 +1355,8 @@ out_unlock:
+ 		mutex_unlock(&me->signal->cred_guard_mutex);
+ 
+ out:
++	if (READ_ONCE(me->signal->group_exec_task) == me)
++		clear_group_exec_task(me);
+ 	return retval;
+ }
+ EXPORT_SYMBOL(begin_new_exec);
+@@ -1373,10 +1383,12 @@ void would_dump(struct linux_binprm *bpr
+ }
+ EXPORT_SYMBOL(would_dump);
+ 
+-void setup_new_exec(struct linux_binprm * bprm)
++int setup_new_exec(struct linux_binprm *bprm)
+ {
+ 	/* Setup things that can depend upon the personality */
+ 	struct task_struct *me = current;
++	struct signal_struct *sig = me->signal;
++	int err = 0;
+ 
+ 	arch_pick_mmap_layout(me->mm, &bprm->rlim_stack);
+ 
+@@ -1387,14 +1399,27 @@ void setup_new_exec(struct linux_binprm
+ 	 * some architectures like powerpc
+ 	 */
+ 	me->mm->task_size = TASK_SIZE;
+-	up_write(&me->signal->exec_update_lock);
+-	mutex_unlock(&me->signal->cred_guard_mutex);
++	up_write(&sig->exec_update_lock);
++	mutex_unlock(&sig->cred_guard_mutex);
++
++	/* The tracer can now attach before reaping the other threads. */
++	if (READ_ONCE(sig->group_exec_task)) {
++		read_lock(&tasklist_lock);
++		spin_lock_irq(&me->sighand->siglock);
++		sig->notify_count = sig->nr_threads - 1;
++		spin_unlock_irq(&me->sighand->siglock);
++		read_unlock(&tasklist_lock);
++
++		err = wait_for_notify_count(me);
++		clear_group_exec_task(me);
++	}
+ 
+ 	/* The exec locks are dropped: release the old address space now. */
+ 	if (bprm->old_mm) {
+ 		exec_mm_put_old(bprm->old_mm);
+ 		bprm->old_mm = NULL;
+ 	}
++	return err;
+ }
+ EXPORT_SYMBOL(setup_new_exec);
+ 
+--- a/include/linux/binfmts.h~exec-fix-ptrace-attach-deadlock
++++ a/include/linux/binfmts.h
+@@ -161,7 +161,7 @@ extern void unregister_binfmt(struct lin
+ 
+ extern int __must_check remove_arg_zero(struct linux_binprm *);
+ extern int begin_new_exec(struct linux_binprm * bprm);
+-extern void setup_new_exec(struct linux_binprm * bprm);
++int setup_new_exec(struct linux_binprm *bprm);
+ extern void finalize_exec(struct linux_binprm *bprm);
+ extern void would_dump(struct linux_binprm *, struct file *);
+ struct file *bprm_open_interpreter(struct linux_binprm *bprm, const char *path);
+--- a/include/linux/sched/signal.h~exec-fix-ptrace-attach-deadlock
++++ a/include/linux/sched/signal.h
+@@ -112,7 +112,7 @@ struct signal_struct {
+ 
+ 	/* thread group exit support */
+ 	int			group_exit_code;
+-	/* notify group_exec_task when notify_count is less or equal to 0 */
++	/* < 0: threads exiting; > 0: zombies being reaped; wake at 0 */
+ 	int			notify_count;
+ 	struct task_struct	*group_exec_task;
+ 
+--- a/kernel/exit.c~exec-fix-ptrace-attach-deadlock
++++ a/kernel/exit.c
+@@ -172,10 +172,7 @@ static void __exit_signal(struct release
+ 		tty = sig->tty;
+ 		sig->tty = NULL;
+ 	} else {
+-		/*
+-		 * If there is any task waiting for the group exit
+-		 * then notify it:
+-		 */
++		/* setup_new_exec() is waiting for the remaining zombies. */
+ 		if (sig->notify_count > 0 && !--sig->notify_count)
+ 			wake_up_process(sig->group_exec_task);
+ 
+@@ -771,8 +768,8 @@ static void exit_notify(struct task_stru
+ 		list_add(&tsk->ptrace_entry, &dead);
+ 	}
+ 
+-	/* mt-exec, de_thread() is waiting for group leader */
+-	if (unlikely(tsk->signal->notify_count < 0))
++	/* de_thread() is waiting for the other threads to exit. */
++	if (tsk->signal->notify_count < 0 && !++tsk->signal->notify_count)
+ 		wake_up_process(tsk->signal->group_exec_task);
+ 	write_unlock_irq(&tasklist_lock);
+ 
+@@ -1101,7 +1098,7 @@ do_group_exit(int exit_code)
+ 
+ 	if (sig->flags & SIGNAL_GROUP_EXIT)
+ 		exit_code = sig->group_exit_code;
+-	else if (sig->group_exec_task)
++	else if (READ_ONCE(sig->group_exec_task))
+ 		exit_code = 0;
+ 	else {
+ 		struct sighand_struct *const sighand = current->sighand;
+--- a/kernel/signal.c~exec-fix-ptrace-attach-deadlock
++++ a/kernel/signal.c
+@@ -1379,13 +1379,13 @@ int zap_other_threads(struct task_struct
+ 
+ 	for_other_threads(p, t) {
+ 		task_clear_jobctl_pending(t, JOBCTL_PENDING_MASK);
+-		count++;
+ 
+ 		/* Don't bother with already dead threads */
+ 		if (t->exit_state)
+ 			continue;
+ 		sigaddset(&t->pending.signal, SIGKILL);
+ 		signal_wake_up(t, 1);
++		count++;
+ 	}
+ 
+ 	return count;
+@@ -2454,6 +2454,10 @@ static int ptrace_stop(int exit_code, in
+ 	if (!current->ptrace || __fatal_signal_pending(current))
+ 		return exit_code;
+ 
++	/* Exec must not wait for a tracer at PTRACE_EVENT_EXIT either. */
++	if (current->signal->group_exec_task)
++		return exit_code;
++
+ 	set_special_state(TASK_TRACED);
+ 	current->jobctl |= JOBCTL_TRACED;
+ 
+--- a/tools/testing/selftests/ptrace/vmaccess.c~exec-fix-ptrace-attach-deadlock
++++ a/tools/testing/selftests/ptrace/vmaccess.c
+@@ -7,6 +7,7 @@
+  * when de_thread is blocked with ->cred_guard_mutex held.
+  */
+ 
++#define _GNU_SOURCE
+ #include "kselftest_harness.h"
+ #include <stdio.h>
+ #include <fcntl.h>
+@@ -43,44 +44,142 @@ TEST(vmaccess)
+ 	ASSERT_EQ(f, 0);
+ }
+ 
+-TEST(attach)
++struct traced_thread_args {
++	int tid_fd;
++	bool trace_exit;
++};
++
++/* Report the traced TID without requiring the parent to reap it. */
++static void *traced_thread(void *arg)
+ {
+-	int s, k, pid = fork();
++	struct traced_thread_args *args = arg;
++	pid_t tid = gettid();
++
++	if (ptrace(PTRACE_TRACEME, 0, 0L, 0L) ||
++	    write(args->tid_fd, &tid, sizeof(tid)) != sizeof(tid))
++		_exit(1);
++	if (args->trace_exit) {
++		raise(SIGSTOP);
++		for (;;)
++			pause();
++	}
++	return NULL;
++}
++
++static void *exec_thread(void *arg)
++{
++	execlp("true", "true", NULL);
++	_exit(1);
++}
++
++static void attach_test(struct __test_metadata *_metadata, bool nonleader,
++			bool trace_exit)
++{
++	int s, k, tid_pipe[2], exec_pipe[2], start_pipe[2];
++	pid_t pid, tid;
++	siginfo_t info;
++	char byte;
++	bool saw_stop = false;
++
++	ASSERT_EQ(pipe2(tid_pipe, O_CLOEXEC), 0);
++	ASSERT_EQ(pipe2(exec_pipe, O_CLOEXEC), 0);
++	ASSERT_EQ(pipe2(start_pipe, O_CLOEXEC), 0);
++	pid = fork();
++	ASSERT_GE(pid, 0);
+ 
+ 	if (!pid) {
++		struct traced_thread_args args = { tid_pipe[1], trace_exit };
+ 		pthread_t pt;
+ 
+-		pthread_create(&pt, NULL, thread, NULL);
+-		pthread_join(pt, NULL);
+-		execlp("sleep", "sleep", "2", NULL);
++		close(tid_pipe[0]);
++		close(exec_pipe[0]);
++		close(start_pipe[1]);
++		if (pthread_create(&pt, NULL, traced_thread, &args))
++			_exit(1);
++		if (trace_exit) {
++			if (read(start_pipe[0], &byte, 1) != 1)
++				_exit(1);
++		} else if (pthread_join(pt, NULL)) {
++			_exit(1);
++		}
++		close(start_pipe[0]);
++		if (nonleader) {
++			if (pthread_create(&pt, NULL, exec_thread, NULL))
++				_exit(1);
++			for (;;)
++				pause();
++		}
++		exec_thread(NULL);
+ 	}
+ 
+-	sleep(1);
+-	k = ptrace(PTRACE_ATTACH, pid, 0L, 0L);
+-	ASSERT_EQ(errno, EAGAIN);
+-	ASSERT_EQ(k, -1);
+-	k = waitpid(-1, &s, WNOHANG);
+-	ASSERT_NE(k, -1);
+-	ASSERT_NE(k, 0);
+-	ASSERT_NE(k, pid);
+-	ASSERT_EQ(WIFEXITED(s), 1);
+-	ASSERT_EQ(WEXITSTATUS(s), 0);
+-	sleep(1);
++	close(tid_pipe[1]);
++	close(exec_pipe[1]);
++	close(start_pipe[0]);
++	ASSERT_EQ(read(tid_pipe[0], &tid, sizeof(tid)), sizeof(tid));
++	close(tid_pipe[0]);
++	if (trace_exit) {
++		ASSERT_EQ(waitpid(tid, &s, __WALL), tid);
++		ASSERT_EQ(WIFSTOPPED(s), 1);
++		ASSERT_EQ(WSTOPSIG(s), SIGSTOP);
++		ASSERT_EQ(ptrace(PTRACE_SETOPTIONS, tid, 0L,
++				 PTRACE_O_TRACEEXIT), 0);
++		ASSERT_EQ(ptrace(PTRACE_CONT, tid, 0L, 0L), 0);
++		ASSERT_EQ(write(start_pipe[1], "x", 1), 1);
++	} else {
++		ASSERT_EQ(waitid(P_PID, tid, &info,
++				 WEXITED | WNOWAIT | __WALL), 0);
++		ASSERT_EQ(info.si_code, CLD_EXITED);
++		ASSERT_EQ(info.si_status, 0);
++	}
++	close(start_pipe[1]);
++
++	/*
++	 * CLOEXEC closes the pipe after de_thread(). The traced zombie is
++	 * still ours (including when exec killed it with TRACEEXIT enabled),
++	 * so exec cannot finish until we reap it below. This
++	 * replaces the sleeps with a stable point inside exec. On a broken
++	 * kernel de_thread() itself waits for us and this read times out.
++	 */
++	ASSERT_EQ(read(exec_pipe[0], &byte, 1), 0);
++	close(exec_pipe[0]);
+ 	k = ptrace(PTRACE_ATTACH, pid, 0L, 0L);
+ 	ASSERT_EQ(k, 0);
+-	k = waitpid(-1, &s, 0);
+-	ASSERT_EQ(k, pid);
+-	ASSERT_EQ(WIFSTOPPED(s), 1);
+-	ASSERT_EQ(WSTOPSIG(s), SIGSTOP);
+-	k = ptrace(PTRACE_DETACH, pid, 0L, 0L);
+-	ASSERT_EQ(k, 0);
+-	k = waitpid(-1, &s, 0);
+-	ASSERT_EQ(k, pid);
++	k = waitpid(tid, &s, __WALL);
++	ASSERT_EQ(k, tid);
+ 	ASSERT_EQ(WIFEXITED(s), 1);
+ 	ASSERT_EQ(WEXITSTATUS(s), 0);
+-	k = waitpid(-1, NULL, 0);
++	/* Attaching during exec can also produce its legacy SIGTRAP stop. */
++	for (;;) {
++		k = waitpid(pid, &s, 0);
++		ASSERT_EQ(k, pid);
++		if (WIFEXITED(s))
++			break;
++		ASSERT_EQ(WIFSTOPPED(s), 1);
++		ASSERT_TRUE(WSTOPSIG(s) == SIGSTOP || WSTOPSIG(s) == SIGTRAP);
++		if (WSTOPSIG(s) == SIGSTOP)
++			saw_stop = true;
++		ASSERT_EQ(ptrace(PTRACE_CONT, pid, 0L, 0L), 0);
++	}
++	ASSERT_TRUE(saw_stop);
++	ASSERT_EQ(WEXITSTATUS(s), 0);
++	k = waitpid(-1, NULL, __WALL);
+ 	ASSERT_EQ(k, -1);
+ 	ASSERT_EQ(errno, ECHILD);
+ }
+ 
++TEST(attach)
++{
++	attach_test(_metadata, false, false);
++}
++
++TEST(attach_nonleader)
++{
++	attach_test(_metadata, true, false);
++}
++
++TEST(attach_exit)
++{
++	attach_test(_metadata, false, true);
++}
++
+ TEST_HARNESS_MAIN
+_
