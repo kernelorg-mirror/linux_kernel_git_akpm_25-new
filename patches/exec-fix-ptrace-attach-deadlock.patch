@@ -47,42 +47,118 @@ Cc: Shuah Khan <shuah@kernel.org>
 Cc: Paul Moore <paul@paul-moore.com>
 Cc: Eric W. Biederman <ebiederm@xmission.com>
 ---
-RFC for review and VM testing; not a runtime-validated fix. Prepared with
-Codex assistance from the reported timeout, the source and Oleg's RFC. No
-human signoff or testing endorsement has been added.
+RFC for Oleg's review, prepared with Codex assistance. This resend updates
+only these testing notes; the changelog above and the diff are unchanged.
+Guest results below were obtained by Andrew Morton on ts. The separate
+Codex build and harness checks are identified explicitly.
 
-Base: akpm/mm mm-unstable, 7ab241d93d6904354022e80b58fd4e449e95fbde. This
-is not the reporter's exact 1f1d65217052 checkout. The Fixes tag follows
-source comparison with cad81bc2529ab and its parent, not a historical
-runtime bisection.
+Base: akpm/mm mm-unstable, 7ab241d93d6904354022e80b58fd4e449e95fbde. The
+Fixes tag follows source comparison with cad81bc2529ab and its parent,
+not a historical runtime bisection.
 
-Built with GCC 13.3 on x86-64: fs/exec.o, kernel/exit.o, kernel/signal.o,
-fs/binfmt_elf.o and fs/compat_binfmt_elf.o. The ptrace selftest directory
-also builds after generating the matching UAPI headers. No compiler
-warnings. ELF-FDPIC and FLAT were not compiled; no full kernel link or
-guest boot was performed.
+Guest regression testing:
 
-Ran the supplied configure-kernel.sh before the kernel object build. Its
-final check rejects an omitted CONFIG_DEBUG_INFO_BTF line when
-BPF_SYSCALL=n makes that option unavailable. Independently checked all
-requested configuration states, including KASAN and DWARF5 enabled and BTF,
-KCOV and the ftrace startup test disabled. The project script was not
-changed.
+- Before this exec fix, vmaccess -t attach timed out on
+  7.4.0-rc1-g1f1d65217052, with Drif's separate proc-empty-vm patch already
+  applied. The tracer was blocked in ptrace_attach(), the execing task
+  was blocked in begin_new_exec(), and its traced sibling was a zombie.
 
-Local runtime testing is blocked: PTRACE_TRACEME returns EPERM. The local
-attach test consequently failed in setup, before reaching the regression.
-The previously supplied VM timeout remains reporter-provided evidence from
-the unfixed kernel; it is not evidence of this patch working.
+- With this patch applied, the updated vmaccess attach, attach_nonleader
+  and attach_exit tests passed individually and for 100 repetitions each.
+  These cover leader and non-leader exec with a traced zombie, and exec
+  killing a traced sibling with PTRACE_O_TRACEEXIT enabled. The tests
+  synchronize with pipes and waitid(WNOWAIT), attach before reaping the
+  sibling, handle the attach/exec stops, and require successful exit.
 
-Before use, boot a kernel with this patch after running configure-kernel.sh
-and building it. Rebuild and copy vmaccess into that guest, then run
-attach, attach_nonleader and attach_exit individually and repeatedly. Also
-test SIGKILL during both exec waits and exec with an unrelated
-CLONE_SIGHAND sharer, including SELinux credential transitions. Those cases
-have not been run here.
+- The broader non-BPF exec and ptrace selftest run reported 24 passes,
+  zero failures, and zero skips, xfails, xpasses or errors. Perl emitted
+  locale warnings; subsequent runs used LC_ALL=C. The BPF-dependent exec
+  test was outside this run's coverage, despite the zero TAP skip count.
 
-Validation: strict checkpatch with --no-signoff, git diff --check and git
-apply --check --whitespace=error against clean copies of the base files.
+- The additional exec/sighand tests ran in a persistent Debian 13
+  x86-64 QEMU/KVM guest, reporting:
+
+    7.4.0-rc1-ptrace-fix-g836f8bf4a1f3-dirty
+    #5 SMP PREEMPT_DYNAMIC Mon Nov 2 14:31:15 PST 2026
+
+  The host source HEAD recorded alongside those runs was
+  00dea76aa367a3cb203d1034853dd92c6e9facb2. This is distinct from both the
+  patch preparation base and the revision embedded in the running kernel
+  name. The full guest build diff/config was not supplied with the logs;
+  the earlier vmaccess and 24-test results did not include a guest uname.
+
+- Plain exec/sighand testing passed all four cases once, then all 400
+  cases in 100 iterations. Each iteration covers leader/non-leader exec,
+  both with and without an unreaped traced zombie. A separate process
+  created with CLONE_VM | CLONE_SIGHAND remains alive across exec.
+  Changing a handler after clone and checking it through a pipe handshake
+  proves the sharing before testing isolation across exec.
+
+  The execing task must reset caught SIGUSR1, preserve ignored SIGUSR2,
+  and preserve blocked, process-directed pending SIGTERM. The external
+  sharer's handlers must remain unchanged. Non-leader exec must retain
+  the process PID and be able to reap that external child afterward.
+  Zombie cases require attach to return before the tracer reaps the
+  original zombie. Each case has a separate process group and watchdog.
+
+- SELinux testing used a separate Debian guest disk and the same reported
+  kernel release. The runner switched from permissive to enforcing mode
+  for the tests. A temporary policy defined real source-to-destination
+  domain transitions with siginh allowed in one case and denied in the
+  other, while allowing the required transition and ptrace operations.
+
+  Both transition modes passed all four cases once, then 400 cases each:
+  800 passes in the repeated run. With siginh allowed, ignored SIGUSR2,
+  blocked SIGTERM and pending SIGTERM must survive. With siginh denied,
+  the ignored disposition must become SIG_DFL and the signal mask and
+  pending SIGTERM must be cleared. Caught SIGUSR1 must reset in both.
+  In every case the external sharer's handlers must remain unchanged.
+
+  The harness checked the actual source and destination SELinux types.
+  Before and after each transition-mode run it verified global enforcing
+  mode, nonpermissive test domains, and the loaded transition, ptrace and
+  siginh permissions. Both repeated runs completed and the final policy
+  check passed. The runner restored the original mode and removed its
+  temporary module. The sddm user warning did not prevent these checks.
+
+The additional harness is tests/exec-sighand/ in kernel-testing version
+18, separate from the in-tree vmaccess changes in this patch. Version 17
+incorrectly rejected SIGCHLD stops when the external observer exited.
+Version 18 reports and forwards SIGCHLD while retaining the signal-state
+and exit-status checks. The successful guest runs above used version 18;
+both zombie cases visibly encountered and forwarded SIGCHLD. Unexpected
+signals still fail with signal number, wait status and siginfo diagnostics.
+
+Separate Codex validation:
+
+- GCC 13.3 x86-64 builds of fs/exec.o, kernel/exit.o, kernel/signal.o,
+  fs/binfmt_elf.o and fs/compat_binfmt_elf.o, plus the ptrace selftests
+  after generating matching UAPI headers, completed without warnings.
+  configure-kernel.sh was run before the kernel object build. Its final
+  check rejected an omitted BTF symbol with BPF_SYSCALL=n; all requested
+  states were independently checked, including KASAN/DWARF5 enabled and
+  BTF, KCOV and the ftrace startup test disabled. That configuration check
+  applies to the Codex build, not an independently verified guest config.
+- The version 18 userspace harness built with -Wall -Wextra -Werror; its
+  two non-ptrace cases passed 100 iterations each on host kernel 6.18.57.
+  Earlier negative controls detected missing CLONE_SIGHAND sharing and
+  a handler reset leaking into the other process. Mock-ptrace checks
+  verified SIGCHLD forwarding, SIGSTOP/SIGTRAP suppression, unexpected
+  SIGSEGV/SIGTERM rejection and GETSIGINFO/CONT error propagation.
+- The test policy compiled and linked with Debian trixie's default policy
+  2:2.20250213-13~deb13u1 and expanded with assertions enabled. Its runtime
+  prerequisite checker rejected disabled SELinux in the Codex environment.
+- Strict checkpatch with --no-signoff, git diff --check and
+  git apply --check --whitespace=error against clean base files passed.
+
+Remaining coverage limits: deliberate SIGKILL interruption during each
+of the two exec waits has not been tested. ELF-FDPIC and FLAT were not
+compiled or run, and there was no non-x86-64 runtime testing of this patch.
+The SELinux runs were targeted credential-transition tests, not the full
+upstream SELinux testsuite. PTRACE_TRACEME returns EPERM in the Codex
+environment, so its local ptrace attempts failed in setup; no full kernel
+link or guest boot was performed there. Successful kernel runtime results
+above are Andrew's guest runs, not simulated results or Codex execution.
 
  fs/binfmt_elf.c                           |    4 
  fs/binfmt_elf_fdpic.c                     |    4 
