@@ -1,0 +1,197 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: selftests/proc: fix proc-maps-race setup and RSS coverage
+Date: Wed, 04 Nov 2026 03:16:47 +0000
+
+If fork() fails, or the modifier exits while setting up its VMAs, the
+parent waits for CHILD_READY until the 30-second harness timeout.  Check
+fork() and have the modifier report readiness through a pipe.  An early
+exit closes the write end and wakes the parent even if the modifier could
+not report an error.
+
+Only the smaps split and resize tests compare RSS.  Keep the three maps
+tests and the smaps remap test running when the locked memory allowance is
+too small.  Pass the mlockall() error to the parent so the two tests which
+need locked pages can report a skip.
+
+MAP_POPULATE can leave pages absent, and reclaim can remove pages before
+mlockall(MCL_ONFAULT).  A skipped VMA with no resident pages contributes
+nothing to the RSS comparison.  Fault in each test page with a write after
+locking the mappings and before making alternate VMAs read-only.  This
+gives the rollup check resident pages to count.
+
+Link: https://lore.kernel.org/r/20261104015447.363602-1-surenb@google.com
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+---
+Applies on top of Suren Baghdasaryan's v3, message ID
+20261104015447.363602-1-surenb@google.com.
+
+All six cases passed on x86-64 Linux 6.18.57, both normally and with
+READ_IMPLIES_EXEC. At memlock limits of zero and 64 KiB, the four
+cases without an RSS check passed and the other two skipped. Injected
+fork, mmap and mprotect failures failed promptly. With the test pages
+discarded before mlockall(), all 387 were present at readiness.
+
+ tools/testing/selftests/proc/proc-maps-race.c |   83 +++++++++-------
+ 1 file changed, 48 insertions(+), 35 deletions(-)
+
+--- a/tools/testing/selftests/proc/proc-maps-race.c~proc-maps-race-followup
++++ a/tools/testing/selftests/proc/proc-maps-race.c
+@@ -62,7 +62,6 @@ struct line_content {
+ 
+ enum test_state {
+ 	INIT,
+-	CHILD_READY,
+ 	PARENT_READY,
+ 	SETUP_READY,
+ 	SETUP_MODIFY_MAPS,
+@@ -147,6 +146,7 @@ FIXTURE(proc_maps_race)
+ 	int shared_mem_size;
+ 	int skip_pages;
+ 	int rollup_fd;
++	int mlock_error;
+ 	int page_size;
+ 	int vma_count;
+ 	bool verbose;
+@@ -174,7 +174,6 @@ typedef bool (*vma_mod_result_check_op)(
+ 					struct line_content *restored_first_line);
+ 
+ struct vma_modifier_info {
+-	int mlock_error;
+ 	int vma_count;
+ 	void *addr;
+ 	int prot;
+@@ -726,6 +725,8 @@ FIXTURE_SETUP(proc_maps_race)
+ 	unsigned long duration_sec;
+ 	char rollup_fname[32];
+ 	char fname[32];
++	int ready[2];
++	ssize_t n;
+ 
+ 	self->page_size = (unsigned long)sysconf(_SC_PAGESIZE);
+ 	self->verbose = verbose && !strncmp(verbose, "1", 1);
+@@ -757,35 +758,45 @@ FIXTURE_SETUP(proc_maps_race)
+ 	mod_info->curr_state = INIT;
+ 	mod_info->exit = false;
+ 
++	ASSERT_EQ(pipe(ready), 0);
+ 	self->pid = fork();
++	ASSERT_GE(self->pid, 0);
+ 	if (!self->pid) {
+ 		/* Child process modifying the address space */
+ 		int i;
+ 
++		close(ready[0]);
+ 		for (i = 0; i < mod_info->vma_count; i++) {
+ 			mod_info->child_mapped_addr[i] = mmap(NULL, self->page_size * 3,
+ 					PROT_READ | PROT_WRITE,
+-					MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
++					MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ 			ASSERT_NE(mod_info->child_mapped_addr[i], MAP_FAILED);
+-			/*
+-			 * Populate writable to get anonymous pages, then alternate
+-			 * write permission even with READ_IMPLIES_EXEC enabled.
+-			 */
+-			if (i % 2)
+-				ASSERT_EQ(mprotect(mod_info->child_mapped_addr[i],
+-						   self->page_size * 3, PROT_READ), 0);
+ 		}
+-		/*
+-		 * Lock all present pages in memory so memory reclaim cannot
+-		 * change RSS during the test, and use MCL_ONFAULT so
+-		 * mremap() expansion does not populate new pages.
+-		 */
+-		if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
+-			mod_info->mlock_error = errno;
+-			signal_state(mod_info, CHILD_READY);
+-			_exit(0);
++
++		/* MCL_ONFAULT keeps later mremap() expansions unpopulated. */
++		if (self->maps_file == SMAPS &&
++		    mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)) {
++			self->mlock_error = errno;
++			ASSERT_TRUE(self->mlock_error == ENOMEM || self->mlock_error == EPERM ||
++				    self->mlock_error == EAGAIN)
++				TH_LOG("mlockall: %s", strerror(self->mlock_error));
+ 		}
+-		signal_state(mod_info, CHILD_READY);
++
++		for (i = 0; i < mod_info->vma_count; i++) {
++			char *addr = mod_info->child_mapped_addr[i];
++
++			/* Fault in writable pages, after locking for the RSS check. */
++			if (!self->mlock_error) {
++				for (int j = 0; j < 3; j++)
++					((volatile char *)addr)[j * self->page_size] = 0;
++			}
++			if (i % 2)
++				ASSERT_EQ(mprotect(addr, self->page_size * 3, PROT_READ), 0);
++		}
++
++		n = write(ready[1], &self->mlock_error, sizeof(self->mlock_error));
++		ASSERT_EQ(n, (ssize_t)sizeof(self->mlock_error));
++		close(ready[1]);
+ 		wait_for_state(mod_info, PARENT_READY);
+ 		while (true) {
+ 			signal_state(mod_info, SETUP_READY);
+@@ -813,20 +824,15 @@ FIXTURE_SETUP(proc_maps_race)
+ 		exit(0);
+ 	}
+ 
+-	/* Check setup before opening proc files: the child may have exited. */
+-	wait_for_state(mod_info, CHILD_READY);
+-	if (mod_info->mlock_error) {
+-		int error = mod_info->mlock_error;
+-		int status;
+-
+-		ASSERT_EQ(waitpid(self->pid, &status, 0), self->pid);
+-		pthread_cond_destroy(&mod_info->sync_cond);
+-		pthread_mutex_destroy(&mod_info->sync_lock);
+-		munmap(mod_info, self->shared_mem_size);
+-		if (error == ENOMEM || error == EPERM || error == EAGAIN)
+-			SKIP(return, "Cannot lock test mappings: %s", strerror(error));
+-		ASSERT_EQ(error, 0);
+-	}
++	/* EOF if the modifier exits before it finishes setting up its VMAs. */
++	close(ready[1]);
++	do {
++		n = read(ready[0], &self->mlock_error, sizeof(self->mlock_error));
++	} while (n < 0 && errno == EINTR);
++	close(ready[0]);
++	if (!n)
++		waitpid(self->pid, NULL, 0);
++	ASSERT_EQ(n, (ssize_t)sizeof(self->mlock_error));
+ 
+ 	switch (self->maps_file) {
+ 	case MAPS:
+@@ -912,6 +918,9 @@ TEST_F(proc_maps_race, test_maps_tearing
+ 	struct line_content restored_first_line;
+ 	struct smaps_rollup_stats orig_stats;
+ 
++	if (self->mlock_error)
++		SKIP(return, "Cannot lock test mappings: %s", strerror(self->mlock_error));
++
+ 	wait_for_state(mod_info, SETUP_READY);
+ 
+ 	/* re-read the file to avoid using stale data from previous test */
+@@ -1015,6 +1024,9 @@ TEST_F(proc_maps_race, test_maps_tearing
+ 	struct line_content restored_first_line;
+ 	struct smaps_rollup_stats orig_stats;
+ 
++	if (self->mlock_error)
++		SKIP(return, "Cannot lock test mappings: %s", strerror(self->mlock_error));
++
+ 	wait_for_state(mod_info, SETUP_READY);
+ 
+ 	/* re-read the file to avoid using stale data from previous test */
+@@ -1109,7 +1121,8 @@ TEST_F(proc_maps_race, test_maps_tearing
+ 	/* re-read the file to avoid using stale data from previous test */
+ 	ASSERT_TRUE(read_boundary_lines(self, &self->last_line, &self->first_line));
+ 
+-	mod_info->vma_setup = setup_remap_vma;
++	mod_info->vma_setup = self->maps_file == SMAPS && !self->mlock_error ?
++		setup_remap_vma : NULL;
+ 	mod_info->vma_modify = remap_vma;
+ 	mod_info->vma_restore = patch_vma;
+ 	mod_info->vma_mod_check = check_remap_result;
+_
