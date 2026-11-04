@@ -1,0 +1,60 @@
+From: Cen Zhang <zzzccc427@gmail.com>
+Subject: ocfs2/dlmfs: keep the superblock alive during lock work
+Date: Thu, 29 Oct 2026 15:00:13 +0800
+
+Queued dlmfs lock work holds an inode reference, but no active reference
+to its superblock.  The workqueue is drained on module exit rather than on
+each dlmfs unmount, and an inode reference does not stop superblock
+shutdown: generic_shutdown_super() reports the busy inode and goes on.
+
+  DLM callback / worker               Unmount
+  ---------------------               -------
+  queue lock work; igrab(inode)
+  worker delayed
+                                      drop last active superblock ref
+                                      kill_anon_super()
+                                        report the busy inode
+                                        free the superblock
+  finish lock work
+  iput(inode)
+    access the inode's freed superblock
+
+Flushing the workqueue from a dlmfs kill_sb would not be enough: a
+blocking AST can queue new work for an inode that is still alive after the
+flush and before eviction, and that work again holds only an inode
+reference.
+
+Take an active superblock reference before acquiring the queued inode
+reference, with the atomic_inc_not_zero() on s_active that grab_super()
+and the NFS and procfs superblock walkers use.  Decline to queue if the
+superblock is already shutting down; the inode is then being evicted and
+user_dlm_destroy_lock() tears the lock down.  The existing l_lock and
+USER_LOCK_QUEUED flag serialize this with other queue attempts.  Each
+execution drops its inode reference before releasing the active superblock
+reference, outside l_lock.  If that releases the last active reference,
+the unmount completes on the worker; it only waits for DLM replies and
+never for this workqueue.
+
+Only the relevant frames of the report are kept:
+
+Oops: general protection fault, probably for non-canonical address 0xfbd59c0000000026: 0000 [#1] SMP KASAN NOPTI
+KASAN: maybe wild-memory-access in range [0xdead000000000130-0xdead000000000137]
+Workqueue: user_dlm user_dlm_unblock_lock
+RIP: 0010:iput+0x246/0xc10
+Call Trace:
+ <TASK>
+ user_dlm_unblock_lock+0x503/0xa50
+ process_one_work+0x9a8/0x1b40
+ worker_thread+0x65c/0xe40
+ </TASK>
+
+Link: https://lore.kernel.org/pm-ocfs2-objects-candidate-0054-v6-c3887cceae3b039e591e@gmail.com
+Fixes: 8df08c89c668 ("[PATCH] OCFS2: The Second Oracle Cluster Filesystem")
+Signed-off-by: Cen Zhang <zzzccc427@gmail.com>
+Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+Cc: <jjzuming@gmail.com>
+Cc: <stable@vger.kernel.org>

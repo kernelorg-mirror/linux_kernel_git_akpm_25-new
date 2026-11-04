@@ -1,0 +1,126 @@
+From: Cen Zhang <zzzccc427@gmail.com>
+Subject: ocfs2: serialize inode journal access with shutdown
+Date: Fri, 30 Oct 2026 12:48:56 +0800
+
+The downconvert thread can run inode cleanup until ocfs2_dlm_shutdown()
+stops it, but unmount shuts down the journal earlier. A final dentry
+post-unlock put can therefore enter ocfs2_clear_inode() while the journal
+is being destroyed.
+
+ocfs2_ci_fully_checkpointed() loads osb->journal before taking
+trans_inc_lock. Journal shutdown neither takes that lock for removal
+nor waits for the downconvert thread before freeing the journal:
+
+  Downconvert thread                    Unmount
+  ------------------                    -------
+  dentry post-unlock; final iput()
+    ocfs2_checkpoint_inode()
+      load osb->journal
+                                        ocfs2_journal_shutdown()
+                                          free journal; clear pointer
+      read the transaction ID
+
+The checkpoint wait queue is embedded in that journal, and the final
+jbd2_journal_release_jbd_inode() also needs its JBD2 journal to remain
+alive for the whole call. Protecting only the pointer load would leave
+those longer uses unprotected.
+
+Read and clear osb->journal under trans_inc_lock when checking checkpoint
+progress. Treat a removed journal as checkpointed. Move checkpoint
+waiters to the existing mount-owned checkpoint_event and wake it after
+checkpoint progress and journal removal, so the queue outlives the
+journal. The commit thread also waits there and rechecks its condition
+when woken.
+
+Serialize the final JBD2 inode release against JBD2 destruction and the
+journal free with a mount-owned rw_semaphore. Take the write side only
+after stopping the commit thread, and drop it before the journal inode's
+final iput(), whose cleanup can take the read side. Inode cleanup holds
+the read side only around the JBD2 release, outside checkpoint waits and
+DLM lock teardown.
+
+KASAN report as below:
+
+    Oops: general protection fault, probably for non-canonical address 0xdffffc000000000e: 0000 [#1] SMP KASAN NOPTI
+    KASAN: null-ptr-deref in range [0x0000000000000070-0x0000000000000077]
+    CPU: 0 UID: 0 PID: 587 Comm: ocfs2dc-33CAF04 Not tainted 7.3.0-rc4-next-20260921-pmb-ocfs2-functional-v1+ #1 PREEMPT(lazy) 
+    Hardware name: QEMU Ubuntu 24.04 PC v2 (i440FX + PIIX, arch_caps fix, 1996), BIOS 1.16.3-debian-1.16.3-2 04/01/2014
+    RIP: 0010:ocfs2_clear_inode+0x8ae/0x1630
+    Code: fc ff df 48 c1 ea 03 80 3c 02 00 0f 85 27 0c 00 00 49 8d 7d 70 48 8b 43 c8 48 ba 00 00 00 00 00 fc ff df 48 89 f9 48 c1 e9 03 <80> 3c 11 00 0f 85 f0 0b 00 00 49 3b 45 70 0f 88 62 03 00 00 e8 49
+    RSP: 0018:ffff888118d3f878 EFLAGS: 00010212
+    RAX: 0000000000000001 RBX: ffff88811a5edc60 RCX: 000000000000000e
+    RDX: dffffc0000000000 RSI: 0000000000000001 RDI: 0000000000000070
+    RBP: ffff888116134000 R08: 0000000000000001 R09: 0000000000000001
+    R10: ffffffff8965765f R11: 0000000000000001 R12: ffff88811a5ed400
+    R13: 0000000000000000 R14: ffff88811a5edbf8 R15: ffff88811a5ed408
+    FS:  0000000000000000(0000) GS:ffff8881fd4dc000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 00007ff35b66f2c0 CR3: 00000001092ae005 CR4: 0000000000770ef0
+    PKRU: 55555554
+    Call Trace:
+     <TASK>
+     ? __pfx_ocfs2_clear_inode+0x10/0x10
+     ? __pfx_ocfs2_inode_is_valid_to_delete+0x10/0x10
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? __lock_acquire+0x5a3/0x2140
+     ocfs2_evict_inode+0x1ed/0x11e0
+     ? inode_wait_for_writeback+0x14c/0x330
+     ? __pfx_ocfs2_evict_inode+0x10/0x10
+     ? lock_acquire+0x190/0x300
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? find_held_lock+0x2b/0x80
+     ? evict+0x347/0x9f0
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? lock_release+0xc8/0x290
+     ? _raw_spin_unlock+0x23/0x40
+     ? __pfx_ocfs2_evict_inode+0x10/0x10
+     evict+0x38b/0x9f0
+     ? __pfx_evict+0x10/0x10
+     ? lock_acquire+0x190/0x300
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? lock_release+0xc8/0x290
+     ? __pfx_inode_just_drop+0x10/0x10
+     iput+0x680/0xb80
+     ocfs2_dentry_lock_put+0xc2/0x110
+     ? __pfx_ocfs2_dentry_post_unlock+0x10/0x10
+     ocfs2_process_blocked_lock+0x1fb/0x420
+     ? __pfx_ocfs2_process_blocked_lock+0x10/0x10
+     ? __pfx_pmbd_probe_hit_cookie+0x10/0x10
+     ? lock_release+0xc8/0x290
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? lockdep_hardirqs_on_prepare+0xeb/0x1a0
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ocfs2_downconvert_thread+0x32b/0x780
+     ? do_raw_spin_lock+0x130/0x270
+     ? __pfx_ocfs2_downconvert_thread+0x10/0x10
+     ? __kthread_parkme+0xc1/0x220
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? lock_release+0xc8/0x290
+     ? __pfx_autoremove_wake_function+0x10/0x10
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? __kthread_parkme+0x177/0x220
+     ? __pfx_ocfs2_downconvert_thread+0x10/0x10
+     kthread+0x351/0x460
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? __pfx_kthread+0x10/0x10
+     ret_from_fork+0x659/0x940
+     ? __pfx_ret_from_fork+0x10/0x10
+     ? srso_alias_return_thunk+0x5/0xfbef5
+     ? __switch_to+0x74f/0xf70
+     ? __pfx_kthread+0x10/0x10
+     ret_from_fork_asm+0x1a/0x30
+     </TASK>
+    Modules linked in:
+    ---[ end trace 0000000000000000 ]---
+
+Link: https://lore.kernel.org/pm-ocfs2-objects-candidate-0004-v8-dbcb8f80b8df476084d6@gmail.com
+Fixes: da5e7c87827e ("ocfs2: cleanup journal init and shutdown")
+Signed-off-by: Cen Zhang <zzzccc427@gmail.com>
+Reviewed-by: Joseph Qi <joseph.qi@linux.alibaba.com> 
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Jia-Ju Bai <baijiaju1990@gmail.com>
+Cc: <jjzuming@gmail.com>
+Cc: <stable@vger.kernel.org>
