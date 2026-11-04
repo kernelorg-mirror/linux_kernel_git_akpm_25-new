@@ -1,0 +1,255 @@
+From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Subject: mm: page_alloc: add a watermark check that knows the migratetype
+Date: Mon, 02 Nov 2026 09:39:34 +0000
+
+Patch series "mm: make watermark checks honour ALLOC_NOFRAGMENT", v2.
+
+With defrag_mode, 64K mTHP faults under memory pressure stall in
+compaction 18 times as often as without it, and get about a third of the
+folios.  Dev Jain reported it [1].
+
+The high-order watermark check counts free pages of every migratetype.
+With defrag_mode, every slowpath allocation is ALLOC_NOFRAGMENT, and a
+request below pageblock_order cannot take free pages from another
+migratetype's pageblock.  Under pressure, that is where the large free
+pages end up.  Two callers act on the wrong answer:
+
+  - direct compaction's up-front check returns COMPACT_SUCCESS without
+    compacting, so compaction is never deferred;
+  - direct reclaim for a costly order stops early, having freed little.
+
+Patches 1-2 give the check the request's migratetype and make it skip
+the free lists the request cannot take.  Patch 3 tells direct reclaim
+that the allocation is ALLOC_NOFRAGMENT.
+
+Dev's benchmark in a 7G VM with only 64K mTHP enabled, medians of 15
+runs:
+
+                              defrag_mode=0  defrag_mode=1  defrag_mode=1
+                                                            + series
+    compact_stall                      1690          30669          7366
+    64K faults allocated              20750           7391         20129
+    64K faults falling back to 4K       725          13832          1339
+
+defrag_mode=1 still compacts more than defrag_mode=0: by design, it
+keeps 64K faults out of unmovable and reclaimable pageblocks [2].
+defrag_mode=0 is unchanged: 20698 64K faults allocated with the series.
+
+
+This patch (of 3):
+
+The high-order check in __zone_watermark_ok() accepts a free page of any
+migratetype.  Under ALLOC_NOFRAGMENT, a request below pageblock_order can
+only take a page of its own migratetype or claim a whole free block, so
+the check can pass when the allocation cannot succeed.
+
+Telling those apart needs the request's migratetype, but not every check
+wants them told apart.  A check whether an allocation can be served now
+has to count only the pages it can take.
+
+A check whether there is enough free memory counts every migratetype:
+kswapd and kcompactd balancing a zone, order-0 thresholds, the
+slowpath's forecast whether reclaim and compaction can still make
+progress.  Reclaim and compaction work across migratetypes to free whole
+pageblocks.
+
+Move the body of __zone_watermark_ok() into __zone_watermark_ok_mt(),
+which takes the migratetype as well, and make __zone_watermark_ok() a
+wrapper around it for the second kind of check.  These use the new
+function:
+
+  - the allocator fast path, zone_watermark_fast();
+  - its recheck after node reclaim in get_page_from_freelist();
+  - compaction's up-front check, compaction_suit_allocation_order().
+
+Declare both in mm/internal.h: nothing outside mm uses them.
+
+Nothing reads the migratetype yet: no functional change.
+
+Link: https://lore.kernel.org/20261102093939.3340540-1-kas@kernel.org
+Link: https://lore.kernel.org/20261102093939.3340540-2-kas@kernel.org
+Link: https://lore.kernel.org/all/4aa14b41-9b89-494c-8825-55fffd5a541c@arm.com/ [1]
+Link: https://lore.kernel.org/all/auCDnqJc7fsBpUW2@thinkstation/ [2]
+Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Tested-by: Dev Jain <dev.jain@arm.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Brendan Jackman <brendan.jackman@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Usama Arif <usama.arif@linux.dev>
+---
+
+ include/linux/mmzone.h |    3 ---
+ mm/compaction.c        |   11 ++++++-----
+ mm/internal.h          |    7 +++++++
+ mm/page_alloc.c        |   37 ++++++++++++++++++++++++++++---------
+ 4 files changed, 41 insertions(+), 17 deletions(-)
+
+--- a/include/linux/mmzone.h~mm-page_alloc-add-a-watermark-check-that-knows-the-migratetype
++++ a/include/linux/mmzone.h
+@@ -1636,9 +1636,6 @@ static inline unsigned long pgdat_end_pf
+ #include <linux/memory_hotplug.h>
+ 
+ void build_all_zonelists(pg_data_t *pgdat);
+-bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+-			 int highest_zoneidx, unsigned int alloc_flags,
+-			 long free_pages);
+ bool zone_watermark_ok(struct zone *z, unsigned int order,
+ 		unsigned long mark, int highest_zoneidx,
+ 		unsigned int alloc_flags);
+--- a/mm/compaction.c~mm-page_alloc-add-a-watermark-check-that-knows-the-migratetype
++++ a/mm/compaction.c
+@@ -2530,7 +2530,7 @@ bool compaction_zonelist_suitable(struct
+ static enum compact_result
+ compaction_suit_allocation_order(struct zone *zone, unsigned int order,
+ 				 int highest_zoneidx, unsigned int alloc_flags,
+-				 bool async, bool kcompactd)
++				 int migratetype, bool async, bool kcompactd)
+ {
+ 	unsigned long free_pages;
+ 	unsigned long watermark;
+@@ -2541,8 +2541,8 @@ compaction_suit_allocation_order(struct
+ 		free_pages = zone_page_state(zone, NR_FREE_PAGES);
+ 
+ 	watermark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK);
+-	if (__zone_watermark_ok(zone, order, watermark, highest_zoneidx,
+-				alloc_flags, free_pages))
++	if (__zone_watermark_ok_mt(zone, order, watermark, highest_zoneidx,
++				   alloc_flags, free_pages, migratetype))
+ 		return COMPACT_SUCCESS;
+ 
+ 	/*
+@@ -2598,6 +2598,7 @@ compact_zone(struct compact_control *cc,
+ 		ret = compaction_suit_allocation_order(cc->zone, cc->order,
+ 						       cc->highest_zoneidx,
+ 						       cc->alloc_flags,
++						       cc->migratetype,
+ 						       cc->mode == MIGRATE_ASYNC,
+ 						       !cc->direct_compaction);
+ 		if (ret != COMPACT_CONTINUE)
+@@ -3083,7 +3084,7 @@ static bool kcompactd_node_suitable(pg_d
+ 		ret = compaction_suit_allocation_order(zone,
+ 				pgdat->kcompactd_max_order,
+ 				highest_zoneidx, alloc_flags,
+-				false, true);
++				MIGRATE_MOVABLE, false, true);
+ 		if (ret == COMPACT_CONTINUE)
+ 			return true;
+ 	}
+@@ -3126,7 +3127,7 @@ static void kcompactd_do_work(pg_data_t
+ 
+ 		ret = compaction_suit_allocation_order(zone,
+ 				cc.order, zoneid, cc.alloc_flags,
+-				false, true);
++				MIGRATE_MOVABLE, false, true);
+ 		if (ret != COMPACT_CONTINUE)
+ 			continue;
+ 
+--- a/mm/internal.h~mm-page_alloc-add-a-watermark-check-that-knows-the-migratetype
++++ a/mm/internal.h
+@@ -728,6 +728,13 @@ extern int min_free_kbytes;
+ extern int defrag_mode;
+ 
+ void setup_per_zone_wmarks(void);
++bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
++			 int highest_zoneidx, unsigned int alloc_flags,
++			 long free_pages);
++bool __zone_watermark_ok_mt(struct zone *z, unsigned int order,
++			    unsigned long mark, int highest_zoneidx,
++			    unsigned int alloc_flags, long free_pages,
++			    int migratetype);
+ void calculate_min_free_kbytes(void);
+ int __meminit init_per_zone_wmark_min(void);
+ 
+--- a/mm/page_alloc.c~mm-page_alloc-add-a-watermark-check-that-knows-the-migratetype
++++ a/mm/page_alloc.c
+@@ -3607,9 +3607,10 @@ static inline long __zone_watermark_unus
+  * one free page of a suitable size. Checking now avoids taking the zone lock
+  * to check in the allocation paths if no pages are free.
+  */
+-bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+-			 int highest_zoneidx, unsigned int alloc_flags,
+-			 long free_pages)
++bool __zone_watermark_ok_mt(struct zone *z, unsigned int order,
++			    unsigned long mark, int highest_zoneidx,
++			    unsigned int alloc_flags, long free_pages,
++			    int migratetype)
+ {
+ 	long min = mark;
+ 	int o;
+@@ -3685,6 +3686,21 @@ bool __zone_watermark_ok(struct zone *z,
+ 	return false;
+ }
+ 
++/*
++ * For checks that are not about serving one allocation now: kswapd and
++ * kcompactd balancing a zone, order-0 thresholds, forecasts whether
++ * reclaim and compaction can still make progress.  They count free pages
++ * of every migratetype: reclaim and compaction work across migratetypes
++ * to free whole pageblocks.
++ */
++bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
++			 int highest_zoneidx, unsigned int alloc_flags,
++			 long free_pages)
++{
++	return __zone_watermark_ok_mt(z, order, mark, highest_zoneidx,
++				      alloc_flags, free_pages, MIGRATE_MOVABLE);
++}
++
+ bool zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+ 		      int highest_zoneidx, unsigned int alloc_flags)
+ {
+@@ -3717,8 +3733,8 @@ static inline bool zone_watermark_fast(s
+ 			return true;
+ 	}
+ 
+-	if (__zone_watermark_ok(z, order, mark, highest_zoneidx, alloc_flags,
+-					free_pages))
++	if (__zone_watermark_ok_mt(z, order, mark, highest_zoneidx, alloc_flags,
++				   free_pages, gfp_migratetype(gfp_mask)))
+ 		return true;
+ 
+ 	/*
+@@ -3730,8 +3746,9 @@ static inline bool zone_watermark_fast(s
+ 	if (unlikely(!order && (alloc_flags & ALLOC_MIN_RESERVE) && z->watermark_boost
+ 		&& ((alloc_flags & ALLOC_WMARK_MASK) == WMARK_MIN))) {
+ 		mark = z->_watermark[WMARK_MIN];
+-		return __zone_watermark_ok(z, order, mark, highest_zoneidx,
+-					alloc_flags, free_pages);
++		return __zone_watermark_ok_mt(z, order, mark, highest_zoneidx,
++					      alloc_flags, free_pages,
++					      gfp_migratetype(gfp_mask));
+ 	}
+ 
+ 	return false;
+@@ -3943,8 +3960,10 @@ check_alloc_wmark:
+ 				continue;
+ 
+ 			/* did we reclaim enough */
+-			if (!zone_watermark_ok(zone, order, mark,
+-					       ac->highest_zoneidx, alloc_flags))
++			if (!__zone_watermark_ok_mt(zone, order, mark,
++					ac->highest_zoneidx, alloc_flags,
++					zone_page_state(zone, NR_FREE_PAGES),
++					gfp_migratetype(gfp_mask)))
+ 				continue;
+ 		}
+ 
+_

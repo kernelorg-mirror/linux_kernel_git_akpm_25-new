@@ -1,0 +1,178 @@
+From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Subject: mm: vmscan: tell direct reclaim the allocation is ALLOC_NOFRAGMENT
+Date: Mon, 02 Nov 2026 09:39:36 +0000
+
+Direct reclaim for a costly order stops as soon as the allocation could
+succeed.  compaction_ready() skips a zone and should_continue_reclaim()
+stops reclaiming when zone_watermark_ok() passes, and zone_watermark_ok()
+accepts a free page of any migratetype.
+
+With defrag_mode, the allocation behind the reclaim is ALLOC_NOFRAGMENT
+and cannot take the free pages left in unmovable and reclaimable
+pageblocks.  Reclaim stops on them anyway, having freed little.
+
+In Dev Jain's 64K mTHP benchmark, with the high-order watermark check
+already honouring ALLOC_NOFRAGMENT, an order-4 direct reclaim frees 16
+pages on average with defrag_mode and 45 without.  64K faults get a bit
+over half as many folios as without defrag_mode (medians of 15 runs):
+
+                              defrag_mode=0  defrag_mode=1  defrag_mode=1
+                                                            + this patch
+    64K faults allocated              20750          11538         19759
+    64K faults falling back to 4K       725           9945          1664
+
+Pass ALLOC_NOFRAGMENT from the allocation down to try_to_free_pages().
+Both checks then ask __zone_watermark_ok_mt() for a free page the
+allocation can take, and an order-4 direct reclaim frees 40 pages on
+average.
+
+Link: https://lore.kernel.org/20261102093939.3340540-4-kas@kernel.org
+Fixes: e3aa7df331bc ("mm: page_alloc: defrag_mode")
+Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Dev Jain <dev.jain@arm.com>
+Closes: https://lore.kernel.org/all/4aa14b41-9b89-494c-8825-55fffd5a541c@arm.com/
+Tested-by: Dev Jain <dev.jain@arm.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Brendan Jackman <brendan.jackman@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Usama Arif <usama.arif@linux.dev>
+---
+
+ mm/internal.h   |    3 ++-
+ mm/page_alloc.c |    8 +++++---
+ mm/vmscan.c     |   21 ++++++++++++++++-----
+ mm/vmscan.h     |    3 +++
+ 4 files changed, 26 insertions(+), 9 deletions(-)
+
+--- a/mm/internal.h~mm-vmscan-tell-direct-reclaim-the-allocation-is-alloc_nofragment
++++ a/mm/internal.h
+@@ -65,7 +65,8 @@ void folio_mark_lazyfree(struct folio *f
+ /* mm/vmscan.c */
+ unsigned long zone_reclaimable_pages(struct zone *zone);
+ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+-				gfp_t gfp_mask, const nodemask_t *mask);
++				gfp_t gfp_mask, const nodemask_t *mask,
++				bool nofragment);
+ unsigned long lruvec_lru_size(struct lruvec *lruvec, enum lru_list lru,
+ 			      int zone_idx);
+ 
+--- a/mm/page_alloc.c~mm-vmscan-tell-direct-reclaim-the-allocation-is-alloc_nofragment
++++ a/mm/page_alloc.c
+@@ -4471,7 +4471,7 @@ static unsigned int check_retry_zonelist
+ 
+ /* Perform direct synchronous page reclaim */
+ static unsigned long
+-__perform_reclaim(gfp_t gfp_mask, unsigned int order,
++__perform_reclaim(gfp_t gfp_mask, unsigned int order, unsigned int alloc_flags,
+ 					const struct alloc_context *ac)
+ {
+ 	unsigned int noreclaim_flag;
+@@ -4485,7 +4485,8 @@ __perform_reclaim(gfp_t gfp_mask, unsign
+ 	noreclaim_flag = memalloc_noreclaim_save();
+ 
+ 	progress = try_to_free_pages(ac->zonelist, order, gfp_mask,
+-								ac->nodemask);
++				     ac->nodemask,
++				     alloc_flags & ALLOC_NOFRAGMENT);
+ 
+ 	memalloc_noreclaim_restore(noreclaim_flag);
+ 	fs_reclaim_release(gfp_mask);
+@@ -4507,7 +4508,8 @@ __alloc_pages_direct_reclaim(gfp_t gfp_m
+ 	int reclaim_order = ac->reclaim_compact_order;
+ 
+ 	psi_memstall_enter(&pflags);
+-	*did_some_progress = __perform_reclaim(gfp_mask, reclaim_order, ac);
++	*did_some_progress = __perform_reclaim(gfp_mask, reclaim_order,
++					       alloc_flags, ac);
+ 	if (unlikely(!(*did_some_progress)))
+ 		goto out;
+ 
+--- a/mm/vmscan.c~mm-vmscan-tell-direct-reclaim-the-allocation-is-alloc_nofragment
++++ a/mm/vmscan.c
+@@ -6151,6 +6151,17 @@ static bool in_reclaim_compaction(struct
+ 	return false;
+ }
+ 
++static bool allocation_can_succeed(struct zone *zone, struct scan_control *sc,
++				   unsigned long mark)
++{
++	unsigned int alloc_flags = sc->nofragment ? ALLOC_NOFRAGMENT : 0;
++	long free_pages = zone_page_state(zone, NR_FREE_PAGES);
++	int migratetype = gfp_migratetype(sc->gfp_mask);
++
++	return __zone_watermark_ok_mt(zone, sc->order, mark, sc->reclaim_idx,
++				      alloc_flags, free_pages, migratetype);
++}
++
+ /*
+  * Reclaim/compaction is used for high-order allocation requests. It reclaims
+  * order-0 pages before compacting the zone. should_continue_reclaim() returns
+@@ -6189,8 +6200,7 @@ static inline bool should_continue_recla
+ 		unsigned long watermark = min_wmark_pages(zone);
+ 
+ 		/* Allocation can already succeed, nothing to do */
+-		if (zone_watermark_ok(zone, sc->order, watermark,
+-				      sc->reclaim_idx, 0))
++		if (allocation_can_succeed(zone, sc, watermark))
+ 			return false;
+ 
+ 		if (compaction_suitable(zone, sc->order, watermark,
+@@ -6415,8 +6425,7 @@ static inline bool compaction_ready(stru
+ 		return false;
+ 
+ 	/* Allocation can already succeed, nothing to do */
+-	if (zone_watermark_ok(zone, sc->order, min_wmark_pages(zone),
+-			      sc->reclaim_idx, 0))
++	if (allocation_can_succeed(zone, sc, min_wmark_pages(zone)))
+ 		return true;
+ 
+ 	/*
+@@ -6800,7 +6809,8 @@ out:
+ }
+ 
+ unsigned long try_to_free_pages(struct zonelist *zonelist, int order,
+-				gfp_t gfp_mask, const nodemask_t *nodemask)
++				gfp_t gfp_mask, const nodemask_t *nodemask,
++				bool nofragment)
+ {
+ 	unsigned long nr_reclaimed;
+ 	struct scan_control sc = {
+@@ -6813,6 +6823,7 @@ unsigned long try_to_free_pages(struct z
+ 		.may_writepage = 1,
+ 		.may_unmap = 1,
+ 		.may_swap = 1,
++		.nofragment = nofragment,
+ 	};
+ 
+ 	/*
+--- a/mm/vmscan.h~mm-vmscan-tell-direct-reclaim-the-allocation-is-alloc_nofragment
++++ a/mm/vmscan.h
+@@ -77,6 +77,9 @@ struct scan_control {
+ 	/* One of the zones is ready for compaction */
+ 	unsigned int compaction_ready:1;
+ 
++	/* The allocation cannot fall back to other migratetypes' blocks */
++	unsigned int nofragment:1;
++
+ 	/* There is easily reclaimable cold cache in the current node */
+ 	unsigned int cache_trim_mode:1;
+ 
+_

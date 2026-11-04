@@ -1,0 +1,95 @@
+From: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Subject: mm: page_alloc: add a watermark check that knows the migratetype
+Date: Mon, 02 Nov 2026 09:39:34 +0000
+
+Patch series "mm: make watermark checks honour ALLOC_NOFRAGMENT", v2.
+
+With defrag_mode, 64K mTHP faults under memory pressure stall in
+compaction 18 times as often as without it, and get about a third of the
+folios.  Dev Jain reported it [1].
+
+The high-order watermark check counts free pages of every migratetype.
+With defrag_mode, every slowpath allocation is ALLOC_NOFRAGMENT, and a
+request below pageblock_order cannot take free pages from another
+migratetype's pageblock.  Under pressure, that is where the large free
+pages end up.  Two callers act on the wrong answer:
+
+  - direct compaction's up-front check returns COMPACT_SUCCESS without
+    compacting, so compaction is never deferred;
+  - direct reclaim for a costly order stops early, having freed little.
+
+Patches 1-2 give the check the request's migratetype and make it skip
+the free lists the request cannot take.  Patch 3 tells direct reclaim
+that the allocation is ALLOC_NOFRAGMENT.
+
+Dev's benchmark in a 7G VM with only 64K mTHP enabled, medians of 15
+runs:
+
+                              defrag_mode=0  defrag_mode=1  defrag_mode=1
+                                                            + series
+    compact_stall                      1690          30669          7366
+    64K faults allocated              20750           7391         20129
+    64K faults falling back to 4K       725          13832          1339
+
+defrag_mode=1 still compacts more than defrag_mode=0: by design, it
+keeps 64K faults out of unmovable and reclaimable pageblocks [2].
+defrag_mode=0 is unchanged: 20698 64K faults allocated with the series.
+
+
+This patch (of 3):
+
+The high-order check in __zone_watermark_ok() accepts a free page of any
+migratetype.  Under ALLOC_NOFRAGMENT, a request below pageblock_order can
+only take a page of its own migratetype or claim a whole free block, so
+the check can pass when the allocation cannot succeed.
+
+Telling those apart needs the request's migratetype, but not every check
+wants them told apart.  A check whether an allocation can be served now
+has to count only the pages it can take.
+
+A check whether there is enough free memory counts every migratetype:
+kswapd and kcompactd balancing a zone, order-0 thresholds, the
+slowpath's forecast whether reclaim and compaction can still make
+progress.  Reclaim and compaction work across migratetypes to free whole
+pageblocks.
+
+Move the body of __zone_watermark_ok() into __zone_watermark_ok_mt(),
+which takes the migratetype as well, and make __zone_watermark_ok() a
+wrapper around it for the second kind of check.  These use the new
+function:
+
+  - the allocator fast path, zone_watermark_fast();
+  - its recheck after node reclaim in get_page_from_freelist();
+  - compaction's up-front check, compaction_suit_allocation_order().
+
+Declare both in mm/internal.h: nothing outside mm uses them.
+
+Nothing reads the migratetype yet: no functional change.
+
+Link: https://lore.kernel.org/20261102093939.3340540-1-kas@kernel.org
+Link: https://lore.kernel.org/20261102093939.3340540-2-kas@kernel.org
+Link: https://lore.kernel.org/all/4aa14b41-9b89-494c-8825-55fffd5a541c@arm.com/ [1]
+Link: https://lore.kernel.org/all/auCDnqJc7fsBpUW2@thinkstation/ [2]
+Signed-off-by: Kiryl Shutsemau (Meta) <kas@kernel.org>
+Tested-by: Dev Jain <dev.jain@arm.com>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Brendan Jackman <brendan.jackman@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Axel Rasmussen <axelrasmussen@google.com>
+Cc: Yuanchu Xie <yuanchu@google.com>
+Cc: Wei Xu <weixugc@google.com>
+Cc: Baoquan He <baoquan.he@linux.dev>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Usama Arif <usama.arif@linux.dev>
