@@ -15,26 +15,6 @@ historical reference. Do not load it for routine reviews, modify it or
 delete it without authorization. The older
 `kernel-patch-review-workflow.md` is also superseded.
 
-Standing override, 2026-10-27 (AKPM): compilation checks are handled by
-others. Do not run kernel, object, consumer, cross-architecture or full
-builds merely to check whether a patch compiles, unless AKPM explicitly
-requests them. Do not recover build prerequisites for that purpose.
-
-Retain source-level caller, type, ABI, configuration and build-graph
-analysis. Retain focused behavioral tests, reproducers and applicable
-formal-model checks; compiling a test harness needed to execute such a
-test is permitted. Distinguish these from compilation-only validation.
-Do not assume that anybody else's build succeeded or claim it as ours.
-
-This override supersedes compilation requirements in older workflow
-text and upstream review guides. Record compilation-only obligations as
-NOT APPLICABLE under this explicit user policy, not as performed or as
-missing mandatory evidence. Other source/test/model requirements remain.
-If a legacy executable gate still mandates a compilation receipt, update
-and validate its policy support transparently for future reviews before
-using it. Never fabricate a build receipt or change historical manifests
-and dispositions to satisfy the new policy.
-
 ## Standalone handoff
 
 This file alone is sufficient as the review-policy handoff for a NEW
@@ -110,9 +90,8 @@ That single old equality proves nothing about subsequent branch states.
 
 For EVERY new review, before examining source or forming a verdict, run
 `akpm-review-gate.py new` with the submitted patch, this workflow, the
-review ID, a verified full 40-character source SHA, a unique manifest
-path, and the Git repository containing that commit (`--repo` in v3).
-The command executes in ChatGPT's own file/runtime environment;
+review ID, a verified full 40-character source SHA, and a unique manifest
+path. The command executes in ChatGPT's own file/runtime environment;
 AKPM does not need to install software, invoke Codex, or run a separate
 review runner. Preserve the manifest and its SHA-bound evidence logs in
 the review artifacts. For a new chat, use the latest gate script supplied
@@ -126,27 +105,6 @@ Document the manually verified caller coverage and retain HOLD until a
 supported gate revision can represent it. A corrected command does not
 erase an earlier failed receipt from the original audit trail.
 
-Gate v3 derives enclosing definitions from verified source and the
-in-memory postimage, including body-only and multiline-signature hunks.
-Hunk-header names are hints, not authority. Its inventory also records
-helper calls introduced or removed by the diff for consumer searches.
-If an affected symbol is missed, `new --symbol H001:NAME` can supplement
-the inventory only when NAME occurs in the verified hunk code or an
-overlapping definition signature. This is an explicit review obligation,
-not a waiver. An unresolved inventory remains HOLD. Source parsing is
-conservative; still inspect every hunk and verify the real call graph.
-
-Keep old gate versions with their review evidence. The v3 checker reads
-v2 manifests under the original rules and does not mutate them. Test a
-gate repair using separate, clearly labeled regression manifests. Those
-tests cannot retroactively supply a before-analysis preflight, erase
-failed receipts or change a prior review's acceptance disposition.
-
-When AKPM explicitly requests a build, check its prerequisites and
-recover missing tools such as flex, bison or bc in Work. Preserve failed
-attempts and successful retries; do not ask AKPM to run local tools.
-Routine reviews do not require compilation checks or their setup.
-
 Whole-tree searches must explicitly select the repository root or tracked
 files. In a noninteractive process, a pathless search can read empty stdin
 instead of traversing the tree. A no-match result is not evidence of no
@@ -154,7 +112,7 @@ callers: verify a known hit and use an explicit path or git grep.
 
 Record inspected source anchors and independent first-pass analysis,
 per-hunk and reverse-consumer coverage, applicable Sashiko/Tejun/Chris
-reviews, source-level ABI/configuration checks, analogous-path searches,
+reviews, source-build and architecture checks, analogous-path searches,
 and an explicit later adversarial analysis with recorded counterexamples
 or rejected hypotheses. The second pass may be a distinct ChatGPT pass
 and MUST be labeled same-model adversarial, not an external reviewer.
@@ -186,104 +144,6 @@ standing-rule audit and all individual mandatory obligations remain
 binding. Neither a per-section receipt nor a successful command is a
 substitute for the source-grounded per-rule statuses in this document.
 
-## Explicit command-retry resolution: 2026-10-28 correction
-
-A failed command remains part of the review history. It need not block
-forever after a verified successful retry satisfies the same obligation.
-This corrects the older blanket failed-command HOLD wording below.
-
-- Use gate v4.1 `resolve-retry` to link the exact failed and successful
-  command receipts. Supply a concrete explanation and a separate JSON
-  resolution file; never delete or edit either receipt or the manifest.
-- The replacement must occur later in the same review and gate, with
-  matching purpose, scope, subject and working directory. It must pass
-  the ordinary command/evidence checks. A resolved failure supplies no
-  evidence itself; the successful command must satisfy the obligation.
-- An unchanged command can be retried. For changed arguments, v4.1 only
-  supports Git diff commit-name corrections with executed evidence that
-  both spellings identify the same commits. Paths, options, search
-  patterns and test targets cannot be weakened through this mechanism.
-- Run `check --resolutions FILE` explicitly. The sidecar binds the exact
-  manifest and original plan. Missing, modified or inconsistent evidence,
-  unresolved command failures and unrelated successes still mean HOLD.
-- Preserve the old gate, original HOLD result and all original evidence.
-  Record a new, dated reassessment after the corrected gate actually
-  runs. Do not relabel the earlier result as a pass or infer that a gate
-  success establishes source correctness.
-- This mechanism cannot repair missing pre-analysis execution, change an
-  immutable coverage inventory, waive a substantive finding, or upgrade
-  a legacy v2/v3 preflight. Those outstanding requirements remain HOLD.
-
-The user explicitly requested this correction after R-050's successful
-exact-SHA retry remained blocked by its earlier missing symbolic ref.
-The old R-050 evidence is preserved; its new assessment is separate.
-
-## Incremental evidence and short closure: 2026-10-28 override
-
-Record evidence during the review so final closure does not reconstruct
-work already completed. This overrides older requirements to rewrite
-master documents immediately or include delivery proof in the archive
-being delivered. It does not weaken source coverage, review independence,
-formal-model decisions, behavioral checks, or acceptance requirements.
-
-- Run the original preflight before source analysis. Resolve failed
-  source/preimage or symbol-inventory checks before proceeding with that
-  patch. Preserve failures and retries. If analysis has already started,
-  record the chronology gap and HOLD; never manufacture an earlier pass.
-- Create the stable obligation IDs before analysis, and the numbered
-  per-clause guard inventory during the first source walkthrough. Check
-  these ordering requirements at the time, not only at final closure.
-- Maintain one evidence index keyed by review, patch, obligation, guard
-  and finding IDs. Attach each source anchor, command receipt, decision
-  and elapsed time when the work completes. Refer to raw evidence once;
-  do not copy it into several overlapping narratives.
-- Delegated tracks return their evidence references and obligation
-  coverage with their findings and dismissals. Reconcile these as tracks
-  finish, while retaining the separate later adversarial pass. Delegation
-  must not precede the independent first-principles pass.
-- Generate counts, timing tables and the compact report from that index.
-  Automation handles bookkeeping; the reviewer must still decide whether
-  the cited evidence satisfies each rule and verify the original IDs and
-  denominator independently. A recorded command is not proof of coverage.
-- At closure, inspect outstanding obligations, contradictions and changed
-  conclusions. Do not repeat completed checks or re-express their evidence
-  unless new information requires it. Retain genuine failures and gaps.
-
-Separate review validation from delivery accounting. Complete the review
-evidence and execute the substantive gate before any positive acceptance
-recommendation. Freeze the report and evidence package, then upload each
-artifact once in an ordered batch. Record the actual upload result in a
-separate delivery receipt that identifies the artifact, version and hash.
-The package need not contain proof of its own upload. Do not rebuild or
-upload it again solely to include that receipt. A content correction is
-a legitimate new version; an upload retry must respect unknown outcomes.
-
-Delivery remains mandatory. Verify the save before claiming persistence;
-disclose a failed or uncertain save separately from the technical verdict.
-The two records together provide review evidence and delivery evidence.
-Gate tooling must represent this separation explicitly and be validated
-before use. A legacy gate failure is still a failure: preserve it and do
-not fabricate a delivery receipt or silently bypass its requirements.
-Do not change historical manifests or HOLD dispositions under this rule.
-
-For routine reviews, record new facts and corrected findings immediately
-in the individual review record and retain it durably. Consolidate master
-documents in the agreed daily batch, or sooner when AKPM explicitly asks.
-Daily consolidation is not a prerequisite for delivering that review.
-Keep the review ID, dispositions, next actions and pending consolidation
-items available so batching cannot lose a finding. This overrides the
-older same-response master-update wording below. It does not imply that
-a scheduled job exists or permit postponing correction of a wrong reply.
-
-Aim for one or two minutes of final closure and measure the result over
-subsequent reviews. This is an unproven target, not a deadline that permits
-skipping review work. Report source analysis, test/model preparation,
-actual execution, evidence closure and saving separately. Show overlap
-between parallel tracks; do not sum their elapsed times as wall time or
-claim a speedup without a suitable comparison. If closure runs long,
-identify the actual cause and improve the recording/tooling path instead
-of lowering reasoning effort or reducing defect-detection coverage.
-
 ## Execution order: independent review plus two coverage tracks
 
 For EVERY review, including single patches and mbox series, cover the
@@ -311,6 +171,13 @@ entire change by three distinct analyses and an evidence-based merge:
    judgments about bug proof, fix proof and architectural suitability.
    Deliver one combined verdict with actionable findings.
 
+When using parallel reviewers, give them distinct obligations: one traces
+missing callers and resource producers; another checks behavior at limits
+and effects on existing users; a later adversarial pass challenges both.
+Do not substitute several similar broad reviews for these different jobs.
+Sequential review must cover the same obligations when delegation is not
+available. Keep their evidence in the existing coverage record.
+
 Retain meaningful intermediate results until reconciliation. Sequential
 analysis is acceptable when parallel models are unavailable, but do not
 call it a native multi-agent Sashiko run or independent model consensus.
@@ -323,26 +190,6 @@ LLM analyses are nondeterministic. The final report must say whether
 native Sashiko ran, whether full applicable stage coverage was completed
 manually, and any missing guides, tests or unverified paths. Do not
 label a review "Sashiko-equivalent" if coverage is incomplete.
-
-### Standing authorization for parallel reviewers
-
-AKPM authorizes parallel reviewers for all kernel patch and series
-reviews whenever useful and available. This is a standing instruction;
-do not ask for permission again for each review. It also applies in
-future chats that load this workflow and does not require Ultra mode.
-
-Complete and record the independent first-principles pass before
-starting delegated review work. Then assign bounded, complementary
-scopes, such as caller and lifetime coverage, history, architecture
-checks or searches for similar bugs elsewhere. Give each reviewer the
-same pinned source revision, relevant patch state and evidence rules.
-
-Verify delegated findings and dismissals against the source before
-merging conclusions. Preserve the separate, later adversarial pass
-and all mandatory coverage and gate requirements. Agent agreement is
-not proof, and delegation does not count as native Sashiko execution
-or an external human review. Record which agents actually ran; use
-sequential analysis when delegation is unavailable or adds no value.
 
 ## Tejun upstream modules and upgrade tracking
 
@@ -516,7 +363,7 @@ consumers, user-visible impact, stable suitability, and concise email
 replies. Sashiko prompts are hypotheses and review methods, not proof;
 evidence standards and AKPM delivery rules always still apply.
 
-## Cross-tree shared-interface and ABI source gate
+## Cross-tree shared-interface and ABI build gate
 
 Any patch changing a shared header, typedef, library symbol, helper
 signature/return type, utility object, or build-visible API must pass
@@ -537,13 +384,14 @@ the following checks BEFORE an unqualified `take` or `Reviewed-by`:
    check clashes with existing kernel/tools/libc typedefs and actual
    include order, on LP64 AND ILP32. For int64_t, use matching
    PRId64/SCNd64 macros or prove the platform's underlying type.
-   Trace representative real consumers on each affected ABI in source;
-   check actual widths and include contexts without requiring a build.
+   A compiler probe of the opposite ABI cannot catch an ABI-specific
+   defect; compile a representative real consumer on each ABI where
+   the toolchain is available.
 4. Audit the actual build graph: a shared object may be compiled under
    another subsystem's CFLAGS, include ordering and header search
-   paths. Inspect representative out-of-subsystem consumer contexts in
-   source. Compilation checks are delegated to others under the standing
-   override; do not report an unexecuted build as successful.
+   paths even when local tests build. Verify at least one real
+   out-of-subsystem consumer build where possible. Clearly record
+   when full builds have NOT been executed.
 5. Check the author's selected base and parallel integration branches
    for overlapping edits (e.g., cgroup-next versus mm-stable), and
    distinguish an intrinsic patch bug from rebase/apply conflicts.
@@ -555,9 +403,8 @@ an incompatible `s64` typedef in `cgroup_util.h` and left six freezer
 callers storing a widened `s64` return value into `long`. It is a
 specific instance of the mandatory all-consumer impact rule, not a
 waiver or replacement for that rule. Mark the gate UNRESOLVED if the
-cross-tree source could not be checked. Omitted compilation is not an
-unresolved requirement under the standing override. Do not report a
-clean whole-tree build without executing one.
+cross-tree source or real consumer build could not be checked; do
+not report a clean whole-tree build without executing one.
 
 ## Source integrity and review scope
 
@@ -647,10 +494,6 @@ in every relevant track, not only after a defect is found:
   configurations selected because their behavior or initial state can
   differ. Verify the relevant helper contracts in those environments;
   do not generalize from the motivating platform or usual lifecycle.
-  When adding core work to an existing notifier, verify that its
-  registration, configuration dependencies and initialization failures
-  match the new responsibility. An optional administrative interface
-  must not silently control an otherwise enabled core feature.
 - Ask whether the new control flow can amplify work, change progress or
   replace a cheap fast path with an expensive path for some valid
   preexisting state. Check common-case and adverse-case costs at the
@@ -661,12 +504,6 @@ in every relevant track, not only after a defect is found:
   offsets, redundant intermediate values, or reconstructed state.
   Compare clarity as a separate review dimension without requiring
   cosmetic changes that do not materially improve understanding.
-- When comparison normalizes values, verify that hashes, indexes,
-  skip tables and cached keys use the same equivalence relation.
-  Do not assume a normalizer is invertible or idempotent. Inspect its
-  full domain and test exceptional values; exhaust small domains when
-  practical. A prefilter must not skip an exact original-value match
-  because it uses a different representation.
 - Choose a clean, maintainable UPSTREAM fix on its merits. Older stable
   branches may need separate adapted backports and validation; missing
   infrastructure there is not by itself a reason to complicate the
@@ -801,6 +638,40 @@ UNRESOLVED premise blocks unconditional acceptance.
 The overall standing-rule audit cannot mark this gate APPLIED unless the
 per-guard evidence table and count actually exist.
 
+### Limits and admission checks: existing users and boundary behavior
+
+For every new or changed limit, rejection or permission check, extend the
+existing guard/error-path record with the following questions. This is
+source work, not a requirement for another report or routine kernel build.
+
+1. Check existing successful users, not only rejected new acquisitions.
+   Can migration, collapse, reclaim, restoration or another maintenance
+   operation revoke an existing mapping, pin or service? Distinguish new
+   resource consumption from replacement that preserves or reduces it.
+2. Identify whose credentials and execution context actually apply at
+   every permission check: initiating task, affected task, worker,
+   overridden credentials, IRQ or NMI. Trace LSM/audit callees as well as
+   the immediate helper. A permission decision about one actor must not
+   silently govern another actor's existing resources.
+3. Establish counter units and representation variants: ordinary versus
+   biased references, small versus large objects, batching and deferred
+   release. Check each increment's size and the reserve assumptions.
+   A limit appropriate for one representation may harm users of another.
+4. Follow each new failure to its userspace endpoint, including wrappers
+   and protocol translations. Record errno/signal, retries, effects on
+   other users, and whether copying, refault or another existing fallback
+   could preserve service. A fallback is a candidate, not automatically
+   safe; validate ownership, partial progress and resource bounds.
+5. Inspect destructive work before every newly fallible call. Identify
+   mappings removed, references released and state published before the
+   rejection. Verify rollback or a safe fallback. In particular, check
+   whether a refcount-reducing conversion can fail after destroying the
+   original representation because the admission test treats it as new
+   growth.
+
+Record concrete source paths and conclusions in existing evidence entries;
+do not satisfy these obligations with generic checked/not-applicable text.
+
 ## Mandatory impact-coverage gate, in ALL tracks
 
 A small condition or bit change can alter behavior in distant code. The
@@ -854,18 +725,6 @@ inventoried. Prevent a recurrence as follows:
    within the table does not prove that its type-specific payload fits.
    Verify any presumed firmware/transport prevalidation in code and
    compare old and new handler reachability before relaxing `<` to `<=`.
-
-10. When adding a UAPI flag or seal, search independently maintained
-    acceptance masks and serialization/restore formats, not just the
-    main syscall validator. Check compatibility-version requirements
-    and round-trip preservation of the new state. A runtime guard can
-    work while its advertised live-update or restore use rejects it.
-11. Distinguish object lifetime from membership in a file or container.
-    A pin or reference may retain storage after removal. For a claimed
-    retention guarantee, trace ordinary-operation rollback as well as
-    explicit removal, and check synchronization separately for every
-    pinning caller. A caller holding an inode lock does not prove that
-    a different caller shares that protection.
 
 Reconciliation must compare these inventories and investigate missing
 path classes, rather than simply vote on reported issues. A convincing
@@ -1031,59 +890,6 @@ its underlying bug pattern, not merely other calls to the changed helper.
   appropriate scope; avoid unnecessary refactoring.
 - Include the similar-code search in the cross-track coverage comparison,
   and explicitly say when it was limited by available source access.
-
-### Related mailing-list search: six-month default
-
-For every patch review, perform a targeted mailing-list search in addition
-to the source and Git-history searches. Default to the preceding six
-calendar months, ending at the current review date. For example, a review
-on 2026-10-27 starts its search window at 2026-04-27.
-
-- Preserve the independent first-principles pass before reading external
-  review conclusions. Then search linux-mm and relevant subsystem lists,
-  including the lists receiving the submitted patch; do not restrict a
-  non-MM patch to linux-mm. Search the subject, changed functions/files,
-  failure mechanism, Fixes commit and useful author/series combinations.
-- Look for existing fixes, newer versions, overlapping series, related
-  failures, rejected approaches and substantive review objections. Read
-  the relevant messages and surrounding thread, not just search snippets.
-  Follow thread roots, dependencies and cited discussions beyond six
-  months when necessary. Keep the submitted revision distinct from later
-  revisions; do not silently review a replacement patch instead.
-- Try public archive alternatives when the preferred route fails. Lore,
-  the GNUweeb public mirror and Spinics are candidate routes, not promises
-  of availability or freshness. Verify actual message dates. A failed
-  feed, blocked query or empty search-engine result does not establish
-  that messages are unavailable or that no related patch exists.
-- Record the requested date range, queries, lists, archive routes and
-  retrieval times in compact evidence. State material access/coverage
-  gaps. The newest observed message is not a proven completeness cutoff;
-  search-engine crawl dates are not message dates. Source-verify relevant
-  claims before treating them as findings or dismissals.
-- Include consequential related patches or prior objections in the
-  concise review/email. Retain links and Message-IDs in the evidence.
-  Do not add a long mailing-list narrative to routine review output.
-
-### Reusable mail cache
-
-Maintain an on-demand cache of retrieved public messages and thread
-metadata in Work's execution environment. Deduplicate by Message-ID,
-retain source URLs, actual retrieval times and content hashes, and label
-rendered extracts separately from complete raw messages. Record query
-coverage separately from cached message content. A cache miss is not
-evidence that no message exists, and a partial cache is not a full mirror.
-
-Refresh relevant threads and the newest search interval when starting
-each review: old threads can acquire new replies. Preserve the snapshots
-used by completed reviews. Reuse unchanged message bodies and existing
-search evidence where its scope still applies; record new gaps honestly.
-Checkpoint reusable cache data/indexes durably so a wiped scratch area
-does not require repeating retrieval. Verify a restored checkpoint and
-its coverage before use. No continuously running/background collection is
-implied; refresh happens during active review work unless separately set
-up. Do not download every message from six months of every list merely
-to perform a targeted related-patch search. Record scan time separately
-so its real cost can be measured and the cache policy adjusted.
 
 ## Independent pass: additional review obligations
 
@@ -1309,6 +1115,10 @@ These local safeguards are additive:
 - Use PlusCal/TLA+ for a meaningful multi-actor shared-state protocol
   when appropriate, not mechanically for every change. The model must
   represent the actual C paths and assumptions; record exclusions.
+- For limit/admission models, include relevant counter representations,
+  actor credentials, existing users and replacement/restoration operations.
+  A model of bounded increment arithmetic alone cannot establish policy
+  correctness, producer coverage or preservation of existing service.
 - When isolation, publication, reuse or ownership spans a lock drop,
   explicitly decide whether a three-actor model is needed. Check the
   original owner, a competing acquirer, and a third actor that can
@@ -1339,11 +1149,10 @@ These requirements apply to ALL user-facing replies, review summaries,
 suggested changelogs and proposed emails. These AKPM preferences
 override conflicting upstream style defaults.
 
-- Prominently display the patch's exact Subject in review responses,
-  including the opening progress message and final verdict. Preserve
-  the supplied PATCH/version/series notation and wording; do not replace
-  the subject with a paraphrase. For a series, display the exact cover
-  subject and identify individual findings by the affected patch subject.
+- Do not include `[PATCH]` in Subject: headers of patches or emails
+  prepared for AKPM. Use the descriptive subject without that prefix.
+  Preserve exact original subjects when quoting or identifying incoming
+  mail; this rule applies to subjects we prepare.
 - Plain 7-bit ASCII only. No curly quotes, Unicode punctuation,
   decorative bullets, typographic quotation bars, or special symbols.
 - Hard-wrap all authored text at 75 columns, including quote prefixes,
@@ -1365,12 +1174,6 @@ override conflicting upstream style defaults.
   Do not defer -stable recommendations with vague "security handling"
   language; name an actual restriction only when established. Draft only;
   never imply the message was sent.
-- Include materially different failure modes and source-supported
-  similar-bug findings in the emailable reply, not only in chat or the
-  detailed report. Briefly state the trigger, userspace effect and
-  evidence limits. Label separate pre-existing bugs as separate
-  follow-ups; do not silently omit them to shorten the reply or imply
-  that the submitted patch introduced them.
 - Refer to a numbered patch by its subject notation, e.g. `[1/2]` or
   `[2/3]`, not `patch 1` or `patch 2` in the email reply.
 - State the verdict and important defects first. For each material
@@ -1390,10 +1193,6 @@ override conflicting upstream style defaults.
   plain-ASCII, 75-column, LKML-ready email text when asked.
 
 ## Immediate discovery-to-Markdown update: mandatory
-
-For routine reviews, the incremental-evidence override above requires
-immediate review-record updates and permits daily master consolidation.
-Explicit requests to update this workflow or the ledger are handled now.
 
 Whenever a substantive new fact, missed path, incorrect previous
 finding, revised disposition or generalizable workflow lesson is
@@ -1437,9 +1236,6 @@ compliance denominator simply because a new rule was added later.
   ledger, listing review IDs, findings, feedback, detailed-report Library
   paths and next actions. On updates, deliver the revised canonical file
   as a direct download; do not require users to hunt through Library.
-  Put the actionable review result, Fixes/stable assessment and actual
-  validation status in this ledger. A separate per-patch report is a
-  supporting record, not a substitute for updating review-activity.md.
 - Store ONLY detailed per-patch review histories in the persistent
   ChatGPT Library under `/Kernel Patch Reviews/reports/`. Each report
   retains its canonical `<topic>-review.md` basename. Update it as new
@@ -1511,6 +1307,11 @@ no ledger, keep the corresponding record in the review report.
    new finding with the omitted code path and why the prior coverage
    audit failed. Correct any stale verdict or proposed reply; do not
    silently retain the earlier "no code changes" assessment.
+   When comparing reviews, distinguish newly discovered findings from
+   independent verification of issues already posted. Check the supplied
+   thread and state the search cutoff. A review summary that expressly
+   excludes known issues cannot be used to claim its reviewer missed them.
+   Do not claim global novelty from absence in the material inspected.
 6. Promote a lesson to THIS AKPM workflow only if it improves review
    methodology across patches. Do not append a special rule for every
    bug, false positive, or argument. Do not edit upstream modules.
@@ -1543,23 +1344,14 @@ identified by its index, if any.
 
 ## Handoff for subsequent chats
 
-For pull summaries, introduce the singleton roundup with this heading:
-`Summary of the NNN singletons in this merge:`
-Replace NNN with the verified singleton count for that merge. Use
-`Summary`, with only the initial S capitalized.
-
 For a continuation of this project's Work-mode review workflow, attach
 `akpm-patch-review-workflow.md`, `review-activity.md`, and
 `kernel-git-access.md`. Attach `akpm-review-gate.py` as the executable
 companion; it is NOT embedded or run automatically merely because a
-Markdown policy was attached. For edits to existing pull summaries,
-retrieve the latest `mm-stable-summary.txt` and
-`mm-nonmm-stable-summary.txt`. AKPM flagged `pull-summary.md` as the wrong
-attachment name; do not guess a replacement policy filename or retrieve
-that policy from GitHub. The new Work session must check its actual
-working repository and invoke the gate itself, rather than assume
-prior-session execution persists. Keep review-side Git operations
-read-only.
+Markdown policy was attached. Add `pull-sumary.md` for pull-request
+writing tasks. The new Work session must check its actual working
+repository and invoke the gate itself, rather than assume prior-session
+execution persists. Keep all review-side Git operations read-only.
 
 For fresh reviews, attach `akpm-patch-review-workflow.md`, the gate
 script if not already available in Work, and the patch/mbox. After the
@@ -1569,3 +1361,9 @@ AKPM's previous findings or feedback, also attach `review-activity.md`
 and only the relevant dated archive. Do not attach the historical
 `tj-patch-review-workflow.md` or `kernel-patch-review-workflow.md`.
 Neither file should be modified or deleted without authorization.
+
+## Trailer policy correction (2026-11-01)
+
+Never include an `Assisted-by:` trailer. It is obsolete. This rule
+supersedes all older instructions to add or order that trailer.
+
