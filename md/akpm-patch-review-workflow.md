@@ -1367,3 +1367,38 @@ Neither file should be modified or deleted without authorization.
 Never include an `Assisted-by:` trailer. It is obsolete. This rule
 supersedes all older instructions to add or order that trailer.
 
+
+## Cross-chat review discovery and testing handoff (2026-11-06)
+
+This section supersedes older archive-only discovery and delivery rules
+where they conflict. Keep a durable, plain-text akpm-review-index.md in
+Library. It is a discovery index, not a replacement for review-activity.md.
+Publish a standalone searchable Markdown review report for every reviewed
+patch/series; an opaque archive alone does not complete the handoff.
+
+Index and report must include exact and normalized subjects, version,
+author, Message-ID, verified base SHA, review key, current disposition,
+report/evidence Library IDs and links, and last update. Preserve existing
+filenames and Library identities. Distinguish exact-series review from
+older versions and partial coverage. Missing index entries mean UNKNOWN.
+
+Save report and evidence first, then publish the index referencing their
+returned IDs. Verify direct retrieval and subject discovery. If ranked
+search has not caught up, use exact filename enumeration with pagination
+and stable IDs; disclose search limitations. Never promise search alone
+is infallible. Keep index IDs in handoff instructions as a direct fallback.
+
+Before review-informed test planning, the testing chat must retrieve the
+current index and matched report, verify version/base, and record which
+review version and findings informed its plan. Failed retrieval is an
+explicit BLOCKED/UNKNOWN dependency, never evidence of no prior review.
+Testing may proceed independently with that limitation stated. Provide
+this lookup requirement in cross-chat handoffs; do not assume another
+chat automatically reads this workflow or alter bughunting.md here.
+
+Persist consequential follow-up corrections immediately in the current
+report and index. Retain historical evidence and original gate receipts.
+Separate confirmed defects, rejected concerns, hypotheses, proposed tests
+and actual runtime results. Daily consolidation must not delay discovery
+or corrections. Save this updated workflow under its existing identity
+and provide the complete canonical downloadable Markdown copy.
