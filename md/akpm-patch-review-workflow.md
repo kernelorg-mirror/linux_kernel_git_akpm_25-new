@@ -1376,6 +1376,21 @@ Library. It is a discovery index, not a replacement for review-activity.md.
 Publish a standalone searchable Markdown review report for every reviewed
 patch/series; an opaque archive alone does not complete the handoff.
 
+The canonical index is already available in Library:
+- Filename: `akpm-review-index.md`
+- Library ID: `libfile_5f208a939bfc819197afb46e882f344b`
+- Direct link:
+  https://chatgpt.com/library?file_id=libfile_5f208a939bfc819197afb46e882f344b&account_id=personal
+
+Both review and testing chats must retrieve the current version from
+Library. Do not require AKPM to download and reattach the index. Include
+its exact filename and stable Library ID in each new-chat handoff. Use
+the ID if filename search fails or returns similarly named copies;
+numbered or timestamped copies do not supersede this canonical identity.
+Attachments are a fallback only when direct retrieval is unavailable.
+Update this same Library item in place; do not create a new index for
+each chat. Read the matching reports and corrections linked from it.
+
 Index and report must include exact and normalized subjects, version,
 author, Message-ID, verified base SHA, review key, current disposition,
 report/evidence Library IDs and links, and last update. Preserve existing
