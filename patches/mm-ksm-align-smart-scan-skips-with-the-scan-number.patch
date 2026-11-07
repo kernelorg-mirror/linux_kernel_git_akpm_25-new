@@ -1,0 +1,149 @@
+From: Qiliang Yuan <odys.yuan@gmail.com>
+Subject: mm/ksm: align smart scan skips with the scan number
+Date: Sat, 07 Nov 2026 11:57:00 -0500
+
+Patch series "mm/ksm: keep smart scan from losing duplicate pages", v3.
+
+With smart scan, which is on by default, two identical pages that become
+mergeable some scans apart can stay unmerged for as long as they live:
+each page times its skipped scans on its own, and once both are old they
+may never be looked at in the same scan, which merging through the
+unstable tree requires. This was first noticed as intermittent failures
+of ksm_tests "KSM NUMA merging" in run_vmtests.sh.
+
+Patch 1 picks the skipped scans by the global scan number, so all old
+pages are looked at together every eighth scan. Over 420 pairs made
+mergeable 0 to 20 scans apart, 361 and 334 merged before on two boots
+and all of them after, at the cost of about 10% more ksmd time on memory
+that never merges.
+
+Patch 2 documents how smart scan picks the scans to skip.
+
+Patch 3 moves waiting for KSM full scans into a vm_util helper, and
+patch 4 adds a ksm_functional_tests case that fails 20/20 without patch
+1 and 0/20 with it, on both boots.
+
+
+This patch (of 4):
+
+Smart scan skips pages that KSM has failed to de-duplicate for a while.
+Once a page is three scans old, its rmap_item counts down its own number
+of scans to skip, 1, 2, 4 and then 8 as it ages, so an old page is looked
+at every ninth scan.
+
+The unstable tree is rebuilt on every scan, so two identical pages that
+are not in the stable tree yet can only be merged in a scan that looks
+at both. Each countdown runs from when its own page became mergeable, so
+two pages that became mergeable at different times end up on different
+phases and, once both are old, may never be looked at in the same scan
+again. They then stay unmerged for as long as they live. The pairs below
+are counted by making a page mergeable, waiting for 0 to 20 full scans
+before doing the same with an identical page, 20 times for each wait,
+and checking the pair after another 64 full scans, on two boots per
+kernel.
+
+Pick the skipped scans by the global scan number instead, with periods
+of 2, 4 and 8 scans. The periods being powers of two, every old page is
+looked at on each scan that is a multiple of 8, whatever its age, so any
+two pages meet at least every eighth scan. The longest period goes from
+nine scans to eight, so ksmd looks at more of the pages that never
+merge. The rest of the table is measured on 64M of such pages, median of
+five runs of 256 scans on each of three boots per kernel, CPU time from
+schedstat:
+
+                              before     after      after/before
+  pairs merged (of 420)       361        420        116%
+                              334        420        126%
+  pages looked at per scan    1792       2048       114%
+  ksmd CPU time per scan      6.30 ms    6.88 ms    109%
+                              6.40 ms    6.96 ms    109%
+                              6.15 ms    6.88 ms    112%
+
+Link: https://lore.kernel.org/20261107-bug-mm-ksm-smart-scan-align-skips-v3-0-16d5ce8b5fd6@gmail.com
+Link: https://lore.kernel.org/20261107-bug-mm-ksm-smart-scan-align-skips-v3-1-16d5ce8b5fd6@gmail.com
+Fixes: 5e924ff54d08 ("mm/ksm: add "smart" page scanning mode")
+Signed-off-by: Qiliang Yuan <odys.yuan@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Xu Xin <xu.xin@linux.dev>
+Reviewed-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Stefan Roesch <shr@devkernel.io>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+---
+
+ mm/ksm.c |   24 ++++++++++--------------
+ 1 file changed, 10 insertions(+), 14 deletions(-)
+
+--- a/mm/ksm.c~mm-ksm-align-smart-scan-skips-with-the-scan-number
++++ a/mm/ksm.c
+@@ -197,7 +197,6 @@ struct ksm_stable_node {
+  * @head: pointer to stable_node heading this list in the stable tree
+  * @hlist: link into hlist of rmap_items hanging off that stable_node
+  * @age: number of scan iterations since creation (unstable node)
+- * @remaining_skips: how many scans to skip (unstable node)
+  * @linear_page_index: the original page's index before merged by KSM (stable node)
+  */
+ struct ksm_rmap_item {
+@@ -214,7 +213,6 @@ struct ksm_rmap_item {
+ 		struct {
+ 			unsigned int oldchecksum;
+ 			rmap_age_t age;
+-			rmap_age_t remaining_skips;
+ 		};			/* when unstable */
+ 		unsigned long linear_page_index;    /* for reverse mapping, when stable */
+ 	};
+@@ -2456,16 +2454,14 @@ static struct ksm_rmap_item *get_next_rm
+ }
+ 
+ /*
+- * Calculate skip age for the ksm page age. The age determines how often
+- * de-duplicating has already been tried unsuccessfully. If the age is
+- * smaller, the scanning of this page is skipped for less scans.
++ * Calculate how often a page of the given ksm page age is scanned. The age
++ * determines how often de-duplicating has already been tried
++ * unsuccessfully. The older the page, the fewer scans look at it.
+  *
+  * @age: rmap_item age of page
+  */
+-static unsigned int skip_age(rmap_age_t age)
++static unsigned int scan_period(rmap_age_t age)
+ {
+-	if (age <= 3)
+-		return 1;
+ 	if (age <= 5)
+ 		return 2;
+ 	if (age <= 8)
+@@ -2515,17 +2511,17 @@ static bool should_skip_rmap_item(struct
+ 		return false;
+ 
+ 	/*
+-	 * Are we still allowed to skip? If not, then don't skip it
+-	 * and determine how much more often we are allowed to skip next.
++	 * The unstable tree is rebuilt on every scan, so two identical pages
++	 * can only be merged if both are looked at in the same scan. Pick the
++	 * scans by the global scan number rather than per page: the periods
++	 * are powers of two, so pages of any age meet on every scan that is a
++	 * multiple of the longest one.
+ 	 */
+-	if (!rmap_item->remaining_skips) {
+-		rmap_item->remaining_skips = skip_age(age);
++	if (!(ksm_scan.seqnr & (scan_period(age) - 1)))
+ 		return false;
+-	}
+ 
+ 	/* Skip this page */
+ 	ksm_pages_skipped++;
+-	rmap_item->remaining_skips--;
+ 	remove_rmap_item_from_tree(rmap_item);
+ 	return true;
+ }
+_

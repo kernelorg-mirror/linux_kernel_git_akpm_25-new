@@ -1,0 +1,211 @@
+From: Qiliang Yuan <odys.yuan@gmail.com>
+Subject: selftests/mm: cover merging KSM pages aged by smart scan
+Date: Sat, 07 Nov 2026 11:57:03 -0500
+
+ksm_functional_tests checks merging and unmerging with ksmd's default
+settings, but nothing there exercises smart scan, which skips pages KSM
+has failed to merge for a while.
+
+Smart scan used to time those skips per page, so two identical pages
+that became mergeable some scans apart could end up never being looked
+at in the same scan, and were never merged. "mm/ksm: align smart scan
+skips with the scan number" fixed that.
+
+Add ksm_get_smart_scan() and ksm_set_smart_scan() to vm_util, and a
+case that enables smart scan, lets sixteen unique pages age for a dozen
+scans, then makes a duplicate of each mergeable one scan apart, and
+expects every pair to be merged 32 scans later:
+
+  kernel               failures, two boots
+  before the fix       20/20, 20/20
+  with the fix          0/20,  0/20
+
+Link: https://lore.kernel.org/20261107-bug-mm-ksm-smart-scan-align-skips-v3-4-16d5ce8b5fd6@gmail.com
+Signed-off-by: Qiliang Yuan <odys.yuan@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: David Hildenbrand (Arm) <david@kernel.org>
+Cc: Xu Xin <xu.xin@linux.dev>
+Cc: Chengming Zhou <chengming.zhou@linux.dev>
+Cc: Stefan Roesch <shr@devkernel.io>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+---
+
+ tools/testing/selftests/mm/ksm_functional_tests.c |   89 +++++++++++-
+ tools/testing/selftests/mm/vm_util.c              |   32 ++++
+ tools/testing/selftests/mm/vm_util.h              |    2 
+ 3 files changed, 122 insertions(+), 1 deletion(-)
+
+--- a/tools/testing/selftests/mm/ksm_functional_tests.c~selftests-mm-cover-merging-ksm-pages-aged-by-smart-scan
++++ a/tools/testing/selftests/mm/ksm_functional_tests.c
+@@ -695,6 +695,92 @@ unmap:
+ 	munmap(map, size);
+ }
+ 
++static void test_merge_aged_pairs(void)
++{
++	const unsigned int pairs = 16;
++	const unsigned long size = 2 * pairs * pagesize;
++	int old_smart_scan;
++	unsigned int i;
++	char *map;
++
++	ksft_print_msg("[RUN] %s\n", __func__);
++
++	old_smart_scan = ksm_get_smart_scan();
++	if (old_smart_scan < 0) {
++		ksft_test_result_skip("smart_scan not supported\n");
++		return;
++	}
++	if (ksm_set_smart_scan(true) < 0) {
++		ksft_test_result_fail("Enabling smart_scan failed\n");
++		return;
++	}
++
++	if (ksm_stop() < 0) {
++		ksft_test_result_fail("Disabling (unmerging) KSM failed\n");
++		goto restore;
++	}
++
++	map = mmap(NULL, size, PROT_READ | PROT_WRITE,
++		   MAP_PRIVATE | MAP_ANON, -1, 0);
++	if (map == MAP_FAILED) {
++		ksft_test_result_fail("mmap() failed\n");
++		goto restore;
++	}
++	if (madvise(map, size, MADV_NOHUGEPAGE) && errno != EINVAL) {
++		ksft_test_result_fail("MADV_NOHUGEPAGE failed\n");
++		goto unmap;
++	}
++
++	/*
++	 * Page i of the first half and page i of the second half form a
++	 * pair with content no other page shares.
++	 */
++	for (i = 0; i < pairs; i++) {
++		memset(map + i * pagesize, i + 1, pagesize);
++		memset(map + (pairs + i) * pagesize, i + 1, pagesize);
++	}
++
++	/* Let the first page of each pair age without a duplicate. */
++	if (madvise(map, size / 2, MADV_MERGEABLE)) {
++		ksft_test_result_fail("MADV_MERGEABLE failed\n");
++		goto unmap;
++	}
++	if (ksm_start() < 0 || ksm_wait_full_scans(12) < 0) {
++		ksft_test_result_fail("Running KSM failed\n");
++		goto unmap;
++	}
++
++	/*
++	 * Make the duplicates mergeable one scan apart so that each pair
++	 * starts out with a different distance in scans.
++	 */
++	for (i = 0; i < pairs; i++) {
++		if (madvise(map + (pairs + i) * pagesize, pagesize,
++			    MADV_MERGEABLE)) {
++			ksft_test_result_fail("MADV_MERGEABLE failed\n");
++			goto unmap;
++		}
++		if (ksm_wait_full_scans(1) < 0) {
++			ksft_test_result_fail("Running KSM failed\n");
++			goto unmap;
++		}
++	}
++
++	if (ksm_wait_full_scans(32) < 0) {
++		ksft_test_result_fail("Running KSM failed\n");
++		goto unmap;
++	}
++
++	ksft_test_result(ksm_get_self_merging_pages() == 2 * pairs,
++			 "Pages aged by smart scan got merged\n");
++unmap:
++	ksm_stop();
++	munmap(map, size);
++restore:
++	if (ksm_set_smart_scan(old_smart_scan) < 0)
++		ksft_print_msg("Restoring smart_scan failed\n");
++}
++
+ static void init_global_file_handles(void)
+ {
+ 	mem_fd = open("/proc/self/mem", O_RDWR);
+@@ -720,7 +806,7 @@ static void init_global_file_handles(voi
+ 
+ int main(int argc, char **argv)
+ {
+-	unsigned int tests = 9;
++	unsigned int tests = 10;
+ 	int err;
+ 
+ 	if (argc > 1 && !strcmp(argv[1], FORK_EXEC_CHILD_PRG_NAME)) {
+@@ -753,6 +839,7 @@ int main(int argc, char **argv)
+ 	test_prctl_fork_exec();
+ 	test_prctl_unmerge();
+ 	test_fork_ksm_merging_page_count();
++	test_merge_aged_pairs();
+ 
+ 	err = ksft_get_fail_cnt();
+ 	if (err)
+--- a/tools/testing/selftests/mm/vm_util.c~selftests-mm-cover-merging-ksm-pages-aged-by-smart-scan
++++ a/tools/testing/selftests/mm/vm_util.c
+@@ -984,6 +984,38 @@ int ksm_use_zero_pages(void)
+ 	return ret == 1 ? 0 : -errno;
+ }
+ 
++int ksm_get_smart_scan(void)
++{
++	int smart_scan_fd;
++	char buf;
++	ssize_t ret;
++
++	smart_scan_fd = open("/sys/kernel/mm/ksm/smart_scan", O_RDONLY);
++	if (smart_scan_fd < 0)
++		return -errno;
++
++	ret = pread(smart_scan_fd, &buf, 1, 0);
++	close(smart_scan_fd);
++	if (ret != 1)
++		return -errno;
++
++	return buf == '1';
++}
++
++int ksm_set_smart_scan(bool enable)
++{
++	int smart_scan_fd;
++	ssize_t ret;
++
++	smart_scan_fd = open("/sys/kernel/mm/ksm/smart_scan", O_WRONLY);
++	if (smart_scan_fd < 0)
++		return -errno;
++
++	ret = write(smart_scan_fd, enable ? "1" : "0", 1);
++	close(smart_scan_fd);
++	return ret == 1 ? 0 : -errno;
++}
++
+ int ksm_wait_full_scans(long nr)
+ {
+ 	long start_scans, end_scans;
+--- a/tools/testing/selftests/mm/vm_util.h~selftests-mm-cover-merging-ksm-pages-aged-by-smart-scan
++++ a/tools/testing/selftests/mm/vm_util.h
+@@ -163,6 +163,8 @@ long ksm_get_self_zero_pages(void);
+ long ksm_get_self_merging_pages(void);
+ long ksm_get_full_scans(void);
+ int ksm_wait_full_scans(long nr);
++int ksm_get_smart_scan(void);
++int ksm_set_smart_scan(bool enable);
+ int ksm_use_zero_pages(void);
+ int ksm_start(void);
+ int ksm_stop(void);
+_
