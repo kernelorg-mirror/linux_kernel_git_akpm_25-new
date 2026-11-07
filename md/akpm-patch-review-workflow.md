@@ -1104,6 +1104,90 @@ instead of inventing a generic prerequisite.
 
 ## Modeling and verification
 
+### Recover the validated AKPM TLA+ checker kit in Work
+
+At the start of every new Work session that undertakes substantive
+kernel reviews, reestablish the TLA+ checkers in that session before
+making a model decision or claiming tool availability. Do not infer
+that TLC or tla-mctj is unavailable from `command -v` or a search of
+current scratch alone. Work scratch and PATH may not retain tools from
+a previous chat. Retrieve the current versions of these stable Library
+identities and inspect their README/RESULTS and archive contents:
+
+- `akpm-tla-tools.tar.gz`:
+  `libfile_f43dbc8e2f688191a4426e97f6461672`
+- `akpm-tla-validated.tar.gz`:
+  `libfile_146daf90c15c8191a5739318f2b8bb8f`
+- `akpm-tla-validation-install-kit.tar.gz`:
+  `libfile_45decc5c8e208191ae37a09f69295484`
+
+The validated archive contains an x86-64 Linux `tla-mctj`,
+`tla2tools.jar`, models, and `validate.sh`. In a compatible Work runtime,
+extract into scratch, verify the tool hashes against its RESULTS.md, and
+run the bundled validation with explicit `TLA_MCTJ`, `TLA_JAR`, and
+`VALIDATION_OUTPUT` paths. Do not run its network-install script when
+the validated binaries are present. Record the exit code and expected
+passing and deliberately failing fixture verdicts. The archived
+October 18, 2026 validation is historical: rerun it in the current
+runtime before claiming checker availability. The 2026-11-07 Work run
+passed (Rust and TLC: 2/18-state protected cases, 2/17-state planted
+faults). Those fixtures validate the checkers, not a kernel patch.
+
+The three named archives do not contain herd7. Check Work's own
+execution environment and Library before declaring herd7 unavailable
+for a Work review. A remote host's installation does NOT satisfy
+Work-local availability. AKPM permits using the connected `ts` host
+for a review's focused model check when that is sensible and the job
+can be isolated from the kernel-testing chat's work. Prefer a local
+Work checker when available. Record the actual host and command for
+every run. On 2026-11-07, Work-local
+herd7 was still absent. The normal `kernel-test` PATH and
+`/usr/local/bin` on ts lacked herd7, but a surviving case-local OPAM
+switch contained herd7 7.58 at:
+
+`/usr/src/kernel-testing/logs/pte-reclaim-sync-20261104/opam/pte-model/bin/herd7`
+
+The earlier `pte-sync-herd-setup-20261104` ts job installed herdtools7
+7.58 into this switch, and `pte-sync-herd-tests-20261104` executed
+18 LKMM model variants successfully. That was ChatGPT-initiated
+execution ON ts, not execution in the Work container. If an authorized
+review uses that host, verify the path and version under the connector
+and run from `/usr/src/25/tools/memory-model` with
+`-conf linux-kernel.cfg`. The working directory matters: it resolves
+`linux-kernel.cat` relative to it. A 2026-11-07 smoke check of
+`MP+pooncerelease+poacquireonce.litmus` exited 0 with Observation
+Never 0 3. Preserve the separate host, model, and run provenance;
+herd7's availability on ts is not Work-local availability or an
+execution on a reviewed patch. If Work-local herd7 is needed, recover
+and validate it inside Work, or use the authorized isolated ts path
+with explicit remote provenance. If neither is suitable, report the
+LKMM check NOT RUN. A TLA+ model decision still
+follows the trigger analysis below; tool availability alone does not
+make a model necessary.
+
+### Sharing ts safely with the kernel-testing chat
+
+The ts host and tunnel also serve AKPM's separate kernel-testing chat.
+Review work must not install packages, modify its project or source
+tree, change kernel configuration/patch queue, build, boot a VM, or
+control its live tests. A model job is allowed when the result is
+needed and its files and state are isolated. Before starting, inspect
+active connector jobs for conflicting state changes. Do not delay a
+review model merely because a testing job consumes CPU; AKPM does not
+consider ts resource use a concern for this work.
+Use a unique review-prefixed job ID, bounded timeout and a private
+per-review temporary directory for model inputs/results. Connector
+job logs are the only routine writes under the kernel-testing project.
+For source/config reads under `/usr/src/25`, hold its existing directory
+lock in shared mode (`exec 9<.; flock -s 9`) for the whole read. The
+testing chat uses the same lock exclusively for source mutations,
+builds and dependent copies. A job-list check is not an atomic lock:
+the shared lock and private paths provide the actual isolation. Do
+not run a model on ts if the required isolation cannot be established.
+Inspect the job's final exit status and full output, and distinguish
+remote model evidence from Work-local execution and kernel runtime
+testing. No running ts job is needed merely to make a model:no decision.
+
 Use Tejun's pinned `review/formal-model-check.md` for model triggers,
 procedure, and verification. Make an explicit `model: yes` or
 `model: no (reason)` decision for each review, even though Tejun's
