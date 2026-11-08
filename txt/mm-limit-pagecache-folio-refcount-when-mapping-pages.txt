@@ -1,0 +1,244 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm: limit pagecache folio refcount when mapping pages
+Date: Sat, 07 Nov 2026 23:23:37 +0100
+
+Patch series "mm: limit pagecache folio refcount", v2.
+
+Users can create a lot of folio references to pagecache folios, making
+it possible to overflow the refcount of large folios.
+
+While we knew that one could in theory overflow a folio's refcount, we
+mostly assumed that bad things would happen and it wouldn't go
+unnoticed.
+
+Not so sure if that is really always the case, and leaving that problem
+unsolved is irresponsible, so let's limit pagecache folio refcounts.
+
+This is really only relevant for large folios / thps in the page cache.
+With anon folios (including THPs), we should not be
+able to trigger folio refcount overflows (until we get PUD-sized ones ;) ).
+
+It was likely a problem for anon folios as well before we had a
+dedicated pincount.
+
+Let's limit the refcount before it turns negative, giving admin processes
+some extra reserves (to recover a problematic system). We still leave some
+headroom to allow for some slight limit overshooting, to make the
+implementation easier.
+
+Then, we also check when splicing pagecache folios to a pipe, and
+improve our existing checks in gup. We also have to take care of
+mmu_gather, to not hold too many references when zapping (whereby new
+page faults could remap pages concurrently).
+
+This is only a temporary solution for upstream+stable, until we have
+something better.
+
+These fixes will be a bit challenging to backport to stable, but it will
+be much easier compared to the RFC series I have here were we do things
+properly by (what we discussed a couple of times earlier):
+
+ - Letting the mapcount of large folios be a long
+ - Holding a single refcount if the folio is mapped, across all mappings
+ - Reverting the limits introduced in this series
+
+I'll polish that up and send it once we merged something that can be
+backported to stable.
+
+Tested on x86-64 by lowering the folio refcount limits such that limits
+can easily be exceeded, to then test fault (SIGBUS), fork(), splice and GUP
+behavior briefly when we run into refcount limits on a shmem THP.
+
+***
+Changes in v2:
+- "mm: limit pagecache folio refcount when mapping pages"
+ - Try not to fail fork() by skipping the PTE/PUD instead. We still have
+   to fail in two scenarios.
+ - Split helper into fast and slow path. Slow path in mm/util.c,
+   exported for Fuse usage in patch #2.
+ - Check has_capability_noaudit(current, CAP_SYS_RESOURCE) instead of
+   capable(CAP_SYS_RESOURCE)
+ - Extended patch description and improved function documentation.
+ - Dropped RBs due to changes.
+- "mm: limit pagecache folio refcount when splicing into pipes"
+ - Return -EOVERFLOW from filemap_splice_read() and
+   shmem_file_splice_read(), and handle it in do_splice_read() by falling
+   back to a copy.
+ - Check in fuse_copy_folio() as well
+ - Updated patch description and updated+improved comments/doc
+ - Dropped RB due to changes
+- "mm/mmu_gather: flush pending references early before the folio limit"
+ - Adjust some comments
+ - Update Fixes:
+ - Extend patch description
+- "mm/gup: limit pagecache folio refcount when grabbing references"
+ - Keep all WARN_ON_ONCE() checks for negative/null refcounts
+ - Skip has_capability_noaudit(current, CAP_SYS_RESOURCE) with disabled
+   interrupts, skipping it for GUP-fast.
+ - Properly forward try_grab_folio() errors
+ - Adjust some comments
+- Link to v1: https://patch.msgid.link/20261105-refcount_overflow_stable-v1-0-70b9c655da3e@kernel.org
+
+To: David Hildenbrand <david@kernel.org>
+To: Lorenzo Stoakes <ljs@kernel.org>
+To: "Liam R. Howlett" <liam@infradead.org>
+To: Vlastimil Babka <vbabka@kernel.org>
+To: Mike Rapoport <rppt@kernel.org>
+To: Suren Baghdasaryan <surenb@google.com>
+To: Michal Hocko <mhocko@suse.com>
+To: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+To: Jan Kara <jack@suse.cz>
+To: Andrew Morton <akpm@linux-foundation.org>
+To: Zi Yan <ziy@nvidia.com>
+To: Baolin Wang <baolin.wang@linux.alibaba.com>
+To: Nico Pache <nico.pache@linux.dev>
+To: Ryan Roberts <ryan.roberts@arm.com>
+To: Dev Jain <dev.jain@arm.com>
+To: Barry Song <baohua@kernel.org>
+To: Lance Yang <lance.yang@linux.dev>
+To: Usama Arif <usama.arif@linux.dev>
+To: Kiryl Shutsemau <kas@kernel.org>
+To: Matthew Brost <matthew.brost@intel.com>
+To: Joshua Hahn <joshua.hahnjy@gmail.com>
+To: Byungchul Park <byungchul@sk.com>
+To: Gregory Price <gourry@gourry.net>
+To: Ying Huang <ying.huang@linux.alibaba.com>
+To: Alistair Popple <apopple@nvidia.com>
+To: Peter Xu <peterx@redhat.com>
+To: Johannes Weiner <hannes@cmpxchg.org>
+To: Song Liu <songliubraving@fb.com>
+To: Rik van Riel <riel@surriel.com>
+To: Miklos Szeredi <miklos@szeredi.hu>
+To: Alexander Viro <viro@zeniv.linux.org.uk>
+To: Christian Brauner <brauner@kernel.org>
+To: Hugh Dickins <hughd@google.com>
+To: Will Deacon <will@kernel.org>
+To: "Aneesh Kumar K.V" <aneesh.kumar@kernel.org>
+To: Nick Piggin <npiggin@gmail.com>
+To: Peter Zijlstra <peterz@infradead.org>
+To: Arnd Bergmann <arnd@arndb.de>
+To: Jason Gunthorpe <jgg@ziepe.ca>
+To: Kevin Tian <kevin.tian@intel.com>
+To: "Joerg Roedel (AMD)" <joro@8bytes.org>
+To: Robin Murphy <robin.murphy@arm.com>
+To: Steve Sistare <steven.sistare@oracle.com>
+To: John Hubbard <jhubbard@nvidia.com>
+To: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+To: Josef Bacik <josef@toxicpanda.com>
+
+***
+
+***
+
+Best regards,
+--
+David Hildenbrand (Arm) <david@kernel.org>
+
+
+This patch (of 5):
+
+With large file folios, overflowing the folio mapcount and refcount
+became possible. For anon folios it is currently not really an issue:
+each large anon folio can only be mapped once into a process; on 4k
+kernels it would be more processes than usually allowed on a system, and
+on 16k or 64k kernels the processes alone would consume hundreds of GiB.
+Something to be sorted out at some point, but it's not as urgent.
+
+Being able to overflow the refcount is not really big news, but it's about
+time that we do something about it because some modern technology might
+find ways to abuse it :)
+
+One of the enablers for that was commit ddc58f27f9ee ("mm: drop tail page
+refcounting"), however, file thp support was added later.
+
+File folios can be mapped multiple times into the same process, allowing
+for processes to hold many references to the same folio.
+
+As a short-term solution, let's introduce two folio refcount limits:
+one for ordinary consumers and one for admins. Leave some headroom
+before the refcount goes negative, which we really don't want (having
+the mapcount go negative is also not expected).
+
+Start reporting SIGBUS if we run into limits. When restoring mappings
+from migration entries, instead zap the pte/pmd entry. We allow for
+slightly exceeding the limit to keep things simpler.
+
+During fork(), prefer not copying page table entries over failing fork.
+Export __folio_ref_count_over_limit() right away as that will be needed
+from fuse code next. Use has_capability_noaudit(current, CAP_SYS_RESOURCE),
+so filesystem credential overrides do not affect access to the admin
+reserve, and to not generate auditing messages simply because we access
+optional reserves.
+
+This is far from ideal, but better than all easy alternatives we can
+backport comfortably. For now it fixes the big problem: letting
+the refcount (+mapcount) go negative and cause trouble.
+
+This is only a temporary fix, we'll follow up with something better.
+
+Check order 0 folios as well for consistency: each
+folio_add_file_rmap*() and folio_dup_file_rmap*() needs a prior check.
+
+Also, just document -EHWPOISON for copy_present_ptes() while at it.
+
+Note: When zapping file migration entries, uffd-wp is preserved using PTE
+markers, but uffd-rwp protection is lost because there is no corresponding
+marker. try_to_unmap() already has the same problem when unmapping file
+folios, so we'll happily ignore it.
+
+Note2: For now we don't let migration or PTE table collapse exceed any
+limits. Admins can always refault, and if we are already operating in
+admin reserves, something is already off.
+
+Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-0-c38f6809b106@kernel.org
+Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-1-c38f6809b106@kernel.org
+Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: <stable@vger.kernel.org>

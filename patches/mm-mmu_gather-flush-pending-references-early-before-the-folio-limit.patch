@@ -1,0 +1,143 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/mmu_gather: flush pending references early before the folio limit
+Date: Sat, 07 Nov 2026 23:23:39 +0100
+
+When a task zaps mappings (e.g., MADV_DONTNEED), it can drop the PT lock
+and defer dropping the folio references. In the meantime, page faults
+can refault pagecache folios, creating more references for the same
+folios. These deferred references can build up over multiple VMAs.
+
+Let's just request a flush after enqueueing a pagecache folio whose
+refcount reached a certain threshold. Start flushing well before new
+references are refused, regardless of the caller's privileges.
+
+When returning "true" from __tlb_remove_folio_pages_size(), PTE zapping
+will flush the TLB before dropping the PT lock, but drop the references
+afterwards. Refaults can still race with that, but flushing early reduces
+the risk of letting others hit the limit.
+
+This is a temporary measure until we have something better.
+
+Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-3-c38f6809b106@kernel.org
+Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Reviewed-by: Lance Yang <lance.yang@linux.dev>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: <stable@vger.kernel.org>
+---
+
+ include/asm-generic/tlb.h |    4 ++--
+ include/linux/mm.h        |    1 +
+ mm/memory.c               |    4 ++--
+ mm/mmu_gather.c           |   10 ++++++----
+ 4 files changed, 11 insertions(+), 8 deletions(-)
+
+--- a/include/asm-generic/tlb.h~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
++++ a/include/asm-generic/tlb.h
+@@ -75,8 +75,8 @@
+  *  - __tlb_remove_folio_pages_size()
+  *
+  *    __tlb_remove_folio_pages_size() is the basic primitive that queues pages
+- *    for freeing. It will return a boolean indicating if the queue is (now)
+- *    full and a call to tlb_flush_mmu() is required.
++ *    for freeing. It returns true when a call to tlb_flush_mmu() is required,
++ *    either because the queue is full or a folio is near its refcount limit.
+  *
+  *    tlb_remove_page() and tlb_remove_page_size() imply the call to
+  *    tlb_flush_mmu() when required and has no return value.
+--- a/include/linux/mm.h~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
++++ a/include/linux/mm.h
+@@ -2256,6 +2256,7 @@ vm_fault_t finish_fault(struct vm_fault
+ /* Leave separate reserves for administrators and concurrent reference gains. */
+ #define FOLIO_REF_COUNT_LIMIT		(INT_MAX - (1U << 26))
+ #define FOLIO_REF_COUNT_ADMIN_LIMIT	(INT_MAX - (1U << 25))
++#define FOLIO_REF_COUNT_FLUSH_LIMIT	(INT_MAX - (1U << 27))
+ 
+ bool __folio_ref_count_over_limit(unsigned int ref_count);
+ 
+--- a/mm/memory.c~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
++++ a/mm/memory.c
+@@ -2074,8 +2074,8 @@ retry:
+ 	pte_unmap_unlock(start_pte, ptl);
+ 
+ 	/*
+-	 * If we forced a TLB flush (either due to running out of
+-	 * batch buffers or because we needed to flush dirty TLB
++	 * If we forced a TLB flush (either to release batched
++	 * references or because we needed to flush dirty TLB
+ 	 * entries before releasing the ptl), free the batched
+ 	 * memory too. Come back again if we didn't do everything.
+ 	 */
+--- a/mm/mmu_gather.c~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
++++ a/mm/mmu_gather.c
+@@ -179,10 +179,7 @@ static bool __tlb_remove_folio_pages_siz
+ #endif
+ 
+ 	batch = tlb->active;
+-	/*
+-	 * Add the page and check if we are full. If so
+-	 * force a flush.
+-	 */
++	/* Add the pages before deciding whether we need to flush. */
+ 	if (likely(nr_pages == 1)) {
+ 		batch->encoded_pages[batch->nr++] = encode_page(page, flags);
+ 	} else {
+@@ -190,6 +187,11 @@ static bool __tlb_remove_folio_pages_siz
+ 		batch->encoded_pages[batch->nr++] = encode_page(page, flags);
+ 		batch->encoded_pages[batch->nr++] = encode_nr_pages(nr_pages);
+ 	}
++	/* Flush pending references well before new references are refused. */
++	if (unlikely((unsigned int)folio_ref_count(page_folio(page)) >=
++		     FOLIO_REF_COUNT_FLUSH_LIMIT))
++		return true;
++
+ 	/*
+ 	 * Make sure that we can always add another "page" + "nr_pages",
+ 	 * requiring two entries instead of only a single one.
+_

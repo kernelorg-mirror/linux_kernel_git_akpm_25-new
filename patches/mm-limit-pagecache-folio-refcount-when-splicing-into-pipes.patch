@@ -1,0 +1,183 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm: limit pagecache folio refcount when splicing into pipes
+Date: Sat, 07 Nov 2026 23:23:38 +0100
+
+Similar to mapping pagecache folios into page tables, let's reject
+additional references when splicing folios into a pipe if the refcount
+is at its limit, similar to how we handle it during GUP.
+
+This will prevent more cases of possible folio refcount overflows with
+large pagecache folios.
+
+Let's keep it simple and check in the two callers of
+splice_folio_into_pipe(). Return -EOVERFLOW if the limit prevents any
+progress, so do_splice_read() can fall back to copy_splice_read() when
+read_iter is available. This keeps sendfile() and other splice users
+working when ordinary reads would still succeed.
+
+Also fall back to copying in FUSE when taking another reference through
+fuse_ref_folio() would exceed the limit.
+
+Also check in try_get_page() to cover pipe-buffer duplication by tee()
+and partial pipe-to-pipe splicing.
+
+Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-2-c38f6809b106@kernel.org
+Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Chris Mason <mason@kernel.org>
+Cc: <stable@vger.kernel.org>
+---
+
+ fs/fuse/dev.c      |    5 +++--
+ fs/splice.c        |    8 +++++++-
+ include/linux/mm.h |    9 ++++++---
+ mm/filemap.c       |   11 ++++++++---
+ mm/shmem.c         |    4 ++++
+ 5 files changed, 28 insertions(+), 9 deletions(-)
+
+--- a/fs/fuse/dev.c~mm-limit-pagecache-folio-refcount-when-splicing-into-pipes
++++ a/fs/fuse/dev.c
+@@ -1265,9 +1265,10 @@ int fuse_copy_folio(struct fuse_copy_sta
+ 		if (cs->write && cs->pipebufs && folio) {
+ 			/*
+ 			 * Can't control lifetime of pipe buffers, so always
+-			 * copy user pages.
++			 * copy user pages. Also copy folios at their refcount limit.
+ 			 */
+-			if (cs->req->args->user_pages) {
++			if (cs->req->args->user_pages ||
++			    unlikely(folio_ref_count_over_limit(folio))) {
+ 				err = fuse_copy_fill(cs);
+ 				if (err)
+ 					return err;
+--- a/fs/splice.c~mm-limit-pagecache-folio-refcount-when-splicing-into-pipes
++++ a/fs/splice.c
+@@ -956,6 +956,7 @@ static ssize_t do_splice_read(struct fil
+ 			      unsigned int flags)
+ {
+ 	unsigned int p_space;
++	ssize_t ret;
+ 
+ 	if (unlikely(!(in->f_mode & FMODE_READ)))
+ 		return -EBADF;
+@@ -977,7 +978,12 @@ static ssize_t do_splice_read(struct fil
+ 	 */
+ 	if ((in->f_flags & O_DIRECT) || IS_DAX(in->f_mapping->host))
+ 		return copy_splice_read(in, ppos, pipe, len, flags);
+-	return in->f_op->splice_read(in, ppos, pipe, len, flags);
++	ret = in->f_op->splice_read(in, ppos, pipe, len, flags);
++
++	/* Fallback to copying when hitting folio refcount limits. */
++	if (unlikely(ret == -EOVERFLOW) && in->f_op->read_iter)
++		ret = copy_splice_read(in, ppos, pipe, len, flags);
++	return ret;
+ }
+ 
+ /**
+--- a/include/linux/mm.h~mm-limit-pagecache-folio-refcount-when-splicing-into-pipes
++++ a/include/linux/mm.h
+@@ -2309,10 +2309,13 @@ static inline void get_page(struct page
+ 
+ static inline __must_check bool try_get_page(struct page *page)
+ {
+-	page = compound_head(page);
+-	if (WARN_ON_ONCE(page_ref_count(page) <= 0))
++	struct folio *folio = page_folio(page);
++
++	if (WARN_ON_ONCE(folio_ref_count(folio) <= 0))
++		return false;
++	if (unlikely(folio_ref_count_over_limit(folio)))
+ 		return false;
+-	page_ref_inc(page);
++	folio_ref_inc(folio);
+ 	return true;
+ }
+ 
+--- a/mm/filemap.c~mm-limit-pagecache-folio-refcount-when-splicing-into-pipes
++++ a/mm/filemap.c
+@@ -3094,9 +3094,10 @@ size_t splice_folio_into_pipe(struct pip
+  * Return: On success, the number of bytes read will be returned and *@ppos
+  * will be updated if appropriate; 0 will be returned if there is no more data
+  * to be read; -EAGAIN will be returned if the pipe had no space, and some
+- * other negative error code will be returned on error.  A short read may occur
+- * if the pipe has insufficient space, we reach the end of the data or we hit a
+- * hole.
++ * other negative error code will be returned on error; -EOVERFLOW will be
++ * returned if the folio's refcount is too high and the caller can fall back to
++ * copying.  A short read may occur if the pipe has insufficient space, we reach
++ * the end of the data or we hit a hole.
+  */
+ ssize_t filemap_splice_read(struct file *in, loff_t *ppos,
+ 			    struct pipe_inode_info *pipe,
+@@ -3168,6 +3169,10 @@ ssize_t filemap_splice_read(struct file
+ 			if (writably_mapped)
+ 				flush_dcache_folio(folio);
+ 
++			if (unlikely(folio_ref_count_over_limit(folio))) {
++				error = -EOVERFLOW;
++				goto out;
++			}
+ 			n = min_t(loff_t, len, isize - *ppos);
+ 			n = splice_folio_into_pipe(pipe, folio, *ppos, n);
+ 			if (!n)
+--- a/mm/shmem.c~mm-limit-pagecache-folio-refcount-when-splicing-into-pipes
++++ a/mm/shmem.c
+@@ -3823,6 +3823,10 @@ static ssize_t shmem_file_splice_read(st
+ 			 * Ok, we have the page, and it's up-to-date, so we can
+ 			 * now splice it into the pipe.
+ 			 */
++			if (unlikely(folio_ref_count_over_limit(folio))) {
++				error = -EOVERFLOW;
++				break;
++			}
+ 			n = splice_folio_into_pipe(pipe, folio, *ppos, part);
+ 			folio_put(folio);
+ 			folio = NULL;
+_
