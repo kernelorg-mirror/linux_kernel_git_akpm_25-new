@@ -1,0 +1,124 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm: don't allocate a page table under RCU in do_set_pmd()
+Date: Fri, 06 Nov 2026 13:36:13 +0100
+
+do_fault_around() skips PTE table preallocation when the PMD already
+points to a PTE table.  A concurrent collapse can then retract that table
+and clear the PMD before filemap_map_pages() locks the new PMD-sized
+folio.
+
+filemap_map_pmd() can then call do_set_pmd() with an empty PMD and no
+preallocated table.  On PowerPC hash MMU, do_set_pmd() then tries
+allocating a PTE table to deposit.  But filemap_map_pmd() calls
+do_set_pmd() under RCU, so allocating from that context is not good.
+
+This race became possible when retract_page_tables() stopped taking the
+mmap and VMA locks.  Previously, those locks excluded retraction while the
+fault was in progress.
+
+Add a may_alloc argument to do_set_pmd() and pass false from
+filemap_map_pmd(), so we can fail with VM_FAULT_FALLBACK instead of trying
+to allocate.
+
+This issue should be fairly hard to hit in practice.
+
+Link: https://lore.kernel.org/20261106-khugepaged_set_pmd-v2-2-d2457b5e377a@kernel.org
+Fixes: 1d65b771bc08 ("mm/khugepaged: retract_page_tables() without mmap or vma lock")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Lance Yang <lance.yang@linux.dev>
+Acked-by: Usama Arif <usama.arif@linux.dev>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Qi Zheng <qi.zheng@linux.dev>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: <stable@vger.kernel.org>
+---
+
+ include/linux/mm.h |    3 ++-
+ mm/filemap.c       |    2 +-
+ mm/khugepaged.c    |    2 +-
+ mm/memory.c        |   10 +++++++---
+ 4 files changed, 11 insertions(+), 6 deletions(-)
+
+--- a/include/linux/mm.h~mm-dont-allocate-a-page-table-under-rcu-in-do_set_pmd
++++ a/include/linux/mm.h
+@@ -2180,7 +2180,8 @@ static inline pte_t maybe_mkwrite(pte_t
+ 	return pte;
+ }
+ 
+-vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page);
++vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page,
++		bool may_alloc);
+ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		struct page *page, unsigned int nr, unsigned long addr);
+ 
+--- a/mm/filemap.c~mm-dont-allocate-a-page-table-under-rcu-in-do_set_pmd
++++ a/mm/filemap.c
+@@ -3749,7 +3749,7 @@ static bool filemap_map_pmd(struct vm_fa
+ 
+ 	if (pmd_none(*vmf->pmd) && folio_test_pmd_mappable(folio)) {
+ 		struct page *page = folio_file_page(folio, start);
+-		vm_fault_t ret = do_set_pmd(vmf, folio, page);
++		vm_fault_t ret = do_set_pmd(vmf, folio, page, /* may_alloc= */ false);
+ 		if (!ret) {
+ 			/* The page is mapped successfully, reference consumed. */
+ 			folio_unlock(folio);
+--- a/mm/khugepaged.c~mm-dont-allocate-a-page-table-under-rcu-in-do_set_pmd
++++ a/mm/khugepaged.c
+@@ -1827,7 +1827,7 @@ static enum scan_result set_huge_pmd(str
+ 	}
+ 
+ 	vmf.pmd = pmdp;
+-	if (do_set_pmd(&vmf, folio, page))
++	if (do_set_pmd(&vmf, folio, page, /* may_alloc= */ true))
+ 		return SCAN_FAIL;
+ 
+ 	folio_get(folio);
+--- a/mm/memory.c~mm-dont-allocate-a-page-table-under-rcu-in-do_set_pmd
++++ a/mm/memory.c
+@@ -5689,7 +5689,8 @@ static void deposit_prealloc_pte(struct
+ 	vmf->prealloc_pte = NULL;
+ }
+ 
+-vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page)
++vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page,
++		bool may_alloc)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	bool write = vmf->flags & FAULT_FLAG_WRITE;
+@@ -5730,6 +5731,8 @@ vm_fault_t do_set_pmd(struct vm_fault *v
+ 	 * related to pte entry. Use the preallocated table for that.
+ 	 */
+ 	if (arch_needs_pgtable_deposit() && !vmf->prealloc_pte) {
++		if (!may_alloc)
++			return VM_FAULT_FALLBACK;
+ 		vmf->prealloc_pte = pte_alloc_one(vma->vm_mm);
+ 		if (!vmf->prealloc_pte)
+ 			return VM_FAULT_OOM;
+@@ -5771,7 +5774,8 @@ out:
+ 	return ret;
+ }
+ #else
+-vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page)
++vm_fault_t do_set_pmd(struct vm_fault *vmf, struct folio *folio, struct page *page,
++		bool may_alloc)
+ {
+ 	return VM_FAULT_FALLBACK;
+ }
+@@ -5895,7 +5899,7 @@ fallback:
+ 
+ 	if (pmd_none(*vmf->pmd)) {
+ 		if (!needs_fallback && folio_test_pmd_mappable(folio)) {
+-			ret = do_set_pmd(vmf, folio, page);
++			ret = do_set_pmd(vmf, folio, page, /* may_alloc= */ true);
+ 			if (ret != VM_FAULT_FALLBACK)
+ 				return ret;
+ 		}
+_
