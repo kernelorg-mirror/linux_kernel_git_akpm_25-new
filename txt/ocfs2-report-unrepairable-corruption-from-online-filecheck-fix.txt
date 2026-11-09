@@ -1,0 +1,65 @@
+From: Joseph Qi <joseph.qi@linux.alibaba.com>
+Subject: ocfs2: report unrepairable corruption from online filecheck fix
+Date: Mon, 09 Nov 2026 20:21:12 +0800
+
+ocfs2_filecheck_repair_inode_block() proceeds when validation fails but
+then returns 0 unconditionally, after repairing only i_blkno,
+fs_generation and l_next_free_rec.  An inode failing any other check is
+reported to userspace as SUCCESS while still corrupt.  Revalidate after
+the repairs and return the residual code.
+Documentation/filesystems/ocfs2-online-filecheck.rst already describes
+this: "the inode must first be checked for errors before performing a
+final fix".
+
+Returning an error from the validate callback is not free, though.
+ocfs2_read_blocks() clears BH_Uptodate on failure, and
+ocfs2_read_locked_inode() bails out before upgrading the cluster lock to
+exclusive and calling ocfs2_write_block().  Simply revalidating at the
+end would therefore leave a dirty non-uptodate buffer in the block device
+cache: the next OCFS2_BH_IGNORE_CACHE read of that block sees
+buffer_dirty(), skips submitting the read, and then fails -EIO on
+!buffer_uptodate(), so later filecheck requests report FAILED instead of
+the real reason.  The half repaired dinode, stamped with a freshly
+computed ecc, would also be flushed by generic writeback without the
+exclusive cluster lock.
+
+Snapshot the block instead and only mark it dirty once the repaired
+dinode validates.  On residual failure restore the snapshot and return
+the error with the buffer clean, so the next read goes to disk as usual.
+Every early return restores it too, including the readonly and jbd gates.
+
+Take the snapshot before the initial validation rather than after it.
+ocfs2_validate_meta_ecc() -> ocfs2_block_check_validate() applies a
+hamming fixup in place and restores only the ocfs2_block_check field on
+the way out, so when the post-fix crc32 still fails the flipped bit stays
+in bh->b_data and a later snapshot would record it.  Undo that flip
+before repairing fields when the initial validation reported BLOCKECC:
+the fixup did not produce a crc32 valid block, so the bit is bogus and
+recomputing the ecc over it would stamp the corruption with a valid
+checksum.  An ecc check that passed leaves good data behind, a successful
+single bit fixup included, and is kept.
+
+The ecc is recomputed before revalidating, otherwise a bad ecc would
+always fail the revalidation and roll back the ecc repair itself.  Whether
+it needs recomputing is taken from the initial validation's error code
+rather than a second ocfs2_validate_meta_ecc() call, since any field
+repair invalidates the ecc anyway.
+
+Also guard the l_next_free_rec repair with a valid l_count.  Copying a
+zero or oversized l_count into l_next_free_rec spread the corruption to a
+second field and stamped it with a good ecc.
+
+Inodes failing an unrepairable check now report INVALIDINO instead of
+SUCCESS.  No new error code is introduced, so ocfs2_filecheck_errs[] and
+its userspace-visible names are unchanged.  A failed repair no longer
+leaves any modification behind, and revalidation runs the ecc check a
+second time, which increments osb_ecc_stats again and emits a second
+ocfs2_filecheck_validate_inode_block trace event per fix request.
+
+Link: https://lore.kernel.org/20261109122121.21473-23-joseph.qi@linux.alibaba.com
+Fixes: d56a8f32e4c6 ("ocfs2: check/fix inode block for online file check")
+Signed-off-by: Joseph Qi <joseph.qi@linux.alibaba.com>
+Cc: Heming Zhao <heming.zhao@suse.com>
+Cc: Mark Fasheh <mark@fasheh.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: <stable@vger.kernel.org>
