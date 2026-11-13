@@ -1,0 +1,547 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm: limit pagecache folio refcount when mapping pages
+Date: Thu, 12 Nov 2026 23:53:20 +0100
+
+Patch series "mm: limit pagecache folio refcount", v4.
+
+Users can create a lot of folio references to pagecache folios, making
+it possible to overflow the refcount of large folios.
+
+While we knew that one could in theory overflow a folio's refcount, we
+mostly assumed that bad things would happen and it wouldn't go
+unnoticed.
+
+Not so sure if that is really always the case, and leaving that problem
+unsolved is irresponsible, so let's limit pagecache folio refcounts.
+
+This is mostly relevant for large folios / thps in the page cache, where
+a single VMA can hold multiple folio references, allowing for many folio
+references. But with sufficient (memory+process) resources, it is also
+possible with small folios, just not that relevant in practice today.
+
+With anon folios (including THPs), we should not be able to trigger folio
+refcount overflows, as one would need so many processes that it
+becomes impossible in practice. It was likely a problem for anon folios as
+well before we had a dedicated pincount.
+
+Let's limit the refcount before it turns negative, giving admin processes
+some extra reserves (to recover a problematic system). We still leave some
+headroom to allow for some slight limit overshooting, to make the
+implementation easier.
+
+But to make that work reliably, we have to make anybody that can take
+an unbounded number of folio references obey these limits.
+
+Patch #1 handles mapping references from page tables. We also have to take
+care of mmu_gather, to not hold too many references when zapping (whereby
+new page faults could remap pages concurrently), which we do in patch #3.
+Patch #4 fixes iommufd cleanup when adding folio pins fails, which these
+limits make easier to trigger.
+
+Splicing pagecache folios to a pipe (patch #2) also needs care. After
+feedback from Linus, these users really should be using try_get_page(),
+where we now also implement the new limit check. We also teach GUP in
+patch #5 to stay below the limit, to avoid negative refcounts that cause
+trouble.
+
+Doing some digging after getting a hint from Andrew, there are various
+paths in net that can also take an unbounded number of page refs and are
+problematic. Let's use try_get_page() in all affected paths.
+
+Net paths that take page refs that I don't touch because the references
+are either bounded or the paths are not relevant in practice:
+
+ - skb_split(): can add one reference per split, but each split
+   allocates a new skb that is charged to the socket, and the references
+   go away once the data was acked. Reworking that to be able to fail
+   requires more plumbing.
+ - IP-TFS reassembly: needs one new inner skb per additional reference.
+ - io_uring zerocopy send (managed frag references): each zerocopy piece
+   is charged at least 4 KiB of TCP memory, so not relevant in practice.
+ - kTLS software splicing: only transfers references from the pipe, so
+   not a problem.
+ - AF_XDP zerocopy TX, nfsd splice reads, sockmap / sk_msg, espintcp:
+   bounded, or require privileges / special setups, so not a problem in
+   practice.
+ - Driver-specific paths (e.g., kTLS device offload): require special
+   hardware, didn't look into these.
+ - page_pool and net_iov frags: not pagecache pages, so not a problem.
+
+For page table mappings, this is only a temporary solution for
+upstream+stable, until we have something better, which will be harder to
+backport:
+
+ - Letting the mapcount of large folios be a long
+ - Holding a single refcount if the folio is mapped, across all mappings
+ - Reverting the limits introduced in this series
+
+After that, most of patch #1 will be reverted, everything else will
+stay.
+
+Tested on x86-64 by lowering the folio refcount limits such that limits
+can easily be exceeded, to then test fault (SIGBUS), fork(), splice and GUP
+behavior briefly when we run into refcount limits on a shmem THP.
+The net patches were tested similarly with AF_PACKET, nft dup, NFQUEUE,
+software GSO segmentation, TCP receive coalescing with dropped ACKs and
+socket splicing.
+
+
+This patch (of 9):
+
+With large file folios, overflowing the folio mapcount and refcount
+became possible more easily. For anon folios it is currently not really
+an issue: each large anon folio can only be mapped once into a process; on
+4k kernels it would be more processes than usually allowed on a system,
+and on 16k or 64k kernels the processes alone would consume hundreds of
+GiB. Something to be sorted out at some point, but it's not as urgent.
+
+Being able to overflow the refcount is not really big news, but it's about
+time that we do something about it because some modern technology might
+find ways to abuse it :)
+
+One of the enablers for that was commit ddc58f27f9ee ("mm: drop tail page
+refcounting"), however, file thp support was added later.
+
+File folios can be mapped multiple times into the same process, allowing
+for processes to hold many references to the same folio.
+
+As a short-term solution, let's introduce two folio refcount limits:
+one for ordinary consumers and one for admins. Leave some headroom
+before the refcount goes negative, which we really don't want (having
+the mapcount go negative is also not expected).
+
+Start reporting SIGBUS and a ratelimited warning if we run into limits.
+When restoring mappings from migration entries, instead zap the pte/pmd
+entry. We allow for slightly exceeding the limit to keep things simpler.
+
+During fork(), prefer not copying page table entries over failing fork.
+For fault-around, check in next_uptodate_folio() before trying to lock
+the folio.
+
+Export folio_ref_count_over_limit_slowpath() using EXPORT_SYMBOL_GPL
+right away so modules can use it through try_get_page(), where we will
+use it next.
+
+Use has_capability_noaudit(current, CAP_SYS_RESOURCE),
+so filesystem credential overrides do not affect access to the admin
+reserve, and to not generate auditing messages simply because we access
+optional reserves.
+
+Don't grant access to the admin reserve from kernel threads, from
+interrupt context, where "current" is just the interrupted task, or with
+IRQs disabled, as even unaudited capability checks can take locks.
+
+This is far from ideal, but better than all easy alternatives we can
+backport comfortably. For now it fixes the big problem: letting
+the refcount (+mapcount) go negative and cause trouble.
+
+This is only a temporary fix. Keep the mapping checks explicit and
+separate from reference acquisition: most are expected to disappear when
+we rework the underlying refcounting.
+
+Check order 0 folios as well for consistency: each
+folio_add_file_rmap*() and folio_dup_file_rmap*() needs a prior check.
+
+Adjust the check in folio_get() to just check for invalid refcounts and
+drop folio_ref_zero_or_close_to_overflow(): we really don't want
+negative refcounts or negative mapcounts. Convert to VM_WARN_ON_FOLIO as
+we touch it.
+
+Also, just document -EHWPOISON for copy_present_ptes() while at it.
+
+Note: When zapping file migration entries, uffd-wp is preserved using PTE
+markers, but uffd-rwp protection is lost because there is no corresponding
+marker. try_to_unmap() already has the same problem when unmapping file
+folios, so we'll happily ignore it.
+
+Link: https://lore.kernel.org/20261112-refcount_overflow_stable-v4-0-ad3deef0bd23@kernel.org
+Link: https://lore.kernel.org/20261112-refcount_overflow_stable-v4-1-ad3deef0bd23@kernel.org
+Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Acked-by: Zi Yan <ziy@nvidia.com>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@kernel.org>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: <stable@vger.kernel.org>
+---
+
+ include/linux/mm.h |   36 ++++++++++++++++++++++++++++++++----
+ mm/filemap.c       |    2 ++
+ mm/huge_memory.c   |   32 ++++++++++++++++++++++++++++++--
+ mm/memory.c        |   37 +++++++++++++++++++++++++++++++++----
+ mm/migrate.c       |   11 +++++++++++
+ mm/userfaultfd.c   |    4 ++++
+ mm/util.c          |   26 ++++++++++++++++++++++++++
+ 7 files changed, 138 insertions(+), 10 deletions(-)
+
+--- a/include/linux/mm.h~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/include/linux/mm.h
+@@ -2248,9 +2248,37 @@ vm_fault_t finish_fault(struct vm_fault
+  *   back into memory.
+  */
+ 
+-/* 127: arbitrary random number, small enough to assemble well */
+-#define folio_ref_zero_or_close_to_overflow(folio) \
+-	((unsigned int) folio_ref_count(folio) + 127u <= 127u)
++/* Leave separate reserves for administrators and concurrent reference gains. */
++#define FOLIO_REF_COUNT_LIMIT		(INT_MAX - (1U << 26))
++#define FOLIO_REF_COUNT_ADMIN_LIMIT	(INT_MAX - (1U << 25))
++
++bool folio_ref_count_over_limit_slowpath(const struct folio *folio,
++		unsigned int ref_count);
++
++/**
++ * folio_ref_count_over_limit - Check whether to refuse more folio references.
++ * @folio: The folio.
++ *
++ * Check before adding page table mappings or other significant refcount users
++ * to pagecache folios (!hugetlb), either before acquiring references or
++ * afterwards with rollback if the operation is refused.
++ *
++ * Checking other folios does no harm.
++ *
++ * This check is an approximation; we leave some headroom such that concurrent
++ * increments, batches, temporary references, or other bounded refcount
++ * consumers are not a problem.
++ *
++ * Return: True if the caller should refuse the operation, false otherwise.
++ */
++static inline bool folio_ref_count_over_limit(const struct folio *folio)
++{
++	const unsigned int ref_count = folio_ref_count(folio);
++
++	if (likely(ref_count < FOLIO_REF_COUNT_LIMIT))
++		return false;
++	return folio_ref_count_over_limit_slowpath(folio, ref_count);
++}
+ 
+ /**
+  * folio_get - Increment the reference count on a folio.
+@@ -2262,7 +2290,7 @@ vm_fault_t finish_fault(struct vm_fault
+  */
+ static inline void folio_get(struct folio *folio)
+ {
+-	VM_BUG_ON_FOLIO(folio_ref_zero_or_close_to_overflow(folio), folio);
++	VM_WARN_ON_FOLIO(folio_ref_count(folio) <= 0, folio);
+ 	folio_ref_inc(folio);
+ }
+ 
+--- a/mm/filemap.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/filemap.c
+@@ -3776,6 +3776,8 @@ static struct folio *next_uptodate_folio
+ 			continue;
+ 		if (!folio_try_get(folio))
+ 			continue;
++		if (unlikely(folio_ref_count_over_limit(folio)))
++			goto skip;
+ 		if (folio_test_locked(folio))
+ 			goto skip;
+ 		/* Has the page moved or been split? */
+--- a/mm/huge_memory.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/huge_memory.c
+@@ -1626,6 +1626,7 @@ static vm_fault_t insert_pmd(struct vm_a
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
+ 	pgtable_t pgtable = NULL;
++	vm_fault_t ret = VM_FAULT_NOPAGE;
+ 	spinlock_t *ptl;
+ 	pmd_t entry;
+ 
+@@ -1662,6 +1663,10 @@ static vm_fault_t insert_pmd(struct vm_a
+ 		if (is_huge_zero_folio(fop.folio)) {
+ 			entry = pmd_mkspecial(entry);
+ 		} else {
++			if (unlikely(folio_ref_count_over_limit(fop.folio))) {
++				ret = VM_FAULT_SIGBUS;
++				goto out_unlock;
++			}
+ 			folio_get(fop.folio);
+ 			folio_add_file_rmap_pmd(fop.folio, &fop.folio->page, vma);
+ 			add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PMD_NR);
+@@ -1688,7 +1693,7 @@ out_unlock:
+ 	spin_unlock(ptl);
+ 	if (pgtable)
+ 		pte_free(mm, pgtable);
+-	return VM_FAULT_NOPAGE;
++	return ret;
+ }
+ 
+ /**
+@@ -1759,6 +1764,7 @@ static vm_fault_t insert_pud(struct vm_a
+ 		pud_t *pud, struct folio_or_pfn fop, pgprot_t prot, bool write)
+ {
+ 	struct mm_struct *mm = vma->vm_mm;
++	vm_fault_t ret = VM_FAULT_NOPAGE;
+ 	spinlock_t *ptl;
+ 	pud_t entry;
+ 
+@@ -1784,6 +1790,10 @@ static vm_fault_t insert_pud(struct vm_a
+ 	if (fop.is_folio) {
+ 		entry = folio_mk_pud(fop.folio, vma->vm_page_prot);
+ 
++		if (unlikely(folio_ref_count_over_limit(fop.folio))) {
++			ret = VM_FAULT_SIGBUS;
++			goto out_unlock;
++		}
+ 		folio_get(fop.folio);
+ 		folio_add_file_rmap_pud(fop.folio, &fop.folio->page, vma);
+ 		add_mm_counter(mm, mm_counter_file(fop.folio), HPAGE_PUD_NR);
+@@ -1799,7 +1809,7 @@ static vm_fault_t insert_pud(struct vm_a
+ 	update_mmu_cache_pud(vma, addr, pud);
+ out_unlock:
+ 	spin_unlock(ptl);
+-	return VM_FAULT_NOPAGE;
++	return ret;
+ }
+ 
+ /**
+@@ -2095,6 +2105,14 @@ int copy_huge_pud(struct vm_area_struct
+ 	if (page) {
+ 		struct folio *folio = page_folio(page);
+ 
++		if (unlikely(folio_ref_count_over_limit(folio))) {
++			/*
++			 * VM_MIXEDMAP may contain driver-inserted pages with no
++			 * fault handler to reconstruct the mapping.
++			 */
++			ret = (dst_vma->vm_flags & VM_MIXEDMAP) ? -ENOMEM : 0;
++			goto out_unlock;
++		}
+ 		folio_get(folio);
+ 		/*
+ 		 * TODO: once we support anonymous pages, use
+@@ -5219,6 +5237,16 @@ void remove_migration_pmd(struct page_vm
+ 	if (!(pvmw->pmd && !pvmw->pte))
+ 		return;
+ 
++	if (!folio_test_anon(folio) && unlikely(folio_ref_count_over_limit(folio))) {
++		/* Leave the file mapping absent so it can be faulted in. */
++		pmd_clear(pvmw->pmd);
++		if (arch_needs_pgtable_deposit())
++			zap_deposited_table(mm, pvmw->pmd);
++		update_hiwater_rss(mm);
++		add_mm_counter(mm, mm_counter_file(folio), -HPAGE_PMD_NR);
++		return;
++	}
++
+ 	entry = softleaf_from_pmd(*pvmw->pmd);
+ 	folio_get(folio);
+ 	pmde = folio_mk_pmd(folio, READ_ONCE(vma->vm_page_prot));
+--- a/mm/memory.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/memory.c
+@@ -1168,7 +1168,10 @@ static __always_inline void __copy_prese
+  * consecutive pages of the same folio by copying them as well.
+  *
+  * Returns -EAGAIN if one preallocated page is required to copy the next PTE.
+- * Otherwise, returns the number of copied PTEs (at least 1).
++ * Returns -ENOMEM if the file folio refcount is too high and the PTE must
++ * be copied.
++ * Returns -EHWPOISON if copying a page fails.
++ * Otherwise, returns the number of processed PTEs (at least 1).
+  */
+ static inline int
+ copy_present_ptes(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+@@ -1186,6 +1189,20 @@ copy_present_ptes(struct vm_area_struct
+ 
+ 	folio = page_folio(page);
+ 
++	if (!folio_test_anon(folio) && unlikely(folio_ref_count_over_limit(folio))) {
++		/*
++		 * VM_MIXEDMAP may contain pages inserted by a driver at mmap
++		 * time, with no fault handler to restore a missing PTE.
++		 */
++		if (dst_vma->vm_flags & VM_MIXEDMAP)
++			return -ENOMEM;
++		if (userfaultfd_pte_rwp(dst_vma, pte))
++			return -ENOMEM;
++		/* Preserve uffd-wp protection when faulting the page back in. */
++		cond_install_uffd_wp_ptes(dst_vma, addr, dst_pte, pte, 1);
++		return 1;
++	}
++
+ 	/*
+ 	 * If we likely have to copy, just don't bother with batching. Make
+ 	 * sure that the common "small folio" case is as fast as possible
+@@ -1367,9 +1384,9 @@ again:
+ 		/*
+ 		 * If we need a pre-allocated page for this pte, drop the
+ 		 * locks, allocate, and try again.
+-		 * If copy failed due to hwpoison in source page, break out.
++		 * Other errors abort the copy after releasing the page table locks.
+ 		 */
+-		if (unlikely(ret == -EAGAIN || ret == -EHWPOISON))
++		if (unlikely(ret < 0))
+ 			break;
+ 		if (unlikely(prealloc)) {
+ 			/*
+@@ -1399,7 +1416,7 @@ again:
+ 			goto out;
+ 		}
+ 		entry.val = 0;
+-	} else if (ret == -EBUSY || unlikely(ret == -EHWPOISON)) {
++	} else if (ret == -EBUSY || ret == -ENOMEM || unlikely(ret == -EHWPOISON)) {
+ 		goto out;
+ 	} else if (ret ==  -EAGAIN) {
+ 		prealloc = folio_prealloc(src_mm, src_vma, addr, false);
+@@ -2481,6 +2498,8 @@ static int insert_page_into_pte_locked(s
+ 	if (unlikely(is_zero_folio(folio))) {
+ 		pteval = pte_mkspecial(pteval);
+ 	} else {
++		if (unlikely(folio_ref_count_over_limit(folio)))
++			return -EOVERFLOW;
+ 		folio_get(folio);
+ 		pteval = mk_pte(page, prot);
+ 		if (mkwrite) {
+@@ -5725,6 +5744,9 @@ vm_fault_t do_set_pmd(struct vm_fault *v
+ 	if (unlikely(folio_test_has_hwpoisoned(folio)))
+ 		return ret;
+ 
++	if (unlikely(folio_ref_count_over_limit(folio)))
++		return VM_FAULT_SIGBUS;
++
+ 	/*
+ 	 * Archs like ppc64 need additional space to store information
+ 	 * related to pte entry. Use the preallocated table for that.
+@@ -5784,6 +5806,9 @@ vm_fault_t do_set_pmd(struct vm_fault *v
+  * @page: The first page to create a PTE for.
+  * @nr: The number of PTEs to create.
+  * @addr: The first address to create a PTE for.
++ *
++ * For file mappings, the caller must check folio_ref_count_over_limit()
++ * before installing PTEs.
+  */
+ void set_pte_range(struct vm_fault *vmf, struct folio *folio,
+ 		struct page *page, unsigned int nr, unsigned long addr)
+@@ -5950,6 +5975,10 @@ fallback:
+ 		goto fallback;
+ 	}
+ 
++	if (!is_cow && unlikely(folio_ref_count_over_limit(folio))) {
++		ret = VM_FAULT_SIGBUS;
++		goto unlock;
++	}
+ 	folio_ref_add(folio, nr_pages - 1);
+ 	set_pte_range(vmf, folio, page, nr_pages, addr);
+ 	type = is_cow ? MM_ANONPAGES : mm_counter_file(folio);
+--- a/mm/migrate.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/migrate.c
+@@ -385,6 +385,17 @@ static bool remove_migration_pte(struct
+ 		    try_to_map_unused_to_zeropage(&pvmw, folio, old_pte, idx))
+ 			continue;
+ 
++		if (!folio_test_anon(folio) && !folio_test_hugetlb(folio) &&
++		    unlikely(folio_ref_count_over_limit(folio))) {
++			/* File contents remain available for a later fault. */
++			pte_clear(vma->vm_mm, pvmw.address, pvmw.pte);
++			cond_install_uffd_wp_ptes(vma, pvmw.address,
++						  pvmw.pte, old_pte, 1);
++			update_hiwater_rss(vma->vm_mm);
++			dec_mm_counter(vma->vm_mm, mm_counter_file(folio));
++			continue;
++		}
++
+ 		folio_get(folio);
+ 		new = folio_page(folio, idx);
+ 		pte = mk_pte(new, READ_ONCE(vma->vm_page_prot));
+--- a/mm/userfaultfd.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/userfaultfd.c
+@@ -373,6 +373,10 @@ static int mfill_atomic_install_pte(pmd_
+ 		goto out_unlock;
+ 
+ 	if (page_in_cache) {
++		if (unlikely(folio_ref_count_over_limit(folio))) {
++			ret = -ENOMEM;
++			goto out_unlock;
++		}
+ 		folio_add_file_rmap_pte(folio, page, dst_vma);
+ 	} else {
+ 		folio_add_new_anon_rmap(folio, dst_vma, dst_addr, RMAP_EXCLUSIVE);
+--- a/mm/util.c~mm-limit-pagecache-folio-refcount-when-mapping-pages
++++ a/mm/util.c
+@@ -791,6 +791,32 @@ int folio_mc_copy(struct folio *dst, str
+ }
+ EXPORT_SYMBOL(folio_mc_copy);
+ 
++bool folio_ref_count_over_limit_slowpath(const struct folio *folio,
++		unsigned int ref_count)
++{
++	if (ref_count >= FOLIO_REF_COUNT_ADMIN_LIMIT)
++		goto over_limit;
++	/* Background threads must not consume admin reserves. */
++	if (current->flags & PF_KTHREAD)
++		goto over_limit;
++	/* Neither must interrupt contexts on behalf of the interrupted task. */
++	if (!in_task())
++		goto over_limit;
++	/* Capability checks are not safe with IRQs disabled. */
++	if (irqs_disabled())
++		goto over_limit;
++	/* Use the task's credentials, which filesystem overrides cannot change. */
++	if (has_capability_noaudit(current, CAP_SYS_RESOURCE))
++		return false;
++
++over_limit:
++	pr_warn_ratelimited("folio:%p refcount:%d mapcount:%d mapping:%p reached refcount limit\n",
++			    folio, (int)ref_count, folio_mapcount(folio),
++			    folio_mapping(folio));
++	return true;
++}
++EXPORT_SYMBOL_GPL(folio_ref_count_over_limit_slowpath);
++
+ int sysctl_overcommit_memory __read_mostly = OVERCOMMIT_GUESS;
+ static int sysctl_overcommit_ratio __read_mostly = 50;
+ static unsigned long sysctl_overcommit_kbytes __read_mostly;
+_

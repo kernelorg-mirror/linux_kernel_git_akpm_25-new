@@ -1,0 +1,181 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/gup: limit pagecache folio refcount when grabbing references
+Date: Thu, 12 Nov 2026 23:53:24 +0100
+
+Let's add __folio_ref_count_over_limit() checks in fast and slow GUP
+before acquiring additional references or pins.
+
+Keep it simple and use the check for all folio types.
+
+Also propagate try_grab_folio() errors when grabbing additional
+references in __get_user_pages() and in memfd_pin_folios(), so hitting
+the limit returns -ENOMEM instead of -EFAULT and -EINVAL, respectively.
+
+Keep the existing invalid-refcount warnings.
+
+Link: https://lore.kernel.org/20261112-refcount_overflow_stable-v4-5-ad3deef0bd23@kernel.org
+Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Song Liu <songliubraving@fb.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+Cc: Steve Sistare <steven.sistare@oracle.com>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@kernel.org>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
+Cc: Chris Mason <mason@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: <stable@vger.kernel.org>
+---
+
+ include/linux/mm.h |   11 +++++------
+ mm/gup.c           |   32 +++++++++++++++++++++-----------
+ 2 files changed, 26 insertions(+), 17 deletions(-)
+
+--- a/include/linux/mm.h~mm-gup-limit-pagecache-folio-refcount-when-grabbing-references
++++ a/include/linux/mm.h
+@@ -2265,6 +2265,9 @@ bool folio_ref_count_over_limit_slowpath
+  * to pagecache folios (!hugetlb), either before acquiring references or
+  * afterwards with rollback if the operation is refused.
+  *
++ * Also required when pinning folios without a dedicated pincount that use
++ * GUP_PIN_COUNTING_BIAS.
++ *
+  * Checking other folios does no harm.
+  *
+  * This check is an approximation; we leave some headroom such that concurrent
+@@ -2986,12 +2989,8 @@ static inline bool folio_maybe_dma_pinne
+ 		return atomic_read(&folio->_pincount) > 0;
+ 
+ 	/*
+-	 * folio_ref_count() is signed. If that refcount overflows, then
+-	 * folio_ref_count() returns a negative value, and callers will avoid
+-	 * further incrementing the refcount.
+-	 *
+-	 * Here, for that overflow case, use the sign bit to count a little
+-	 * bit higher via unsigned math, and thus still get an accurate result.
++	 * Use unsigned math so even an unexpected negative refcount is
++	 * treated as possibly pinned.
+ 	 */
+ 	return ((unsigned int)folio_ref_count(folio)) >=
+ 		GUP_PIN_COUNTING_BIAS;
+--- a/mm/gup.c~mm-gup-limit-pagecache-folio-refcount-when-grabbing-references
++++ a/mm/gup.c
+@@ -74,10 +74,14 @@ static inline void sanity_check_pinned_p
+ static inline struct folio *try_get_folio(struct page *page, int refs)
+ {
+ 	struct folio *folio;
++	int ref_count;
+ 
+ retry:
+ 	folio = page_folio(page);
+-	if (WARN_ON_ONCE(folio_ref_count(folio) < 0))
++	ref_count = folio_ref_count(folio);
++	if (WARN_ON_ONCE(ref_count < 0))
++		return NULL;
++	if (unlikely(__folio_ref_count_over_limit(folio, ref_count)))
+ 		return NULL;
+ 	if (unlikely(!folio_ref_try_add(folio, refs)))
+ 		return NULL;
+@@ -140,7 +144,13 @@ static void gup_put_folio(struct folio *
+ int __must_check try_grab_folio(struct folio *folio, int refs,
+ 				unsigned int flags)
+ {
+-	if (WARN_ON_ONCE(folio_ref_count(folio) <= 0))
++	const int ref_count = folio_ref_count(folio);
++
++	if (WARN_ON_ONCE(ref_count <= 0))
++		return -ENOMEM;
++
++	if ((flags & (FOLL_GET | FOLL_PIN)) &&
++	    unlikely(__folio_ref_count_over_limit(folio, ref_count)))
+ 		return -ENOMEM;
+ 
+ 	if (unlikely(!(flags & FOLL_PCI_P2PDMA) && folio_is_pci_p2pdma(folio)))
+@@ -1482,17 +1492,17 @@ next_page:
+ 				struct folio *folio = page_folio(page);
+ 
+ 				/*
+-				 * Since we already hold refcount on the
+-				 * large folio, this should never fail.
++				 * Grabbing more references can fail once we
++				 * hit folio refcount limits.
+ 				 */
+-				if (try_grab_folio(folio, page_increm - 1,
+-						   gup_flags)) {
++				ret = try_grab_folio(folio, page_increm - 1,
++						     gup_flags);
++				if (ret) {
+ 					/*
+-					 * Release the 1st page ref if the
+-					 * folio is problematic, fail hard.
++					 * Release the folio reference we
++					 * already took.
+ 					 */
+ 					gup_put_folio(folio, 1, gup_flags);
+-					ret = -EFAULT;
+ 					goto out;
+ 				}
+ 			}
+@@ -3538,10 +3548,10 @@ long memfd_pin_folios(struct file *memfd
+ 					break;
+ 				}
+ 
+-				if (try_grab_folio(folio, 1, FOLL_PIN)) {
++				ret = try_grab_folio(folio, 1, FOLL_PIN);
++				if (ret) {
+ 					folio_unlock(folio);
+ 					folio_batch_release(&fbatch);
+-					ret = -EINVAL;
+ 					goto err;
+ 				}
+ 
+_

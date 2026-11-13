@@ -1,0 +1,88 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Subject: Squashfs: don't store large xattr id table indexes in memory
+Date: Wed, 11 Nov 2026 23:43:59 +0000
+
+When mounting a Squashfs filesystem, the code reads the entire xattr id
+table indexes into memory.  Their size is determined by the number of
+xattr ids in the filesystem, where the maximum number of xattr ids is
+2^32, and this will allocate and read 64 MiB.
+
+This is an excessive and unnecessary amount of memory because the
+indexes do not need to be read into memory in their entirety.  In
+addition kmalloc() is used to allocate memory, and this can fail when
+large amounts of memory are requested.  Kmalloc() on modern kernels is
+usually limited to 4096 KiB.  If panic-on-warn is set, then failure to
+allocate memory will result in a kernel panic.
+
+This commit uses a 4 page cache if the size of the xattr id table
+indexes are 4 pages or larger.  A simple and fast lookup array is
+retained where the total index size is less than 4 pages in size, which
+is the vast majority of Squashfs filesystems.
+
+Reproducer
+==========
+
+The following reproducer will create a Squashfs filesystem with
+280 million xattr ids, which will cause the xattr id table indexes to
+exceed 4096 KiB, and the kmalloc() should fail when the filesystem is
+mounted.
+
+=====================================================================
+#!/bin/bash
+
+ARGS="-pf pseudo -mem 100m -no-hardlinks -no-sparse -no-duplicates "
+ARGS+="-no-exports -no-recovery -no-progress -no-xattr-dups"
+
+finish() {
+	popd 2>&1 > /dev/null
+	rm -rf $DIR
+	exit 1
+}
+
+IMG=$PWD/reproducer.sqsh
+DIR=$(mktemp -d)
+
+if [ -e $IMG ]; then
+	rm $IMG
+fi
+
+pushd $DIR 2>&1 > /dev/null
+
+# create 20 million pseudo file links to empty file
+touch a
+a=0
+while [ $a -le 19 ]; do
+	b=0
+	while [ $b -le 999 ]; do
+		c=0
+		while [ $c -le 999 ]; do
+			echo "X/$a/$b/$c l a" >> file
+			echo "X/$a/$b/$c x user.x=1" >> file
+			(( c ++ ))
+		done
+		(( b ++ ))
+	done
+	(( a ++ ))
+done
+
+for i in $(seq 1 14); do
+	sed "s/X/$i/g" file > pseudo
+	echo
+	echo Iteration $i - appending 20 million files to Squashfs filesystem
+	echo
+	if ! mksquashfs - $IMG -pd "d 0777 0 0" $ARGS; then
+		echo Appending to Squashfs filesystem failed
+		finish
+	fi
+done
+
+popd 2>&1 > /dev/null
+rm -rf $DIR
+
+echo Generated Squashfs filesystem $IMG
+=====================================================================
+
+Link: https://lore.kernel.org/20261111234402.252354-20-phillip@squashfs.org.uk
+Fixes: 4b5397dc24ab ("squashfs: add xattr id support")
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
+Cc: Phillip Lougher <phillip.lougher@gmail.com>
