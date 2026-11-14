@@ -1,0 +1,194 @@
+From: "Lorenzo Stoakes (ARM)" <ljs@kernel.org>
+Subject: mm/migrate_device: fix use-after-free of the anon rmap
+Date: Fri, 13 Nov 2026 21:45:27 +0000
+
+A munmap() of anonymous memory can result in a use-after-free of the
+anonymous rmap if a concurrent device memory migration occurs and the
+migration runs without the mmap_lock held.
+
+This can occur for a long-term pin of device-coherent memory, or a driver
+evicting its device memory by PFN.
+
+Consider:
+
+    eviction                        munmap()
+    ========                        ========
+    migrate_device_range()
+      migrate_device_unmap()
+        try_to_migrate()
+                                    zap the migration entry
+                                    unlink_anon_vmas()
+                                      last VMA: free the anon_vma
+    migrate_device_finalize()
+      remove_migration_ptes()
+        /* locks and walks the freed anon_vma */
+
+If munmap() runs before try_to_migrate() instead, the folio is no longer
+mapped and gets no migration entry. The walk still runs, and follows the
+stale folio->mapping to the freed anon_vma.
+
+Resolve this by pinning the anon rmap of each folio which possesses one in
+migrate_device_range(), migrate_device_pfns() and
+migrate_device_coherent_folio() before its PTEs are replaced, and
+unpinning it once the walk is done.
+
+A folio which is no longer mapped cannot be pinned and has no migration
+entries to remove, so skip it rather than migrating it.
+
+Link: https://lore.kernel.org/20261113-mason-migrate-et-al-fixes-v2-9-50a2ed382b61@kernel.org
+Fixes: e778406b40db ("mm/migrate_device.c: add migrate_device_range()")
+Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Reviewed-by: Zi Yan <ziy@nvidia.com>
+Tested-by: Gregory Price (Meta) <gourry@gourry.net>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Jann Horn <jannh@google.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Matthew Wilcox (Oracle) <willy@infradead.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Johannes Weiner <hannes@cmpxchg.org>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kairui Song <kasong@tencent.com>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: Jérôme Glisse <jglisse@redhat.com>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Yu, Yu-cheng <yu-cheng.yu@intel.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Dennis Zhou <dennis@kernel.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Christoph Lameter <cl@gentwo.org>
+Cc: Peng Fan <peng.fan@nxp.com>
+Cc: Borislav Petkov <bp@alien8.de>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Dennis Zhou (Facebook) <dennisszhou@gmail.com>
+Cc: Rick Edgecombe <rick.p.edgecombe@intel.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Roman Gushchin <roman.gushchin@linux.dev>
+Cc: <stable@vger.kernel.org>
+
+ include/linux/migrate.h |    1 
+ mm/migrate_device.c     |   39 +++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+--- a/include/linux/migrate.h~mm-migrate_device-fix-use-after-free-of-the-anon-rmap
++++ a/include/linux/migrate.h
+@@ -136,6 +136,7 @@ static inline int migrate_misplaced_foli
+ #define MIGRATE_PFN_MIGRATE	(1UL << 1)
+ #define MIGRATE_PFN_WRITE	(1UL << 3)
+ #define MIGRATE_PFN_COMPOUND	(1UL << 4)
++#define MIGRATE_PFN_ANON_RMAP	(1UL << 5)	/* mm internal */
+ #define MIGRATE_PFN_SHIFT	6
+ 
+ static inline struct page *migrate_pfn_to_page(unsigned long mpfn)
+--- a/mm/migrate_device.c~mm-migrate_device-fix-use-after-free-of-the-anon-rmap
++++ a/mm/migrate_device.c
+@@ -553,6 +553,27 @@ static bool migrate_vma_check_page(struc
+ }
+ 
+ /*
++ * Pin the anonymous rmap if present to allow migration entries to be safely
++ * removed. Returns true if the pin succeeded or no pin is required, and false
++ * if the folio is no longer mapped.
++ */
++static bool pin_anon_rmap(struct folio *folio, unsigned long *src_pfn)
++{
++	if (!folio_test_anon(folio) || folio_test_ksm(folio))
++		return true;
++	if (!folio_get_anon_vma(folio)) /* Pin the anon rmap. */
++		return false;
++	*src_pfn |= MIGRATE_PFN_ANON_RMAP;
++	return true;
++}
++
++static void unpin_anon_rmap(struct folio *folio, unsigned long src_pfn)
++{
++	if (src_pfn & MIGRATE_PFN_ANON_RMAP)
++		put_anon_vma(folio_anon_vma(folio)); /* Unpin the anon rmap. */
++}
++
++/*
+  * Unmaps pages for migration. Returns number of source pfns marked as
+  * migrating.
+  */
+@@ -633,6 +654,7 @@ next:
+ 
+ 		folio = page_folio(page);
+ 		remove_migration_ptes(folio, folio, 0);
++		unpin_anon_rmap(folio, src_pfns[i]);
+ 
+ 		src_pfns[i] = 0;
+ 		if (fault_folio != folio)
+@@ -1331,6 +1353,7 @@ static void __migrate_device_finalize(un
+ 		if (!folio_is_zone_device(dst))
+ 			folio_add_lru(dst);
+ 		remove_migration_ptes(src, dst, 0);
++		unpin_anon_rmap(src, src_pfns[i]);
+ 		if (fault_folio != src)
+ 			folio_unlock(src);
+ 		folio_put(src);
+@@ -1380,6 +1403,7 @@ EXPORT_SYMBOL(migrate_vma_finalize);
+ 
+ static unsigned long migrate_device_pfn_lock(unsigned long pfn)
+ {
++	unsigned long src_pfn = migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
+ 	struct folio *folio;
+ 
+ 	folio = folio_get_nontail_page(pfn_to_page(pfn));
+@@ -1391,7 +1415,13 @@ static unsigned long migrate_device_pfn_
+ 		return 0;
+ 	}
+ 
+-	return migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
++	if (!pin_anon_rmap(folio, &src_pfn)) {
++		folio_unlock(folio);
++		folio_put(folio);
++		return 0;
++	}
++
++	return src_pfn;
+ }
+ 
+ /**
+@@ -1427,6 +1457,7 @@ int migrate_device_range(unsigned long *
+ 		nr = folio_nr_pages(folio);
+ 		if (nr > npages - i) {
+ 			if (src_pfns[i] & MIGRATE_PFN_MIGRATE) {
++				unpin_anon_rmap(folio, src_pfns[i]);
+ 				folio_unlock(folio);
+ 				folio_put(folio);
+ 			}
+@@ -1470,6 +1501,7 @@ int migrate_device_pfns(unsigned long *s
+ 		nr = folio_nr_pages(folio);
+ 		if (nr > npages - i) {
+ 			if (src_pfns[i] & MIGRATE_PFN_MIGRATE) {
++				unpin_anon_rmap(folio, src_pfns[i]);
+ 				folio_unlock(folio);
+ 				folio_put(folio);
+ 			}
+@@ -1505,6 +1537,11 @@ int migrate_device_coherent_folio(struct
+ 
+ 	folio_lock(folio);
+ 	src_pfn = migrate_pfn(folio_pfn(folio)) | MIGRATE_PFN_MIGRATE;
++	if (!pin_anon_rmap(folio, &src_pfn)) {
++		folio_unlock(folio);
++		folio_put(folio);
++		return -EBUSY;
++	}
+ 
+ 	/*
+ 	 * We don't have a VMA and don't need to walk the page tables to find
+_
