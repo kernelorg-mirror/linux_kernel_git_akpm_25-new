@@ -1,0 +1,211 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/mempolicy: limit shared policy ranges per inode
+Date: Fri, 13 Nov 2026 22:36:13 +0100
+
+Shared NUMA policy ranges can accumulate on an inode after its mappings
+are removed. Currently, these nodes are effectively unbounded (even though
+the allcoations are charged).
+
+An unbounded tree can cause long rwlock hold times when replacing or
+freeing policies. Instead of trying to fix that, it sounds more like
+having many nodes is actually only a scenario for processes trying to
+cause trouble. Most use cases will probably only use a handful of them,
+not millions.
+
+Add vm.max_shared_policy_count (inspired by vm.max_map_count), defaulting
+to 1024 ranges per inode. Reject updates with -ENOMEM if they would
+increase the count beyond the limit, taking merging, splitting etc.
+into account.
+
+Link: https://lore.kernel.org/20261113-mempolicy_limit-v1-2-16688b2644dc@kernel.org
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Chris Mason <mason@kernel.org>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Eva Kurchatova <eva.kurchatova@virtuozzo.com>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: "Kiryl Shutsemau (Meta)" <kas@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: "Pratyush Yadav (Google)" <pratyush@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Nhat Pham <nphamcs@gmail.com>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: Kairui Song <ryncsn@gmail.com>
+Cc: "Oscar Salvador (SUSE)" <osalvador@kernel.org>
+Cc: Oscar Salvador <osalvador@suse.de>
+---
+
+ Documentation/admin-guide/sysctl/vm.rst |   18 ++++++
+ include/linux/mempolicy.h               |    1 
+ mm/mempolicy.c                          |   57 ++++++++++++++++++++++
+ 3 files changed, 76 insertions(+)
+
+--- a/Documentation/admin-guide/sysctl/vm.rst~mm-mempolicy-limit-shared-policy-ranges-per-inode
++++ a/Documentation/admin-guide/sysctl/vm.rst
+@@ -41,6 +41,7 @@ Currently, these files are in /proc/sys/
+ - legacy_va_layout
+ - lowmem_reserve_ratio
+ - max_map_count
++- max_shared_policy_count
+ - mem_profiling         (only if CONFIG_MEM_ALLOC_PROFILING=y)
+ - memory_failure_early_kill
+ - memory_failure_recovery
+@@ -473,6 +474,23 @@ e.g., up to one or two maps per allocati
+ The default value is 65530.
+ 
+ 
++max_shared_policy_count
++=======================
++
++The maximum number of shared NUMA policy ranges stored on a single inode.
++This applies to tmpfs files, shared anonymous mappings, shmem-backed memfds
++and System V shared memory segments, and guest_memfds. The policies are
++shared by all mappings of the same inode and remain after all mappings are
++removed.
++
++An update that would increase the number of ranges beyond this limit fails
++with -ENOMEM; this includes splitting of existing ranges. Lowering the
++limit will not remove existing policies. Updates that preserve or reduce
++the count remain allowed even if it exceeds the limit.
++
++The default value is 1024. The minimum value is 1.
++
++
+ mem_profiling
+ ==============
+ 
+--- a/include/linux/mempolicy.h~mm-mempolicy-limit-shared-policy-ranges-per-inode
++++ a/include/linux/mempolicy.h
+@@ -114,6 +114,7 @@ static inline bool mpol_equal(struct mem
+ struct shared_policy {
+ 	struct rb_root root;
+ 	rwlock_t lock;
++	unsigned int nr_nodes;
+ };
+ struct sp_node {
+ 	struct rb_node nd;
+--- a/mm/mempolicy.c~mm-mempolicy-limit-shared-policy-ranges-per-inode
++++ a/mm/mempolicy.c
+@@ -106,6 +106,7 @@
+ #include <linux/rmap.h>
+ #include <linux/security.h>
+ #include <linux/syscalls.h>
++#include <linux/sysctl.h>
+ #include <linux/ctype.h>
+ #include <linux/mm_inline.h>
+ #include <linux/mmu_notifier.h>
+@@ -130,6 +131,28 @@
+ static struct kmem_cache *policy_cache;
+ static struct kmem_cache *sn_cache;
+ 
++static int sysctl_max_shared_policy_count __read_mostly = 1024;
++
++#ifdef CONFIG_SYSCTL
++static const struct ctl_table mempolicy_sysctls[] = {
++	{
++		.procname	= "max_shared_policy_count",
++		.data		= &sysctl_max_shared_policy_count,
++		.maxlen		= sizeof(sysctl_max_shared_policy_count),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ONE,
++	},
++};
++
++static int __init mempolicy_sysctl_init(void)
++{
++	register_sysctl_init("vm", mempolicy_sysctls);
++	return 0;
++}
++subsys_initcall(mempolicy_sysctl_init);
++#endif
++
+ /* Highest zone. An specific allocation for a zone below that is not
+    policied. */
+ enum zone_type policy_zone = 0;
+@@ -2977,6 +3000,7 @@ static void sp_insert(struct shared_poli
+ 	}
+ 	rb_link_node(&new->nd, parent, p);
+ 	rb_insert_color(&new->nd, &sp->root);
++	sp->nr_nodes++;
+ }
+ 
+ /* Find shared policy intersecting idx */
+@@ -3136,6 +3160,7 @@ void mpol_put_task_policy(struct task_st
+ static void sp_delete(struct shared_policy *sp, struct sp_node *n)
+ {
+ 	rb_erase(&n->nd, &sp->root);
++	sp->nr_nodes--;
+ 	sp_free(n);
+ }
+ 
+@@ -3168,6 +3193,30 @@ static struct sp_node *sp_alloc(unsigned
+ 	return n;
+ }
+ 
++static int sp_check_node_limit(struct shared_policy *sp, struct sp_node *n,
++			       pgoff_t start, pgoff_t end, bool new)
++{
++	unsigned long new_nodes = new ? 1 : 0;
++
++	if (n && n->start < start) {
++		/*
++		 * Splitting adds one node for the old policy. Otherwise,
++		 * check the successor.
++		 */
++		if (n->end > end)
++			new_nodes++;
++		else
++			n = rb_entry_safe(rb_next(&n->nd), struct sp_node, nd);
++	}
++	/* Without a new node, or with a whole node removed, the count cannot grow. */
++	if (!new_nodes || (n && n->end <= end))
++		return 0;
++
++	if (sp->nr_nodes + new_nodes > READ_ONCE(sysctl_max_shared_policy_count))
++		return -ENOMEM;
++	return 0;
++}
++
+ /* Replace a policy range. */
+ static int shared_policy_replace(struct shared_policy *sp, pgoff_t start,
+ 				 pgoff_t end, struct sp_node *new)
+@@ -3197,6 +3246,13 @@ restart:
+ 		}
+ 	}
+ 	n = sp_lookup(sp, start, end);
++
++	ret = sp_check_node_limit(sp, n, start, end, new);
++	if (ret) {
++		write_unlock(&sp->lock);
++		goto err_out;
++	}
++
+ 	/* Take care of old policies in the same range. */
+ 	while (n && n->start < end) {
+ 		struct rb_node *next = rb_next(&n->nd);
+@@ -3268,6 +3324,7 @@ void mpol_shared_policy_init(struct shar
+ 
+ 	sp->root = RB_ROOT;		/* empty tree == default mempolicy */
+ 	rwlock_init(&sp->lock);
++	sp->nr_nodes = 0;
+ 
+ 	if (mpol) {
+ 		struct sp_node *sn;
+_
