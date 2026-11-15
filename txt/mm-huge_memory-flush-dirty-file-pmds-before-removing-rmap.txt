@@ -1,0 +1,68 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/huge_memory: flush dirty file PMDs before removing rmap
+Date: Fri, 13 Nov 2026 18:15:26 +0100
+
+Unmapping a file PMD can lose concurrent stores when it races with
+writeback.  zap_huge_pmd() removes rmap and drops the PMD lock before the
+gather flushes the TLB.  Writeback can then clean the folio while another
+CPU can still write through a stale writable TLB entry.  Those stores do
+not fault and dirty the folio again.  Filesystem DAX has the same problem
+with its dirty tags.
+
+Commit 5df397dec7c4 ("mm: delay page_remove_rmap() until after the TLB has
+been flushed") fixed the same race for PTEs by adding delayed rmap removal
+to the mmu_gather infrastructure.  The PMD path still removes rmap before
+flushing.
+
+Flush the TLB under the PMD lock before removing rmap for dirty file PMDs.
+Skip the early flush at address-space teardown, when no users remain, and
+for mappings without writeback, including shmem and device DAX.
+
+Use tlb_can_delay_rmap() to share the PTE path's architecture checks.  On
+s390, clearing the entry already handles TLB synchronization, and
+__tlb_remove_page_size() immediately drops the mapping reference, so rmap
+must be removed first.  UP cannot have concurrent stores from another CPU
+while holding the page table lock.  Make the predicate side-effect-free
+and set the gather's delayed_rmap flag when an entry is actually queued
+for delayed rmap removal.
+
+Queue the folio before the early flush, while the gather still has a valid
+range.  Keep batching references and drain a full batch only after
+dropping the PMD lock.  The early flush resets the gather's TLB state, so
+draining the batch does not flush that range again.
+
+Although writing to files through mmap is generally discouraged, unmapping
+such mappings may become slower: each dirty file PMD now requires a TLB
+flush under the PMD lock.  Future work should properly extend the
+delayed-rmap machinery to PMDs and hold the PMD spinlock across multiple
+entries, so their TLB invalidations and rmap removals can be batched.
+
+Link: https://lore.kernel.org/20261113-dirty_file_pmd-v1-1-8c11f2a2e65f@kernel.org
+Fixes: 4b4bb46d00b3 ("dax: clear dirty entry tags on cache flush")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Reported-by: Kiryl Shutsemau <kas@kernel.org>
+Closes: https://lore.kernel.org/linux-mm/aoWw_iKEDLjKL2jr@thinkstation/
+Reported-by: Chris Mason <mason@kernel.org>
+Suggested-by: Lance Yang <lance.yang@linux.dev>
+Suggested-by: Usama Arif <usama.arif@linux.dev>
+Reviewed-by: Lance Yang <lance.yang@linux.dev>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Ross Zwisler <zwisler@kernel.org>
+Cc: <stable@vger.kernel.org>
