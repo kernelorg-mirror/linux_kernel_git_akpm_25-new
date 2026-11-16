@@ -1,0 +1,130 @@
+From: Eliav Farber <farbere@amazon.com>
+Subject: mm/memory: remove racy huge PMD assertion from walk_to_pmd()
+Date: Sun, 15 Nov 2026 20:58:20 +0000
+
+Patch series "mm: fix races between huge and non-huge faults in PFN
+mappings".
+
+A driver that implements both ->fault and ->huge_fault must anticipate
+concurrent use of both.
+
+This can happen, for example, if a user calls prctl(PR_SET_THP_DISABLE)
+concurrent with faulting, as that only holds the mmap write lock and thus
+does not exclude faulting threads stabilised by VMA lock.
+
+A number of places in the code that implements huge PFN support fails to
+take this into account correctly, which this series aims to address.
+
+Generally the shape of the issue is that faulting the same empty page table
+entry can result in the ->fault and ->huge_fault handlers racing and the
+loser finding something they didn't expect.
+
+The fault code must tolerate this, but fails to in 3 places:
+
+1. walk_to_pmd() asserts, without the PMD lock, that the PMD entry is not
+   huge, so a VM_BUG_ON() triggers. [ vfio-pci, nvgrace-gpu ]
+
+2. insert_pfn() treats a failure to map the PTE table as an allocation
+   failure and reports OOM, causing kernel accesses to the range to
+   spuriously fail with -EFAULT. [ vfio-pci, nvgrace-gpu ]
+
+3. insert_pmd() and insert_pud() assume a populated entry is huge and
+   compare its PFN on write fault, warning when that of a page table does
+   not match. [ mshv_vtl, drm_gem_syhmem, panthor ]
+
+This was originally reported and fixed by Eliav Farber in [0], this series
+reworks patches 1-3 of that one.
+
+Patch 4 of that series (x86 PAT encoding of huge PFN mappings) is dropped -
+it is unrelated to the above, no in-tree driver is affected by it, and it
+needs a different approach which is better pursued separately with the x86
+maintainers.
+
+All three issues were reproduced on x86-64 under QEMU using vfio-pci in
+no-IOMMU mode on an ivshmem BAR, with 6 threads faulting the same address
+in each PMD or PUD aligned range of the mapping while another toggles
+PR_SET_THP_DISABLE (note that vfio-pci had to be modified to pass the write
+flag to reproduce the third issue.)
+
+Without this series the BUG is hit immediately, with only patch 1 applied
+tens of thousands of -EFAULTs are observed within seconds, and with patches
+1 and 2 (and the vfio-pci modification) both warnings fire immediately.
+
+With the series applied 30 second runs at each of PMD and PUD size complete
+with none of the above, with or without the vfio-pci modification.
+
+
+This patch (of 3):
+
+walk_to_pmd() asserts that the PMD entry it returns is not huge, but does
+so without holding the PMD lock, so the assertion is only valid if nothing
+can concurrently install a huge PMD entry in the range.
+
+This is not the case for a VMA whose driver implements both ->fault and
+->huge_fault and which invokes vmf_insert_pfn() from the former.
+
+The existence of prctl(PR_SET_THP_DISABLE) is problematic here, as it only
+takes the mmap write lock and faults taken under the VMA lock are
+unaffected by this.
+
+This can result in two concurrent threads faulting the same thing
+disagreeing as to whether to attempt a huge fault and thus ->fault and
+->huge_fault running at the same time and triggering this assertion.
+
+So just remove the assert.
+
+Target the commit which introduced the first driver able to do this for the
+fix - vfio-pci. DAX also mixes fault orders within a VMA, but serialises
+them using its own mapping entry lock.
+
+[ljs@kernel.org: rewrote commit message]
+Link: https://lore.kernel.org/20261115-huge-pfnmap-fault-races-v1-0-537605643f6f@kernel.org
+Link: https://lore.kernel.org/20261115-huge-pfnmap-fault-races-v1-1-537605643f6f@kernel.org
+Link: https://lore.kernel.org/all/20261112051440.16140-2-farbere@amazon.com/
+Link: https://lore.kernel.org/all/20261112051440.16140-1-farbere@amazon.com/ [0]
+Fixes: f9e54c3a2f5b ("vfio/pci: implement huge_fault support")
+Signed-off-by: Eliav Farber <farbere@amazon.com>
+Signed-off-by: Lorenzo Stoakes (ARM) <ljs@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Tested-by: Gregory Price (Meta) <gourry@gourry.net>
+  Link: https://lore.kernel.org/179485082513.482102.6134237207669235151.b4-reply@b4
+Reviewed-by: Gregory Price (Meta) <gourry@gourry.net>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Alex Williamson <alex@shazbot.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Nico Pache <nico.pache@linux.dev>
+Cc: Ryan Roberts <ryan.roberts@arm.com>
+Cc: Dev Jain <dev.jain@arm.com>
+Cc: Barry Song <baohua@kernel.org>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: Usama Arif <usama.arif@linux.dev>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Wei Liu <wei.liu@kernel.org>
+Cc: Roman Kisel <romank@linux.microsoft.com>
+Cc: Saurabh Sengar <ssengar@linux.microsoft.com>
+Cc: Naman Jain <namjain@linux.microsoft.com>
+Cc: Michael Kelley <mhklinux@outlook.com>
+Cc: <stable@vger.kernel.org>
+
+ mm/memory.c |    1 -
+ 1 file changed, 1 deletion(-)
+
+--- a/mm/memory.c~mm-memory-remove-racy-huge-pmd-assertion-from-walk_to_pmd
++++ a/mm/memory.c
+@@ -2384,7 +2384,6 @@ static pmd_t *walk_to_pmd(struct mm_stru
+ 	if (!pmd)
+ 		return NULL;
+ 
+-	VM_BUG_ON(pmd_trans_huge(*pmd));
+ 	return pmd;
+ }
+ 
+_
