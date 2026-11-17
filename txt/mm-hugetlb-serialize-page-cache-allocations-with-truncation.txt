@@ -1,0 +1,96 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/hugetlb: serialize page-cache allocations with truncation
+Date: Mon, 16 Nov 2026 19:29:29 +0100
+
+Truncation can remove an inode reservation while a fault is still
+allocating its folio. UFFDIO_COPY and memfd pinning can also consume
+reservations beyond the new i_size. This can underflow resv_huge_pages
+and leave folios beyond EOF.
+
+The main issue is that truncation takes the fault mutex for folios in
+the page-cache, but it has no clue about faults that are still being
+processed concurrently.
+
+Matthew Wilcox raised mapping->invalidate_lock in a different upstream
+hugetlb locking discussion:
+
+  "although I wonder if we still need the fault mutex array, given that we
+   now have mapping->invalidate_lock?"
+
+While it likely cannot remove the mutex array entirely (concurrent page
+faults have to sync ... ), we can at least use it to fix this problem.
+
+Hold mapping->invalidate_lock shared across the size check, allocation
+and page cache insertion or reservation rollback. Truncation takes it
+exclusively around i_size_write() only for now: it waits for concurrent
+allocations to finish updating the page-cache or rolling back reservations
+before changing the size. Subsequent allocations see the updated i_size.
+
+Let truncation release the lock for now before unmapping and removing
+folios to preserve the existing lock ordering. Cached-folio faults and
+private allocations do not acquire the new lock.
+
+Use it to synchronize with truncation, keeping the fault mutexes to
+serialize allocations for the same index.
+
+Locking order is now:
+
+  fault mutex -> hugetlb VMA lock (read) -> invalidate lock (read) ->
+  folio lock -> PTE lock
+
+And on truncation:
+
+  i_rwsem (write) -> invalidate lock (write)
+
+Add hugetlb_pgoff_valid() to not repeat the same size check multiple
+times. Memfd needs a bit of care, as it traditionally allowed partial
+folios to be pinned: the size check in memfd_pin_folios() allows for
+that.
+
+Link: https://lore.kernel.org/20261116-fixes_hugetlb-v2-8-4dd9e94ea9ac@kernel.org
+Fixes: 1c9e8def43a3 ("userfaultfd: hugetlbfs: add UFFDIO_COPY support for shared mappings")
+Fixes: 188a39725ad7 ("hugetlbfs: revert use i_mmap_rwsem to address page fault/truncate race")
+Fixes: 89c1905d9c14 ("mm/gup: introduce memfd_pin_folios() for pinning memfd folios")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Reported-by: Josef Bacik <josef@toxicpanda.com>
+Closes: https://lore.kernel.org/all/ajMfdQf-Fspwmstr@casper.infradead.org/
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Andy Whitcroft <apw@canonical.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Breno Leitao <leitao@debian.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Chris Mason <mason@kernel.org>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: "Gregory Price (Meta)" <gourry@gourry.net>
+Cc: <stable@kernel.org>

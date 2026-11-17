@@ -1,0 +1,87 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/hugetlb: delay anon folio rmap removal until after the TLB flush
+Date: Mon, 16 Nov 2026 19:29:36 +0100
+
+After fork(), parent and child map anonymous folios read-only shared
+by CoW. On a write fault, hugetlb_wp() reuses an anonymous page instead of
+copying it if its mapcount is 1. As documented, switching to the safer
+refcount would cause more harm than help with these scarce resources.
+
+munmap() and MADV_DONTNEED unmap such folios and decrement the mapcount
+before the TLB is flushed. Until then, another thread of the process can
+still read the page through a stale TLB entry:
+
+    child: reader        child: munmap()       parent: writer
+    =============        ===============       ==============
+    reads the page
+                         clears the entry
+                         mapcount drops to 1
+                                               store to the page
+                                                 hugetlb_wp() reuses it
+    reads the store
+      /* leak */
+                         flushes the TLB
+
+Similar observations are also known and possible with things like
+vmsplice().
+
+Extend the mmu_gather delayed-rmap machinery to handle hugetlb folios.
+Defer anonymous hugetlb rmap removal until after the batched TLB flush.
+
+Flush the TLB and remove pending rmaps when the batch fills and before
+leaving the VMA, then drain the batch so later rmap flushes cannot process
+the same entries again. This is very similar to how zap_present_ptes()
+operates.
+
+Skip deferral at exit. On UP, flush before removing the rmap. With
+MMU_GATHER_NO_GATHER, clearing the entry already flushes the TLB.
+
+Restore reservations after the actual rmap removal, preserving the existing
+mapcount check.
+
+This is very likely not stable-worthy, as hugetlb is commonly not used
+for applications with different parent vs. child trust boundaries.
+
+Link: https://lore.kernel.org/20261116-fixes_hugetlb-v2-15-4dd9e94ea9ac@kernel.org
+Fixes: 24669e58477e ("hugetlb: use mmu_gather instead of a temporary linked list for accumulating pages")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Mel Gorman <mgorman@suse.de>
+Cc: Andy Whitcroft <apw@canonical.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Breno Leitao <leitao@debian.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@kernel.org>
+Cc: Nicholas Piggin <npiggin@gmail.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Heiko Carstens <hca@linux.ibm.com>
+Cc: Vasily Gorbik <gor@linux.ibm.com>
+Cc: Alexander Gordeev <agordeev@linux.ibm.com>
+Cc: Christian Borntraeger <borntraeger@linux.ibm.com>
+Cc: Sven Schnelle <svens@linux.ibm.com>
+Cc: Arnd Bergmann <arnd@arndb.de>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: "Gregory Price (Meta)" <gourry@gourry.net>
