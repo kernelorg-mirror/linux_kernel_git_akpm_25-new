@@ -2,15 +2,182 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: mm/rmap: avoid reusing batched TLB flush generations v2
 Date: Tue, 17 Nov 2026 17:49:27 -0800
 
-mm->tlb_flush_batched resets to 1 when its 15-bit pending count grows
-large.  A concurrent flush can read 1, flush, then see 1 again after
-the reset and mark newer unmaps as flushed.  A subsequent zap can skip
-a needed TLB flush and leave a stale writable translation.
+The packed mm->tlb_flush_batched counter can reuse a value while a
+concurrent TLB flush is in progress. A flusher can read pending=1 and
+flush the TLB, then pause before recording flushed=1. Another task can
+defer 16,384 real PTE unmaps; the old 15-bit pending counter then resets
+the whole packed word to 1. The first flusher's cmpxchg succeeds and
+records the later unmaps as flushed, although its flush preceded them.
+An mprotect or zap can then see pending=flushed=1 and skip the flush
+needed before proceeding. A CPU may retain a stale writable translation
+after the PTE change.
 
-Use separate 64-bit pending and flushed counts.  An unmap during a
-flush leaves them unequal.  Concurrent flushers can move the flushed
-count backwards, causing an extra flush, but cannot hide an unmap.
+Use separate 64-bit pending and flushed counters. Record the pending
+value read before the flush as flushed only after flush_tlb_mm() returns.
+An unmap during the flush leaves the counts unequal, so a later check
+flushes again. Concurrent flushers can write an older flushed count,
+causing an extra flush, but cannot mark a newer unmap as flushed.
 
 Fixes: be4fc7ef0f05 ("mm/rmap: fix potential batched TLB flush race")
 Reported-by: Kirk Swidowski <swidowski@google.com>
 Cc: <stable@vger.kernel.org>
+
+---
+
+Testing: Matched x86-64 QEMU guests used four CPUs, two NUMA nodes,
+2 GiB RAM, identical kernel configurations, and the same temporary
+source patch quoted below. That patch inserted task-scoped waits and
+logged the real deferred PTE unmaps and TLB flushes. It did not change
+the production counter updates or the decision to flush.
+
+A one-page migration set pending=1 and waited before its own batched
+flush. A one-page mprotect performed a real flush at pending=1 and
+waited before recording completion. Another task migrated 20,000
+populated anonymous pages. On the unpatched kernel, its 16,384th real
+deferred PTE unmap reset the packed word to 1; the migration task then
+waited before flushing its own batch. The earlier flusher recorded
+flushed=1. A separate MADV_DONTNEED zap saw pending=flushed=1 and
+skipped the TLB flush while that batch was still waiting. No real TLB
+flush occurred between the earlier flush and this zap.
+
+With the fix, those unmaps left pending=16385 and flushed=1. An at-risk
+check called flush_tlb_mm() while the migration batch was still held;
+the later zap saw pending=flushed=16385. Both guests migrated all
+20,000 pages and the zap succeeded. The event-order check passed
+on fresh A and B guest runs with the saved matching images. The test
+established the missed flush. It did not observe a stale userspace
+access or data corruption.
+
+Temporary source patch, applied unchanged to both kernels (remove the
+leading ':' on each line to apply it separately):
+
+:--- a/mm/migrate.c
+:+++ b/mm/migrate.c
+:@@ -16,1 +16,3 @@
+:+#include <linux/atomic.h>
+:+#include <linux/delay.h>
+: #include <linux/migrate.h>
+:@@ -1850,1 +1852,9 @@
+:+	/* Wait once, after move_pages has collected the migration list. */
+:+	static atomic_t kt_aba_mover_ready = ATOMIC_INIT(0);
+:+	if (!strncmp(current->comm, "kt_move", 7) &&
+:+	    atomic_cmpxchg(&kt_aba_mover_ready, 0, 1) == 0) {
+:+		pr_info("KT_ABA mover_ready\n");
+:+		msleep(1200);
+:+	}
+:+
+: 	VM_WARN_ON_ONCE(mode != MIGRATE_ASYNC &&
+:--- a/mm/rmap.c
+:+++ b/mm/rmap.c
+:@@ -64,1 +64,3 @@
+:+#include <linux/delay.h>
+:+#include <linux/jiffies.h>
+: #include <linux/rmap.h>
+:@@ -706,2 +708,6 @@
+: #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+:+static atomic_t kt_aba_unmaps = ATOMIC_INIT(0);
+:+static atomic_t kt_aba_worker_hold = ATOMIC_INIT(0);
+:+static atomic_t kt_aba_flusher_done = ATOMIC_INIT(0);
+:+static atomic_t kt_aba_flusher_committed = ATOMIC_INIT(0);
+: /*
+:@@ -720,1 +726,22 @@
+:+	if (!strncmp(current->comm, "kt_seed", 7)) {
+:+		unsigned long until = jiffies + 15 * HZ;
+:+
+:+		pr_info("KT_ABA seed_hold pending_work=%d\n",
+:+			tlb_ubc->flush_required);
+:+		while (time_before(jiffies, until))
+:+			msleep(1);
+:+	}
+:+	if (!strncmp(current->comm, "kt_move", 7) &&
+:+	    atomic_read(&kt_aba_unmaps) == 16384) {
+:+		unsigned long until = jiffies + 3 * HZ;
+:+
+:+		atomic_set(&kt_aba_worker_hold, 1);
+:+		pr_info("KT_ABA worker_hold unmaps=16384 pending_work=%d\n",
+:+			tlb_ubc->flush_required);
+:+		while (!atomic_read(&kt_aba_flusher_committed) &&
+:+		       time_before(jiffies, until))
+:+			msleep(1);
+:+		msleep(1100);
+:+		atomic_set(&kt_aba_worker_hold, 0);
+:+	}
+: 	arch_tlbbatch_flush(&tlb_ubc->arch);
+:@@ -744,4 +771,41 @@
+:+/* Read only; the submitted patch chooses which counter layout exists. */
+:+static void kt_aba_counts(struct mm_struct *mm, s64 *pending, s64 *flushed)
+:+{
+:+#ifdef TLB_FLUSH_BATCH_FLUSHED_SHIFT
+:+	int value = atomic_read(&mm->tlb_flush_batched);
+:+
+:+	*pending = value & TLB_FLUSH_BATCH_PENDING_MASK;
+:+	*flushed = value >> TLB_FLUSH_BATCH_FLUSHED_SHIFT;
+:+#else
+:+	*pending = atomic64_read(&mm->tlb_flush_batch_pending);
+:+	*flushed = atomic64_read(&mm->tlb_flush_batch_flushed);
+:+#endif
+:+}
+:+
+:+static void kt_aba_flush_tlb_mm(struct mm_struct *mm)
+:+{
+:+	s64 p, f;
+:+
+:+	flush_tlb_mm(mm);
+:+	kt_aba_counts(mm, &p, &f);
+:+	pr_info("KT_ABA actual_flush caller=%s pending=%lld flushed=%lld hold=%d unmaps=%d\n",
+:+		current->comm, (long long)p, (long long)f,
+:+		atomic_read(&kt_aba_worker_hold), atomic_read(&kt_aba_unmaps));
+:+	if (!strncmp(current->comm, "kt_flush", 8) &&
+:+	    atomic_cmpxchg(&kt_aba_flusher_done, 0, 1) == 0) {
+:+		unsigned long until = jiffies + 7 * HZ;
+:+
+:+		pr_info("KT_ABA flush_done\n");
+:+		while (!atomic_read(&kt_aba_worker_hold) &&
+:+		       time_before(jiffies, until))
+:+			cpu_relax();
+:+		pr_info("KT_ABA flush_resume hold=%d unmaps=%d\n",
+:+			atomic_read(&kt_aba_worker_hold),
+:+			atomic_read(&kt_aba_unmaps));
+:+	}
+:+}
+:+
+: static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
+: 		unsigned long start, unsigned long end)
+: {
+: 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+:@@ -776,2 +840,15 @@
+:+	if (!strncmp(current->comm, "kt_seed", 7) ||
+:+	    !strncmp(current->comm, "kt_move", 7)) {
+:+		s64 pending, flushed;
+:+
+:+		kt_aba_counts(mm, &pending, &flushed);
+:+		if (!strncmp(current->comm, "kt_seed", 7))
+:+			pr_info("KT_ABA seed generation=%lld\n",
+:+				(long long)pending);
+:+		else if (atomic_inc_return(&kt_aba_unmaps) == 16384)
+:+			pr_info("KT_ABA reset_seen unmaps=16384 generation=%lld pending_work=%d\n",
+:+				(long long)pending, current->tlb_ubc.flush_required);
+:+	}
+:+
+: 	/*
+: 	 * If the PTE was dirty then it's best to assume it's writable. The
+:@@ -819,1 +896,1 @@
+:-		flush_tlb_mm(mm);
+:+		kt_aba_flush_tlb_mm(mm);
+:@@ -826,3 +903,16 @@
+: 	}
+:+	if (!strncmp(current->comm, "kt_flush", 8) ||
+:+	    !strncmp(current->comm, "kt_verify", 9)) {
+:+		s64 p, f;
+:+
+:+		kt_aba_counts(mm, &p, &f);
+:+		pr_info("KT_ABA check caller=%s pending=%lld flushed=%lld skip=%d hold=%d unmaps=%d\n",
+:+			current->comm, (long long)p, (long long)f, p == f,
+:+			atomic_read(&kt_aba_worker_hold), atomic_read(&kt_aba_unmaps));
+:+		if (!strncmp(current->comm, "kt_flush", 8)) {
+:+			pr_info("KT_ABA flush_commit\n");
+:+			atomic_set(&kt_aba_flusher_committed, 1);
+:+		}
+:+	}
+: }
+: #else
