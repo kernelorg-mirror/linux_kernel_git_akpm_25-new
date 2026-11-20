@@ -1,0 +1,51 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: mm/migrate: flush batched unmaps before unlocking a failed source folio
+Date: Tue, 17 Nov 2026 17:49:27 -0800
+
+An asynchronous migration can replace some of a folio's PTEs with
+migration entries, defer the TLB flush and then fail to unmap another
+mapping.  The failure path restores the remaining migration entries
+and unlocks the source folio, but the flush waits until the end of all
+retry passes.
+
+A concurrent zap can clear a migration entry.  If truncate then
+removes the remaining mappings, a later retry can drop the migration
+reference and free the folio before the deferred flush.  A CPU can
+retain a writable translation to the freed page and change its next
+owner's contents.  Flush the batched unmaps before unlocking a source
+folio after a failed unmap.  Also flush before a retry drops its last
+reference, in case an earlier path left batched unmaps pending.
+
+Fixes: 7e12beb8ca2a ("migrate_pages: batch flushing TLB")
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Kirk Swidowski <swidowski@google.com>
+Cc: <stable@vger.kernel.org>
+
+ mm/migrate.c |    7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/mm/migrate.c~mm-migrate-flush-batched-unmaps-before-unlocking-a-failed-source-folio
++++ a/mm/migrate.c
+@@ -1193,8 +1193,11 @@ static void __migrate_folio_extract(stru
+ static void migrate_folio_undo_src(struct folio *src, int was_mapped,
+ 		struct anon_vma *anon_vma, bool locked, struct list_head *ret)
+ {
+-	if (was_mapped)
++	if (was_mapped) {
+ 		remove_migration_ptes(src, src, 0);
++		/* The source can be freed before the batch ends. */
++		try_to_unmap_flush();
++	}
+ 	/* Drop an anon rmap reference if we took one */
+ 	if (anon_vma)
+ 		put_anon_vma(anon_vma);
+@@ -1926,6 +1929,8 @@ static int migrate_pages_batch(struct li
+ 			 */
+ 			if (likely(!page_has_movable_ops(&folio->page)) &&
+ 			    folio_ref_count(folio) == 1) {
++				if (pass)
++					try_to_unmap_flush();
+ 				folio_clear_active(folio);
+ 				folio_clear_unevictable(folio);
+ 				list_del(&folio->lru);
+_
