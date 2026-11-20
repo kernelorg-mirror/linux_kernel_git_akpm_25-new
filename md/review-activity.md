@@ -1,8 +1,608 @@
 # Review activity - AKPM
 
-Last updated: 2026-10-26 (PDT)
-Latest numbered review: R-042 (memfd F_SEAL_PUNCH_HOLE series).
-R-034 through R-042 remain HOLD; see their individual records.
+Per-case reports are Library-only. Historical `reports/` references
+below are filename hints, not project paths. Evidence removed from
+the v39 project tarball is preserved in Library
+`kernel-review-case-evidence.tar.gz` (ID
+`libfile_d4d380467eb88191ae209b91a4611a3e`). The imported history
+is in Library `kernel-review-history.tar.gz` (ID
+`libfile_e9cd753e319c8191b7054a8e1b961f84`).
+
+## 2026-11-20 UTC: primary source directory and inbox
+
+The primary chat owns project publication and uses the private
+`kernel-test` source clone
+`/home/kernel-test/kernel-review/instance-1/linux` on ts. The secondary
+chat independently uses `instance-2/linux` and deposits substantial
+findings in the Library inbox. The primary clone's `origin`, `core`,
+`page_alloc` and `linus` remotes were fetched; 12, 17, four and one
+advertised heads respectively matched the fetched refs at
+2026-11-20T21:02:29Z. The clone is blobless and non-shallow. See
+`kernel-git-access.md` for the exact checkpoint; refresh before any
+later branch-content or upstream-inclusion claim.
+
+The inbox was enumerated before this respin. Four previously indexed
+secondary reports (MGLRU NOIO, workingset nokmem, hugetlb bulk restore,
+KMSAN v2), Tejun's memcg review and its unexecuted follow-up/test plan
+retain their pending status; none becomes a primary acceptance decision.
+New secondary report for
+"[PATCH v2] lib/test_hmm: fix alloc tag leak when splitting
+device-private folios" by Nilay Vaish, Message-ID
+<20261119233119.1721789-1-nilayvaish@google.com>, says the loop
+counters and split/free paths appear consistent. Its exact current
+mm-unstable source and the primary evidence record remain to be
+assessed. Library report
+libfile_fde3_f-72d8e2c612a48191b375d1fde86d97e2_4b2ce93b89ac81918fc7647a8ebd5560.
+The review/testing handoff was updated in this project's workflow and
+AGENTS.md; the corresponding kernel-testing project change remains
+for its separate owner. The inbox note stays pending until both owners
+have accounted for it.
+
+## 2026-11-19 UTC: PMD copying at fork, v6
+
+`R-FORK-HUGE-PMD-V6-20261119`: exact cover
+"[PATCH v6 0/4] mm/huge_memory: copy PMDs at fork like the PTE path does";
+all four v6 patches by Konstantin Khorenko and retained v1-v5 replies
+read. Author base mm/core for-next f7d95bf74091373fad7273db4557df9b5a902335
+verified; current mm-unstable is 47854e5f27f59a8004c623f543e00209b8967a4c.
+No confirmed kernel-code regression in v6. Its new file-folio refcount
+limit guard matches the PTE/PUD paths. Follow-up inspection demoted the
+unchecked MADV_DONTFORK return to optional test hardening: this aligned,
+mapped range has no ordinary failure path. The selftest must use
+pmd_psize() in mm-unstable; the old name exists on the author's base.
+Revoked special PMDs can persist in children
+before 3/4; ppc64 hash can dereference a NULL table. Stable candidate
+for 3/4 with dependencies/equivalent narrow fix; 1/4 has no prior caller.
+Next: make the 4/4 helper rename when integrating, then determine the
+mm/core/mm-unstable integration and actual stable backport shape. The
+v5 evidence gate was not run in timely fashion in this review; no
+unconditional take or Reviewed-by. No compilation, test, patch apply
+or mail delivery. Detailed Library report
+libfile_fde3_f-35ca437941e88191ad6d0e6fde213e1a_4b2ce93b89ac81918fc7647a8ebd5560.
+
+## 2026-11-18 UTC: reboot v2 and inbox reconciliation
+
+"[PATCH v2] reboot: don't rely on the poweroff/reboot helper before init has started"
+at AKPM mm-unstable 866f761fd414012d4be77cc82c06667d23a3a7fc,
+kernel/reboot.c blob 9a84401adde5a082f15021ada6e0b996f481ee92.
+V2 resolves v1's lost `orderly_poweroff(false)` request. New finding:
+the request only schedules poweroff/reboot work, while the
+`system_state` test occurs in the worker. An early forced request whose
+worker runs after `SYSTEM_RUNNING` can still exec the ineffective
+initramfs helper and lose the one-shot hardware protection action.
+CHANGES NEEDED / HOLD; retain early request state across the queue.
+The separate post-`SYSTEM_RUNNING` readiness interval is acknowledged.
+Source review only; no kernel build, runtime test, patch-application
+check or completed v5 preflight. Detailed Library report
+libfile_75e74fedd2f88191a61cd8cb3b3277c8.
+
+The inbox's three previously indexed secondary reports (MGLRU NOIO,
+workingset nokmem, hugetlb bulk restore) remain pending, not primary
+acceptance reviews. Two newer cases were read and compared with this
+project. KMSAN v2 0/7 flags 32-bit page-owner alignment in 2/7 and the
+new contiguous allocation requirement for non-KMSAN SPARSEMEM
+page-extension users in 5/7; the prior v1 case and Chris Down's
+corrections remain historical. Report
+libfile_6315fbf0c6288191b1af36c453c9aef3. The Tejun legacy memcg
+freeze review flags cross-cgroup OOM risk from a global writeback-wait
+skip. Its Andrew-authored per-target follow-up and A/B plan are
+unexecuted proposals, not runtime evidence. Report
+libfile_1f8909b8bfd0819182f75359fb4a6f1e; patch
+libfile_be670315ba808191930daea2a1478f98; plan
+libfile_68bf575cde1c81918889c5cb2f93bc6b.
+No primary take decision was made for either inbox case.
+
+## 2026-11-17 UTC: secondary inbox reconciliation (pending)
+
+The inbox currently contains three unincorporated, Library-only source
+reports. New `R-MGLRU-NOIO-SWAPPINESS-20261116` reviews
+"[PATCH] mm/vmscan: respect can_reclaim_anon_pages() in MGLRU get_swappiness()"
+at mm-unstable e1f34fb16e0236c4e60b5f392f1cf5aee76f7d0f. It
+flags the broader anon-aging change, overlap with Barry Song's MGLRU
+v9 in mm-new and the missing exact preimage. Source-only HOLD, with
+an incomplete v5 gate inventory, not a primary acceptance verdict.
+Report ID libfile_9db8161d0ec481919a4f95ae290a7da7.
+`R-WORKINGSET-NOKMEM-20261116` reviews
+"[PATCH] mm: workingset: compare shadow nodes node-wide without kmem accounting"
+at mm-unstable e1f34fb16e0236c4e60b5f392f1cf5aee76f7d0f. It
+describes the nokmem shadow-budget mismatch and conditional refault
+effects; its formal v5 gate remains HOLD with incomplete inventory.
+Report ID libfile_eeca3c5db5a08191a1d28b7b682eb045. The other,
+`R-HUGETLB-BULK-RESTORE-20261116`, reviews the reported title
+"hugetlb: don't restore vmemmap of non-HVOed folios on bulk restore error"
+at the same mm-unstable SHA. It finds no new locking race in the changed
+branch and flags a conditional `CONFIG_DEBUG_VM` and `panic_on_warn=1`
+effect. Its v5 gate also remains HOLD with incomplete inventory. Report
+ID libfile_529be944895c819188e70c7abbfe1b78. None of these reports
+is a primary acceptance review; no matching case entry was found here,
+and none was promoted to a take or Reviewed-by decision. The
+primary chat should read the reports and current source before such a
+decision. No build, runtime test or patch application was performed in
+those secondary reports.
+
+## 2026-11-16 UTC: xarray spare-node Fixes lineage
+
+"[PATCH 0/2] xarray: free unused spare node after range creation";
+1/2 exactly "[PATCH 1/2] lib: xarray: free unused spare node in
+xas_create_range()", 2/2 exactly "[PATCH 2/2] lib/test_xarray: check
+unused spare node after range creation". The first patch's
+`Fixes: cae106dd67b9` is incorrect: that refactor only redirected
+the failed-`xas_nomem()` exit. The unused-spare leak needs successful
+`xas_nomem()`, intervening tree population and a successful retry.
+That production retry loop without a cleanup was added by
+`77da9389b9d5` in 2018; recommend its full Fixes trailer.
+`2264f5132fe4` introduced the helper and is a general API alternative,
+but not as precise for the verified khugepaged path. Patch 2/2 only
+tests this case. This is focused historical lineage, not a full
+acceptance review. No kernel build, runtime test, patch application,
+push or mail. Library report xarray-spare-node-fixes-lineage-review.md,
+ID libfile_e49040436920819196bb1130c3c8ffe1.
+
+## 2026-11-16 UTC: Jiebin Sun percpu-counter rwlock
+
+"[PATCH] lib/percpu_counter: allow concurrent sums with an rwlock"
+was reviewed by source on mm-unstable
+4b028d0cedf95f66b8c5294fde2d7d698bf830da. Exhaustive textual
+sum-site and relevant wrapper search found plausible high-rate
+conditional consumers in near-full ext4/XFS allocation, low-threshold
+dirty throttling, Btrfs reservation pressure and near-`file-max` open.
+BFQ dispatch sums are debug-only and already under the queue lock;
+Btrfs's clamp sum is under the space-info lock. The best plausible
+recurring parallel-sum case is low-threshold dirty throttling, without
+a measured win. Most other consumers report statistics,
+perform teardown or run infrequently. All direct `fbc->lock` users
+are internal to `lib/percpu_counter.c`; no specific locking bug was
+found, but global transfers/reset/CPU-dead fold can now wait for
+multiple readers. Upstream stress-ng dentry worker has no visible
+`statfs()` call in its loop or directory helper, so the reported
+47.34% gain is not attributed to the described `ext4_statfs` path.
+REQUEST PERFORMANCE EVIDENCE / HOLD for PID-linked before/after
+profiles, revision, variance and update-heavy workload cost. V5
+preflight was missed, hence no formal gate PASS or positive acceptance.
+No kernel build, runtime test, patch-application check, push or mail.
+Detailed Library-only report percpu-counter-rwlock-jiebin-review.md,
+ID libfile_352e312802ac8191abe22ded89a7b834.
+
+## 2026-11-15 UTC: Yingjie Wang SEMOPM v5
+
+"[PATCH v5 0/3] ipc/sem: account dynamic sops arrays and validate SEMOPM"
+was reviewed in full, following old R-005's signed-limit and live-sysctl
+findings. Current `mm-nonmm-unstable`
+199bbdb0b473185737495b13bfa86eeab9d63ddb has pre-series code.
+"[PATCH v5 1/3] ipc/sem: account dynamically allocated sops arrays to memcg"
+charges ordinary calls' arrays larger than 64 operations. The earlier
+author's blocked-call report quantified approximately 61 MB and 101 MB
+of host memory retained outside a 32 MiB memcg. The ARM OABI path still
+uses an unaccounted allocation capped at 500 operations. Without an
+effective memcg limit, positive large SEMOPM values remain a host risk.
+"[PATCH v5 2/3] ipc/sem: reject negative SEMOPM values" rejects the
+unsigned comparison bypass and stages sysctl writes, closing a separate
+error path where failed invalid SEMMNI writes can leave SEMOPM=0 and
+break later semaphore calls. "[PATCH v5 3/3] ipc/sem: remove obsolete
+SEMOPM fragmentation warning" changes documentation only. Both stable
+tags are prospective candidates on real effects; request specific
+effects in each standalone changelog. Author tests were not rerun.
+The three v5 source-only gate preflights/checks remain HOLD with
+73/88/77 missing/unresolved items; no take or Reviewed-by is given.
+No kernel build, runtime test, patch application, push or mail. Full
+report in Library semopm-v5-review.md (ID
+libfile_d1c9cd7c8fa08191981deb572352d95e).
+
+## 2026-11-15 UTC: IPC branch-status correction
+
+"[PATCH v3] ipc/msg: fix msg_qbytes truncation in IPC_SET" (R-054)
+was previously titled
+"[PATCH v2] ipc/msg: prevent msg_qbytes limit bypass in IPC_SET"
+(R-052). A 20:59 UTC check of all 17 current AKPM heads, with Google
+and public kernel.org ref advertisements equal, found the v3
+`unsigned long` source changes and selftest in `mm-nonmm-unstable`
+199bbdb0b473185737495b13bfa86eeab9d63ddb and `mm-everything`
+930e275dda34ee72b0ad0b12a3af91b570ffd338. The other 15 heads,
+including `mm-unstable` 4b028d0cedf95f66b8c5294fde2d7d698bf830da,
+lacked them. The October 30 mm-commits notice explicitly reports
+pickup into mm-nonmm-unstable. My earlier answer wrongly treated an
+mm-unstable miss as project-wide absence. The scan established tip-tree
+source presence, not exact commit ancestry. No kernel build, runtime
+test or patch application. Detailed branch inventory is in
+kernel-git-access.md; R-054 report remains Library-only.
+
+## 2026-11-15 UTC: M. Grove folio waiter order
+
+"[PATCH] mm/filemap: queue non-exclusive folio waiters ahead of exclusive",
+Message-ID <179296822701.680532.8543194155713536453@airmail.cc>,
+review ID R-FILEMAP-WAIT-20261115. Focused source review at current
+mm-unstable 4b028d0cedf95f66b8c5294fde2d7d698bf830da. An
+exclusive waiter consumes one wake; a later non-exclusive waiter remains
+queued, but the exclusive owner's later unlock should wake it. New
+exclusive waiters queue after it. Josef's already present signal-race
+fix handles a concrete case where the follow-on unlock was absent.
+Reordering plausibly avoids extra locker-cycle latency; it has not
+proved an independently permanent hang. The author's skipped-entry
+count does not count permanently stranded sleepers. A syzbot stack at
+the same DROP wait site is not causal evidence. Effects: prolonged
+uninterruptible reads and boot-service delays are conditional on many
+or slow preceding lockers; no corruption or unbounded user-triggerable
+DoS is established solely from ordering. PENDING/HOLD; ask for a
+per-waiter trace after the last relevant unlock on a tree containing
+Josef's fix before attributing/closing syzbot. Report in Library:
+folio-waiter-order-grove-review.md, ID
+libfile_1017f26aab6081919885b390adff2608. Focused source check
+only; no full v5 preflight, native multi-track check, kernel build,
+runtime test or patch application. Reply drafted, no mail sent.
+
+Follow-up correction, same date: the first report mislabeled the
+`io_uring` async tail entry as exclusive. `io_rw_should_retry()` sets
+flags=0 and its callback returns 1 without consuming `nr_exclusive`
+in the waitqueue walk; the callback's deferred retry therefore does
+not strand a DROP waiter behind it. Josef's fix suffices for the
+established signal lost-wakeup case; dropping Grove's mail as a
+correctness fix is reasonable. Keep the syzbot cause unresolved. The
+Library report retains the original mistake and corrected trace.
+
+## 2026-11-15 UTC: David Hildenbrand snapshot_page() proposal
+
+"[PATCH] mm/util: fix retry detection and handling in snapshot_page()"
+is David's embedded replacement in reply
+<72dc7b45-ad20-450b-8ec7-3e86be8a41f8@kernel.org> to Shao Mingyin's
+"[PATCH] mm/util: fix off-by-one when checking folio index in snapshot_page()".
+The equality check needs `>=`, but a head can be sampled with
+`_nr_pages == 0` during free-page bad-state reporting. David treats
+that sampled count as one for validation and resets snapshot flags on
+each retry. Whole-tree caller trace found `dump_page()`, privileged
+`/proc/kpageflags` and `/proc/kpagecount`; deliberate concurrent reads
+can amplify inaccurate diagnostics or page metadata, but no material
+harmful consumer of this particular index/flag error was established.
+The bad-page diagnostic path itself requires a separate bad-page
+condition. David's low-severity/no-stable judgment is supported in
+this focused source assessment. Current public mm-unstable SHA
+4b028d0cedf95f66b8c5294fde2d7d698bf830da. Gate preflight was
+late and `check` returned HOLD with 73 missing/unresolved items: no
+full gate-certified take or Reviewed-by, kernel build, runtime test or
+patch application. Detailed Library-only report:
+snapshot-page-david-proposal-review.md, ID
+libfile_3ea557b54d60819181d041a3c66cbe74.
+
+## 2026-11-15 UTC: dirty file PMD filesystem DAX follow-up
+
+"[PATCH] mm/huge_memory: flush dirty file PMDs before removing rmap"
+by David Hildenbrand (Arm), Message-ID
+<20261113-dirty_file_pmd-v1-1-8c11f2a2e65f@kernel.org>, patch base
+55c8a634fd238bc7e6e2c4010985192ae8163435, review key
+dirty-file-pmd-dax-v1. Source trace: filesystem DAX installs folio-backed
+PMDs; `dax_writeback_one()` cleans mappings, flushes CPU caches and
+clears its dirty tag. If PMD unmap clears the entry but delays the TLB
+shootdown, a stale writable translation can allow an untagged store
+after the cache flush. David's under-PMD-lock flush closes this
+source-reachable window. A previous DAX data-loss fix demonstrates
+the dirty-tag failure mode, not this exact interleaving. Jan Kara is
+directly copied on the patch, but Dan Williams, Matthew Wilcox and
+the DAX lists are not. Recommend seeking their review on follow-up;
+no mail sent. Detailed Library-only focused report:
+dax-dirty-file-pmd-followup-review.md (ID
+libfile_487b64b7b3f48191b531b75a4e8a9fe3). No complete v5 gate,
+kernel build, runtime test or patch application.
+
+## 2026-11-15 UTC: Cen Zhang ocfs2 domain-handler drain
+
+"[PATCH] ocfs2: drain domain handlers before destroying the DLM worker"
+by Cen Zhang, Message-ID
+<pm-ocfs2-objects-candidate-0056-v2-57239c657ac017b50fa1@gmail.com>,
+review key ocfs2-domain-handler-drain-cen-v1. Joseph Qi asked to guard
+the flush when the handler list is empty; see
+<88281285-5b3e-4266-88d9-784dfea5ebe7@linux.alibaba.com>. An early
+registration failure can leave the list empty; a partial failure can
+invoke cleanup again after it was emptied. A guard around the combined
+unregister-and-flush call preserves the drain for installed handlers
+and avoids unrelated workqueue flushing otherwise. An Andrew-authored
+incremental patch was prepared against mm-nonmm-unstable
+199bbdb0b473185737495b13bfa86eeab9d63ddb. Detailed focused report:
+ocfs2-domain-handler-flush-followup-review.md (Library ID
+libfile_55861354dbc08191ab4320e0b34c5838). Prepared patch:
+ocfs2-skip-network-flush-when-no-domain-handlers-are-registered.patch
+(Library ID libfile_42c9b4446ab4819181b2ec7f36b73cfb). Next action:
+Andrew may fold it into Cen's patch or use the separate follow-up; no
+mail sent. This is a focused source follow-up, not a complete new gate
+review; no kernel build, runtime test or patch application.
+
+## 2026-11-15 UTC: KMSAN page extension series
+
+Correction after Chris Down's three replies:
+CHANGES NEEDED / HOLD. The initial source-favorable assessment below
+missed that `kmsan_get_shadow_origin_ptr()` calls the new lookup twice
+per direct-mapped instrumented access. Chris reports 14-17% slower
+elapsed times in three VM workloads and a one-lookup prototype near
+baseline. He reproduced the original crash and reports the series
+fixes it. His config's `struct page` shrinks 80 to 64 bytes, crossing
+HVO's power-of-two eligibility check; the changelog and
+Documentation/dev-tools/kmsan.rst need correction. For [2/3], he
+requested changelog disclosure of the FLATMEM callback move, the
+FLATMEM-style DMA lower bound and quieter free logs; Muchun agreed.
+Chris's KMSAN hotplug `EBUSY` and HVO boot observations are his runtime
+reports, not independent local tests. Our initial review omitted the
+hot-path multiplicity, size gate and documentation consumer; its
+proposed reply is superseded. Detailed evidence and links are in
+reports/kmsan-page-ext-v1-review.md.
+
+"[PATCH 0/3] KMSAN: Move per-page metadata out of struct page"
+(Muchun Song), cover Message-ID
+<20261114104150.58424-1-songmuchun@bytedance.com>, base
+6ec534d64f85e949a5d58070678dcd7711875a7c. Reviewed all [1/3]
+through [3/3] against author base and current mm-unstable
+4b028d0cedf95f66b8c5294fde2d7d698bf830da. No blocking defect
+established in source; the move addresses loss of KMSAN pointers when
+HugeTLB tails are reinitialized. KMSAN debug kernels can otherwise
+lose diagnostics and leak metadata backing, without established normal
+user-data corruption. No kernel compilation, boot, runtime reproduction
+or patch-application check. New v5 gate preflight has 41 hunks;
+receipt check exited 2 (164 incomplete), HOLD, with no take or
+Reviewed-by. Guard audit 19/19, zero redundant or unresolved. Model:
+no new coordination protocol. TLA+ checker validation fixtures passed,
+but this patch was not modeled. Report:
+reports/kmsan-page-ext-v1-review.md (Library ID
+libfile_1c830b6073d48191a47cc52182a90e7c). Next action: source-favorable
+assessment at the time; superseded by the correction above.
+
+## 2026-11-14 UTC: NUMA emulation leftover physical nodes
+
+Impact correction: the prior review said only wrong distances and
+performance loss. On an ACPI machine with a valid SRAT, no SLIT, fake
+NUMA and a leftover PXM node, `numa_reset_distance()` leaves the
+physical table count zero, `numa_emulation()` leaves `phys_dist` NULL,
+and the old second loop dereferences it during early boot. This may
+prevent userspace from starting. The patch's out-of-range fallback
+also handles this zero-count case. When a table exists, wrong
+distances can affect allocator zonelists, scheduler placement and
+memory demotion, with potentially severe latency/throughput loss;
+the source does not establish data corruption. Requesting stable
+backports is reasonable. No boot reproduction was performed.
+
+Reachability follow-up: with two SRAT RAM nodes, no optional SLIT,
+`CONFIG_NUMA_EMU=y` and `numa=fake=1`, both physical nodes contribute
+memory to fake node 0, whose map records physical node 0. Physical
+node 1 keeps an unused PXM and is assigned leftover emulated slot 1.
+The fake-node distance initialization builds the emulated table,
+but the old loop then reads `phys_dist[1]` while `phys_dist` is NULL.
+Invalid SLIT rejected by the parser is another zero-count path. The
+feature and configuration are narrow; prevalence is unknown.
+
+Scope clarification: NVIDIA's original `63db8170bf34 ("mm/fake-numa:
+allow later numa node hotplug")` explains actual performance-test use
+on physical multi-node hardware, and newer MM work uses fake nodes
+to test memory tiers. A single physical node split into fake nodes
+does not supply a leftover physical PXM for this defect. These uses
+do not measure how common the no-SLIT crash setup is.
+
+"[PATCH] mm/numa_emulation: use the real node id for leftover nodes"
+reviewed at explicit base 84abb955b1015477aa11a96e2f3ac1b938b77f48.
+The leftover-slot allocator in `fix_pxm_node_maps()` does not maintain
+the original distance loop's `slot-max_emu_nid == physical ID`
+assumption. The new assignment and fake/fake-only skip repair that
+relationship while preserving explicit fake-node distance overrides.
+No further concrete defect in inspected source paths. G04/G06: the
+new negative-ID tests are redundant after fake-node default fill and
+extra-slot assignment; ask the author to drop them. Guard audit 7/7,
+2 redundant, 0 unresolved. Full consumer search and formal evidence
+receipts incomplete; v5 gate HOLD, no unconditional take or
+Reviewed-by. See reports/numa-emulation-leftover-v1-review.md and
+reports/evidence/numa-leftover-manifest.json. No build, runtime test,
+or patch-application check.
+
+## 2026-11-14 UTC: LZ4 fast decode v2
+
+"[PATCH v2] lib/lz4: backport upstream fast decode loop" reviewed at
+mainline base 97d73c8251226cf27cc6656b4c542869bb8c69fa.
+CHANGES NEEDED / HOLD. F01: EROFS in-place decoding still selects the
+old `LZ4_DECOMPRESS_INPLACE_MARGIN()`, although the new fixed-width
+copies can overwrite unread compressed input; Michal Wilczynski's
+related 12/15 patch supplies independent tests on the upstream loop.
+F02: checked `read_variable_length()` internal accumulation does not
+check addition of the token and MINMATCH on 32-bit; the literal caller
+also ignores `loop_error`, newly accepting a malformed 16 MiB chain
+that the old decoder rejected. A suspected small-buffer overflow in a
+zero-length match was rejected after tracing the preceding literal
+boundary check. Report: reports/lz4-fast-decode-v2-review.md. Gate v5
+preflight exists but its receipt check exited 2. No take or Reviewed-by,
+kernel build, runtime test or application check. Sashiko HEAD
+26034727e8040dd68e3cf28803b2daa9576d826f (2026-11-13), Tejun
+cbb4478d0f73e15907335e70a2dc2fe54a9e7167 (2026-10-18), Chris
+d048f8742f6740c38833adf02e87901412d771ca (2026-10-01) observed;
+native Sashiko and full pinned prompt-stage receipts were not run.
+
+## list_lru memcg ID reuse review (2026-11-12)
+
+2026-11-12 PST: prepared the incremental patch
+"[PATCH] mm/list_lru: verify memcg owner before skipping allocation"
+at reports/evidence/mm-list_lru-verify-memcg-owner-before-skipping-allocation.patch.
+Standalone Library ID: libfile_08535f4f88a48191ad5ac61b63953766.
+It checks owner identity in `memcg_list_lru_allocated()` while holding
+RCU across the XArray read and comparison. Intended for folding into
+Shakeel's change; no signoff or separate `Fixes:` trailer was added.
+No application check, kernel build or runtime test was performed.
+
+F01, correction after the user-supplied embargoed Sashiko 0.9.3
+review: **CHANGES NEEDED / HOLD**, retract the earlier source-favorable
+verdict and proposed reply. `memcg_list_lru_allocated()` in the changed
+`mm/list_lru.c` still checks only whether `lru->xa[old_id]` is non-NULL.
+A new, unrelated memcg can own that slot after child C offlines while
+parent P has no list. The false positive skips allocation of P's list.
+After C's folio objcg is reparented to P, a deferred THP can be queued
+on root; when P later allocates its list, unqueue locks P but unlinks a
+root item. This is an existing ID-reuse hole left unfixed by the patch,
+not a new regression. Khugepaged's charge/preallocation sequence
+supplies a concrete producer; an extended bounded model fails the
+wrong-lock invariant with the submitted presence check and passes with
+an owner-aware one. Request a matching presence/ownership check with
+RCU protection before recommending take or stable nomination.
+
+Why missed: the original review treated ancestor allocation as
+unconditional, overlooked a same-file presence fast path, and modeled
+only already allocated child/parent lists. The incomplete pinned-tree
+search was not causal: the decisive code was in the inspected file.
+The workflow now requires a table of all reads of a recyclable index
+and a missing-owner/missing-ancestor/ID-reuse/late-allocation inverse
+case. The previous 21/24 standing-rule self-assessment is superseded;
+the formal gate also remains HOLD. Detailed report at the same path
+and Library ID below; the complete archive includes the new model.
+
+Original 2026-11-12 review (superseded):
+
+"[PATCH] mm: list_lru: don't use a new memcg's lists for an offline
+memcg" (Shakeel Butt). Source-level review of all seven hunks against
+mm-unstable 4318887a3efa4c53d6f083ccfd7105b809a3ac65 found the
+owner check sufficient for both the old-list and reused-ID schedules.
+The bounded three-actor model fails on the old lookup and satisfies the
+wrong-lock invariant with the new owner check; it is not a kernel test.
+The changelog should qualify immediate ID reuse when private-ID refs
+remain, and should remove its preemptible-RCU limitation because SMP
+can reach the race under nonpreemptible RCU. The cited
+28e98022b31e ("mm/list_lru: simplify reparenting and initial
+allocation") is a defensible Fixes target; the subsequent
+fb56fdf8b9a2 ("mm/list_lru: split the lock to per-cgroup scope") made
+wrong-list selection a wrong-lock list mutation. Formal v5 evidence
+gate HOLD: exact pinned whole-tree search and gate receipts missing;
+first preflight started late. No unconditional take or Reviewed-by;
+no kernel compilation, runtime test, or patch application. Detailed
+report: reports/list-lru-memcg-id-reuse-v1-review.md, Library ID
+libfile_7171c4246f908191a009221a87314dae. The complete project
+archive contains the model, source patch and gate manifests.
+
+## Shmem collapse beyond EOF diagnostic (2026-11-12)
+
+"[PATCH] mm/khugepaged: reject shmem collapse ranges beyond i_size".
+Pedro Falcato correctly notes that shmem PMDs can cross i_size. Andrew
+ran reports/evidence/shmem-collapse-eof-repro.c on ts's unpatched
+6.8.0-124-generic kernel: the pre-collapse write raised SIGBUS; after
+MADV_COLLAPSE a write to the page beyond EOF succeeded; after unmapping,
+adding F_SEAL_WRITE and extending the file, the written 0x51 marker was
+visible. Current mm-unstable source retains the proposed fix's exact
+mm/khugepaged.c preimage. A new permanent regression-test patch,
+"selftests/mm: khugepaged: check data after shmem EOF extension", is at
+reports/evidence/shmem-collapse-eof-selftest.patch. The v24 draft
+incorrectly required EINVAL and SIGBUS after collapse, despite the
+intentional PMD mapping policy defended by Hugh Dickins in 2025. V25
+checks the zero-fill result after extension, allowing either collapse
+policy. V26 clarifies the marker, Jérémy Jean's name, and the linked
+prior patch; use only this revision. It was not compiled or run in this
+review chat. No complete fix review is claimed. See
+reports/shmem-collapse-eof-diagnostic.md.
+
+## Current review checkpoint (2026-11-11)
+
+"[PATCH 00/13] mm: batch of (urgentish?) fixes in oomk, cachestat,
+dev-migrate, percpu" (Lorenzo Stoakes, v1). Expanded source review
+of all 13 patches against mm-unstable
+d3925707865d051ba04d5710d60550776e744368 now records each old
+failure and new-path invariant, lifetime/error paths, targeted AMD
+and nouveau callers, and two rejected counterexamples. [03/13]
+should be selected with [02/13] for stable; consider stable for
+[11/13]. [13/13] mitigates the scheduling window but cannot promise
+completion. No new code defect established in inspected paths. The
+author's exact base is no longer treated as a routine-review obstacle.
+Whole-tree caller receipts and external review stages remain
+unresolved, so no Reviewed-by or unconditional take. All 13 original
+v5 gate checks remain HOLD. No kernel build, runtime test or
+patch-application check. Detailed record:
+reports/mason-migrate-et-al-fixes-v1-review.md, Library ID
+libfile_9dfcaa1db6b88191ad135d3aea41c496.
+
+## Process checkpoint (2026-11-11 UTC)
+
+Gate v5 supports source-only reviews without exact-preimage checks,
+patch application, kernel builds or runtime tests. Historical v2-v4
+manifests retain their original policy and disposition. The workflow
+now requires KCSAN reports and race fixes to be assessed for a feasible
+path to material system failure, including explicit uncertainty and
+whether the proposed fix closes that path. This is a process change,
+not a new review or retroactive acceptance of an earlier patch.
+
+## Current handoff (2026-11-10 UTC)
+
+Latest review: "[PATCH v7] lib/group_cpus: Snapshot cluster masks to keep
+grouping hotplug invariant" (Vishal Badole; Message-ID
+`20261110174513.461743-1-Vishal.Badole@amd.com`). Full source and caller
+review identified no v7 defect and requests no revision. The v4 R-036
+HOLD remains historical; v5 and v7 must be read separately. The then
+current v4.2 gate required a prohibited application check, so no
+gate-certified take or Reviewed-by was offered. The later v5 gate does
+not retroactively certify this review. No build, runtime test,
+or patch-application check by this review. Detailed current record:
+`reports/group-cpus-snapshot-v7-review.md`, Library ID
+`libfile_b908cd45e1188191af1e57726bd6f503`; submitted mail:
+`reports/evidence/group-cpus-snapshot-v7.patch`. Both MM public mirrors
+advertised mm-unstable `93d7a816a2df3e907e2719bd12b0073f1285fc5c`
+at 2026-11-10T18:48Z. Those refs are a dated checkpoint.
+2026-11-10 follow-up: the v7 report now has a proposed ts/QEMU NVMe
+runtime A/B test. It requires nontrivial guest cluster masks, proof of
+successful snapshot capture, unchanged queue count across reset, and
+an observed unpatched grouping change. A controller reset exercises
+IRQ reallocation; it does not alone reproduce the physical s2idle
+quirk or stall. No test was started.
+
+## Previous handoff (2026-11-08 PST)
+
+Project migration, 2026-11-08 PST: kernel-review version 1 imports all
+13 md files from kernel.org 25-new master
+3c656f8c8cb980fc3e5388a20705a8b6385472e0. The latest Library header and
+records were retained, and 1,363 additional historical lines were
+restored from the kernel.org ledger, including R-038 through R-042.
+No historical review verdict or receipt was promoted by this merge.
+See reconciliation.md and history/import-provenance.json. Deliver the
+complete kernel-review.tar.gz after every project-file change. The
+GitHub project is read only for ChatGPT. This line is a migration
+checkpoint; the repository was subsequently provisioned.
+
+This cumulative ledger retains historical review details. For the
+current discovery inventory, corrections, reused review numbers and
+post-October reports, first read the existing `akpm-review-index.md`
+(Library ID `libfile_5f208a939bfc819197afb46e882f344b`). Retrieve
+each matching report's current version; this ledger's older R-001
+through R-042 summaries do not supersede those reports.
+
+AKPM retired the pagecache-refcount work (R-069) and the separate
+Trinity OOM diagnosis on 2026-11-08. Remove both from pending work and
+future handoffs. Do not resume either unless AKPM explicitly asks.
+
+The stable `kernel-git-access.md` identity has been refreshed with the
+newer Work-chat startup instructions. Its 2026-10-24 SHAs and clone
+path remain historical checkpoints; each new chat must establish
+current availability and fetch current refs before a substantive
+review. `akpm-patch-review-workflow.md` remains the methodology.
+
+Work startup, 2026-11-08 PST: the canonical workflow (Library version
+18 before this session's policy update) and index (version 11) were
+retrieved by stable ID. Original review manifests and evidence were
+not changed.
+The workflow now records Andrew's explicit no-compilation instruction
+for new preflights; mandatory source checks remain required.
+
+The latest recovered gate is packaged as `akpm-review-gate.py`.
+Its Library fallback is `akpm-review-gate(4).py`, Library ID
+`libfile_822f70d96474819194997b1f8388fbce`, version 5. Its help identifies
+v4.2; its SHA256 is
+`d6131a45f43b6fa32ab9af1ed6878f84bb5142ad4caaf1e72e76b685368451be`.
+The unsuffixed Library item predates this project import. The new
+session retrieved the latest script and checked its syntax and help;
+no new review preflight or acceptance check was run without a patch.
+
+Work-local tla-mctj and TLC were restored from the validated kit; both
+binary hashes matched RESULTS.md. The bundled validation exited 0:
+protected cases passed with 2 and 18 states, and planted faults failed
+as expected with exit 12 at 2 and 17 states. This validates the tools,
+not a kernel protocol. No kernel build or runtime test ran. Current
+Git availability and ref checkpoints are in `kernel-git-access.md`.
+The new complete, non-shallow Work clone passed connectivity checking.
+At 15:04 PST, all advertised MM heads/tags matched Google and public
+kernel.org. The pinned default mm-unstable was
+`58243c0a1bf3a59ddef3807cf5f15582767448c3`, committed
+2026-11-07T17:57:26-08:00 (about 21 hours old). Linus master was
+`8a65162514fbad21a2c58ffed65f42b27e92b163`. No authenticated Gitolite
+comparison was made. These are startup checkpoints, not a new review.
+
+Library baseline last consolidated: 2026-10-24 (America/Los_Angeles)
+Latest reviews in that consolidation: R-033 (memcg high_work),
+R-034 (cgroup s64),
+R-035 (KSM soft-dirty v3), R-036 (group_cpus hotplug invariance),
+R-037 (FAT failed-write truncation locking).
 Numbering follows documentation catch-up, not original patch posting order.
 Scope: working ledger plus Subject-to-location index, NOT review method.
 Method: `akpm-patch-review-workflow.md` (invokes pinned upstream Tejun
@@ -384,8 +984,9 @@ such a subject, consult the named active record or archive FIRST.
   HOLD: [R-034](#r-034); LP64 KVM typedef/build blocker and incomplete
   freezer conversions; prior acceptance recommendation withdrawn.
 - `lib/group_cpus: snapshot cluster masks to keep grouping hotplug invariant`
-  HOLD: [R-036](#r-036); counterexamples for the stated invariance;
-  actual kernel/NVMe reproducer outstanding.
+  v4 HOLD: [R-036](#r-036); historical counterexamples. V7 source
+  review above identifies no remaining source defect; gate result
+  remains unavailable under the no-apply policy.
 
 ## Active records
 
@@ -4339,3 +4940,408 @@ The new UAPI itself isn't a stable candidate.
 Packaging and save confirmation continue after this checkpoint.
 The final chat table includes their measured elapsed time.
 ```
+
+## mm/mprotect: UFFD-WP marker installation versus PTE-table reclaim
+
+2026-11-08 PST. Reviewed David Hildenbrand's 2026-11-07 v1,
+Message-ID 20261107-uffd_shmem_marker-v1-1-91fa2d653cfe@kernel.org.
+Submitted base a3d27154a205f6b32000e7e2734b2a6a4d22c65b;
+live Google mm-unstable b024a51b0184b1efb6f55b11aaf7b15a490a6307.
+The three-hunk patch applies to the exact base. See the complete report
+in reports/uffd-shmem-marker-v1-review.md.
+
+Finding: the actual race is MADV_DONTNEED's empty-PTE-table reclaim,
+introduced by 6375e95f381e. Both khugepaged collapse/retract paths
+exclude userfaultfd-protected VMAs at this base. Ask the author to
+remove the khugepaged claim and reconsider the earlier fe2567eb5521
+Fixes tag and stable backport floor. No confirmed patch-code defect on
+the inspected paths. No compilation or runtime testing.
+
+Mandatory gate: original `new` manifest preserved in reports/evidence/.
+`check` exited 2 with 76 missing/invalid receipts. HOLD, no take or
+Reviewed-by recommendation. This gate status reflects incomplete review
+receipts, not a demonstrated defect in the patch.
+
+### Version-range correction, 2026-11-08 PST
+
+Historical source check for v5.19, v6.6, v6.12, v6.13 and v6.14:
+fe2567eb5521 and deb4c93a9871 both landed in v5.19. The latter
+prevents khugepaged from retracting UFFD-WP PTE tables, with the
+guard still present in v6.13. MADV_DONTNEED PTE-table reclaim from
+6375e95f381e first landed in v6.14; at that tag CONFIG_PT_RECLAIM
+defaults to y on supported configurations, including x86-64.
+Consequently the demonstrated race does not apply to the checked
+pre-v6.14 mainline versions just because they contain fe2567eb5521.
+Stable targeting should start with affected 6.14+ branches, subject
+to configuration and independent downstream backports. The exact
+2026 patch fails `git apply --check` against v5.19, v6.13 and v6.14
+preimages, so a stable backport needs separate review. No builds/tests.
+
+## reboot: fail run_cmd() before init so hw protection can force the action
+
+Exact subject: [PATCH] reboot: fail run_cmd() before init so hw
+protection can force the action. Zak Brighton Knight, 2026-11-07.
+Submitted base d48723711bae9b8cdc56719c448ba42fef28cbee;
+live Google mm-unstable b024a51b0184b1efb6f55b11aaf7b15a490a6307.
+The one-hunk diff applies to its exact kernel/reboot.c preimage.
+Detailed report: reports/reboot-early-hw-protection-v1-review.md.
+
+Finding 1, CHANGES NEEDED: run_cmd() serves __orderly_poweroff(false)
+as well as forced callers. An early Highbank key or Freescale shutdown
+doorbell invokes orderly_poweroff(false); the proposed -EBUSY has no
+fallback and the work function ignores it. An available initramfs
+helper that could act before init is therefore suppressed. Scope the
+guard to forced requests or retain the non-forced request safely.
+
+Finding 2, UNRESOLVED: SYSTEM_RUNNING is set before do_sysctl_args()
+and run_init_process(). The acknowledged post-state/pre-init gap can
+still produce the reported no-op exec and consume the hardware latch
+when the backup timer defaults to zero. Ask for precise coverage and
+consider a protection-specific fallback for complete safety.
+
+The author reports physical T520 behavior and pre/post QEMU evidence;
+we did not reproduce it. Historical 10a0a8d4e3f6 is a plausible Fixes
+origin, with ef1d87e06ab4 documenting the early no-op and backup
+timer. Stable suitability requires narrowing the guard and per-tree
+backport review. No compilation or runtime testing by this reviewer.
+Preflight manifest preserved. Gate `check` exited 2 with 73 missing
+or invalid receipts; HOLD, no take or Reviewed-by recommendation.
+
+
+## 2026-11-08: vmalloc contiguous-mapping v12
+
+"[PATCH v12 00/10] mm/vmalloc: Speed up ioremap, vmalloc and vmap with contiguous memory"
+HOLD. Patch 09's new early scan may dereference a NULL page before
+the old -ENOMEM check. Ten patches apply sequentially to verified
+mm-unstable b024a51b0184b1efb6f55b11aaf7b15a490a6307. All ten
+preflight checks exit 2 with missing receipts. No build or runtime test.
+See reports/vmalloc-contiguous-v12-review.md and evidence manifests.
+
+### Fresh ten-commit review correction, 2026-11-09 UTC
+
+"[PATCH v12 00/10] mm/vmalloc: Speed up ioremap, vmalloc and vmap with contiguous memory"
+
+All ten commits were read in sequence against their matching source
+preimages, with final-state mapping/inverse, config and representative
+cross-subsystem callers examined. The earlier [09/10] NULL-page
+regression claim and pre-scan-check request are withdrawn: old error
+handling alone did not prove a legal NULL input. A separate [07/10]
+source-level issue is documented: the prior unsigned high-order
+mapping loop now shares the int nr direct-walker index, which can
+overflow beyond INT_MAX base pages (>8 TiB on x86-64/4 KiB). No
+actual in-tree request of this extreme size or runtime failure was
+demonstrated. [09/10]'s nr_contig < 2 check is redundant for valid
+nonempty input. See the current detailed report for exact subjects
+and source anchors.
+
+New per-commit preflights were created before the restarted source
+analysis. All ten check invocations exit 2, with 83, 81, 87, 74, 79,
+81, 84, 76, 83, 79 missing or invalid receipts. The 01 H001 and
+03 H002 body-only inventories also remain unresolved. The added-guard
+audit and complete guided/adversarial receipts are outstanding; HOLD,
+no take or Reviewed-by. No compilation, kernel runtime tests or mail.
+
+### Version 8 evidence extension, 2026-11-09 UTC
+
+The ten-patch manual guided and adversarial passes are recorded in
+reports/evidence/vmalloc-v12-guided-coverage.md. The 45-row added-guard
+inventory is in reports/evidence/vmalloc-v12-guard-audit.md: 37 checked,
+one redundant, eight unresolved diagnostic assertions. Gate receipts
+and prohibited compilation remain separate HOLD conditions; the
+original check counts remain unchanged.
+
+### Review policy correction, 2026-11-09
+
+Andrew expressly excludes kernel builds/runtime tests and routine
+patch application or git apply --check. These are not missing review
+work. The v12 review remains unfinished because G01-G08 were not
+resolved, whole-tree source caller/ABI coverage and similar-thread
+research were incomplete, and source-bound gate receipts were not
+recorded. Gate v4.2 itself requires an application check; report that
+tool/policy mismatch separately from the source gaps and preserve
+the historical preflights and failed check outputs unchanged.
+## 2026-11-09 PT: kmemleak report RCU series
+
+"[PATCH 0/2] mm: kmemleak: avoid long RCU read-side sections in reports"
+Weilin Tong, 2026-11-05; base 6628e7d4c6b25c8d18f1345e3a20d21829aae7e4
+(Linux 7.4-rc1). Both submitted patches reviewed in series order using
+the attached mbox and the pinned base mm/kmemleak.c. CHANGES NEEDED / HOLD.
+Patch [1/2] correctly keeps scan_mutex across background cleanup; the
+clear and seq read paths already take that mutex. Patch [2/2] tests
+*pos modulo 256 in the kmemleak_seq_next() inner loop; *pos increments
+only once per call, so a long chain of skipped, concurrently removed
+objects gets no periodic RCU break when *pos is not a multiple of 256
+and preemption clears need_resched(). The helper's pin/deferred-delete
+protocol was traced against deletion, cleanup and seq_stop. Suggested
+fix: keep the output position check for successive returned records
+and add a per-candidate counter for skipped objects in seq_next().
+Both Fixes trailers identify introducing changes. No kernel build,
+runtime test or patch application was performed. Gate v4.2 cannot
+certify under the no-application direction; no PASS/take/Reviewed-by.
+Manual source review and selected pinned upstream guides were read;
+native Sashiko and the complete stage receipt inventory did not run.
+Detailed report: reports/kmemleak-report-rcu-v1-review.md;
+Library ID libfile_150e0f8bdc548191a294bb4124e37b51.
+
+## 2026-11-11 UTC: BCH xi_tab coallocation
+
+"[PATCH] lib/bch: use flexible array member for xi_tab" by Rosen Penev.
+All four hunks were reviewed against mm-unstable
+d3925707865d051ba04d5710d60550776e744368. The validated m range
+is 5..15; the table's writer and reader stay within m, the macro
+allocates the structure and table together, and bch_free() releases
+both through kfree(bch). Three direct MTD callers store the control
+pointer and use bch_init()/bch_free(). No source-level defect found.
+The pinned partial clone could not complete its whole-tree consumer
+search after missing-object retrieval failed; the v5 evidence gate is
+HOLD (82 missing or invalid checks), so no gate-certified take or
+Reviewed-by. No kernel build, runtime test or patch application.
+Full report: reports/bch-xi-tab-v1-review.md.
+
+## 2026-11-11 PT: agent skills v5 six-patch series
+
+"[PATCH v5 0/6] agents: add skills for Fixes tags, stable tags, similar bugs, and commit messages"
+The attached 0/6 through 6/6 mbox was read in full against
+7475ea8b58616b33c04afb976cf0fbaad9dd63fb for process and KUnit
+API definitions. Changes requested: [3/6] overstates stable eligibility
+of merely reported KCSAN data races relative to the stable rules at
+the base; [6/6] has reversed macro arguments in the deferred cleanup
+example, so copying it produces the wrong function name. Other four
+patches had no identified source/documentation defect. No gate pass,
+build or runtime test. Report: reports/agent-skills-v5-review.md.
+
+## 2026-11-11 PT: single-folio migration TLB v4
+
+"[PATCH v4] mm/migrate: don't batch the TLB flush when there is nothing to batch"
+Source reviewed against author base
+56b90edee105e976d4870b9a048e6965dc0eac56 and current relevant
+mm-unstable behavior, with v1-v3 discussion. A one-folio NUMA async
+batch can leave per-mm batched flush pending even after the per-task
+flush, causing the scanner to flush the mm at subsequent PTE tables.
+The new direct PTE path avoids that state, and multi-mapped, large and
+multi-folio paths retain the batched flag. No code defect found.
+Recommend Fixes: 7e12beb8ca2a ("migrate_pages: batch flushing TLB");
+stable eligibility separate. Exact-base whole-tree and formal v5 gate
+coverage incomplete, so no gate-certified take or Reviewed-by. No
+build, runtime test or patch application by this project.
+Detailed report: reports/migrate-tlb-single-v4-review.md.
+
+## 2026-11-12 UTC: first-page shmem punch-hole mapping invalidation
+
+Sashiko reported a separate pre-existing issue while reviewing
+"[PATCH] shmem: Serialize fallocate progress with writeout" by Zhu Jun.
+On mm-unstable d3925707865d051ba04d5710d60550776e744368,
+`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, 1)` reaches
+`unmap_mapping_range(mapping, 0, 0, 0)` because `unmap_end=-1` is
+compared as u64. This invalidates file-backed translations from page
+zero to EOF across mapped processes. A small nonzero offset in the
+first page similarly invalidates from page one to EOF. The actual
+`shmem_truncate_range()` retains the requested byte range, and
+`even_cows=0` preserves private COW pages. Source-backed impact:
+long fallocate stalls, TLB flushes and mass refaults; repeated punches
+can severely degrade service. No direct extra zeroing, file data loss,
+SIGBUS or OOM established. This is a focused pre-existing bug triage,
+not an acceptance verdict on Zhu Jun's patch. Source record:
+reports/shmem-first-page-punch-unmap-review.md. No build, runtime test
+or patch-application check.
+
+## 2026-11-12 UTC: PRIVATE XFS direct-I/O/COW security triage
+
+Exact supplied report subject: "[security] xfs: unprivileged local root
+via O_DIRECT write into blocks freed by a concurrent COW remap (v4.11
+to mainline, reflink filesystems)". Proposed patch title: "[PATCH]
+xfs: don't free unshared blocks under in-flight direct I/O through
+COW remaps". On author's fa4ad798f6f681031775266044ba1b0cf3c670bd,
+source permits a direct-I/O physical mapping to outlive a COW remap
+that drops the old block's last reference. The draft prevents the
+identified private-data/preallocation path and serializes software
+atomic writes, but an unresolved writeback overlap and a separate
+stale direct-read path remain. Reporter claims of root/container
+exploitation and test rates were not independently verified. Do not
+publish or treat the draft as a complete security fix. The attachment
+explicitly requests nondisclosure. Private report:
+reports/xfs-dio-cow-private-security-review.md. No kernel build,
+runtime test, patch application or mail delivery.
+
+## 2026-11-14 UTC: per-memcg shrinker xarray v2
+
+"[PATCH v2 0/2] mm/shrinker: per-memcg shrinker units in an xarray, allocated on demand"
+Both patches were read against Konstantin Khorenko's v7.4-rc1 base
+6628e7d4c6b25c8d18f1345e3a20d21829aae7e4; current mm-unstable
+was 24231596edf2c9d5269d8efbc7007512026672f5. The unit-first
+publication, list-lru bit setters, root special case, failed
+allocation and cgroup-offline paths were examined. No concrete
+regression was proved. The reported performance results remain the
+author's measurements. HOLD: exact-base whole-tree caller search,
+formal model and full mandatory stage evidence remain unresolved;
+the preflight was created late and gate check returned exit 2. The
+newer tree's owner-aware list-lru checks must be retained in any
+integration. No Reviewed-by or take, kernel build, runtime test or
+patch-application check. Report:
+reports/shrinker-xarray-v2-review.md.
+
+## 2026-11-15 UTC: unexpected-marker readahead lookahead v2
+
+"[PATCH v2] mm/readahead: look two windows ahead for the hole on a marker hit"
+by Qiliang Yuan, one hunk, author base 7475ea8b58616b33c04afb976cf0fbaad9dd63fb,
+current mm-unstable 24231596edf2c9d5269d8efbc7007512026672f5.
+The second-window scan can bridge a cached mmap read-around; the
+resulting I/O is still capped by `max_pages`. No source correctness
+defect established. Longer XArray scans and speculative I/O for
+interleaved readers are bounded possible costs. Author's 16 GiB mmap
+copy timing is not independently measured. Gate preflight occurred
+too late for a valid PASS: RETROSPECTIVE / HOLD; no take or Reviewed-by,
+kernel build, runtime test, or patch-application check. Report:
+reports/readahead-two-windows-v2-review.md. Checked prompt SHAs:
+Tejun cbb4478d0f73e15907335e70a2dc2fe54a9e7167,
+Chris d048f8742f6740c38833adf02e87901412d771ca,
+Sashiko 26034727e8040dd68e3cf28803b2daa9576d826f.
+
+## 2026-11-16 Pacific: HugeTLB memfd memory failure policy v4
+
+"[PATCH v4 0/3] memfd-based Userspace MFR Policy for HugeTLB" from
+Jiaqi Yan and two Chris Down replies, all six supplied messages read.
+Exact patch titles: "[PATCH v4 1/3] mm: memfd/hugetlb: memfd-based
+userspace HugeTLB MFR policy", "[PATCH v4 2/3] selftests/mm: test
+userspace MFR for HugeTLB hugepage", and "[PATCH v4 3/3]
+Documentation: add documentation for MFD_MF_KEEP_UE_MAPPED".
+
+On current mm-unstable e1f34fb16e0236c4e60b5f392f1cf5aee76f7d0f,
+source checks support Chris's four findings: UFFDIO_CONTINUE and
+memory hotremove still reject/unmap poisoned folios; a surviving pin
+can prevent dissolution, then its final put can count poisoned folio
+capacity as free despite allocation skipping it (unexpected later
+SIGBUS); rejection of a subsequent raw error by hwpoison_filter can
+erase earlier poison history; the private seal-mode test consumes a
+second four-page HugeTLB reservation, and automated test coverage
+selects only 1G. Patch 3/3 promises immediate isolation after close,
+which does not hold with a surviving pin. The author explicitly
+disclosed AI assistance; Chris's writing provides no proof of his
+process. HOLD; current source is not the author's exact base
+0ea6dc8c4a21 with v7 dependency, and the three v5 preflight source
+manifests did not reach PASS. No kernel build, runtime test, patch
+application or mail delivery. Detailed Library-only report:
+[mfr-hugetlb-v4-chris-down-review.md](https://chatgpt.com/library?file_id=libfile_a27504897a888191bbf1d26d4d5fa59c&account_id=personal).
+
+## 2026-11-17 Pacific: BPF memcg forced flush v3
+
+`R-MEMCG-BPF-FORCE-FLUSH-V3-20261117`: "[PATCH v3] mm/bpf: Always flush
+memcg stats when explicitly requested" by Runli
+<mingyu.he@shopee.com>, Message-ID
+<20261112041348.66915-1-mingyu.he@shopee.com>. mm-unstable
+866f761fd414012d4be77cc82c06667d23a3a7fc. The threshold
+bookkeeping race permits root rstat-derived counters to miss the
+ordinary flush until the periodic forced flush. This patch makes an
+explicit BPF flush unconditional while preserving memcg bookkeeping;
+no code correctness defect found. `memory.stat` remains thresholded,
+while `memory.current` and memory.max enforcement do not read the
+affected rstat values. Cost: repeated forced BPF calls can contend on
+the rstat lock. Provisional source assessment; request precise effects
+wording and an immediate BPF-read test. v5 preflight was not run before
+review, so no PASS, unconditional take or Reviewed-by. No build,
+runtime test or patch application. Library-only report:
+[memcg-bpf-force-flush-v3-review.md](https://chatgpt.com/library?file_id=libfile_df124ac4d89481919c11e527a6a3aeac&account_id=personal).
+
+## 2026-11-17 Pacific: userfaultfd state fixes v3
+
+`R-UFFD-STATE-V3-20261117`: "[PATCH v3 0/9] userfaultfd: assorted fixes
+(part 1)" by Tal Zussman <tz2294@columbia.edu>, Message-ID
+<20261117-uffd-state-fixes-v3-0-b617009d1a4a@columbia.edu>. All
+nine patches in the attached series were read. The exact author mm-new
+base 25fee5b1762b8799dd8b72c2f6d666eb01680cc7 was subsequently
+retrieved; all initial file blobs match, with no patch application.
+mm-unstable 866f761fd414012d4be77cc82c06667d23a3a7fc also read.
+Correction to first assessment: 1/9 permits unauthorized allocation
+and accounting of a zero folio in a sparse shmem file via a private,
+potentially read-only mapping; it cannot overwrite an existing file-cache
+entry, and may instead falsely return -EEXIST. Source also supports
+persistent `UFFDIO_MOVE` retries against a device-private THP (2/9),
+false PAGEMAP_SCAN written state (3/9 and 5/9), loss of uffd state
+after failed mremap rollback (7/9), and failed unregistration clearing
+protection before detecting an unaligned hugetlb end (9/9). Patch 4/9
+drops the uffd bit from a malformed writable+uffd huge migration entry
+on restoration, unlike before, and warns (fatal with panic_on_warn).
+Patch 3/9 closes the known producer, but other producers or future
+regressions could expose this conditional new failure. Patch 7/9 adds a
+destination-VMA protection walk and spurious write faults. Ask for
+focused reproducer or selftest evidence, especially for 1/9, 2/9,
+3/9, 7/9 and 9/9. The
+nine source-only preflights remain HOLD for incomplete receipts: no
+unconditional take or Reviewed-by. No build, runtime test or patch
+application. Library-only report:
+[uffd-v3-review.md](https://chatgpt.com/library?file_id=libfile_e1c001a4bf388191891e34bed6034fa2&account_id=personal).
+
+## 2026-11-17 Pacific: XArray root offset v2 A/B split
+
+`R-XARRAY-ROOT-OFFSET-V2-20261117`: "[PATCH v2] xarray: initialise
+the offset of a new root node" by Nickolai Zeldovich. The exact
+author base 26344c0dd32af8790d8474d233619db825441138 matches
+both old file blobs. The current Google mm-unstable tip
+1b697248a755254115fde38598193d127c562e7f was checked on
+2026-11-17 Pacific, committer time 21:45:15 -0800. A recycled root
+can retain a nonzero offset; `xas_expand()` writes it while lockless
+`xas_find()` reads it, and an iterator can return the wrong index or
+skip an entry. `find_lock_entries()` contains a CONFIG_DEBUG_VM
+`VM_BUG_ON_FOLIO` for a folio returned at an inconsistent index. The
+root-zero initialization and deletion of the expansion-time store
+close this path; no new source defect identified. Split the submitted
+test hunk into [1/2] and fix hunks into [2/2], preserving both diffs.
+A test pass without the fix is inconclusive because allocation reuse
+is not assured. Source-only preflight started late and remains HOLD.
+No kernel build, runtime test, patch application or mail delivery.
+Library-only [review](https://chatgpt.com/library?file_id=libfile_77adfe1c28b08191bd7b91e8a37f75de&account_id=personal),
+[test patch](https://chatgpt.com/library?file_id=libfile_f13eea1e3d98819180ce3bd293088d93&account_id=personal),
+[fix patch](https://chatgpt.com/library?file_id=libfile_8ea8c3e136688191a6e10ab09dbea7c3&account_id=personal).
+
+## 2026-11-18 Pacific: RapidIO config-space read credentials
+
+`R-RAPIDIO-FILE-CAP-V1-20261118`: "[PATCH] rapidio: Use
+file_ns_capable() when checking config space read access" by Suyuan
+Wang. The current Google mm-unstable tip
+376fb945578b6a1f0001fe27adcd01b11340f4a4 was checked. Source
+review: opener credentials rather than reader credentials determine
+whether the config sysfs file reads 256 bytes or all 16 MiB. A
+privileged-opened descriptor can newly let an unprivileged task read
+undefined configuration space; source warns affected chips can lock
+up. The original RapidIO core commit 394b701ce4fb introduced the
+check. Request a use case and stable rationale; no source-code defect
+in the opener-credential implementation itself. Preflight created
+before analysis; its required source receipts remain unfilled (HOLD).
+No kernel build, runtime test, patch application or mail delivery.
+Library-only [report](https://chatgpt.com/library?file_id=libfile_fde3_f-2b3797e4a1808191822130ba48e7d0cb_4b2ce93b89ac81918fc7647a8ebd5560&account_id=personal).
+
+## 2026-11-19 Pacific: failed-fork mm lifetime
+
+`R-FORK-CLEAR-MM-20261119`: "[PATCH] fork: clear p->mm when
+copy_process() fails" by Chris Mason, forwarded by David Hildenbrand.
+Current mm-unstable 47854e5f27f59a8004c623f543e00209b8967a4c
+has the submitted old kernel/fork.c blob. The author's exact base was
+not fetched. Perf inherited child contexts and the BPF task_free LSM
+hook can reach a failed child. If `copy_mm()` made an independent mm,
+the old cleanup's `mmput()` can free it while `p->mm` stays non-NULL;
+`get_task_mm()` or `bpf_find_vma()` can then use freed memory. Clearing
+under task_lock before mmput closes these readers; the final clear
+removes the borrowed parent mm pointer on earlier failure paths.
+No source regression identified. Both Fixes trailers and stable Cc
+have source support. A late v5 preflight remains HOLD for unfilled
+receipts, so no unconditional acceptance or Reviewed-by. No kernel
+build, runtime test, patch application or mail delivery. Library-only
+[report](https://chatgpt.com/library?file_id=libfile_fde3_f-e96d899d2a80819187ed935264184ac2_4b2ce93b89ac81918fc7647a8ebd5560&account_id=personal).
+
+## 2026-11-19 Pacific: early managed CMA boot figure
+
+`R-MM-INIT-CMA-20261119`: "[PATCH] mm/mm_init: don't subtract managed
+CMA pages twice" by Chris Mason, forwarded by David Hildenbrand.
+Verified the author's old mm/mm_init.c blob on the named base using
+GitHub source and current mm-unstable
+47854e5f27f59a8004c623f543e00209b8967a4c for the affected
+printout. Early hugetlb CMA setup adds some CMA pageblocks to both
+zone managed_pages and zone cma_pages before mem_init_print_info().
+Only the CMA remainder is still unmanaged and must be subtracted from
+the boot reserved count. This corrects an understated or unsigned
+wrapped boot message without changing allocation or later accounting.
+The Fixes commit moved hugetlb setup before the printout; no stable
+backport is needed for the displayed figure. No new source defect
+identified. The late v5 preflight remains HOLD for missing receipts.
+No kernel build, runtime test, patch application or mail delivery.
+Library-only [report](https://chatgpt.com/library?file_id=libfile_fde3_f-e52129a0082c8191a583f5d7b1f7c5f9_4b2ce93b89ac81918fc7647a8ebd5560&account_id=personal).

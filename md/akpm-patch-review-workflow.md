@@ -1,6 +1,25 @@
 # AKPM kernel patch review workflow
 
 Purpose: local review policy for future ChatGPT kernel patch reviews.
+For a pull summary, read `pull-summary.md`: a branch name containing
+`hotfixes` selects the fuller hotfix signed-tag format, while a regular
+merge-window pull selects only significant singletons for its roundup.
+Do not substitute a short pull-email summary for a signed-tag summary
+unless the short email text was requested.
+Assess adversarial reachability as a first-class severity question. A bug
+does not become negligible because it has not been observed in ordinary
+operation: ask whether an actor can deliberately drive its trigger with
+parallel CPUs, repeated calls or chosen inputs and obtain a material
+failure. A 16-CPU, one-hour attempt is a useful example of an attacker
+budget, not a required threshold or proof of exploitability. Trace the
+entry point, privileges, scheduling window, consequence and fix. Do not
+claim a security issue from a race or warning without a source-supported
+harmful path. See the mandatory adversarial impact rule below.
+When Andrew writes `effects?`, expand it to "describe the worst-case
+userspace-visible runtime effects of this bug" and answer for the
+current bug or patch. Distinguish established consequences from
+conditional possibilities, including an early-boot failure that
+prevents userspace from starting.
 For Work-mode direct Git setup and historical verified remote checkpoints,
 see `kernel-git-access.md`. The Work clone path in that document is not
 persistent or guaranteed to exist in a new chat.
@@ -14,6 +33,95 @@ The original `tj-patch-review-workflow.md` (S2) is a retired, read-only
 historical reference. Do not load it for routine reviews, modify it or
 delete it without authorization. The older
 `kernel-patch-review-workflow.md` is also superseded.
+
+## Mandatory full patch-scripts scan in each chat
+
+Before the first substantive kernel-review task in a new chat, retrieve
+the current Library `patch-scripts-project-state.tar.gz` (stable ID
+`libfile_eda7e8f57d788191a25992ace97085c8`). Check its VERSION.txt,
+unpack it and inventory every member. Read EVERY text member completely,
+including all Markdown, scripts, source, generated command help,
+configuration, data and tests; inspect long files in bounded sections
+without silently accepting truncated output. Identify non-text members.
+Keep a private path-by-path record of what was read, and an operational
+account of the tools, command effects, mail access, patch formatting,
+deployment and open issues. Do not claim to have scanned the project
+until every member is accounted for. The README, selected task guides,
+search hits, old notes or a previous version do not replace this scan.
+Repeat it if the archive version changes. Distinguish current rules from
+historical examples; do not install or change the project merely to read
+it. This requirement precedes task-specific guidance, but does not
+change the source-only review policy or authorize side effects.
+
+## Paste-ready patch, changelog and email rule
+
+After the complete scan above, recheck the full `patch-formatting.md`
+before incoming queue patches or changelogs; it is authoritative for
+that work. The patch-scripts README.md still supplies task-specific
+operating routes. Mail research on ts uses `tool-use.md` execution
+context, `mail-retrieval.md`,
+installed version and the chosen command's `--help`; other installed
+tools use `tool-use.md` and their help. Read the development and
+mail-administration documents during the full scan, but perform those
+operations only on an authorized task. Andrew-authored outgoing patches
+need their own provenance and are not governed by the
+incoming patch's submission-Link or maintainer-signoff restrictions.
+For paste-ready review emails, use the reporting rules below.
+Use a literal `text` code fence, never a rich writing block. Preserve
+the original body `From:` attribution and existing trailers when
+replacing a whole changelog; do not invent or duplicate a signoff.
+Check literal angle brackets around addresses, 75-column wrapping and
+trailer order in the final text. Use 7-bit ASCII except for people's
+actual accented names in changelog bodies. When referring to another
+patch, number the reference `[n]` in prose and add the matching
+`Link: URL [n]` changelog trailer above `---`. Include a clickable link
+whenever describing a mailing-list claim or discussion in a review or
+follow-up answer; identify the actual message or thread rather than
+relying on conversation memory. Offer every prepared patch as its own
+download, named by the current patch-scripts `massage-subject` output
+for its `Subject:` plus `.patch`. The complete kernel-review.tar.gz
+remains required for every project change.
+
+## Project packaging and ownership (2026-11-08)
+
+This work now lives in the dedicated kernel-review project. Its root
+contains these canonical files; /usr/src/25/md is the retired source
+location after Andrew installs the migration. Read AGENTS.md and
+README.md for project maintenance. The new GitHub repository is read
+only for ChatGPT; Andrew installs changes, commits and pushes them.
+
+After EVERY change to ANY project file, increment VERSION.txt once for
+that delivery and provide the complete all-file kernel-review.tar.gz.
+Never change the downloadable filename or append a date, version or
+suffix. Preserve canonical filenames inside the archive. This full
+project delivery supersedes older workflow/ledger-only download rules.
+Run the project tests and archive checks appropriate to the change.
+Do not install on Andrew's hosts or remove the old md directory here.
+
+Maintain the current workflow, index and ledger under their existing
+Library identities for cross-chat retrieval. Detailed per-case reports,
+evidence, models and old gate receipts belong in Library only, never in
+the kernel-review Git project or its tarball. Preserve their Library IDs
+in the index/ledger; existing `reports/` path mentions are historical
+lookup hints, not local files. The old imported project snapshots are
+preserved in Library `kernel-review-history.tar.gz` (ID
+`libfile_e9cd753e319c8191b7054a8e1b961f84`). The evidence removed
+from v39 is in Library `kernel-review-case-evidence.tar.gz` (ID
+`libfile_d4d380467eb88191ae209b91a4611a3e`). Old manifests, failed
+receipts and verdicts stay intact there. Store source trees outside the
+project as before.
+
+The primary chat alone publishes this project and its canonical Library
+workflow, index and ledger. Secondary chats may deposit case reports at
+`/Kernel Patch Reviews/kernel-review-inbox` without changing shared
+project files. Before each respin, enumerate and read new inbox reports,
+compare them with matching Library case records and the current project,
+and record pending findings without promoting incomplete secondary
+reviews to acceptance. Fetch the latest project revision before edits;
+do not overwrite another revision. At Andrew's request for a new primary
+chat, finish all ongoing publications, explicitly transfer sole publisher
+responsibility, tell the successor to retrieve the latest project and
+inspect the inbox, identify pending work, then stop shared updates.
 
 ## Standalone handoff
 
@@ -40,12 +148,21 @@ not automatically run for another reviewer.
 
 Unless AKPM specifies a different tree, branch or revision, treat
 akpm/mm's `mm-unstable` branch as the intended source base for reviews.
-Use this Google Git mirror for read-only source inspection. In Work mode,
-prefer direct, read-only Git fetch/clone and local git show/grep/log/blame
-against the fetched immutable revision; follow `kernel-git-access.md`.
-The previous Work session proved HTTPS Git access, but each new session
-must test connectivity and establish whether its clone still exists.
-Do not depend on prior ChatGPT sandbox or Work scratch paths.
+Use this Google Git mirror for read-only source inspection. On ts, the
+primary chat's private clone is
+`/home/kernel-test/kernel-review/instance-1/linux`, used as
+`kernel-test`. The secondary chat independently uses
+`/home/kernel-test/kernel-review/instance-2/linux`; do not use or
+change that directory. The primary clone is blobless with complete
+commit history, not shallow, and has no checked-out source tree.
+Fetch the relevant `origin` (AKPM mm), `core` (David Hildenbrand),
+`page_alloc` (Vlastimil Babka), or `linus` (mainline) refs before
+claiming current contents or upstream inclusion. Pin full SHAs and
+use local `git show`, `git grep`, `git log` and `git blame` against the
+fetched source. Missing blobs can be fetched on demand. Check the
+actual connection and refs in each new session; follow
+`kernel-git-access.md` for commands and dated verification. Keep the
+clone and `/usr/src/25` separate; do not commit or push.
 
 
 https://kernel.googlesource.com/pub/scm/linux/kernel/git/akpm/mm/
@@ -68,6 +185,31 @@ request the relevant source; never silently substitute mainline,
 `mm-new`, `mm-everything` or another branch. An explicit author/user
 base or tree overrides the default while still requiring verification.
 
+### Application-status checks across AKPM branches
+
+The `mm-unstable` default selects the source base for a new patch review;
+it does not answer whether Andrew has applied a patch. For an applied,
+merged, present, picked-up or similar status question, enumerate ALL
+currently advertised `refs/heads/*` in akpm/mm, including `mm-nonmm-*`,
+hotfix and integration branches. Pin each tip SHA and the check time;
+compare the Google mirror with public kernel.org where available and
+recheck refs after inspection. Inspect every advertised tip for the
+relevant changed source and selftest, then report which branch tips
+contain them. `mm-everything` is an integration view, not by itself
+proof of the patch's delivery branch. Do not infer absence from an
+`mm-unstable` miss, even if the path is outside `mm/`.
+
+Track revisions across changed titles using Message-ID, change-id,
+author, affected paths and hunks, and `mm-commits` notifications. Quote
+each revision's exact Subject when identifying it; record aliases
+instead of assuming a title search covers the series. Distinguish
+exact commit ancestry, patch-equivalent code, and a notification that
+it was queued. A shallow tip-only fetch can establish source presence
+but cannot establish complete ancestry; say which check was performed.
+If a branch cannot be inspected, name it rather than claiming complete
+coverage. This status check is separate from the review's selected
+source base and involves no kernel build, runtime test or patch apply.
+
 Verified Work checkpoint, 2026-10-24 (NOT an always-current tip):
 Google and public kernel.org MM advertised `mm-unstable` at
 `d10295141a98938a767234e73d45b954a69c9a2f` and `mm-stable` at
@@ -79,7 +221,7 @@ before every review and preserve exact fetch timestamps, SHA, branch,
 preimage verification, and the actual comparison performed. Prefer
 complete ancestry for historical `Fixes:` attribution. If direct Git
 is blocked, use a proven source connector only for claims it supports;
-record the resulting whole-tree/history/build coverage gaps as HOLD.
+record the resulting whole-tree/history/source coverage gaps as HOLD.
 
 Historical mirror checkpoint (NOT a standing synchronization claim):
 Google `mm-new` matched authoritative gitolite at
@@ -88,22 +230,23 @@ That single old equality proves nothing about subsequent branch states.
 
 ## Automatic preflight and evidence gate in ChatGPT reviews
 
-For EVERY new review, before examining source or forming a verdict, run
-`akpm-review-gate.py new` with the submitted patch, this workflow, the
-review ID, a verified full 40-character source SHA, and a unique manifest
-path. The command executes in ChatGPT's own file/runtime environment;
-AKPM does not need to install software, invoke Codex, or run a separate
-review runner. Preserve the manifest and its SHA-bound evidence logs in
-the review artifacts. For a new chat, use the latest gate script supplied
-with the handoff; do not pretend a prior script execution carried over.
+For a new review, run `akpm-review-gate.py new` before source analysis
+with the patch, workflow, review ID, source revision and unique manifest
+path. The command executes in ChatGPT's own runtime. Preserve manifests
+and SHA-bound evidence logs. Gate v5 inventories submitted hunks and
+uses source definitions to identify caller-search subjects. It does
+not verify patch application, compare exact preimages, compile, or run
+kernel tests. A matching source definition is an indexing hint, not
+proof that a hunk applies. Historical v2-v4 preflights retain their
+original policy and results; do not reclassify them.
 
 For body-only hunks, check that the preflight identified the enclosing
-changed function. If the supplied classifier leaves its symbol inventory
-empty and rejects the real caller search, preserve that failure. Do not
-alter the patch, gate script or immutable manifest to manufacture a pass.
-Document the manually verified caller coverage and retain HOLD until a
-supported gate revision can represent it. A corrected command does not
-erase an earlier failed receipt from the original audit trail.
+changed function. If the classifier leaves its symbol inventory empty,
+create a new preflight with source-bound `--symbol H001:name`, if the
+source and diff support it. Preserve the earlier failure; do not rewrite
+an immutable manifest. Document manually verified caller coverage and
+retain HOLD if the inventory cannot represent the change. A corrected
+command does not erase an earlier failed receipt from the audit trail.
 
 Whole-tree searches must explicitly select the repository root or tracked
 files. In a noninteractive process, a pathless search can read empty stdin
@@ -112,7 +255,8 @@ callers: verify a known hit and use an explicit path or git grep.
 
 Record inspected source anchors and independent first-pass analysis,
 per-hunk and reverse-consumer coverage, applicable Sashiko/Tejun/Chris
-reviews, source-build and architecture checks, analogous-path searches,
+reviews, source-level build-graph and architecture reasoning, analogous-path
+searches,
 and an explicit later adversarial analysis with recorded counterexamples
 or rejected hypotheses. The second pass may be a distinct ChatGPT pass
 and MUST be labeled same-model adversarial, not an external reviewer.
@@ -120,13 +264,16 @@ If an actual external reviewer contributed, label that provenance
 separately and independently verify their findings and dismissals.
 
 Before composing ANY proposed `take`, `Reviewed-by:`, or other positive
-acceptance recommendation, execute `akpm-review-gate.py check` against
-that review's original preflight manifest. Include its actual result,
-evidence counts and unresolved mandatory items in the review report and
-activity ledger. Exit code 2, a missing manifest, a failed command, an
-unverified full source/base, or any missing required receipt means HOLD:
-findings and an emailable review may be delivered, but NO take/accept
-recommendation. The gate must be rerun after correcting evidence gaps.
+acceptance recommendation, execute `akpm-review-gate.py check` for
+the current review's original v5 preflight. Include its actual result,
+evidence counts and unresolved mandatory source items in the review
+report and activity ledger. Exit code 2 or missing receipts block a
+positive acceptance recommendation, but separate tool/policy mismatch
+from source-review incompleteness and from actual patch defects.
+If the gate cannot represent a substantive source check, do not pretend
+it passed. Complete the source analysis and report its conclusion and
+the uncovered evidence separately. Rerun the gate after correcting
+its evidence gaps.
 Never make up missing evidence retroactively. For older reviews without
 a genuine preflight, label the audit RETROSPECTIVE and HOLD, not PASS.
 
@@ -336,6 +483,29 @@ Establish the *final system state*, not just local branch correctness.
 Also compare how much work the patch adds to normal successful paths.
 These are general proof methods, not KASAN-specific rules.
 
+### Recycled keys, identity checks and lazy allocation
+
+When a patch distinguishes an indexed entry's owner or generation from
+the key used to find it, enumerate ALL reads of that index, including
+unchanged `exists`, `allocated`, empty, count and fast-path predicates.
+Record a small table of each reader's key, expected owner, returned
+meaning, early return and downstream operation. A non-NULL entry at a
+reused key does not establish that the requested owner has a resource.
+Check RCU or lock protection around dereferencing the entry for this
+identity test.
+
+For lazy or hierarchical resources, test the reachable state in which
+both the requested owner's entry and an ancestor's entry are absent,
+while an unrelated new owner has reused the requested key. Follow any
+false-positive presence result through skipped initialization, fallback
+insertion, later ancestor allocation, and the inverse removal or lookup.
+Prove each ancestor-allocation premise from the actual successful
+allocation path; do not infer it from a reused index's mere presence.
+When no recyclable-keyed resource is affected, say why this check is
+inapplicable. This question exposes a counterexample without knowing a
+specific bug: can a presence fast path report ready for the wrong owner,
+and where will a later consumer place and remove the object?
+
 When a native Sashiko runner and a suitable source tree are available,
 run it for each authorized review. Obtain explicit approval before
 third-party data transfer, especially for nonpublic security reports.
@@ -363,7 +533,38 @@ consumers, user-visible impact, stable suitability, and concise email
 replies. Sashiko prompts are hypotheses and review methods, not proof;
 evidence standards and AKPM delivery rules always still apply.
 
-## Cross-tree shared-interface and ABI build gate
+## Compilation and patch-application policy: explicit AKPM override (2026-11-09)
+
+For AKPM reviews, compilation and runtime testing are handled by
+others. Do not compile a kernel, object, consumer or architecture
+variant, build a kernel or run runtime tests unless Andrew explicitly
+requests that work. Retain source-level caller, type, ABI,
+configuration and build-graph reasoning. Record what was not run,
+without labeling the deliberately omitted build or test a review
+failure or a reason by itself to hold a patch.
+
+Do not run git apply, git apply --check, b4 am, or reconstruct and
+apply a patch or series merely to check applicability. Do not claim
+that a patch applies to a particular revision unless the check was
+separately authorized and performed. The sole standing exception is
+when applying the patch is actually necessary for a focused
+tool-based model; document that need and the exact isolated use.
+Read each commit and reason about it in series order using source
+and diff context, without routinely constructing patched trees.
+Inspect the author's base or integration history only when relevant
+to a substantive behavior, Fixes attribution or model, not to
+certify patch application.
+
+These are Andrew's standing directions and override contrary review
+instructions below and any tool's preferred evidence categories.
+Never execute a prohibited action merely to make the gate pass.
+Gate v5 has no mandatory compilation, runtime, exact-preimage, or
+patch-application check. Its source review still requires a complete
+inventory and source-grounded evidence; missing source work remains
+HOLD. Historical v2-v4 manifests and receipts retain their original
+meaning and must not be rewritten under this policy.
+
+## Cross-tree shared-interface and ABI source gate
 
 Any patch changing a shared header, typedef, library symbol, helper
 signature/return type, utility object, or build-visible API must pass
@@ -385,26 +586,28 @@ the following checks BEFORE an unqualified `take` or `Reviewed-by`:
    include order, on LP64 AND ILP32. For int64_t, use matching
    PRId64/SCNd64 macros or prove the platform's underlying type.
    A compiler probe of the opposite ABI cannot catch an ABI-specific
-   defect; compile a representative real consumer on each ABI where
-   the toolchain is available.
+   defect. Under Andrew's no-compilation policy, reason from actual
+   include order, types and relevant consumers; do not compile either
+   ABI without a specific request.
 4. Audit the actual build graph: a shared object may be compiled under
    another subsystem's CFLAGS, include ordering and header search
-   paths even when local tests build. Verify at least one real
-   out-of-subsystem consumer build where possible. Clearly record
-   when full builds have NOT been executed.
-5. Check the author's selected base and parallel integration branches
-   for overlapping edits (e.g., cgroup-next versus mm-stable), and
-   distinguish an intrinsic patch bug from rebase/apply conflicts.
-   Do not infer mainline compatibility merely from matching the
-   original AKPM preimage.
+   paths even when local tests build. Trace real out-of-subsystem
+   consumers and their build configuration in source. Do not execute
+   a consumer build without a specific request.
+5. Consult the author's selected base and parallel integration
+   branches when overlapping edits affect the behavior under review
+   (e.g., cgroup-next versus mm-stable). Distinguish an intrinsic
+   defect from a source-context uncertainty without checking whether
+   the patch applies.
 
 This gate was added after R-034 missed a KVM compilation failure from
 an incompatible `s64` typedef in `cgroup_util.h` and left six freezer
 callers storing a widened `s64` return value into `long`. It is a
 specific instance of the mandatory all-consumer impact rule, not a
 waiver or replacement for that rule. Mark the gate UNRESOLVED if the
-cross-tree source or real consumer build could not be checked; do
-not report a clean whole-tree build without executing one.
+cross-tree source could not be checked. The deliberately omitted
+consumer build is not an unresolved review obligation under the
+standing policy; never report a clean build without executing one.
 
 ## Source integrity and review scope
 
@@ -413,18 +616,17 @@ not report a clean whole-tree build without executing one.
   Distinguish the proposed patch from older patches quoted in email.
 - Trust the author to have used a suitable base for routine reviews.
   An exact base-commit SHA is not required and its absence is not a
-  review finding or a routine caveat. Patch applicability and build
-  compatibility are the practical tests; report them as verified only
-  if actually checked. Do not spend time reconstructing a base solely
-  to establish a bit-for-bit preimage match.
-- Preserve patch ordering: assess each series commit with only its
-  predecessors applied, so it remains independently correct and
-  bisectable. Inspect the relevant surrounding implementation, callers,
-  and error paths in a suitable source tree, not isolated diff snippets.
-- When a patch does not apply, behavior materially differs by tree,
-  history or ordering is consequential, or the author specifies a
-  non-mainline tree, resolve the actual source context. Do not silently
-  substitute mainline for `mm-new`, `mm-everything`, or `linux-next`.
+  review finding or a routine caveat. Do not check application or
+  reconstruct a base solely to establish a bit-for-bit preimage match.
+- Preserve patch ordering: reason about each series commit with only
+  its predecessors' changes in scope, so it remains independently
+  correct and bisectable. Inspect surrounding implementation, callers
+  and error paths in a suitable source tree; routine patch application
+  is not part of this analysis.
+- When behavior materially differs by tree, history or ordering is
+  consequential, or the author specifies a non-mainline tree, resolve
+  the relevant source context. Do not silently substitute mainline for
+  `mm-new`, `mm-everything`, or `linux-next`.
 - Verify relevant Fixes commits and the actual old behavior. Check
   build/config/hardware reachability before asserting a regression.
 - If material evidence is missing, describe the precise limitation.
@@ -531,6 +733,11 @@ is correct. Treat these as two separate proof obligations:
 - Check the earliest point at which the new state, flag or decision is
   published. Follow outstanding references, sharing, error cleanup,
   asynchronous work, retries, and concurrency across that point.
+- When a request queues work and the worker makes a decision using current
+  system state, compare the state at request time with the state at worker
+  execution. If correctness depends on the earlier state, preserve it
+  across scheduling and coalesced requests; a later state change must not
+  erase a required fallback.
 - Verify that the fix removes the original failure without creating a
   new failure or suppressing a legitimate recovery path. Compare both
   the old and new results for each reachable state class.
@@ -756,6 +963,18 @@ review; no earlier stage is waived by a passing adversarial check.
    and 64-bit systems.  Check EOF/bounds in the original signed and
    full-width type before narrowing.  Test 2^32-wrap offsets, negative
    positions, short reads, and the inverse/retry paths.
+   When replacing a pointer member with a flexible array member, search
+   for struct assignment, by-value arguments and returns, and copies
+   sized with `sizeof(struct ...)`. These copy only the fixed part, not
+   the trailing array contents; a standalone struct has no allocated
+   trailing storage. Check every allocation size and every consumer of
+   the copied object before treating the conversion as equivalent.
+   Prefer a type-aware static query over text matching for assignment,
+   initialization from another struct, by-value calls and returns.
+   Generic compiler warnings and sparse's flexible-array layout/sizeof
+   options do not reliably diagnose a legal struct copy. KASAN may
+   catch an out-of-bounds use and KMSAN may catch an uninitialized read,
+   but neither detects a stale, initialized value in valid storage.
 3. **Architecture and configuration effects.** For a generic operation,
    search architecture overrides, hooks and alternate configurations
    affecting the changed path. Trace their real effects: a function
@@ -897,6 +1116,12 @@ its underlying bug pattern, not merely other calls to the changed helper.
   programs, the conditions that trigger it, and the expected correction.
 - Read every hunk and identify changed branches, checks, allocations,
   frees, locking transitions, ownership and object lifetime changes.
+- For code on an instrumentation or allocator hot path, count new work
+  at the actual producer callsite, including repeated helper calls per
+  logical operation. Check configuration-dependent object size changes
+  against power-of-two and threshold gates, and search documentation
+  for stale descriptions of moved fields. Keep source-derived costs
+  separate from measured performance claims.
 - Execute the added-guard gate on this first pass, before adopting an
   existing neighboring idiom as evidence. Separately justify every
   Boolean clause; record non-reachability as a review result, not an
@@ -939,6 +1164,64 @@ its underlying bug pattern, not merely other calls to the changed helper.
   suggestions without a reachable failure.
 
 ## User-visible impact and changelog gate: mandatory for EACH bugfix
+
+### Mandatory adversarial impact question
+
+For every candidate bug, ask separately from normal workload prevalence:
+could an actor who studies this code deliberately amplify the trigger
+(for example with 16 CPUs for an hour) and cause a material system
+failure? Identify an accessible entry point, control over inputs and
+timing, required privileges and configuration, a feasible sequence from
+trigger to the affected consumer, and the resulting failure. For a race,
+consider repeated attempts, parallelism, CPU affinity and controlled
+contention; where testing is authorized, consider race widening. A low
+probability per attempt is not a dismissal when attempts can be repeated.
+
+Record the answer as source-supported harmful path, credible but
+unproved path, diagnostic/low-impact effect, or unresolved. Distinguish
+the bug's effects from those of pre-existing corruption or some other
+bug needed to reach the diagnostic path. No reported victims and no
+ordinary workload reproduction are not grounds for saying "no impact".
+Conversely, an attacker budget cannot turn a false statistic or warning
+into data corruption, privilege gain or denial of service without a
+traced causal path. If the path is unresolved, name the missing link and
+investigate it before making a severity or stable recommendation. Apply
+the same test to the proposed fix: which harmful sequence does it stop,
+and what remains possible?
+
+For a KCSAN report or proposed race fix, explicitly assess whether the
+race meets Marco Elver's practical threshold for maintainer attention
+(2026-11-11): a source-grounded path from feasible overlapping accesses
+to a material system failure, preferably accompanied by a fix that
+closes that path. This is a severity judgment, not a rule that all
+less severe correctness bugs are acceptable. Record the assessment in
+the review's standing-rule inventory and report, including uncertainty.
+
+Trace the exact fields, bits, widths, access types, writer/readers,
+execution contexts, locks and lifetime. For a shared flags word, check
+whether a read relies on a stable bit and separately whether concurrent
+read-modify-write operations can lose another bit update. Construct a
+feasible interleaving and follow the altered value to its consumer and
+userspace-visible effect. Identify prerequisites, frequency and whether
+the claim is observed, source-proved, modeled or speculative. Check
+compiler transformations as well as hardware ordering where relevant.
+
+Review the fix against that failure path: `data_race()` describes an
+intentional access but does not make it safe; `READ_ONCE()`/
+`WRITE_ONCE()` constrain particular compiler behavior but do not make
+a compound read-modify-write atomic or establish an ordering/lifetime
+contract. Do not promote a KCSAN warning or a warning-silencing change
+alone into a severe bug finding. State one of: demonstrated material
+failure, credible but unproved material failure, lower-impact or
+intentional race, or unresolved. Recommend a concrete RFC when a
+material failure path and an appropriate fix can be explained. The
+`tsacct`/`capable()` report cited by Marco is an illustration: reading
+stable `PF_KTHREAD` on a userspace task alone does not prove an
+accounting failure; a separate lost-update hypothesis needs its own
+writer and consequence proof.
+
+Background: https://lwn.net/Articles/816854/ and
+https://docs.kernel.org/dev-tools/lkmm/docs/access-marking.html .
 
 Bugfix changelogs must answer "why should users care?" BEFORE spending
 most of their space on internal code mechanics. The changelog is a durable
@@ -1048,11 +1331,15 @@ substitute for that explanation.
 Use the documented submission routes correctly:
 
 - Preferred option 1: for a prospective upstream stable candidate, add
-  `Cc: stable@vger.kernel.org` in the commit trailer/sign-off area (NOT
+  `Cc: <stable@vger.kernel.org>` in the commit trailer/sign-off area (NOT
   merely the email header). `Fixes:` assists version selection but does
   not replace the stable tag. Where an actual non-public disclosure is
-  being maintained, the rules document `Cc: stable@kernel.org` to avoid
+  being maintained, the rules document `Cc: <stable@kernel.org>` to avoid
   exposing a fix through ordinary public mailing-list delivery.
+  This describes a deliberate stable submission, not an automatic trailer
+  on an assistant-prepared draft. Never introduce a stable Cc merely
+  because a Fixes tag is present or stable consideration is discussed.
+  Preserve an existing stable Cc in its final trailer position.
 - Option 2: for an already mainlined fix, email stable@vger.kernel.org
   with subject, commit ID, why it is needed and requested kernel series.
 - Option 3: for an adapted downstream backport, include the exact
@@ -1233,11 +1520,42 @@ These requirements apply to ALL user-facing replies, review summaries,
 suggested changelogs and proposed emails. These AKPM preferences
 override conflicting upstream style defaults.
 
-- Do not include `[PATCH]` in Subject: headers of patches or emails
-  prepared for AKPM. Use the descriptive subject without that prefix.
-  Preserve exact original subjects when quoting or identifying incoming
-  mail; this rule applies to subjects we prepare.
-- Plain 7-bit ASCII only. No curly quotes, Unicode punctuation,
+- Begin every user-facing patch or series review with its exact incoming
+  Subject title in quotation marks, including `[PATCH]`, version, patch
+  number or series count, capitalization, and punctuation. Unfold mail
+  header line breaks, but do not paraphrase or normalize the title. For
+  reviews covering multiple messages, quote each relevant exact title.
+  Repeat the exact title in a later review update so the patch remains
+  identifiable without earlier chat context. This identifies incoming
+  mail; the separate rule below still governs Subject headers we prepare.
+
+- Follow the patch-scripts project's current `patch-formatting.md` for
+  incoming queue patches. Begin with `From:`, `Subject:`, then `Date:`,
+  in that order, preserving the effective author's identity and an
+  existing author date. If a date must be supplied, use an RFC email
+  date with an explicit timezone. Do not assume Andrew is the author.
+  An Andrew-authored outgoing patch is a separate case: establish its
+  actual provenance and do not fabricate a submission Link.
+  Put one blank line before the changelog. Do not add transport `To:`,
+  `Cc:` or `In-Reply-To:` headers to this prepared patch header block.
+  Keep recipients and threading information in any separately drafted
+  covering email as needed.
+- Enclose email addresses in angle brackets in prepared patch and mail
+  headers and changelog trailers: `Name <person@example.org>` or
+  `<address@example.org>` without a display name. In particular, a
+  deliberately added stable trailer is `Cc: <stable@vger.kernel.org>`.
+  Check this formatting before presenting a copyable patch or email.
+- Do not automatically add `Cc: <stable@vger.kernel.org>` to a prepared
+  patch. Do not generate changelog Ccs for mailing lists or an Andrew
+  signoff. Existing stable Ccs stay last in the contiguous trailer
+  block. Preserve verified metadata; leave Andrew's signoff for him.
+- Do not include `[PATCH]`, revision or n/N numbering in the `Subject:`
+  header of a held changelog or prepared queue patch. Outgoing transport
+  email subjects may have `[PATCH]` and series numbering under the current
+  patch-scripts formatting rules. Preserve exact original subjects when
+  quoting or identifying incoming mail.
+- Plain 7-bit ASCII except that people's actual accented names must be
+  preserved in changelog bodies. No curly quotes, Unicode punctuation,
   decorative bullets, typographic quotation bars, or special symbols.
 - Hard-wrap all authored text at 75 columns, including quote prefixes,
   bullets and indentation. Unbreakable identifiers and URLs are the
@@ -1320,8 +1638,8 @@ compliance denominator simply because a new rule was added later.
   ledger, listing review IDs, findings, feedback, detailed-report Library
   paths and next actions. On updates, deliver the revised canonical file
   as a direct download; do not require users to hunt through Library.
-- Store ONLY detailed per-patch review histories in the persistent
-  ChatGPT Library under `/Kernel Patch Reviews/reports/`. Each report
+- Store detailed per-patch review histories in the persistent ChatGPT
+  Library (prefer `/Kernel Patch Reviews/reports/`). Each report
   retains its canonical `<topic>-review.md` basename. Update it as new
   source findings, feedback or methodology corrections are discovered.
 - For per-patch reports, verify Library upload success and tell the user
@@ -1432,7 +1750,7 @@ For a continuation of this project's Work-mode review workflow, attach
 `akpm-patch-review-workflow.md`, `review-activity.md`, and
 `kernel-git-access.md`. Attach `akpm-review-gate.py` as the executable
 companion; it is NOT embedded or run automatically merely because a
-Markdown policy was attached. Add `pull-sumary.md` for pull-request
+Markdown policy was attached. Add `pull-summary.md` for pull-request
 writing tasks. The new Work session must check its actual working
 repository and invoke the gate itself, rather than assume prior-session
 execution persists. Keep all review-side Git operations read-only.
@@ -1494,6 +1812,23 @@ explicit BLOCKED/UNKNOWN dependency, never evidence of no prior review.
 Testing may proceed independently with that limitation stated. Provide
 this lookup requirement in cross-chat handoffs; do not assume another
 chat automatically reads this workflow or alter bughunting.md here.
+
+When testing would resolve a concrete review question, add a short
+`Testing requested` section to the existing Library-only case report.
+Identify the exact series and member titles, revision, Message-ID or
+change-id, author's base and present queue identity separately. For
+each requested path, state the A failure and B observation, setup,
+possible performance regressions and assumptions still unproved. A
+proposed test is not a runtime result; do not create a second report.
+The testing chat should record that report's exact Library ID and
+version, the actual queue patch names and tested base, and each path's
+A/B outcome in its own case plan and result. If the tested patch bytes
+differ from the reviewed revision, say so; an older review is
+background. Kernel-testing's primary chat owns its own documentation
+and release. This review chat does not automatically follow tests.
+When Andrew requests analysis of a saved test result, link that result
+from the same review report and update conclusions, keeping source
+claims separate from observed behavior.
 
 Persist consequential follow-up corrections immediately in the current
 report and index. Retain historical evidence and original gate receipts.

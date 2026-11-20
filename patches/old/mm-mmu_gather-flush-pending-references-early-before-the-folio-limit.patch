@@ -1,15 +1,15 @@
 From: "David Hildenbrand (Arm)" <david@kernel.org>
 Subject: mm/mmu_gather: flush pending references early before the folio limit
-Date: Sat, 07 Nov 2026 23:23:39 +0100
+Date: Thu, 12 Nov 2026 23:53:22 +0100
 
 When a task zaps mappings (e.g., MADV_DONTNEED), it can drop the PT lock
 and defer dropping the folio references. In the meantime, page faults
 can refault pagecache folios, creating more references for the same
 folios. These deferred references can build up over multiple VMAs.
 
-Let's just request a flush after enqueueing a pagecache folio whose
-refcount reached a certain threshold. Start flushing well before new
-references are refused, regardless of the caller's privileges.
+Let's just request a flush after enqueueing folios whose refcount reached
+a certain threshold. Start flushing well before new references are refused,
+regardless of the caller's privileges.
 
 When returning "true" from __tlb_remove_folio_pages_size(), PTE zapping
 will flush the TLB before dropping the PT lock, but drop the references
@@ -18,7 +18,7 @@ the risk of letting others hit the limit.
 
 This is a temporary measure until we have something better.
 
-Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-3-c38f6809b106@kernel.org
+Link: https://lore.kernel.org/20261112-refcount_overflow_stable-v4-3-ad3deef0bd23@kernel.org
 Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
 Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
 Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
@@ -27,6 +27,7 @@ Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Reported-by: Chris Mason <mason@kernel.org>
 Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
 Reviewed-by: Lance Yang <lance.yang@linux.dev>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
 Cc: Liam R. Howlett <liam@infradead.org>
 Cc: Vlastimil Babka <vbabka@kernel.org>
@@ -69,6 +70,14 @@ Cc: Robin Murphy <robin.murphy@arm.com>
 Cc: Steve Sistare <steven.sistare@oracle.com>
 Cc: John Hubbard <jhubbard@nvidia.com>
 Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@kernel.org>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
 Cc: <stable@vger.kernel.org>
 ---
 
@@ -93,17 +102,17 @@ Cc: <stable@vger.kernel.org>
   *    tlb_flush_mmu() when required and has no return value.
 --- a/include/linux/mm.h~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
 +++ a/include/linux/mm.h
-@@ -2256,6 +2256,7 @@ vm_fault_t finish_fault(struct vm_fault
+@@ -2251,6 +2251,7 @@ vm_fault_t finish_fault(struct vm_fault
  /* Leave separate reserves for administrators and concurrent reference gains. */
  #define FOLIO_REF_COUNT_LIMIT		(INT_MAX - (1U << 26))
  #define FOLIO_REF_COUNT_ADMIN_LIMIT	(INT_MAX - (1U << 25))
 +#define FOLIO_REF_COUNT_FLUSH_LIMIT	(INT_MAX - (1U << 27))
  
- bool __folio_ref_count_over_limit(unsigned int ref_count);
- 
+ bool folio_ref_count_over_limit_slowpath(const struct folio *folio,
+ 		unsigned int ref_count);
 --- a/mm/memory.c~mm-mmu_gather-flush-pending-references-early-before-the-folio-limit
 +++ a/mm/memory.c
-@@ -2074,8 +2074,8 @@ retry:
+@@ -2076,8 +2076,8 @@ retry:
  	pte_unmap_unlock(start_pte, ptl);
  
  	/*

@@ -1,15 +1,11 @@
 From: "David Hildenbrand (Arm)" <david@kernel.org>
 Subject: mm/gup: limit pagecache folio refcount when grabbing references
-Date: Sat, 07 Nov 2026 23:23:41 +0100
+Date: Thu, 12 Nov 2026 23:53:24 +0100
 
-Let's add a folio_ref_count_over_limit() check in fast and slow GUP
+Let's add __folio_ref_count_over_limit() checks in fast and slow GUP
 before acquiring additional references or pins.
 
 Keep it simple and use the check for all folio types.
-
-Don't check capabilities with IRQs disabled, as even unaudited capability
-checks can take locks. Refuse access to the admin reserve, so GUP-fast will
-fail and fall back to GUP-slow if possible.
 
 Also propagate try_grab_folio() errors when grabbing additional
 references in __get_user_pages() and in memfd_pin_folios(), so hitting
@@ -17,12 +13,14 @@ the limit returns -ENOMEM instead of -EFAULT and -EINVAL, respectively.
 
 Keep the existing invalid-refcount warnings.
 
-Link: https://lore.kernel.org/20261107-refcount_overflow_stable-v2-5-c38f6809b106@kernel.org
+Link: https://lore.kernel.org/20261112-refcount_overflow_stable-v4-5-ad3deef0bd23@kernel.org
 Fixes: 800d8c63b2e9 ("shmem: add huge pages support")
 Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
 Fixes: 793917d997df ("mm/readahead: Add large folio readahead")
 Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reviewed-by: Jose A. Perez de Azpillaga <azpijr@gmail.com>
+Reviewed-by: Pedro Falcato <pfalcato@suse.de>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
 Cc: Liam R. Howlett <liam@infradead.org>
 Cc: Vlastimil Babka <vbabka@kernel.org>
@@ -65,22 +63,28 @@ Cc: Jörg Rödel <joro@8bytes.org>
 Cc: Robin Murphy <robin.murphy@arm.com>
 Cc: Steve Sistare <steven.sistare@oracle.com>
 Cc: John Hubbard <jhubbard@nvidia.com>
-Cc: Jose A. Perez de Azpillaga <azpijr@gmail.com>
 Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: David S. Miller <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@kernel.org>
+Cc: Jakub Kicinski <kuba@kernel.org>
+Cc: Paolo Abeni <pabeni@redhat.com>
+Cc: Simon Horman <horms@kernel.org>
+Cc: Neal Cardwell <ncardwell@google.com>
+Cc: Kuniyuki Iwashima <kuniyu@google.com>
 Cc: Chris Mason <mason@kernel.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
 Cc: <stable@vger.kernel.org>
 ---
 
  include/linux/mm.h |   11 +++++------
- mm/gup.c           |   24 +++++++++++++++---------
- mm/util.c          |    3 +++
- 3 files changed, 23 insertions(+), 15 deletions(-)
+ mm/gup.c           |   32 +++++++++++++++++++++-----------
+ 2 files changed, 26 insertions(+), 17 deletions(-)
 
 --- a/include/linux/mm.h~mm-gup-limit-pagecache-folio-refcount-when-grabbing-references
 +++ a/include/linux/mm.h
-@@ -2267,6 +2267,9 @@ bool __folio_ref_count_over_limit(unsign
-  * Check before adding page table mappings or other significant refcount users
-  * to large pagecache folios (!hugetlb), to avoid overflows.
+@@ -2265,6 +2265,9 @@ bool folio_ref_count_over_limit_slowpath
+  * to pagecache folios (!hugetlb), either before acquiring references or
+  * afterwards with rollback if the operation is refused.
   *
 + * Also required when pinning folios without a dedicated pincount that use
 + * GUP_PIN_COUNTING_BIAS.
@@ -88,7 +92,7 @@ Cc: <stable@vger.kernel.org>
   * Checking other folios does no harm.
   *
   * This check is an approximation; we leave some headroom such that concurrent
-@@ -2959,12 +2962,8 @@ static inline bool folio_maybe_dma_pinne
+@@ -2986,12 +2989,8 @@ static inline bool folio_maybe_dma_pinne
  		return atomic_read(&folio->_pincount) > 0;
  
  	/*
@@ -105,27 +109,38 @@ Cc: <stable@vger.kernel.org>
  		GUP_PIN_COUNTING_BIAS;
 --- a/mm/gup.c~mm-gup-limit-pagecache-folio-refcount-when-grabbing-references
 +++ a/mm/gup.c
-@@ -79,6 +79,8 @@ retry:
+@@ -74,10 +74,14 @@ static inline void sanity_check_pinned_p
+ static inline struct folio *try_get_folio(struct page *page, int refs)
+ {
+ 	struct folio *folio;
++	int ref_count;
+ 
+ retry:
  	folio = page_folio(page);
- 	if (WARN_ON_ONCE(folio_ref_count(folio) < 0))
- 		return NULL;
-+	if (unlikely(folio_ref_count_over_limit(folio)))
+-	if (WARN_ON_ONCE(folio_ref_count(folio) < 0))
++	ref_count = folio_ref_count(folio);
++	if (WARN_ON_ONCE(ref_count < 0))
 +		return NULL;
++	if (unlikely(__folio_ref_count_over_limit(folio, ref_count)))
+ 		return NULL;
  	if (unlikely(!folio_ref_try_add(folio, refs)))
  		return NULL;
- 
-@@ -143,6 +145,10 @@ int __must_check try_grab_folio(struct f
- 	if (WARN_ON_ONCE(folio_ref_count(folio) <= 0))
- 		return -ENOMEM;
- 
-+	if ((flags & (FOLL_GET | FOLL_PIN)) &&
-+	    unlikely(folio_ref_count_over_limit(folio)))
+@@ -140,7 +144,13 @@ static void gup_put_folio(struct folio *
+ int __must_check try_grab_folio(struct folio *folio, int refs,
+ 				unsigned int flags)
+ {
+-	if (WARN_ON_ONCE(folio_ref_count(folio) <= 0))
++	const int ref_count = folio_ref_count(folio);
++
++	if (WARN_ON_ONCE(ref_count <= 0))
 +		return -ENOMEM;
 +
- 	if (unlikely(!(flags & FOLL_PCI_P2PDMA) && folio_is_pci_p2pdma(folio)))
- 		return -EREMOTEIO;
++	if ((flags & (FOLL_GET | FOLL_PIN)) &&
++	    unlikely(__folio_ref_count_over_limit(folio, ref_count)))
+ 		return -ENOMEM;
  
-@@ -1482,17 +1488,17 @@ next_page:
+ 	if (unlikely(!(flags & FOLL_PCI_P2PDMA) && folio_is_pci_p2pdma(folio)))
+@@ -1482,17 +1492,17 @@ next_page:
  				struct folio *folio = page_folio(page);
  
  				/*
@@ -150,7 +165,7 @@ Cc: <stable@vger.kernel.org>
  					goto out;
  				}
  			}
-@@ -3538,10 +3544,10 @@ long memfd_pin_folios(struct file *memfd
+@@ -3538,10 +3548,10 @@ long memfd_pin_folios(struct file *memfd
  					break;
  				}
  
@@ -163,16 +178,4 @@ Cc: <stable@vger.kernel.org>
  					goto err;
  				}
  
---- a/mm/util.c~mm-gup-limit-pagecache-folio-refcount-when-grabbing-references
-+++ a/mm/util.c
-@@ -798,6 +798,9 @@ bool __folio_ref_count_over_limit(unsign
- 	/* Background threads must not consume admin reserves. */
- 	if (current->flags & PF_KTHREAD)
- 		return true;
-+	/* Capability checks are not safe with IRQs disabled. */
-+	if (irqs_disabled())
-+		return true;
- 	/* Use the task's credentials, which filesystem overrides cannot change. */
- 	return !has_capability_noaudit(current, CAP_SYS_RESOURCE);
- }
 _
