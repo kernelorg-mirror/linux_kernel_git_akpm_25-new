@@ -1,0 +1,65 @@
+From: Nilay Vaish <nilayvaish@google.com>
+Subject: lib/test_hmm: fix alloc tag leak when splitting device-private folios
+Date: Thu, 19 Nov 2026 15:31:19 -0800
+
+For device-private memory, test_hmm backs each fake device folio with real
+system RAM of the same order, allocated with folio_alloc() in
+dmirror_devmem_alloc_page().
+
+When the core MM splits a large device-private folio, the driver's
+->folio_split() callback, dmirror_devmem_folio_split(), has to split the
+backing memory as well.  It does that by hand: clear_compound_head() on
+the tail pages, folio_reset_order() on the head page, and
+folio_set_count() on each of them.  dmirror_devmem_free() then frees every
+backing page as an order-0 page.
+
+This open-coded split does not split the allocator's metadata.  The
+allocation tag and the page_owner record still describe one high-order
+allocation, and PG_head stays set on the head page.  When the pages are
+freed one by one, the tag is debited for only one page when the head is
+freed, and the tail pages carry no tag at all.  With
+CONFIG_MEM_ALLOC_PROFILING, running the HMM selftests and unloading the
+module reports the leak:
+
+  lib/test_hmm.c:808 module test_hmm func:dmirror_devmem_alloc_page has 16744448 allocated at module unload
+
+and with CONFIG_MEM_ALLOC_PROFILING_DEBUG freeing a tail page triggers:
+
+  alloc_tag was not set
+  WARNING: ./include/linux/alloc_tag.h:164 at ___free_pages+0x2a0/0x2d0
+
+The backing memory is a private buffer of the test driver and nothing
+requires it to be a folio.  Allocate it with alloc_pages() instead and
+split it right away with split_page(), which splits the allocation tag,
+page_owner and memcg state and is already exported to modules.  It is
+still allocated as one high-order block rather than as individual order-0
+pages because the driver finds the backing page of the Nth page of a
+device folio by offsetting from the first backing page, so the backing
+pages have to be physically contiguous.  Every backing page is then an
+independent order-0 page for its whole lifetime, so
+dmirror_devmem_folio_split() only has to point the new device folio at its
+backing page, and dmirror_devmem_free() frees the backing pages one at a
+time.
+
+As the backing pages no longer form a folio, take the order from the
+device folio rather than from the backing page, and index and copy the
+backing pages individually instead of using folio_page() and folio_copy().
+
+With this patch the device-private HMM selftests pass and the module
+unloads without the messages above.
+
+Link: https://patch.msgid.link/20261119233119.1721789-1-nilayvaish@google.com
+Fixes: 56ef39899643 ("mm/memremap: add driver callback support for folio splitting")
+Signed-off-by: Nilay Vaish <nilayvaish@google.com>
+Reported-by: Zenghui Yu <zenghui.yu@linux.dev>
+Closes: https://lore.kernel.org/linux-mm/be9a8bae-9223-4966-bba9-2cbe39c8f4de@linux.dev/
+Suggested-by: David Hildenbrand (Arm) <david@kernel.org>
+Link: https://lore.kernel.org/linux-mm/8ef6e92d-4cb3-444e-857e-fdbf88c035ea@kernel.org/
+Tested-by: Zenghui Yu (Huawei) <zenghui.yu@linux.dev>
+  Link: https://lore.kernel.org/aa414751-9913-43ac-9782-aa9043b77517@linux.dev
+Acked-by: Zi Yan <ziy@nvidia.com>
+Cc: Balbir Singh <balbirs@nvidia.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Leon Romanovsky <leon@kernel.org>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
