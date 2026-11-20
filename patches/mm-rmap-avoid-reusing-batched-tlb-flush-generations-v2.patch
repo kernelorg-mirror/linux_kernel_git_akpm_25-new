@@ -1,0 +1,114 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: mm/rmap: avoid reusing batched TLB flush generations v2
+Date: Tue, 17 Nov 2026 17:49:27 -0800
+
+mm->tlb_flush_batched resets to 1 when its 15-bit pending count grows
+large.  A concurrent flush can read 1, flush, then see 1 again after
+the reset and mark newer unmaps as flushed.  A subsequent zap can skip
+a needed TLB flush and leave a stale writable translation.
+
+Use separate 64-bit pending and flushed counts.  An unmap during a
+flush leaves them unequal.  Concurrent flushers can move the flushed
+count backwards, causing an extra flush, but cannot hide an unmap.
+
+Fixes: be4fc7ef0f05 ("mm/rmap: fix potential batched TLB flush race")
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Kirk Swidowski <swidowski@google.com>
+Cc: <stable@vger.kernel.org>
+
+ include/linux/mm_types.h |    3 +-
+ mm/rmap.c                |   42 +++++--------------------------------
+ 2 files changed, 8 insertions(+), 37 deletions(-)
+
+--- a/include/linux/mm_types.h~mm-rmap-avoid-reusing-batched-tlb-flush-generations-v2
++++ a/include/linux/mm_types.h
+@@ -1407,7 +1407,8 @@ struct mm_struct {
+ 		atomic_t tlb_flush_pending;
+ #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
+ 		/* See flush_tlb_batched_pending() */
+-		atomic_t tlb_flush_batched;
++		atomic64_t tlb_flush_batch_pending;
++		atomic64_t tlb_flush_batch_flushed;
+ #endif
+ 		struct uprobes_state uprobes_state;
+ #ifdef CONFIG_PREEMPT_RT
+--- a/mm/rmap.c~mm-rmap-avoid-reusing-batched-tlb-flush-generations-v2
++++ a/mm/rmap.c
+@@ -731,21 +731,10 @@ void try_to_unmap_flush_dirty(void)
+ 		try_to_unmap_flush();
+ }
+ 
+-/*
+- * Bits 0-14 of mm->tlb_flush_batched record pending generations.
+- * Bits 16-30 of mm->tlb_flush_batched bit record flushed generations.
+- */
+-#define TLB_FLUSH_BATCH_FLUSHED_SHIFT	16
+-#define TLB_FLUSH_BATCH_PENDING_MASK			\
+-	((1 << (TLB_FLUSH_BATCH_FLUSHED_SHIFT - 1)) - 1)
+-#define TLB_FLUSH_BATCH_PENDING_LARGE			\
+-	(TLB_FLUSH_BATCH_PENDING_MASK / 2)
+-
+ static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
+ 		unsigned long start, unsigned long end)
+ {
+ 	struct tlbflush_unmap_batch *tlb_ubc = &current->tlb_ubc;
+-	int batch;
+ 	bool writable = pte_dirty(pteval);
+ 
+ 	if (!pte_accessible(mm, pteval))
+@@ -755,23 +744,11 @@ static void set_tlb_ubc_flush_pending(st
+ 	tlb_ubc->flush_required = true;
+ 
+ 	/*
+-	 * Ensure compiler does not re-order the setting of tlb_flush_batched
++	 * Ensure compiler does not re-order the pending count update
+ 	 * before the PTE is cleared.
+ 	 */
+ 	barrier();
+-	batch = atomic_read(&mm->tlb_flush_batched);
+-retry:
+-	if ((batch & TLB_FLUSH_BATCH_PENDING_MASK) > TLB_FLUSH_BATCH_PENDING_LARGE) {
+-		/*
+-		 * Prevent `pending' from catching up with `flushed' because of
+-		 * overflow.  Reset `pending' and `flushed' to be 1 and 0 if
+-		 * `pending' becomes large.
+-		 */
+-		if (!atomic_try_cmpxchg(&mm->tlb_flush_batched, &batch, 1))
+-			goto retry;
+-	} else {
+-		atomic_inc(&mm->tlb_flush_batched);
+-	}
++	atomic64_inc(&mm->tlb_flush_batch_pending);
+ 
+ 	/*
+ 	 * If the PTE was dirty then it's best to assume it's writable. The
+@@ -805,24 +782,17 @@ static bool should_defer_flush(struct mm
+  * if required. This will cost one additional flush per reclaim cycle paid
+  * by the first operation at risk such as mprotect and mumap.
+  *
+- * This must be called under the PTL so that an access to tlb_flush_batched
++ * This must be called under the PTL so that an access to the pending count
+  * that is potentially a "reclaim vs mprotect/munmap/etc" race will synchronise
+  * via the PTL.
+  */
+ void flush_tlb_batched_pending(struct mm_struct *mm)
+ {
+-	int batch = atomic_read(&mm->tlb_flush_batched);
+-	int pending = batch & TLB_FLUSH_BATCH_PENDING_MASK;
+-	int flushed = batch >> TLB_FLUSH_BATCH_FLUSHED_SHIFT;
++	s64 pending = atomic64_read(&mm->tlb_flush_batch_pending);
+ 
+-	if (pending != flushed) {
++	if (pending != atomic64_read(&mm->tlb_flush_batch_flushed)) {
+ 		flush_tlb_mm(mm);
+-		/*
+-		 * If the new TLB flushing is pending during flushing, leave
+-		 * mm->tlb_flush_batched as is, to avoid losing flushing.
+-		 */
+-		atomic_cmpxchg(&mm->tlb_flush_batched, batch,
+-			       pending | (pending << TLB_FLUSH_BATCH_FLUSHED_SHIFT));
++		atomic64_set(&mm->tlb_flush_batch_flushed, pending);
+ 	}
+ }
+ #else
+_
