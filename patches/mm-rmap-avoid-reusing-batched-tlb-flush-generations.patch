@@ -16,18 +16,46 @@ FLUSHING after its flush, preserving that new work.  There are no
 generation values to wrap or for a delayed flusher to write back, and
 mm_struct does not grow.
 
-Order the PTE clear before setting PENDING.  Initialize the state for a
-new mm: dup_mm() copies the parent's mm_struct before mm_init(), so the
-child must not inherit an in-progress flush with no owner.
+The unmapper holds the PTE lock through the clear and PENDING update. 
+smp_mb__before_atomic() orders the clear before atomic_or(), which has no
+memory ordering of its own.  A successful cmpxchg takes ownership before
+flush_tlb_mm().  The flush completes before atomic_andnot() clears
+FLUSHING.  flush_tlb_mm() provides the required ordering of TLB
+invalidation completion; the final atomic operation only needs to preserve
+PENDING if an unmap races with that clear.
 
-Fixes: be4fc7ef0f05 ("mm/rmap: fix potential batched TLB flush race")
+All callers that check the state hold the relevant PTE lock.  Once a
+checker acquires that lock, its zero-state read cannot miss an unmap which
+published PENDING before releasing it.  A zero read, including a failed
+cmpxchg returning zero, can also follow a completed flush by another
+owner.  An unmap under another PTE lock cannot clear the entry this
+checker is about to change.
+
+Initialize the state for a new mm: dup_mm() copies the parent's mm_struct
+before mm_init(), so the child must not inherit an in-progress flush with
+no owner.
+
+The owner executes a cmpxchg before flush_tlb_mm() and an atomic_andnot()
+afterward, rather than one post-flush cmpxchg in the counter code.  This
+adds an atomic read-modify-write operation to an uncontended pending-flush
+call.  The unmap path also replaces a compiler barrier with
+smp_mb__before_atomic(), which can cost more on weakly ordered CPUs.
+
+Concurrent flushes can cause additional full-mm flushes.  If an unmap sets
+PENDING while the owner flushes, a second checker can flush and cover that
+unmap, but cannot mark it complete.  The owner clears only FLUSHING,
+leaving PENDING for a third checker to flush again.  With counters, the
+second checker could record the newer generation as flushed.  These costs
+have not been measured.
+
+Fixes: 5ee2fa2f0636 ("mm/rmap: fix potential batched TLB flush race")
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Reported-by: Kirk Swidowski <swidowski@google.com>
 Cc: <stable@vger.kernel.org>
 
  include/linux/mm_inline.h |    3 +
- mm/rmap.c                 |   63 ++++++++++++------------------------
- 2 files changed, 25 insertions(+), 41 deletions(-)
+ mm/rmap.c                 |   65 ++++++++++++++----------------------
+ 2 files changed, 29 insertions(+), 39 deletions(-)
 
 --- a/include/linux/mm_inline.h~mm-rmap-avoid-reusing-batched-tlb-flush-generations
 +++ a/include/linux/mm_inline.h
@@ -43,14 +71,17 @@ Cc: <stable@vger.kernel.org>
  static inline void inc_tlb_flush_pending(struct mm_struct *mm)
 --- a/mm/rmap.c~mm-rmap-avoid-reusing-batched-tlb-flush-generations
 +++ a/mm/rmap.c
-@@ -731,21 +731,13 @@ void try_to_unmap_flush_dirty(void)
- 		try_to_unmap_flush();
+@@ -732,20 +732,18 @@ void try_to_unmap_flush_dirty(void)
  }
  
--/*
+ /*
 - * Bits 0-14 of mm->tlb_flush_batched record pending generations.
 - * Bits 16-30 of mm->tlb_flush_batched bit record flushed generations.
-- */
++ * PENDING marks an unmap needing a flush. FLUSHING marks the caller
++ * flushing earlier unmaps. New unmaps can set PENDING during that flush;
++ * only the caller that claimed FLUSHING clears it after its flush.
++ * Other callers seeing FLUSHING must flush for themselves.
+  */
 -#define TLB_FLUSH_BATCH_FLUSHED_SHIFT	16
 -#define TLB_FLUSH_BATCH_PENDING_MASK			\
 -	((1 << (TLB_FLUSH_BATCH_FLUSHED_SHIFT - 1)) - 1)
@@ -67,7 +98,7 @@ Cc: <stable@vger.kernel.org>
  	bool writable = pte_dirty(pteval);
  
  	if (!pte_accessible(mm, pteval))
-@@ -754,24 +746,9 @@ static void set_tlb_ubc_flush_pending(st
+@@ -754,24 +752,9 @@ static void set_tlb_ubc_flush_pending(st
  	arch_tlbbatch_add_pending(&tlb_ubc->arch, mm, start, end);
  	tlb_ubc->flush_required = true;
  
@@ -95,7 +126,7 @@ Cc: <stable@vger.kernel.org>
  
  	/*
  	 * If the PTE was dirty then it's best to assume it's writable. The
-@@ -811,19 +788,23 @@ static bool should_defer_flush(struct mm
+@@ -811,19 +794,23 @@ static bool should_defer_flush(struct mm
   */
  void flush_tlb_batched_pending(struct mm_struct *mm)
  {
@@ -127,8 +158,8 @@ Cc: <stable@vger.kernel.org>
 +
 +	flush_tlb_mm(mm);
 +	if (state == TLB_FLUSH_BATCH_PENDING)
-+		atomic_fetch_and(~TLB_FLUSH_BATCH_FLUSHING,
-+				 &mm->tlb_flush_batched);
++		atomic_andnot(TLB_FLUSH_BATCH_FLUSHING,
++			      &mm->tlb_flush_batched);
  }
  #else
  static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
