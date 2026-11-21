@@ -53,10 +53,68 @@ Fixes: 5ee2fa2f0636 ("mm/rmap: fix potential batched TLB flush race")
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Reported-by: Kirk Swidowski <swidowski@google.com>
 Cc: <stable@vger.kernel.org>
+---
+Result: No repeatable performance difference.
+
+I compared the old batched-TLB-flush counter code (A) with the updated
+PENDING/FLUSHING patch (B). Both x86-64 QEMU guests had four CPUs, two
+NUMA nodes, 4 GiB RAM, the same kernel configuration and CPU placement,
+and QEMU host caching disabled. Mapping setup was excluded from timing.
+Each trial used a fresh process. I ran ten trials per condition in
+A/B/A/B order, without source pauses in the timing runs.
+
+Each reclaim trial made 128 MADV_PAGEOUT calls over 8,192 populated
+file pages. The four-thread condition made exactly 1,024
+madvise(MADV_COLD) calls per thread on distinct PTE pages in one mm.
+The calls began after pageout started. A separate condition made 256
+mprotect calls. The table shows medians [minimum-maximum].
+
+Reclaim + four MADV_COLD threads      A                     B
+First elapsed (ms)               41.85 [35.99-44.20]   37.27 [19.75-39.09]
+Repeat elapsed (ms)              39.66 [32.17-41.35]   40.46 [33.52-41.34]
+First CPU (ms)                  115.52 [110.99-121.25] 97.19 [72.43-108.91]
+Repeat CPU (ms)                 110.92 [94.37-119.07] 107.89 [99.51-116.97]
+First full-mm flushes             3464 [3204-3618]      3501 [2855-3669]
+Repeat full-mm flushes            3530 [3389-3680]      3550 [3359-3674]
+First flushes/1000 COLD calls      846 [782-883]         855 [697-896]
+Repeat flushes/1000 COLD calls     862 [827-898]         867 [820-897]
+First deferred publications       5339 [4544-6656]      5696 [4096-8192]
+Repeat deferred publications      6048 [4608-7936]      6106 [4890-7168]
+First flushes/1000 publications    655 [524-745]         616 [349-816]
+Repeat flushes/1000 publications   582 [464-741]         585 [513-687]
+
+Both kernels made exactly 4,096 MADV_COLD calls and reclaimed 8,192
+pages per four-thread trial. All A calls and at least 3,065 B calls
+overlapped pageout in the first set; all 4,096 calls overlapped on
+both sides in the repeat. A "deferred publication" records that an
+unmap marked a batched TLB flush pending. It does not count individual
+PTEs, and its frequency varied with the order of pageout and PTE walks.
+
+Other conditions, elapsed median (ms)   A first  B first  A repeat  B repeat
+Reclaim alone                            18.73    19.19     18.62     18.87
+Reclaim + mprotect                       20.97    20.58     20.61     20.92
+No reclaim, mprotect                      0.82     0.78      0.82      0.80
+No reclaim, four MADV_COLD threads       11.79    10.94     12.03     12.01
+
+Median pageout-call latency with four MADV_COLD threads was 366/297
+microseconds on the first A/B set and 339/332 on the repeat. Median
+MADV_COLD-call latency was 18.18/15.86 microseconds, then 17.72/17.32.
+These call timings exclude the subsequent userspace read of the page.
+The no-reclaim controls produced no deferred publications or full-mm
+flushes. Only a few mprotect calls overlapped pageout in most trials,
+limiting what that condition says about sustained mprotect contention.
+
+B recorded about 1,580 flushes per four-thread trial by callers that
+found another flush in progress. The event counts do not identify any
+particular flush as unnecessary. The first timed set favored B; the
+repeat reversed the elapsed-time ordering. Full-mm flush counts per
+fixed number of MADV_COLD calls were similar. These runs establish
+neither a repeatable performance change nor the rare extra-flush
+ordering described in the changelog.
 
  include/linux/mm_inline.h |    3 +
- mm/rmap.c                 |   65 ++++++++++++++----------------------
- 2 files changed, 29 insertions(+), 39 deletions(-)
+ mm/rmap.c                 |   64 ++++++++++++++----------------------
+ 2 files changed, 29 insertions(+), 38 deletions(-)
 
 --- a/include/linux/mm_inline.h~mm-rmap-avoid-reusing-batched-tlb-flush-generations
 +++ a/include/linux/mm_inline.h
@@ -72,7 +130,15 @@ Cc: <stable@vger.kernel.org>
  static inline void inc_tlb_flush_pending(struct mm_struct *mm)
 --- a/mm/rmap.c~mm-rmap-avoid-reusing-batched-tlb-flush-generations
 +++ a/mm/rmap.c
-@@ -732,20 +732,18 @@ void try_to_unmap_flush_dirty(void)
+@@ -52,6 +52,7 @@
+  *         folio_lock
+  */
+ 
++#include <linux/bits.h>
+ #include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sched/task.h>
+@@ -732,20 +733,18 @@ void try_to_unmap_flush_dirty(void)
  }
  
  /*
@@ -88,8 +154,8 @@ Cc: <stable@vger.kernel.org>
 -	((1 << (TLB_FLUSH_BATCH_FLUSHED_SHIFT - 1)) - 1)
 -#define TLB_FLUSH_BATCH_PENDING_LARGE			\
 -	(TLB_FLUSH_BATCH_PENDING_MASK / 2)
-+#define TLB_FLUSH_BATCH_PENDING	1
-+#define TLB_FLUSH_BATCH_FLUSHING	2
++#define TLB_FLUSH_BATCH_PENDING	BIT(0)
++#define TLB_FLUSH_BATCH_FLUSHING	BIT(1)
  
  static void set_tlb_ubc_flush_pending(struct mm_struct *mm, pte_t pteval,
  		unsigned long start, unsigned long end)
@@ -99,7 +165,7 @@ Cc: <stable@vger.kernel.org>
  	bool writable = pte_dirty(pteval);
  
  	if (!pte_accessible(mm, pteval))
-@@ -754,24 +752,9 @@ static void set_tlb_ubc_flush_pending(st
+@@ -754,24 +753,9 @@ static void set_tlb_ubc_flush_pending(st
  	arch_tlbbatch_add_pending(&tlb_ubc->arch, mm, start, end);
  	tlb_ubc->flush_required = true;
  
@@ -127,14 +193,15 @@ Cc: <stable@vger.kernel.org>
  
  	/*
  	 * If the PTE was dirty then it's best to assume it's writable. The
-@@ -811,19 +794,23 @@ static bool should_defer_flush(struct mm
+@@ -811,19 +795,23 @@ static bool should_defer_flush(struct mm
   */
  void flush_tlb_batched_pending(struct mm_struct *mm)
  {
 -	int batch = atomic_read(&mm->tlb_flush_batched);
 -	int pending = batch & TLB_FLUSH_BATCH_PENDING_MASK;
 -	int flushed = batch >> TLB_FLUSH_BATCH_FLUSHED_SHIFT;
--
++	int state = atomic_read(&mm->tlb_flush_batched);
+ 
 -	if (pending != flushed) {
 -		flush_tlb_mm(mm);
 -		/*
@@ -144,8 +211,6 @@ Cc: <stable@vger.kernel.org>
 -		atomic_cmpxchg(&mm->tlb_flush_batched, batch,
 -			       pending | (pending << TLB_FLUSH_BATCH_FLUSHED_SHIFT));
 -	}
-+	int state = atomic_read(&mm->tlb_flush_batched);
-+
 +	if (!state)
 +		return;
 +
