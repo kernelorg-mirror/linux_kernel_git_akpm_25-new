@@ -1,0 +1,156 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: mm: notify pre-content listeners on mremap and remap_file_pages
+Date: Sat, 21 Nov 2026 17:02:34 -0800
+
+The pre-content mmap hook covers a file range before it becomes accessible.
+Growing a file-backed VMA with mremap() and changing its file offsets with
+remap_file_pages() can expose a range without calling that hook. A local
+user with ordinary file access can therefore read data before a pre-content
+handler has filled it, or without giving that handler a chance to deny the
+new range.
+
+Notify the handler for the newly exposed tail on mremap() expansion and
+for the target file range in remap_file_pages(). The latter already drops
+mmap_lock before calling security_mmap_file(). For mremap(), drop the write
+lock before calling the potentially blocking handler, then verify the file
+and offset under the reacquired lock. Recheck the VMA and map count before
+changing anything. If another thread has replaced the mapping, fail with
+-EAGAIN instead of using a permission decision for the wrong file range.
+Moves and shrinking do not expose new file offsets.
+
+This is reachable by an unprivileged caller with read access to a marked
+file; remap_file_pages() also requires a writable shared mapping. It does
+not grant access to files that ordinary permissions prevent the caller
+from opening. The failure matters when a pre-content handler uses the
+notification to fill file data or to enforce a range-specific denial.
+
+Fixes: 066e053fe208 ("fsnotify: add pre-content hooks on mmap()")
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: n3rd <18670333770@163.com>
+Closes: https://lore.kernel.org/r/4f296d67.bbe3e.1a1c54655f8.Coremail.18670333770@163.com
+Cc: Jan Kara <jack@suse.cz>
+Cc: Amir Goldstein <amir73il@gmail.com>
+Cc: Matt Bobrowski <matt@bobrowski.net>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Josef Bacik <josef@toxicpanda.com>
+
+ mm/mmap.c   |    4 ++
+ mm/mremap.c |   67 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+
+--- a/mm/mmap.c~mm-notify-pre-content-listeners-on-mremap-and-remap_file_pages
++++ a/mm/mmap.c
+@@ -23,6 +23,7 @@
+ #include <linux/init.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
++#include <linux/fsnotify.h>
+ #include <linux/personality.h>
+ #include <linux/security.h>
+ #include <linux/hugetlb.h>
+@@ -1156,6 +1157,9 @@ SYSCALL_DEFINE5(remap_file_pages, unsign
+ 
+ 	/* Call outside mmap_lock to be consistent with other callers. */
+ 	ret = security_mmap_file(file, prot, flags);
++	if (!ret)
++		ret = fsnotify_mmap_perm(file, prot,
++					(loff_t)pgoff << PAGE_SHIFT, size);
+ 	if (ret) {
+ 		fput(file);
+ 		return ret;
+--- a/mm/mremap.c~mm-notify-pre-content-listeners-on-mremap-and-remap_file_pages
++++ a/mm/mremap.c
+@@ -17,6 +17,7 @@
+ #include <linux/swap.h>
+ #include <linux/capability.h>
+ #include <linux/fs.h>
++#include <linux/fsnotify.h>
+ #include <linux/leafops.h>
+ #include <linux/highmem.h>
+ #include <linux/security.h>
+@@ -2025,6 +2026,65 @@ static unsigned long remap_move(struct v
+ 	return res;
+ }
+ 
++/*
++ * A pre-content handler can wait for userspace.  Do not call it with
++ * mmap_lock held, and make sure the mapping still refers to the range
++ * for which the handler granted permission when we take the lock again.
++ */
++static int mremap_file_perm(struct vma_remap_struct *vrm)
++{
++	struct mm_struct *mm = current->mm;
++	struct vm_area_struct *vma = vrm->vma;
++	struct file *file;
++	pgoff_t pgoff;
++	loff_t off;
++	int prot = 0;
++	int ret;
++
++	if (vrm->remap_type != MREMAP_EXPAND || !vma->vm_file ||
++	    !FMODE_FSNOTIFY_HSM(vma->vm_file->f_mode))
++		return 0;
++
++	file = get_file(vma->vm_file);
++	pgoff = linear_page_index(vma, vrm->addr);
++	off = (loff_t)(pgoff + (vrm->old_len >> PAGE_SHIFT)) << PAGE_SHIFT;
++	if (vma_test(vma, VMA_READ_BIT))
++		prot |= PROT_READ;
++	if (vma_test(vma, VMA_WRITE_BIT))
++		prot |= PROT_WRITE;
++	if (vma_test(vma, VMA_EXEC_BIT))
++		prot |= PROT_EXEC;
++
++	mmap_write_unlock(mm);
++	vrm->mmap_locked = false;
++	ret = fsnotify_mmap_perm(file, prot, off, vrm->delta);
++	if (ret)
++		goto out_file;
++
++	if (mmap_write_lock_killable(mm)) {
++		ret = -EINTR;
++		goto out_file;
++	}
++	vrm->mmap_locked = true;
++
++	vma = vma_lookup(mm, vrm->addr);
++	if (!vma || vma->vm_file != file ||
++	    linear_page_index(vma, vrm->addr) != pgoff) {
++		mmap_write_unlock(mm);
++		vrm->mmap_locked = false;
++		ret = -EAGAIN;
++		goto out_file;
++	}
++
++	/* The VMA may have changed while the lock was dropped. */
++	vrm->vma = vma;
++	vrm->populate_expand = false;
++	ret = check_prep_vma(vrm);
++out_file:
++	fput(file);
++	return ret;
++}
++
+ static unsigned long do_mremap(struct vma_remap_struct *vrm)
+ {
+ 	struct mm_struct *mm = current->mm;
+@@ -2054,6 +2114,13 @@ static unsigned long do_mremap(struct vm
+ 		res = check_prep_vma(vrm);
+ 		if (res)
+ 			goto out;
++		res = mremap_file_perm(vrm);
++		if (res)
++			goto out;
++		if (!check_map_count_against_split_early(vrm)) {
++			res = -ENOMEM;
++			goto out;
++		}
+ 
+ 		/* Actually execute mremap. */
+ 		res = vrm_implies_new_addr(vrm) ? mremap_to(vrm) : mremap_at(vrm);
+_
