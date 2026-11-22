@@ -2,31 +2,56 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: selinux: recheck backing-file permissions on remap_file_pages()
 Date: Sat, 21 Nov 2026 17:58:52 -0800
 
-remap_file_pages() rechecks mmap permission on vma->vm_file before
-replacing a shared file mapping.  On a stacked filesystem that pointer can
-refer to a backing file opened with the mounter's credentials.  SELinux
-then checks the caller against the backing file's opener SID and inode,
-rather than the saved user file, and can reject a permitted remap with
-EACCES.  A confined process can reach this using its own writable shared
-overlayfs mapping; it does not need mount privileges.
+A process confined by SELinux can open and mmap() a writable shared
+overlayfs file, yet remap_file_pages() fails with EACCES when it selects
+another page of that same file.  mmap() and mprotect() succeed, and the
+same remap works on an ordinary ext4 file.  The caller needs no mount
+privileges.  Programs using remap_file_pages() on an accessible overlayfs
+file can therefore fail despite having permission to use the file.
 
-Use the user path and saved opener SID for the caller check.  Recheck
-intermediate mounters and the backing file as mprotect() does, while
-retaining the existing FILE__MAP check for the remap.  Ordinary files keep
-their existing checks.  This repairs the demonstrated denial and avoids
-omitting backing-layer checks; an access-control bypass was not
-demonstrated by the report.  The separate missing fsnotify pre-content
-notification is not addressed here.
+remap_file_pages() passes the VMA's backing file to the SELinux mmap hook.
+On overlayfs, that file was opened by the mounter, so the hook checks the
+caller against the backing file's opener SID instead of the saved user
+file.  In the A/B test, the resulting denial was an fd { use } check
+against the backing file's opener.
+
+Check the saved user file and opener SID for the caller's permissions,
+then check intermediate mounters and the backing file under their
+appropriate credentials, as mprotect() does.  Retain the FILE__MAP check. 
+Ordinary files continue through the existing check.
+
+With this patch alone, the overlayfs remap succeeded and returned the
+selected page's contents.  Denying write on the user-visible file or map
+permission on the upper file still made the remap fail with EACCES.  The
+ordinary ext4 control succeeded on both kernels.
 
 Link: https://lore.kernel.org/r/CAEjxPJ5tOwBfXpqbb_pFkjtHGtrHYL_idAj=es9QDGE1qPLDBA@mail.gmail.com
+Fixes: ea7e2d5e49c0 ("mm: call the security_mmap_file() LSM hook in remap_file_pages()"
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Reported-by: n3rd <18670333770@163.com>
+Tested-by: Andrew Morton <akpm@linux-foundation.org>
 Cc: Paul Moore <paul@paul-moore.com>
 Cc: Stephen Smalley <stephen.smalley.work@gmail.com>
 Cc: Ondrej Mosnáček <omosnacek@gmail.com>
 Cc: Miklos Szeredi <miklos@szeredi.hu>
 Cc: Amir Goldstein <amir73il@gmail.com>
+Cc: Shu Han <ebpqwerty472123@gmail.com>
 Cc: <stable@vger.kernel.org>
+---
+Testing: On A, without this patch, uid 65534 in
+user_u:user_r:user_t:s0, with SELinux enforcing, opened and mapped a
+writable shared overlayfs file. mmap() and mprotect() returned 0, but
+remap_file_pages() returned EACCES and left page A (byte 65) mapped.
+The AVC denied { use } on an fd from user_t to its kernel_t opener;
+the recorded backing inode matched the overlay upper file. An ordinary
+ext4 file remapped successfully in the same context.
+
+On B, with this patch alone, the overlay remap returned 0 and read the
+selected page B (byte 66). After the initial mapping, denying write on
+the user-visible file returned EACCES with a file { write } AVC.
+Independently denying map permission on the upper file to the saved
+mounter SID returned EACCES with a backing-file { map } AVC. The ordinary
+ext4 control still succeeded. No kernel warning or oops was observed.
 
  security/selinux/hooks.c |   34 +++++++++++++++++++++++++++++++---
  1 file changed, 31 insertions(+), 3 deletions(-)
