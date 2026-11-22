@@ -2,34 +2,43 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: mm: prevent pre-content bypass through mremap and remap_file_pages
 Date: Sat, 21 Nov 2026 18:23:13 -0800
 
-A pre-content handler is notified before mmap() exposes a file range, but
-mremap() can grow a file VMA beyond its existing range without notifying
-the handler. remap_file_pages() can replace a mapping with a different
-file range without notification. A caller with ordinary file access can
-therefore see data before the handler fills it, or without giving it a
-chance to deny that range.
+An fsnotify pre-content handler is notified before mmap() exposes a file
+range, but mremap() can grow a file VMA beyond its existing range without
+notifying the handler.  remap_file_pages() can replace a mapping with a
+different file range without notification.
+
+For example, a handler may supply file contents one range at a time.  A
+process maps a populated range, extends the mapping with mremap(), and
+faults on a newly mapped page.  Because the handler is not told about that
+page, the process can read the file's current contents there, such as
+zeroes from an unfilled hole, instead of the contents the handler would
+have supplied.  If the handler would have denied that range, the process
+can instead read the bytes already present without that denial.  The
+result is wrong data or a bypass of the handler's range-specific policy,
+depending on what the handler does; it is not a bypass of file
+permissions.
 
 Reject mremap() growth past the current VMA end when the file mode allows
-pre-content checks. Resizing within the existing VMA still works because
-mmap() already covered that range. This deliberately makes some previously
-successful mremap() calls fail with EOPNOTSUPP, even if a handler would
-allow the access; the caller can use mmap() to request the new file range.
-The file mode can also be set by a legacy FAN_ACCESS_PERM listener without
-a pre-content mark, so such files may also be refused. Calling the
-potentially blocking handler while holding mmap_write_lock would risk
-deadlock, so do not add that call here.
+pre-content checks.  Resizing within the existing VMA still works because
+mmap() already covered that range.  This deliberately makes some
+previously successful mremap() calls fail with EOPNOTSUPP, even if a
+handler would allow the access; the caller can use mmap() to request the
+new file range.  The file mode can also be set by a legacy FAN_ACCESS_PERM
+listener without a pre-content mark, so such files may also be refused. 
+Calling the potentially blocking handler while holding mmap_write_lock
+would risk deadlock, so do not add that call here.
 
-remap_file_pages() already drops mmap_lock around security_mmap_file().
+remap_file_pages() already drops mmap_lock around security_mmap_file(). 
 Call the pre-content hook there too, for the target file range.
 
-An unprivileged process can reach the mremap() case with read access to a
-watched file. remap_file_pages() also requires a writable shared mapping.
-Neither path bypasses ordinary file-opening permissions. The observable
-failure depends on a handler that fills content or denies specific ranges.
+An unprivileged process with read access to the watched file can reach the
+mremap() case.  remap_file_pages() also requires a writable shared
+mapping.
 
 Fixes: 066e053fe208 ("fsnotify: add pre-content hooks on mmap()")
 Reported-by: n3rd <18670333770@163.com>
 Closes: https://lore.kernel.org/r/4f296d67.bbe3e.1a1c54655f8.Coremail.18670333770@163.com
+Tested-by: Andrew Morton <akpm@linux-foundation.org>
 Cc: Jan Kara <jack@suse.cz>
 Cc: Amir Goldstein <amir73il@gmail.com>
 Cc: Matt Bobrowski <matt@bobrowski.net>
@@ -40,3 +49,19 @@ Cc: Mike Rapoport <rppt@kernel.org>
 Cc: Michal Hocko <mhocko@suse.com>
 Cc: Lorenzo Stoakes <ljs@kernel.org>
 Cc: Josef Bacik <josef@toxicpanda.com>
+---
+Testing: On A, without this patch, an unprivileged process mapped a file
+watched by a FAN_CLASS_PRE_CONTENT/FAN_PRE_ACCESS listener. The listener
+allowed page A and denied access to the newly selected range. mremap()
+growth, both in place and with a forced move, returned 0 and exposed page
+B (byte 66) without another event. remap_file_pages() returned 0 and
+exposed page C (byte 67) without an event for C. A direct mmap() spanning
+the denied range did generate an event and returned EPERM.
+
+On B, with this patch alone, remap_file_pages() generated an event for
+page C (offset 8192, length 4096) and returned EPERM when denied; page A
+(byte 65) remained mapped. Watched mremap() growth returned EOPNOTSUPP
+without exposing B. Growth also returned EOPNOTSUPP with an allow-all
+watcher, which is a compatibility cost. Allow-all mmap(), unwatched
+growth, shrinking and resizing within the existing VMA succeeded.
+No kernel warning or oops was observed.
