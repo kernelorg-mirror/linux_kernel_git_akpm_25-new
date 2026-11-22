@@ -1,0 +1,130 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: fuse: let memory-failure remove poisoned page-cache folios
+Date: Sun, 22 Nov 2026 14:45:24 -0800
+
+fuse_file_aops has no ->error_remove_folio().  memory_failure() then
+falls back to mapping_evict_folio(), which cannot remove a dirty folio.
+So when a dirty FUSE page-cache page is hard-poisoned, recovery fails:
+
+  Memory failure: 0x7ffce: Failed to invalidate
+  Memory failure: 0x7ffce: dirty LRU page still referenced by 1 users
+  Memory failure: 0x7ffce: recovery action for dirty LRU page: Failed
+
+madvise(MADV_HWPOISON) returns -EBUSY.  The poisoned folio stays in the
+page cache, and the kernel later reads it again to write it back to the
+server.  With a real uncorrected memory error that is a second access to
+bad memory.
+
+The poisoned folio also outlives the last close() of an unlinked file by
+however long the inode takes to be evicted.  The memory-failure selftest
+unpoisons the page in its teardown and that failed with -EBUSY in 6 of 40
+runs on FUSE.
+
+Set ->error_remove_folio() to generic_error_remove_folio(), as ext4, xfs,
+btrfs, NFS and others do.  The folio is then truncated at the time of the
+error:
+
+  Memory failure: 0x7dcf5: recovery action for dirty LRU page: Recovered
+
+madvise() returns 0 and nothing is written back.  The -EIO which
+memory_failure() records in the mapping is reported exactly as before:
+by the first fsync(), or by close() if FOPEN_NOFLUSH is not in effect.
+
+Tested on x86_64 under QEMU with a minimal /dev/fuse server and simulated
+poison (MADV_HWPOISON), with and without the writeback cache and with
+FOPEN_NOFLUSH.  The memory-failure selftest then passes 40 of 40 runs on
+FUSE.  Not tested: virtiofs, DAX, a real memory error.
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Miklos Szeredi <miklos@szeredi.hu>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Kurt Lin <lylin1023@gmail.com>
+---
+INSTRUCTIONS FOR THE TESTING CHAT.  Pass on everything from this line down
+to the diffstat.
+
+Goal: show what this one-line kernel change does on real FUSE servers, and
+that it breaks nothing in FUSE.
+
+This patch changes the kernel.  Build TWO kernels from the same tree and
+the same .config: K0 without this patch, K1 with it.  Nothing else may
+differ.  Use the config from the selftest patch
+(selftests-mm-check-that-fsync-reports-hard-poisoned-dirty-page-cache)
+plus FUSE_DAX, PROVE_LOCKING, DEBUG_VM and DEBUG_LIST.
+
+Test binary: tools/testing/selftests/mm/memory-failure built from a tree
+with that selftest patch applied, but with its one ftruncate(fd, 0) line
+and the comment above it deleted.  Call it B-notrunc.  That line hides
+the problem this patch fixes, so it must not be there.  Say in the report
+that you removed it.
+
+Part 1, on K0 and then on K1.  For each FUSE setup below, cd into a fresh
+directory on it and run B-notrunc 40 times.
+
+  fuse         a libfuse passthrough example over ext4
+  fuse         the same with the writeback cache enabled
+  virtiofs     virtiofsd with its default cache mode
+  virtiofs     with writeback enabled
+  virtiofs     with DAX, if the host can provide it
+  overlayfs    upper and lower on virtiofs, if it will mount
+  ext4         control, 5 runs: must be identical on K0 and K1
+
+Record for each: passes out of 40, every distinct failing assertion with
+its count, and from the kernel log the counts of
+
+  recovery action for dirty LRU page: Recovered / Failed / Delayed
+  recovery action for clean LRU page: Recovered / Failed / Delayed
+  Failed to invalidate
+
+Expected on K0: "Failed to invalidate" for every hard dirty_pagecache
+run, and some runs failing in teardown with
+
+  memory-failure.c:211:...:Expected unpoison_memory(self->pfn) (-16) == 0
+
+Expected on K1: no "Failed to invalidate", dirty LRU page Recovered,
+40 of 40.
+
+Part 2, on K0 and then on K1: regressions.  On the fuse passthrough mount
+and on virtiofs run whatever FUSE coverage the test machine has, in this
+order of preference: fstests "-g quick" with FSTYP=fuse or virtiofs, the
+libfuse test suite, otherwise fsx and fsstress for 10 minutes each.
+Report the list of failing tests on K0 and on K1.  Only differences
+between the two lists matter.
+
+Part 3, on K1 only: poison under load.  On the fuse passthrough mount
+with the writeback cache enabled, run fsstress or fsx on one file while a
+second process repeatedly mmaps that file MAP_SHARED, dirties a random
+page and calls madvise(MADV_HWPOISON) on it, for 5 minutes.  Unpoison
+through /sys/kernel/debug/hwpoison/unpoison-pfn afterwards.  Report any
+WARNING, BUG, lockdep report, hung task or bad page state in the kernel
+log.  I/O errors and SIGBUS in the test programs are expected.
+
+Rules:
+
+- A failure is a result.  Report it.  Do not change the kernel, the test
+  or the mount options to make something pass.
+- If a setup cannot be made or mounted, report it as NOT RUN with the
+  exact command and error.  Do not leave it out.
+- Any WARNING, BUG or lockdep report in the kernel log on K1 which is not
+  also on K0 must be quoted in full.
+- Check HardwareCorrupted in /proc/meminfo before Part 1 and after
+  Part 3.  Report both values.
+
+Report: one table for Part 1 with K0 and K1 side by side, the two lists
+for Part 2, the kernel log findings for Part 3, then anything NOT RUN.
+
+ fs/fuse/file.c |    1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/fs/fuse/file.c~fuse-let-memory-failure-remove-poisoned-page-cache-folios
++++ a/fs/fuse/file.c
+@@ -3156,6 +3156,7 @@ static const struct address_space_operat
+ 	.readahead	= fuse_readahead,
+ 	.writepages	= fuse_writepages,
+ 	.launder_folio	= fuse_launder_folio,
++	.error_remove_folio = generic_error_remove_folio,
+ 	.dirty_folio	= iomap_dirty_folio,
+ 	.release_folio	= iomap_release_folio,
+ 	.invalidate_folio = iomap_invalidate_folio,
+_

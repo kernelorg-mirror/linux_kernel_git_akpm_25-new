@@ -1,0 +1,150 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: selftests/mm: check that fsync() reports hard-poisoned dirty page-cache
+Date: Sun, 22 Nov 2026 14:38:21 -0800
+
+MADV_HWPOISON on a dirty page-cache page records -EIO in the file's
+mapping.  Filesystems whose ->flush() checks the mapping report that error
+from close(): NFS, FUSE, CIFS and orangefs do, and overlayfs and ecryptfs
+pass on whatever the lower filesystem's ->flush() returns.  The hard
+dirty_pagecache variant ends with ASSERT_EQ(close(fd), 0), so on those
+filesystems it fails.  From a FUSE directory:
+
+  memory-failure.c:389:dirty_pagecache:Expected close(fd) (-1) == 0 (0)
+
+Commit e14e52a7ce02 ("selftests/mm: skip hard dirty page-cache test on
+NFS") handled this by skipping the variant on NFS, and the same has been
+proposed for FUSE.  But the -EIO is the expected result of the injection,
+and the test never checks that the kernel recorded it.  On filesystems
+with no ->flush(), such as ext4, close() returns 0 and the error goes
+unobserved.
+
+So test for it.  After the hard variant, expect fsync() to fail with EIO.
+That also consumes the error, so the close() which follows returns 0 on
+every filesystem and the NFS skip can go away.
+
+FUSE has no ->error_remove_folio(), so memory_failure() cannot remove the
+poisoned dirty page.  It stays in the page cache until the inode is
+evicted, which FUSE can do after close() has returned, and until then the
+test's teardown cannot unpoison the page: unpoison_memory() failed with
+-EBUSY in 6 of 40 runs.  Truncate the file after the fsync() check so the
+page is gone before teardown.
+
+The page-cache tests can only work on a filesystem which keeps its data on
+backing store.  tmpfs was already skipped for that reason, but ramfs and
+hugetlbfs are in the same position and the tests fail on both today.  Skip
+all three, and say why in a comment.
+
+memory-failure results on x86_64 under QEMU, with the working directory on
+each filesystem.  FUSE was a minimal test server, not virtiofs.
+
+                before            after
+  ext4          10 pass           10 pass
+  FUSE          9 pass, 1 fail    10 pass
+  NFSv4.2       9 pass, 1 skip    10 pass
+  tmpfs         6 pass, 4 skip    6 pass, 4 skip
+  ramfs         7 pass, 3 fail    6 pass, 4 skip
+  hugetlbfs     6 pass, 4 fail    6 pass, 4 skip
+
+Fixes: d51b5076c746 ("selftests/mm: add memory failure dirty pagecache test")
+Reported-by: Kurt Lin <lylin1023@gmail.com>
+Closes: https://lore.kernel.org/20261123-memory-failure-fuse-skip-v1-1-19dcbda6e2e8@gmail.com
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: Shuah Khan <shuah@kernel.org>
+Cc: Muhammad Usama Anjum <usama.anjum@arm.com>
+---
+INSTRUCTIONS FOR THE TESTING CHAT.  Pass on everything from this line down
+to the diffstat.
+
+Goal: run tools/testing/selftests/mm/memory-failure with its working
+directory on every filesystem an x86_64 QEMU guest can mount, without and
+with this patch, and report one table.
+
+This patch changes only the selftest.  So:
+
+- Build ONE kernel, with every filesystem below built in (=y, not =m).
+  Do not build a kernel per filesystem.  The same kernel runs both test
+  binaries.
+- Build the selftest twice: binary A from the tree without this patch,
+  binary B with it.  Run the binaries directly, as root, with the current
+  directory on the filesystem under test.  Do not use run_vmtests.sh: it
+  does not change directory.
+
+Kernel: current mm-new, x86_64 defconfig, plus
+
+  the test needs   MEMORY_FAILURE HWPOISON_INJECT DEBUG_FS
+                   PROC_PAGE_MONITOR BLK_DEV_LOOP
+  disk             EXT2_FS EXT4_FS XFS_FS BTRFS_FS F2FS_FS JFS_FS
+                   NILFS2_FS GFS2_FS OCFS2_FS EXFAT_FS VFAT_FS NTFS3_FS
+                   NTFS_FS UDF_FS MINIX_FS HFSPLUS_FS
+  network          NFS_FS NFS_V3 NFS_V4 NFS_V4_2 NFSD NFSD_V4 CIFS
+                   SMB_SERVER 9P_FS NET_9P_VIRTIO
+  FUSE, stacked    FUSE_FS VIRTIO_FS OVERLAY_FS ECRYPT_FS
+  memory only      TMPFS HUGETLBFS
+
+Check .config afterwards: every symbol above must be =y.  If one is not,
+find the missing dependency; do not drop it silently.
+
+In the guest, mount debugfs on /sys/kernel/debug.  Then for each line
+below make the filesystem, mount it, cd into a fresh directory on it, and
+run A then B.
+
+  ext2 ext4 xfs btrfs f2fs jfs nilfs2 exfat vfat udf minix hfsplus
+               one loop image each, 1G
+  ntfs3, ntfs  the same mkntfs image, mounted once with each driver
+  gfs2         mkfs.gfs2 -p lock_nolock -j 1
+  ocfs2        mkfs.ocfs2 -M local
+  nfs v3, nfs v4.2
+               loopback mount of a knfsd export (rw,no_root_squash) of
+               the ext4 mount
+  cifs         loopback mount of a ksmbd or samba share of the ext4 mount
+  9p           QEMU -virtfs share; run with cache=mmap, again with
+               cache=loose
+  virtiofs     virtiofsd on the host; run with its default cache mode
+               and again with writeback enabled
+  fuse         a libfuse passthrough example over the ext4 mount
+  overlayfs    upper and lower on ext4; again with upper and lower on
+               virtiofs if it will mount
+  ecryptfs     over the ext4 mount
+  tmpfs, ramfs controls
+  hugetlbfs    control; first echo 8 > /proc/sys/vm/nr_hugepages
+
+On fuse, virtiofs and anything else where the kernel logs "Failed to
+invalidate", run B 20 times, not once, and report how many runs passed.
+The failure being looked for is in teardown:
+
+  memory-failure.c:211:...:Expected unpoison_memory(self->pfn) (-16) == 0
+
+For each run record the "# Totals:" line, every "not ok" line with the
+"Expected ..." line above it, and the kernel's "Memory failure: ...
+recovery action for dirty LRU page: ..." lines.
+
+Expected with B: pass:10 fail:0 skip:0 on everything with backing store;
+pass:6 skip:4 on tmpfs, ramfs and hugetlbfs.
+Expected with A: fail:1 where close() reports the error, skip:1 on NFS,
+3 failures on ramfs, 4 on hugetlbfs.
+
+Rules:
+
+- A failure is a result.  Report it.  Do not change the selftest, the
+  kernel, the mount options or the list to make something pass.
+- If a filesystem cannot be made or mounted, report it as NOT RUN with the
+  exact command and error.  Do not leave it out.
+- If B fails, say which assertion: fsync() returning 0 means that
+  filesystem does not report the error from fsync(); close() failing
+  after fsync() means the error was not consumed; ftruncate() failing
+  means the poisoned page could not be removed.  All are findings.
+- If B fails on a filesystem at fsync() and that filesystem has no backing
+  store, say so: it probably belongs in fs_has_backing_store().
+- Check HardwareCorrupted in /proc/meminfo before the first run and after
+  the last.  It must be unchanged.
+
+Report one table with a row per run above: filesystem and mount options,
+A totals, B totals (and passes out of 20 where repeated), first failing
+assertion, recovery action (Recovered, Failed or Delayed) for the hard
+dirty_pagecache test.  Then list anything NOT RUN.
