@@ -1,0 +1,83 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: jfs: validate xattr entry bounds before replacing an attribute
+Date: Sat, 21 Nov 2026 22:09:53 -0800
+
+ea_get() checks the size of a JFS extended attribute list against the
+inode EA descriptor, but __jfs_setxattr() does not check the boundaries
+of the entries within that list. A malformed entry can claim more bytes
+than remain in the list. When that entry matches the name being replaced,
+__jfs_setxattr() subtracts its untrusted size from xattr_size and writes
+the new entry before the allocated buffer. The later size consistency
+check runs after the damage is done.
+
+Seonggwon Yoon reproduced this with a 5021-byte list whose matching
+entry's value length was changed from 5000 to 5020. Its computed size
+became 5037 bytes, leaving xattr_size at -16. A setxattr() on the
+malformed JFS root inode then wrote 16 bytes before the kmalloc buffer.
+The report observed four KASAN invalid writes on v7.3.4 and v7.4-rc2.
+
+JFS cannot be mounted directly from an unprivileged user namespace.
+UDisks2 is used by familiar desktop file managers: GNOME Files gets disk
+information through GVfs's UDisks2 monitor [3], while KDE Plasma's device
+UI and Dolphin use Solid's UDisks2 backend [4][5]. On installations whose
+policy permits an active local user to set up a loop device from a file
+and request a mount through UDisks2 [2], its privileged daemon can mount
+a crafted JFS image supplied by that user. If the affected inode permits
+that user to set an attribute, the write is reachable without the user
+having mount privilege. The route depends on policy and JFS availability;
+the reported reproducer ran setxattr() as root.
+
+Reject a nonempty list shorter than its header. Before examining each
+entry, check that the fixed fields and the entire encoded name and value
+fit in the remaining list bytes. This also checks entries after the
+matching one before any move or replacement write. Return EUCLEAN for a
+malformed list; valid xattr updates retain their existing behavior.
+
+An earlier patch by Sebastian Alba Vives [1] identified the missing
+entry bounds check. This version checks the fixed fields before reading
+the encoded entry size and also checks the outer header length.
+
+Link: https://lore.kernel.org/r/20260413140328.173446-1-sebasjosue84@gmail.com [1]
+Link: https://storaged.org/udisks/docs/udisks-polkit-actions.html [2]
+Link: https://github.com/GNOME/gvfs/blob/master/monitor/udisks2/what-is-shown.txt [3]
+Link: https://develop.kde.org/docs/features/solid/ [4]
+Link: https://codebrowser.dev/kde/solid/src/solid/devices/backends/udisks2/udisksmanager.cpp.html [5]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Seonggwon Yoon <keyakoto@gmail.com>
+Cc: Dave Kleikamp <shaggy@kernel.org>
+Cc: Sebastian Alba Vives <sebasjosue84@gmail.com>
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>
+Cc: <stable@vger.kernel.org>
+
+ fs/jfs/xattr.c |   17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+--- a/fs/jfs/xattr.c~jfs-validate-xattr-entry-bounds-before-replacing-an-attribute
++++ a/fs/jfs/xattr.c
+@@ -687,9 +687,24 @@ int __jfs_setxattr(tid_t tid, struct ino
+ 	ealist = (struct jfs_ea_list *) ea_buf.xattr;
+ 	new_size = sizeof (struct jfs_ea_list);
+ 
++	if (xattr_size && xattr_size < sizeof(*ealist)) {
++		rc = -EUCLEAN;
++		goto release;
++	}
++
+ 	if (xattr_size) {
+-		for (ea = FIRST_EA(ealist); ea < END_EALIST(ealist);
++		char *end = (char *)ealist + xattr_size;
++
++		for (ea = FIRST_EA(ealist); (char *)ea < end;
+ 		     ea = NEXT_EA(ea)) {
++			size_t remaining = end - (char *)ea;
++
++			if (remaining < sizeof(*ea) ||
++			    EA_SIZE(ea) > remaining) {
++				rc = -EUCLEAN;
++				goto release;
++			}
++
+ 			if ((namelen == ea->namelen) &&
+ 			    (memcmp(name, ea->name, namelen) == 0)) {
+ 				found = 1;
+_
