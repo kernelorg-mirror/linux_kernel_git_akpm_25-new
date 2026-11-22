@@ -1,0 +1,59 @@
+From: Zhiteng Qiu <qiuzhiteng@hygon.cn>
+Subject: mm/migrate: don't batch the TLB flush when there is nothing to batch
+Date: Thu, 12 Nov 2026 09:03:57 +0800
+
+NUMA balancing migrates one folio at a time, but since commit
+7e12beb8ca2a ("migrate_pages: batch flushing TLB") it still unmaps
+with TTU_BATCH_FLUSH like any other MIGRATE_ASYNC migration.  When the
+batch contains one small folio mapped only once, there is nothing to
+batch, and the batched unmap can leave mm->tlb_flush_batched pending,
+so the NUMA scanner's next change_pte_range() can call flush_tlb_mm()
+before changing the PTE table.  With migrations running concurrently,
+that state keeps being refilled, and on this workload the scanner
+often flushes the whole mm as it walks the PTE tables.
+
+This slows scanning and keeps mm->tlb_flush_pending raised longer.  On
+x86, a migration that unmaps a PROT_NONE PTE while
+mm->tlb_flush_pending is set gets true from pte_accessible() and needs
+a flush too; with batching, the resulting arch_tlbbatch_flush() is a
+full flush.  The two feed each other.  In one run, 33% of the
+migrations overlapped a scan pass, although passes covered only 9% of
+the time.
+
+On a 2-socket, 384-CPU x86 machine without INVLPGB, with v7.3, a
+120 GiB anonymous working set on 4 KiB pages and 384 threads (three
+balancing on/off pairs per kernel):
+
+                                     v7.3          patched
+  throughput loss from balancing     13.0-16.5%    0.5-6.3%
+  TLB interrupts per migrated page   202-210       12.7-13.6
+  average scanner mmu_gather time    ~90 ms        ~6.7 ms
+
+The mmu_gather times were measured in separate instrumented runs.
+
+So don't ask for a batched flush when the batch holds a single small
+folio that is not mapped shared; try_to_migrate_one() then uses
+ptep_clear_flush() for each PTE it encounters.  Large folios retain
+their existing flush behavior.  migrate_pages_batch() computes the
+flags, since it knows how many folios it is migrating.  PMD-mapped
+THPs are not affected, since set_pmd_migration_entry() flushes them
+regardless of TTU_BATCH_FLUSH.
+
+Link: https://patch.msgid.link/20261112010357.2739389-1-qiuzhiteng@hygon.cn
+Signed-off-by: Zhiteng Qiu <qiuzhiteng@hygon.cn>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Xin Hao <xhao@linux.alibaba.com>
+Cc: Dave Hansen <dave.hansen@linux.intel.com>
+Cc: Yuan Zhong <zhongyuan@hygon.cn>
+Cc: Shifei Ge <geshifei@hygon.cn>
+Cc: Jianyong Wu <wujianyong@hygon.cn>
+Cc: Shijie Huang <huangsj@hygon.cn>
+Cc: Yibin Liu <liuyibin@hygon.cn>
+Cc: Fengyu Wang <wangfengyu@hygon.cn>
