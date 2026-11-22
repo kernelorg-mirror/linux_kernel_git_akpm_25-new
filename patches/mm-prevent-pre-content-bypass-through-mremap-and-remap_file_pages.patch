@@ -2,30 +2,33 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: mm: prevent pre-content bypass through mremap and remap_file_pages
 Date: Sat, 21 Nov 2026 20:26:34 -0800
 
-An fsnotify pre-content handler sees the range passed to mmap(), but
-mremap() can extend a file mapping beyond that range without notifying it.
-A process with ordinary read access can map a populated page, grow the
-mapping, and fault on the newly exposed page.  It can then read zeroes
-from an unfilled hole instead of the contents the handler would have
-supplied, or read bytes that a range-specific handler would have denied. 
-This does not bypass file-opening permissions.  remap_file_pages() can
-likewise replace a file range without notifying the handler.
+On files watched by a pre-content fanotify handler, which uses the
+kernel's fsnotify framework, a process that can open the file can expose a
+new range without notifying the handler.  It can then read zeroes before
+the handler fills that range, or read bytes the handler would deny.  This
+can silently give applications wrong data or defeat a range-specific
+denial.  Ordinary file-opening permissions still apply.  Files without a
+pre-content handler do not acquire a new permission denial.
 
-For growth beyond the existing VMA end, hold a reference to the file and
-ask the pre-content handler about only the newly exposed file range.  Drop
-mmap_write_lock before calling the handler, which can block while it fills
-the range.  After reacquiring the lock, repeat the VMA checks: if the file
-or newly exposed range changed meanwhile, request permission for the
-current range instead.  A denial leaves the mapping unchanged.  Growth
-within the already mapped file range needs no new notification.
+mmap() sends the handler a FAN_PRE_ACCESS event for the initial file
+range.  mremap() can grow the mapping beyond that range, and
+remap_file_pages() can select a different range, without sending one.
 
-Call the same pre-content hook in remap_file_pages() before it acquires
-mmap_write_lock, using the replacement file range.
+Notify the handler about the newly exposed range before mremap() growth. 
+Hold a file reference and drop mmap_write_lock while waiting for the
+response.  After reacquiring the lock, repeat the VMA checks; if the file
+or required range changed, request permission for the current range. 
+Growth within the range covered by mmap() needs no additional event.
 
-An active pre-content handler can now delay or deny growth.  It may also
-receive a permission event for a remap that subsequently fails for an
-unrelated reason, or another event if the mapping changes while it is
-responding.
+Also notify the handler about the replacement range before
+remap_file_pages() acquires mmap_write_lock.
+
+These calls can now wait while the handler fills or approves the range. 
+Denial returns the handler's error without performing the remap; approval
+still permits growth.  A file with only an ordinary FAN_ACCESS_PERM watch
+still permits mremap() growth.  The handler may receive an event for a
+remap that later fails for another reason, or another event if the mapping
+changes while it is responding.
 
 Fixes: 066e053fe208 ("fsnotify: add pre-content hooks on mmap()")
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
