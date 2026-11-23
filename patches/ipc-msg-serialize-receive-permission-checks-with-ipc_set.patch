@@ -1,35 +1,41 @@
 From: Hyunho Song <songhh06101@gmail.com>
 Subject: ipc/msg: serialize receive permission checks with IPC_SET
-Date: Wed, 18 Nov 2026 12:28:21 +0900
+Date: Sun, 22 Nov 2026 18:37:35 -0800
 
-do_msgrcv() checks read permission before taking the queue lock.  IPC_SET
-can revoke access and pass through expunge_all() between that check and
-insertion into q_receivers.  The new receiver can then sleep through the
-revocation and accept a later message, even if senders skip receivers that
-IPC_SET found on the list.
+do_msgrcv() checks read permission before taking the queue lock. IPC_SET
+can revoke access after that check and before the receiver joins
+q_receivers. It then misses the IPC_SET wakeup and can receive a later
+message despite losing access.
 
-Check read permission under the same queue lock that protects IPC_SET and
-waiter insertion, as do_msgsnd() already does for write permission.  On
-denial, release the lock through the existing out_unlock0 path.
+Take the queue lock before checking read permission and hold it through
+each retry after an -EAGAIN wakeup. This also avoids the back-to-back
+unlock and relock in the previous revision [1]. The receiver still
+drops the lock before sleeping and reacquires it when it must remove
+itself from q_receivers.
 
 Signed-off-by: Hyunho Song <songhh06101@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Cc: Manfred Spraul <manfred@colorfullife.com>
+Link: https://lore.kernel.org/r/20261120153224.ea4b38665ac135a27f85c652@linux-foundation.org [1]
+Reported-by: Hyunho Song <songhh06101@gmail.com>
+Closes: https://lore.kernel.org/r/CAJ5=Bnt42P4J_t_4=hUSsAd-WWNSoxendooYm8aTLFjyZqAh=Q@mail.gmail.com
+Suggested-by: Manfred Spraul <manfred@colorfullife.com>
+Link: https://lore.kernel.org/r/2f817237-9571-4c06-a7ca-6de93613bb14@colorfullife.com
 Cc: Davidlohr Bueso <dave@stgolabs.net>
-Tested-by: Andrew Morton <akpm@linux-foundation.org>
 Cc: <stable@vger.kernel.org>
 
- ipc/msg.c |    6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
+ ipc/msg.c |    7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
 
 --- a/ipc/msg.c~ipc-msg-serialize-receive-permission-checks-with-ipc_set
 +++ a/ipc/msg.c
-@@ -1135,11 +1135,11 @@ static long do_msgrcv(int msqid, void __
+@@ -1132,14 +1132,13 @@ static long do_msgrcv(int msqid, void __
+ 		return PTR_ERR(msq);
+ 	}
+ 
++	ipc_lock_object(&msq->q_perm);
  	for (;;) {
  		struct msg_receiver msr_d;
  
-+		ipc_lock_object(&msq->q_perm);
-+
  		msg = ERR_PTR(-EACCES);
  		if (ipcperms(ns, &msq->q_perm, S_IRUGO))
 -			goto out_unlock1;
@@ -39,4 +45,13 @@ Cc: <stable@vger.kernel.org>
  
  		/* raced with RMID? */
  		if (!ipc_valid_object(&msq->q_perm)) {
+@@ -1248,8 +1247,6 @@ static long do_msgrcv(int msqid, void __
+ 			msg = ERR_PTR(-ERESTARTNOHAND);
+ 			goto out_unlock0;
+ 		}
+-
+-		ipc_unlock_object(&msq->q_perm);
+ 	}
+ 
+ out_unlock0:
 _

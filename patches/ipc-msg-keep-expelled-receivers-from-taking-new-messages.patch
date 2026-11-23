@@ -1,43 +1,50 @@
-From: Hyunho Song <songhh06101@gmail.com>
+From: songhyunho1111 <songhh06101@gmail.com>
 Subject: ipc/msg: keep expelled receivers from taking new messages
 Date: Wed, 18 Nov 2026 12:28:21 +0900
 
 Patch series "ipc/msg: prevent reads after queue permission revocation".
 
-Two races can let a blocked msgrcv() obtain a message sent after IPC_SET
-revoked its read permission.  Patch 1 prevents a sender from handing a
-message to a receiver that IPC_SET has asked to retry.  Patch 2 makes the
-receive permission check atomic with insertion into the receiver list. 
-Messages handed off before IPC_SET takes the queue lock retain their
-existing behavior.
+A process whose read access to a SysV message queue was revoked by
+IPC_SET can receive a message sent afterward. A blocked receiver needs
+no capability and can have a different UID from the queue owner. Patch 1
+prevents delivery to a receiver awakened by IPC_SET. Patch 2 closes the
+window between the read permission check and waiter insertion.
+
+IPC_SET continues to wake every blocked receiver, whether its access
+changed or not. A receiver with unchanged access leaves and rejoins the
+wait list after waking, potentially changing its position as before.
+A sender can queue a message instead of handing it to that receiver.
 
 
 This patch (of 2):
 
-IPC_SET wakes blocked receivers to recheck read permission, but
-expunge_all() leaves them in q_receivers.  Before a receiver runs,
-pipelined_send() can replace its -EAGAIN result with a new message.  The
-receiver can then obtain data sent after its read access was revoked.
+IPC_SET sets a blocked receiver's result to -EAGAIN so it retries its
+read permission check. expunge_all() leaves the receiver on q_receivers;
+a sender can hand it a new message before it wakes. If IPC_SET revoked
+its read access, it receives data that was sent after the revocation.
 
-Mark receivers touched by expunge_all() and skip them in pipelined_send().
-Leave them on the list until they wake: IPC_RMID must still find them and
-change -EAGAIN to -EIDRM before the queue can be freed.  A skipped message
-remains on the queue for an authorized receiver.  The resumed receiver
-removes itself from the list and retries its permission check.
+Mark every receiver that expunge_all() touched and skip it in
+pipelined_send(). Keep it linked until it wakes so IPC_RMID can still
+find it and change its result to -EIDRM. The message remains queued. After waking, a receiver whose access
+was revoked gets -EACCES. The wake-all behavior and possible wait-list
+reordering on IPC_SET remain.
 
 Signed-off-by: Hyunho Song <songhh06101@gmail.com>
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Cc: Manfred Spraul <manfred@colorfullife.com>
-Cc: Davidlohr Bueso <dave@stgolabs.net>
+Reported-by: Hyunho Song <songhh06101@gmail.com>
+Closes: https://lore.kernel.org/r/CAJ5=Bnt42P4J_t_4=hUSsAd-WWNSoxendooYm8aTLFjyZqAh=Q@mail.gmail.com
+Reviewed-by: Manfred Spraul <manfred@colorfullife.com>
 Tested-by: Andrew Morton <akpm@linux-foundation.org>
+  Link: https://lore.kernel.org/r/20261120153057.f1b13f748c4876044c706449@linux-foundation.org
+Cc: Davidlohr Bueso <dave@stgolabs.net>
 Cc: <stable@vger.kernel.org>
 
- ipc/msg.c |    7 +++++++
+ ipc/msg.c | 7 +++++++
  1 file changed, 7 insertions(+)
 
---- a/ipc/msg.c~ipc-msg-keep-expelled-receivers-from-taking-new-messages
-+++ a/ipc/msg.c
-@@ -82,6 +82,7 @@ struct msg_receiver {
+--- a/ipc/msg.c
++++ b/ipc/msg.c
+@@ -82,6 +82,7 @@
  	long			r_maxsize;
  
  	struct msg_msg		*r_msg;
@@ -45,7 +52,7 @@ Cc: <stable@vger.kernel.org>
  };
  
  /* one msg_sender for each sleeping sender */
-@@ -255,6 +256,8 @@ static void expunge_all(struct msg_queue
+@@ -255,6 +256,8 @@
  		struct task_struct *r_tsk;
  
  		r_tsk = get_task_struct(msr->r_tsk);
@@ -54,7 +61,7 @@ Cc: <stable@vger.kernel.org>
  
  		/* see MSG_BARRIER for purpose/pairing */
  		smp_store_release(&msr->r_msg, ERR_PTR(res));
-@@ -819,6 +822,9 @@ static inline int pipelined_send(struct
+@@ -819,6 +822,9 @@
  	struct msg_receiver *msr, *t;
  
  	list_for_each_entry_safe(msr, t, &msq->q_receivers, r_list) {
@@ -64,7 +71,7 @@ Cc: <stable@vger.kernel.org>
  		if (testmsg(msg, msr->r_msgtype, msr->r_mode) &&
  		    !security_msg_queue_msgrcv(&msq->q_perm, msg, msr->r_tsk,
  					       msr->r_msgtype, msr->r_mode)) {
-@@ -1178,6 +1184,7 @@ static long do_msgrcv(int msqid, void __
+@@ -1178,6 +1184,7 @@
  			goto out_unlock0;
  		}
  
@@ -72,4 +79,3 @@ Cc: <stable@vger.kernel.org>
  		list_add_tail(&msr_d.r_list, &msq->q_receivers);
  		msr_d.r_tsk = current;
  		msr_d.r_msgtype = msgtyp;
-_
