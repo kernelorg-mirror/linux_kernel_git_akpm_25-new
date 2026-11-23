@@ -1,0 +1,96 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: nilfs2: report mapping errors from fsync()
+Date: Sun, 22 Nov 2026 17:23:26 -0800
+
+nilfs_sync_file() constructs a segment and flushes the device, but never
+looks at the error state of the file's mapping.  Nothing else in nilfs2
+does either.  So an error which was recorded with mapping_set_error() is
+never reported to the application.
+
+memory_failure() records -EIO that way when it has to discard a dirty
+page-cache page.  On other filesystems the next fsync() then fails with
+EIO, which is how the application learns that data it wrote has been
+lost.  On nilfs2 fsync() returns 0.  The memory-failure selftest, once it
+checks for this, fails on nilfs2 in 20 of 20 runs:
+
+  memory-failure.c:413:dirty_pagecache:Expected fsync(fd) (0) == -1 (-1)
+
+Call file_check_and_advance_wb_err() in nilfs_sync_file().  Call it even
+when segment construction or the flush has failed, so that the recorded
+error is consumed for this file either way, and return it if nothing
+failed earlier.
+
+Cc: Ryusuke Konishi <konishi.ryusuke@gmail.com>
+Cc: Viacheslav Dubeyko <slava@dubeyko.com>
+Cc: Miaohe Lin <linmiaohe@huawei.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+---
+INSTRUCTIONS FOR THE TESTING CHAT.  Pass on everything from this line down
+to the diffstat.
+
+Goal: show that fsync() on nilfs2 now reports the -EIO which
+memory_failure() records, and that ordinary fsync() is unaffected.
+
+This patch changes the kernel.  Build TWO kernels from the same tree and
+the same .config: K0 without this patch, K1 with it.  Use the config from
+the earlier memory-failure run (NILFS2_FS=y, MEMORY_FAILURE,
+HWPOISON_INJECT, DEBUG_FS, PROC_PAGE_MONITOR, BLK_DEV_LOOP, PROVE_LOCKING,
+DEBUG_VM, DEBUG_LIST).  ext4 is the control throughout.
+
+Test binaries, both built from a tree with
+selftests-mm-check-that-fsync-reports-hard-poisoned-dirty-page-cache
+applied: B as it is, and B-notrunc with its one ftruncate(fd, 0) line and
+the comment above it deleted.
+
+Part 1, on K0 then K1, cwd on a fresh nilfs2 loop mount (1G image), then
+on ext4:
+
+- B, 20 runs.  Expected on nilfs2: K0 0 of 20 (fsync() returned 0, then
+  unpoison -EBUSY in teardown); K1 20 of 20.
+- B-notrunc, 20 runs.  nilfs2 has no ->error_remove_folio(), so on K1 the
+  fsync() assertion should now pass but teardown may still fail with
+
+    memory-failure.c:211:...:Expected unpoison_memory(self->pfn) (-16) == 0
+
+  Report how many of 20.  That failure is a known, separate problem and
+  is not a regression from this patch.
+
+Record for each: passes, every distinct failing assertion with its count,
+the "recovery action for dirty LRU page" counts, and HardwareCorrupted in
+/proc/meminfo before and after.
+
+Part 2, on K1, nilfs2: the error is reported once and only once.  Write a
+small program: create a file, ftruncate to one page, mmap MAP_SHARED,
+write to the page, madvise(MADV_HWPOISON) with a SIGBUS handler
+installed, munmap, then call fsync() three times and close().  Print
+every return value and errno.  Expected: first fsync() -1/EIO, second and
+third 0, close() 0.  Then repeat with a second file descriptor which was
+open on the same file before the poisoning: each descriptor's first
+fsync() should return -1/EIO.  Run the same program on ext4 and report
+both side by side; any difference between nilfs2 on K1 and ext4 is a
+finding.
+
+Part 3, on K0 then K1, nilfs2: regressions.
+
+- fsync() of a file with no error must still return 0: write 1000 files
+  of 1 to 64 kB, fsync() and fdatasync() each, check every return value,
+  unmount, remount, verify the contents.
+- Whatever nilfs2 coverage the machine has, in this order of preference:
+  fstests "-g quick" with FSTYP=nilfs2, otherwise fsx and fsstress for 10
+  minutes each.  Report the failing tests on K0 and on K1.  Only
+  differences between the two matter.
+- Run nilfs-tools' checks if present (lscp, lssu) after each part and
+  report anything they complain about.
+
+Rules:
+
+- A failure is a result.  Report it.  Do not change the kernel, the tests
+  or the mount options to make something pass, other than making
+  B-notrunc as described; say in the report that you did that.
+- If something cannot be built, made or mounted, report it as NOT RUN
+  with the exact command and error.
+- Quote in full any WARNING, BUG, lockdep report or nilfs2 error message
+  in the kernel log on K1 which is not also on K0.
+
+Report: a K0/K1 table for Part 1, the return values for Part 2 with ext4
+beside nilfs2, the two lists for Part 3, then anything NOT RUN.
