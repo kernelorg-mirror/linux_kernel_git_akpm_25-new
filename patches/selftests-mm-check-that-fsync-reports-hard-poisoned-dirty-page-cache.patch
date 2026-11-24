@@ -1,55 +1,20 @@
 From: Andrew Morton <akpm@linux-foundation.org>
 Subject: selftests/mm: check that fsync() reports hard-poisoned dirty page-cache
-Date: Sun, 22 Nov 2026 14:38:21 -0800
+Date: Mon, 23 Nov 2026 23:18:44 -0800
 
-MADV_HWPOISON on a dirty page-cache page records -EIO in the file's
-mapping.  Filesystems whose ->flush() checks the mapping report that error
-from close(): NFS, FUSE, CIFS and orangefs do, and overlayfs and ecryptfs
-pass on whatever the lower filesystem's ->flush() returns.  The hard
-dirty_pagecache variant ends with ASSERT_EQ(close(fd), 0), so on those
-filesystems it fails.  From a FUSE directory:
+MADV_HWPOISON on a dirty page-cache page records -EIO in the mapping.  The
+test currently requires close() to succeed but never checks whether the
+error was reported.  Filesystems with ->flush() may return EIO from
+close(), while those without it can leave the error unnoticed.
 
-  memory-failure.c:389:dirty_pagecache:Expected close(fd) (-1) == 0 (0)
+Require fsync() to return EIO after hard poisoning.  It consumes the
+mapping error before close(), allowing the NFS skip to go.  The clean and
+dirty page-cache cases also skip tmpfs, ramfs and hugetlbfs because they
+have no backing store from which to reread a poisoned clean page.
 
-Commit e14e52a7ce02 ("selftests/mm: skip hard dirty page-cache test on
-NFS") handled this by skipping the variant on NFS, and the same has been
-proposed for FUSE.  But the -EIO is the expected result of the injection,
-and the test never checks that the kernel recorded it.  On filesystems
-with no ->flush(), such as ext4, close() returns 0 and the error goes
-unobserved.
-
-So test for it.  After the hard variant, expect fsync() to fail with EIO.
-That also consumes the error, so the close() which follows returns 0 on
-filesystems which report the mapping error, and the NFS skip can go away.
-
-NILFS2's nilfs_sync_file() does not check the mapping error: fsync()
-returned 0 after hard poisoning.  Skip only this one NILFS2 case for
-now.  The other NILFS2 page-cache tests still run, and the skip can be
-removed when NILFS2 reports the error.
-
-FUSE has no ->error_remove_folio(), so memory_failure() cannot remove the
-poisoned dirty page.  It stays in the page cache until the inode is
-evicted, which FUSE can do after close() has returned, and until then the
-test's teardown cannot unpoison the page: unpoison_memory() failed with
--EBUSY in 6 of 40 runs.  Truncate the file after the fsync() check so the
-page is gone before teardown.
-
-The page-cache tests can only work on a filesystem which keeps its data on
-backing store.  tmpfs was already skipped for that reason, but ramfs and
-hugetlbfs are in the same position and the tests fail on both today.  Skip
-all three, and say why in a comment.
-
-memory-failure results on x86_64 under QEMU, with the working directory on
-each filesystem.  FUSE was a minimal test server, not virtiofs.
-
-                before            after
-  ext4          10 pass           10 pass
-  FUSE          9 pass, 1 fail    10 pass
-  NFSv4.2       9 pass, 1 skip    10 pass
-  NILFS2        9 pass, 1 fail    9 pass, 1 skip
-  tmpfs         6 pass, 4 skip    6 pass, 4 skip
-  ramfs         7 pass, 3 fail    6 pass, 4 skip
-  hugetlbfs     6 pass, 4 fail    6 pass, 4 skip
+With all three patches under x86_64 QEMU, ext4, FUSE and NFSv4.2 reported
+10 passes; NILFS2 reported 9 passes and 1 skip.  The FUSE server used for
+this test was a minimal server, not virtiofs.
 
 Fixes: d51b5076c746 ("selftests/mm: add memory failure dirty pagecache test")
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
@@ -70,16 +35,16 @@ to the diffstat.
 
 Goal: run tools/testing/selftests/mm/memory-failure with its working
 directory on every filesystem an x86_64 QEMU guest can mount, without and
-with this patch, and report one table.
+with all three patches, and report one table.
 
-This patch changes only the selftest.  So:
+All three patches change only the selftest.  So:
 
 - Build ONE kernel, with every filesystem below built in (=y, not =m).
   Do not build a kernel per filesystem.  The same kernel runs both test
   binaries.
-- Build the selftest twice: binary A from the tree without this patch,
-  binary B with it.  Run the binaries directly, as root, with the current
-  directory on the filesystem under test.  Do not use run_vmtests.sh: it
+- Build the selftest twice: binary A from the tree without this series,
+  binary B with all three patches.  Run them directly as root, with the
+  current directory on the filesystem under test.  Do not use run_vmtests.sh: it
   does not change directory.
 
 Kernel: current mm-new, x86_64 defconfig, plus
@@ -157,8 +122,8 @@ A totals, B totals (and passes out of 20 where repeated), first failing
 assertion, recovery action (Recovered, Failed or Delayed) for the hard
 dirty_pagecache test.  Then list anything NOT RUN.
 
- tools/testing/selftests/mm/memory-failure.c |   57 +++++++++++++++---
- 1 file changed, 50 insertions(+), 7 deletions(-)
+ tools/testing/selftests/mm/memory-failure.c |   44 ++++++++++++++----
+ 1 file changed, 36 insertions(+), 8 deletions(-)
 
 --- a/tools/testing/selftests/mm/memory-failure.c~selftests-mm-check-that-fsync-reports-hard-poisoned-dirty-page-cache
 +++ a/tools/testing/selftests/mm/memory-failure.c
@@ -201,31 +166,22 @@ dirty_pagecache test.  Then list anything NOT RUN.
  		close(fd);
  		SKIP(return, "unsupported filesystem :%x\n", fs_type);
  	}
-@@ -353,15 +376,17 @@ TEST_F(memory_failure, dirty_pagecache)
+@@ -353,13 +376,7 @@ TEST_F(memory_failure, dirty_pagecache)
  	if (fd < 0)
  		SKIP(return, "failed to open test file.\n");
  	fs_type = get_fs_type(fd);
-+	if (!fs_has_backing_store(fs_type)) {
-+		close(fd);
-+		SKIP(return, "unsupported filesystem :%x\n", fs_type);
-+	}
- 	/*
+-	/*
 -	 * MADV_HARD poisoning of dirty page-cache data records an expected
 -	 * -EIO in the file mapping. NFS reports this error on close(), so
 -	 * skip this variant.
-+	 * nilfs2 does not check the mapping error in nilfs_sync_file().
-+	 * Remove this skip when its fsync() reports poisoned dirty data.
- 	 */
+-	 */
 -	if (!fs_type || fs_type == TMPFS_MAGIC ||
 -	    (fs_type == NFS_SUPER_MAGIC && variant->type == MADV_HARD)) {
-+	if (fs_type == NILFS_SUPER_MAGIC && variant->type == MADV_HARD) {
++	if (!fs_has_backing_store(fs_type)) {
  		close(fd);
--		SKIP(return, "unsupported filesystem :%x\n", fs_type);
-+		SKIP(return, "nilfs2 fsync() does not report poisoned dirty data\n");
+ 		SKIP(return, "unsupported filesystem :%x\n", fs_type);
  	}
- 
- 	addr = mmap(0, self->page_size, PROT_READ | PROT_WRITE,
-@@ -386,6 +411,24 @@ TEST_F(memory_failure, dirty_pagecache)
+@@ -386,6 +403,17 @@ TEST_F(memory_failure, dirty_pagecache)
  
  	ASSERT_EQ(munmap(addr, self->page_size), 0);
  
@@ -238,13 +194,6 @@ dirty_pagecache test.  Then list anything NOT RUN.
 +	if (variant->type == MADV_HARD) {
 +		ASSERT_EQ(fsync(fd), -1);
 +		ASSERT_EQ(errno, EIO);
-+		/*
-+		 * A filesystem which could not remove the poisoned page from
-+		 * its page cache (FUSE, for one) keeps it until the inode is
-+		 * evicted, which can be after close() returns.  Remove it now
-+		 * so that teardown can unpoison the page.
-+		 */
-+		ASSERT_EQ(ftruncate(fd, 0), 0);
 +	}
 +
  	ASSERT_EQ(close(fd), 0);
