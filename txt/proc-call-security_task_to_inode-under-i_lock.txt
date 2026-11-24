@@ -1,0 +1,90 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: proc: call security_task_to_inode() under i_lock
+Date: Mon, 23 Nov 2026 22:03:02 -0800
+
+A task which has just changed its LSM label can be refused access to its
+own /proc/<pid> files when another process looks up the same files at
+the same time.
+
+To demonstrate, with Smack: a task without CAP_MAC_OVERRIDE alternately
+writes "AAA" and "BBB" to /proc/self/attr/current and after each write
+opens its own /proc/<pid>/environ.  Two other processes stat()
+/proc/<pid>, /proc/<pid>/environ and /proc/<pid>/attr/current.  Under QEMU
+the open() failed with -EACCES once in 84,256 attempts.  With a 300
+microsecond delay added to smack_task_to_inode() between reading the
+task's label and storing it, the open() failed 299 times in 22,372
+attempts and the write to attr/current failed 318 times.  With this patch
+neither failed, with the delay (12,898 attempts) or without (22,168).
+
+This is the same problem as the one fixed for the inode's owner by "proc:
+serialize task owner lookup and inode updates".  security_task_to_inode()
+is called after i_lock has been dropped.  smack_task_to_inode() and
+selinux_task_to_inode() read the task's label and then store it in the
+inode's security blob.  Smack does this with no lock and SELinux reads the
+label before it takes isec->lock.  So two lookups of one entry can store
+in either order, and a label which was read before the task changed it can
+overwrite the one which was read afterwards.  The inode then has a stale
+label until the next lookup.  A check which uses the stale label can
+wrongly refuse access, as above, and for the same reason could wrongly
+allow it.
+
+Call security_task_to_inode() before dropping i_lock, so that the LSM's
+read of the task and its update of the inode are serialized along with the
+owner update.
+
+The hook could not sleep before this change either: pid_revalidate() calls
+it under rcu_read_lock().  SELinux takes isec->lock inside it, which now
+nests inside i_lock.  Nothing in security/ takes i_lock.
+
+Cc: Paul Moore <paul@paul-moore.com>
+Cc: James Morris <jmorris@namei.org>
+Cc: "Serge E. Hallyn" <serge@hallyn.com>
+Cc: Casey Schaufler <casey@schaufler-ca.com>
+Cc: Stephen Smalley <stephen.smalley.work@gmail.com>
+Cc: Ondrej Mosnacek <omosnacek@gmail.com>
+Cc: John Johansen <john.johansen@canonical.com>
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Kees Cook <kees@kernel.org>
+---
+NOTES (everything from here to the diffstat is not changelog).
+
+- Goes on top of proc-serialize-task-owner-updates.patch.
+- No Signed-off-by, Fixes: or stable Cc from me.
+- SELinux: I did not demonstrate a stale label there (it needs a policy
+  with a domain transition).  The claim for SELinux is from reading
+  selinux_task_to_inode(): the SID is read before isec->lock is taken.
+- The "wrongly allow" direction is by the same reasoning and I did not
+  try to produce it.  The LSM people should judge how much that matters;
+  the contents of the sensitive /proc/<pid> files are also guarded by
+  ptrace-style checks against the task itself, which do not use the
+  inode's label.
+- The alternative is to fix each LSM (read the label under isec->lock
+  in SELinux; add locking to Smack).  This way covers all of them in
+  one place, including any BPF LSM program on this hook, at the price of
+  calling the hook with i_lock held.
+- "Nothing in security/ takes i_lock" is from grep over security/selinux,
+  security/smack, security/apparmor and security/security.c.
+
+Tested under QEMU, 2 CPUs, kernel with SELinux, Smack and AppArmor built
+in, PROVE_LOCKING and DEBUG_ATOMIC_SLEEP:
+- the Smack demonstration above (lsm=smack), with and without this
+  patch, with and without the test-only delay;
+- lsm=selinux (no policy loaded) and lsm=smack: three processes looking
+  up /proc/<pid>, status, fd/*, fdinfo/*, ns/pid, map_files/*, task/*
+  while the target flips its euid and is ptrace-seized: no warnings.
+Not tested: SELinux with a policy, AppArmor active, BPF LSM, PREEMPT_RT
+with this patch (the first patch was tested on RT).
+
+FOR THE TESTING CHAT: boot with lsm=smack (no Smack rules needed).
+Target, as root: drop CAP_MAC_OVERRIDE from the effective and permitted
+sets, then loop { write "AAA" to /proc/self/attr/current; open
+/proc/<own pid>/environ and count EACCES; the same with "BBB" }.  Two
+observers with full capabilities: loop stat() on the target's
+/proc/<pid>, /proc/<pid>/environ and /proc/<pid>/attr/current.  Expect
+about one EACCES per 100,000 opens without the patch and none with it.
+With SELinux in enforcing mode and a policy: run the selinux-testsuite,
+and something which does setcon()/exec transitions while "ps -eZ" loops.
