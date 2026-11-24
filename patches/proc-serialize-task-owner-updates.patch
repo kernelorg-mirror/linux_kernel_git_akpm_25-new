@@ -2,26 +2,26 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: proc: serialize task owner lookup and inode updates
 Date: Mon, 23 Nov 2026 20:59:01 -0800
 
-A task which has just changed its credentials can be refused access to its
-own /proc/<pid> files when another process looks up the same files at the
-same time.
+A task which has just changed its credentials can be refused access to
+its own /proc/<pid> files when another process looks up the same files
+at the same time.
 
 To demonstrate: a task sets its euid to 1000, makes itself dumpable and
 opens its own /proc/<pid>/environ (mode 0400), in a loop.  Two other
 processes stat() that file.  Under QEMU the open() failed with -EACCES
 twice in 128,000 attempts.  With a 300 microsecond delay added between
-task_dump_owner() reading the task's credentials and storing the result it
-failed 87 times in 82,653 attempts.  With this patch it did not fail in
-either test.
+task_dump_owner() reading the task's credentials and storing the result
+it failed 87 times in 82,653 attempts.  With this patch it did not fail
+in either test.
 
-This happens because revalidation of a /proc/<pid> dentry reads the task's
-owner and then writes it to the inode's i_uid and i_gid with no
+This happens because revalidation of a /proc/<pid> dentry reads the
+task's owner and then writes it to the inode's i_uid and i_gid with no
 serialization.  Two lookups of the same entry can do their stores in
 either order, so an owner which was read before the task changed its
 credentials can overwrite one which was read afterwards.  The inode then
-has a stale owner until the next lookup, and a permission check which uses
-it gets the wrong answer.  The two fields can also be taken from different
-credentials.
+has a stale owner until the next lookup, and a permission check which
+uses it gets the wrong answer.  The two fields can also be taken from
+different credentials.
 
 KCSAN reports the concurrent writes.
 
@@ -30,8 +30,8 @@ pointed out that taking the snapshot before the lock still lets an old
 snapshot overwrite a newer one [2].  Dmitry Vyukov showed AppArmor's
 permission check being given a stale owner [3].
 
-Hold i_lock while both obtaining the task owner and updating the inode. 
-Do this for the ordinary proc entries, fd entries and map_files entries. 
+Hold i_lock while both obtaining the task owner and updating the inode.
+Do this for the ordinary proc entries, fd entries and map_files entries.
 Also serialize the mode updates in the first two paths.
 
 Link: https://lore.kernel.org/r/20191020173010.GA14744@avx2 [1]
@@ -51,6 +51,43 @@ Cc: Dmitry Vyukov <dvyukov@google.com>
 Cc: Kees Cook <kees@kernel.org>
 Cc: John Johansen <john.johansen@canonical.com>
 ---
+NOTES (everything from here to the diffstat is not changelog).
+
+Changes from the version you sent me:
+- The PREEMPT_RT fallback to ref-walk is gone.  spin_lock() may nest in
+  an RCU read-side critical section on RT (see the comment above
+  RTLOCK_RESCHED_OFFSETS in kernel/locking/spinlock_rt.c),
+  selinux_task_to_inode() already takes a spinlock_t at this point, and
+  ref-walk holds rcu_read_lock() here as well so it avoided nothing.
+- Changelog: the userspace effect and how to see it are now first; the
+  mechanism is spelled out; the AppArmor sentence says what Dmitry
+  showed; the RT sentence is gone.
+- Your Signed-off-by is not here.  I don't add it; please put it back.
+- No Fixes: or stable Cc from me.
+
+Tested under QEMU, 2 CPUs:
+- the demonstration above (non-RT kernel, with and without the patch);
+- lockdep + DEBUG_ATOMIC_SLEEP: three processes looking up /proc/<pid>,
+  status, fd/*, fdinfo/*, ns/pid, map_files/*, task/*, cwd while the
+  target flips its euid and is ptrace-seized: no warnings;
+- the same on PREEMPT_RT with PROVE_RAW_LOCK_NESTING: no warnings.
+Not tested: KCSAN, AppArmor, real hardware.
+
+Cost: not established.  I earlier reported about 9% fewer stat() calls
+per second on one task's /proc/<pid>/status with two processes.  A third
+run of the unpatched kernel came out as low as the patched one (273-329k
+calls/s over three runs unpatched, 271-303k patched), so that figure was
+noise.  This is on emulated CPUs and needs a real machine to say more.
+
+DO NOT skip the lock when the inode already has the right owner.  I
+suggested that and then tested it: the task's open() of its own environ
+fails again (1 in 257,000 opens as is, 19 in 170,000 with the 300us
+test delay).  The owner goes 1000 -> 0 -> 1000 in the test.  A lookup
+which sees the old 1000 in the inode skips, and so does not wait for
+another lookup which holds i_lock and is about to store the 0 it read a
+moment ago.  The lock is what makes a lookup wait for stores which are
+in flight.
+
 FOR THE TESTING CHAT: the test is three processes.  Target: loop
 { setresuid(-1, 1000, -1); prctl(PR_SET_DUMPABLE, 1);
   open("/proc/<own pid>/environ", O_RDONLY) and count EACCES;
