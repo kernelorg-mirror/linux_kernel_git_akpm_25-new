@@ -77,7 +77,8 @@ Cost: not established.  I earlier reported about 9% fewer stat() calls
 per second on one task's /proc/<pid>/status with two processes.  A third
 run of the unpatched kernel came out as low as the patched one (273-329k
 calls/s over three runs unpatched, 271-303k patched), so that figure was
-noise.  This is on emulated CPUs and needs a real machine to say more.
+noise.  This is on emulated CPUs and says nothing about real machines.
+See the performance section below.
 
 DO NOT skip the lock when the inode already has the right owner.  I
 suggested that and then tested it: the task's open() of its own environ
@@ -96,6 +97,230 @@ observers: loop stat() on the target's /proc/<pid>/environ.  Expect a
 handful of EACCES per 100,000 opens without the patch, none with it.
 Note that stat() of /proc/<pid> cannot show the problem: pid_getattr()
 reports the owner from the task, not from the inode.
+
+FOR THE TESTING CHAT, PERFORMANCE.  Nothing above measures this.
+
+What the patch costs: every lookup of a /proc/<pid> entry now takes that
+inode's i_lock around two or three stores.  Path walks stay in RCU-walk.
+So there is (a) one uncontended lock and unlock per pid-based path
+component, and (b) contention when many CPUs look up the same entry at
+once.  The /proc/<tgid> directory inode is in the path of every
+/proc/self/... and /proc/<pid>/... lookup, so all threads of a process
+which read /proc/self share it.  Lookups of different pids share nothing
+new.
+
+Machine: bare metal with as many CPUs as possible (32 at least, two
+sockets if there are any), and separately a guest on a busy host.
+Emulated CPUs are useless for this.  Same config and compiler for both
+kernels.  At least five runs of each data point; report median and
+range.  A difference which is inside the run-to-run range is not a
+result (see my 9% above).
+
+Workloads:
+1. procbench.c (quoted at the end of these notes): every mode at 1, 2,
+   4, ... up to the number of CPUs, 10 seconds each.  self-stat,
+   self-open, self-fd, thread-stat and one-stat hit the same inodes from
+   every worker; spread-stat is the control where each process uses its
+   own pid.  The same-inode modes already scale badly without the patch
+   because every lookup writes the owner into the inode, so compare the
+   two kernels at each worker count rather than looking at the scaling.
+2. As many loops of "TZ=/etc/localtime ps -fe >/dev/null" as there are
+   CPUs, with a few thousand tasks present; ps runs per second and %sys.
+   This is Stephen Brennan's workload from the change which let
+   pid_revalidate() run in RCU-walk, and it is why falling back to
+   ref-walk on RT was a bad idea.
+3. stress-ng --procfs <CPUs> -t 60 --metrics-brief, as a broad check.
+
+Kernels and configs, each compared with and without the patch:
+- default config;
+- SELinux enabled (selinux_task_to_inode() already takes a spinlock at
+  this point, so the relative cost may differ);
+- PREEMPT_RT.  A contended i_lock there blocks on an rtmutex rather than
+  spinning, so this is where a same-inode regression should be largest;
+- with proc-call-security_task_to_inode-under-i_lock.patch on top, as a
+  separate data point, because it lengthens the hold time.
+
+Report for each: ops/s by mode and worker count for both kernels; a perf
+profile at the highest worker count showing the share of
+native_queued_spin_lock_slowpath (or the rtmutex slow path on RT) below
+pid_update_inode() and tid_fd_update_inode(); and, in a separate run,
+lock_stat for proc's i_lock class.
+
+Please flag: more than 3% lost in spread-stat or at one worker in any
+mode; any same-inode mode where the patched kernel loses more than 10%
+at any worker count; any worker count from which the patched kernel's
+total ops/s goes down while the unpatched one still goes up; and
+anything visible in workload 2.
+
+procbench.c follows.  Remove the one leading ":" from every line to get
+the file.
+
+:// SPDX-License-Identifier: GPL-2.0
+:/*
+: * procbench - lookup rate on /proc/<pid> entries, for comparing kernels.
+: *
+: * usage: procbench <mode> <workers> <seconds>
+: *
+: * Modes.  "Same inode" modes are where a per-inode lock in the /proc/<pid>
+: * revalidation path would show up.
+: *   self-stat    threads: stat("/proc/self/status")           same inodes
+: *   self-open    threads: open+close "/proc/self/status"      same inodes
+: *   self-fd      threads: readlink("/proc/self/fd/0")         same inodes
+: *   thread-stat  threads: stat("/proc/thread-self/stat")      shared tgid
+: *                         directory, per-thread leaf
+: *   one-stat     processes: stat("/proc/<parent>/status")     same inodes
+: *   spread-stat  processes: stat("/proc/<own pid>/status")    control, no
+: *                         sharing
+: *
+: * Prints one line: mode, workers, total ops/s, slowest and fastest worker.
+: * Build: gcc -O2 -pthread -o procbench procbench.c
+: */
+:#define _GNU_SOURCE
+:#include <errno.h>
+:#include <fcntl.h>
+:#include <pthread.h>
+:#include <sched.h>
+:#include <stdio.h>
+:#include <stdlib.h>
+:#include <string.h>
+:#include <sys/mman.h>
+:#include <sys/stat.h>
+:#include <sys/wait.h>
+:#include <unistd.h>
+:
+:enum op { OP_STAT, OP_OPEN, OP_READLINK };
+:
+:struct shared {
+:	volatile int go, stop;
+:	unsigned long count[];
+:};
+:
+:static struct shared *sh;
+:static enum op op;
+:static const char *path;	/* NULL: per-process path */
+:static long ncpu;
+:
+:static void pin(int i)
+:{
+:	cpu_set_t set;
+:
+:	CPU_ZERO(&set);
+:	CPU_SET(i % ncpu, &set);
+:	sched_setaffinity(0, sizeof(set), &set);
+:}
+:
+:static void work(int i, const char *p)
+:{
+:	struct stat st;
+:	char buf[256];
+:	unsigned long n = 0;
+:	int fd;
+:
+:	pin(i);
+:	while (!sh->go)
+:		sched_yield();
+:	while (!sh->stop) {
+:		switch (op) {
+:		case OP_STAT:
+:			if (stat(p, &st))
+:				goto fail;
+:			break;
+:		case OP_OPEN:
+:			fd = open(p, O_RDONLY);
+:			if (fd < 0)
+:				goto fail;
+:			close(fd);
+:			break;
+:		case OP_READLINK:
+:			if (readlink(p, buf, sizeof(buf)) < 0)
+:				goto fail;
+:			break;
+:		}
+:		n++;
+:	}
+:	sh->count[i] = n;
+:	return;
+:fail:
+:	fprintf(stderr, "%s: %s\n", p, strerror(errno));
+:	exit(1);
+:}
+:
+:static void *thread_fn(void *arg)
+:{
+:	work((long)arg, path);
+:	return NULL;
+:}
+:
+:int main(int argc, char **argv)
+:{
+:	unsigned long total = 0, min = ~0UL, max = 0;
+:	char own[64], parent[64];
+:	int workers, secs, procs = 0, i;
+:	pthread_t *th;
+:
+:	if (argc != 4) {
+:		fprintf(stderr, "usage: %s <mode> <workers> <seconds>\n", argv[0]);
+:		return 2;
+:	}
+:	workers = atoi(argv[2]);
+:	secs = atoi(argv[3]);
+:	ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+:	snprintf(parent, sizeof(parent), "/proc/%d/status", getpid());
+:
+:	if (!strcmp(argv[1], "self-stat")) {
+:		op = OP_STAT; path = "/proc/self/status";
+:	} else if (!strcmp(argv[1], "self-open")) {
+:		op = OP_OPEN; path = "/proc/self/status";
+:	} else if (!strcmp(argv[1], "self-fd")) {
+:		op = OP_READLINK; path = "/proc/self/fd/0";
+:	} else if (!strcmp(argv[1], "thread-stat")) {
+:		op = OP_STAT; path = "/proc/thread-self/stat";
+:	} else if (!strcmp(argv[1], "one-stat")) {
+:		op = OP_STAT; path = parent; procs = 1;
+:	} else if (!strcmp(argv[1], "spread-stat")) {
+:		op = OP_STAT; path = NULL; procs = 1;
+:	} else {
+:		fprintf(stderr, "unknown mode %s\n", argv[1]);
+:		return 2;
+:	}
+:	if (workers < 1 || secs < 1)
+:		return 2;
+:
+:	sh = mmap(NULL, sizeof(*sh) + workers * sizeof(unsigned long),
+:		  PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+:	if (sh == MAP_FAILED)
+:		return 1;
+:	th = calloc(workers, sizeof(*th));
+:
+:	for (i = 0; i < workers; i++) {
+:		if (!procs) {
+:			pthread_create(&th[i], NULL, thread_fn, (void *)(long)i);
+:		} else if (!fork()) {
+:			snprintf(own, sizeof(own), "/proc/%d/status", getpid());
+:			work(i, path ? path : own);
+:			_exit(0);
+:		}
+:	}
+:	sh->go = 1;
+:	sleep(secs);
+:	sh->stop = 1;
+:	for (i = 0; i < workers; i++) {
+:		if (procs)
+:			wait(NULL);
+:		else
+:			pthread_join(th[i], NULL);
+:	}
+:	for (i = 0; i < workers; i++) {
+:		total += sh->count[i];
+:		if (sh->count[i] < min)
+:			min = sh->count[i];
+:		if (sh->count[i] > max)
+:			max = sh->count[i];
+:	}
+:	printf("%-12s workers=%-4d ops/s=%-10lu worker-min/s=%-9lu worker-max/s=%lu\n",
+:	       argv[1], workers, total / secs, min / secs, max / secs);
+:	return 0;
+:}
 
  fs/proc/base.c |    4 ++++
  fs/proc/fd.c   |    2 ++
