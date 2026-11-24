@@ -1,0 +1,93 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: coda: copy Venus requests to userspace without holding vc_mutex
+Date: Mon, 23 Nov 2026 15:07:44 -0800
+
+coda_psdev_read() holds vc_mutex while copying an upcall into the Venus
+process, and copy_to_user() may take mmap_lock.  coda_file_mmap() runs
+with mmap_lock held and its access-intent upcall takes vc_mutex.  Lockdep
+reports the inversion:
+
+  WARNING: possible circular locking dependency detected
+  init/1 is trying to acquire lock:
+  (&(&coda_comms[i])->vc_mutex){+.+.}-{4:4}, at: coda_upcall+0x2e/0x437
+
+  but task is already holding lock:
+  (&mm->mmap_lock){++++}-{4:4}, at: vm_mmap_pgoff+0x71/0x10c
+
+  which lock already depends on the new lock.
+
+  -> #1 (&mm->mmap_lock){++++}-{4:4}:
+         __might_fault+0x4e/0x6a
+         _copy_to_user+0x22/0x4d
+         coda_psdev_read+0x19a/0x203
+         ksys_read+0x72/0xa2
+
+  -> #0 (&(&coda_comms[i])->vc_mutex){+.+.}-{4:4}:
+         coda_upcall+0x2e/0x437
+         venus_access_intent+0xc6/0xfa
+         coda_file_mmap+0xa2/0x1ef
+         __mmap_region+0x87d/0xcac
+         mmap_region+0xc3/0xe5
+         do_mmap+0x5a4/0x5e3
+         vm_mmap_pgoff+0xd4/0x10c
+         ksys_mmap_pgoff+0x6c/0x95
+
+   Possible unsafe locking scenario:
+
+         CPU0                    CPU1
+         ----                    ----
+    lock(&mm->mmap_lock);
+                                 lock(&(&coda_comms[i])->vc_mutex);
+                                 lock(&mm->mmap_lock);
+    lock(&(&coda_comms[i])->vc_mutex);
+
+This is not a deadlock with a normal Venus, because the fault takes
+Venus's mmap_lock and the task which calls mmap() holds its own.  The two
+are the same lock only when the mmap() caller shares its mm with the task
+which reads the Coda device.
+
+Copy the upcall into a private buffer while holding vc_mutex.  Keep the
+request pending if the allocation fails.  Once the request has been moved
+to the processing list (or freed, for an asynchronous request), drop
+vc_mutex before copying the private buffer to Venus.  The copy no longer
+depends on the lifetime of the original request, which its sender is free
+to remove once vc_mutex has been dropped.
+
+The allocation is GFP_KERNEL, as are the ones which coda_upcall() already
+makes under vc_mutex.
+
+Return -EFAULT when the userspace copy fails.  Previously the nonzero
+count took precedence over retval, reporting a successful read even though
+the copy failed.
+
+Cc: Jan Harkes <jaharkes@cs.cmu.edu>
+Cc: <coda@cs.cmu.edu>
+---
+NOTES (everything from here to the diffstat is not changelog).
+
+Changes from the version you sent me:
+- kmemdup(GFP_NOFS)/kfree -> kvmemdup(GFP_KERNEL)/kvfree.
+- Changelog: lockdep report added (trimmed; the test kernel uses the
+  guess unwinder so I removed the repeated and unrelated entries); the
+  "can deadlock an mmap()" sentence replaced by what is true; GFP note.
+- Your Signed-off-by is not here.  I don't add it; please put it back.
+- Cc: the two Coda addresses from MAINTAINERS added.
+- No Fixes:.  I could not look up history in my shallow tree.
+
+Tested under QEMU with PROVE_LOCKING and a stand-in for Venus (root,
+getattr, lookup, open_by_fd, access intent, signal), base vs this patch:
+- lockdep report above on base, none with the patch;
+- read() of the device into an unmapped buffer: returns 50 on base,
+  -EFAULT with the patch;
+- an interrupted upcall still gets a CODA_SIGNAL message to the reader;
+- 2 x 300 passes of open/mmap/pread/close through /coda: no warnings.
+  (About a third of those mmap() calls fail with -EPERM, with or without
+  this patch.  That is the i_mmap_writable problem; separate patch.)
+
+FOR THE TESTING CHAT: the task which reads /dev/cfs0 and the task which
+calls mmap() on a Coda file must be separate processes (fork(), not
+threads).  If they share an mm, mmap() hangs with or without this patch
+whenever the reader's buffer has to be faulted in: coda_file_mmap() waits
+for the reader's reply with mmap_lock held for write, and the reader is
+waiting for that mmap_lock in its page fault.  That is not what this
+patch fixes.
