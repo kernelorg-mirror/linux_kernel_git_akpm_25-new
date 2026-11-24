@@ -1,0 +1,70 @@
+From: Jiahao Xu <xujiahao@cmss.chinamobile.com>
+Subject: iommufd: only hold references to files memfd_pin_folios() can pin
+Date: Thu, 19 Nov 2026 16:35:31 +0800
+
+iopt_map_file_pages() stores a reference to the file passed to
+IOMMU_IOAS_MAP_FILE in the iopt_pages of the new mapping:
+
+	iopt_map_file_pages()
+	  iopt_alloc_file_pages()
+	    pages->file = get_file(file)
+
+iopt_release_pages() drops that reference only when the iopt_pages is
+destroyed, which for a file mapping happens while the iommufd file is
+being torn down.  Nothing restricts which file can be passed, so userspace
+can map the iommufd file itself, or a vfio device fd bound to the same
+iommufd, both of which own an iommufd_ctx reference.  The reference graph
+then contains a cycle and the file, the iopt_pages, the IOAS and the
+iommufd_ctx are all leaked; kmemleak reports it as "memory leak in
+path_openat" with the holder taken through iopt_map_file_pages().
+
+Reverse the test instead of trying to enumerate the files that own an
+iommufd_ctx: accept only the files that memfd_pin_folios() is able to pin,
+which is exactly the set of files the mapping can be built from. 
+file_is_memfd_compatible() reports that set, so the same test can run here
+before the reference is handed to iopt_pages.  dma-bufs are unaffected:
+they are taken by the dma_buf_get() branch above and never reach the file
+branch, and iopt_pages holds the dma_buf there, not a struct file.
+
+Link: https://patch.msgid.link/20261119163531.315791-1-xujiahao@cmss.chinamobile.com
+Fixes: f4986a72d6e4 ("iommufd: Add IOMMU_IOAS_MAP_FILE")
+Signed-off-by: Jiahao Xu <xujiahao@cmss.chinamobile.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: <syzbot+7666ed2c3d42196bf7e3@syzkaller.appspotmail.com>
+Closes: https://syzkaller.appspot.com/bug?extid=7666ed2c3d42196bf7e3
+Reviewed-by: Samiullah Khawaja <skhawaja@google.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: David Hildenbrand <david@kernel.org>
+Cc: John Hubbard <jhubbard@nvidia.com>
+Cc: Peter Xu <peterx@redhat.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Kevin Tian <kevin.tian@intel.com>
+Cc: Jörg Rödel <joro@8bytes.org>
+Cc: Will Deacon <will@kernel.org>
+Cc: Robin Murphy <robin.murphy@arm.com>
+
+ drivers/iommu/iommufd/io_pagetable.c |   12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+--- a/drivers/iommu/iommufd/io_pagetable.c~iommufd-only-hold-references-to-files-memfd_pin_folios-can-pin
++++ a/drivers/iommu/iommufd/io_pagetable.c
+@@ -515,6 +515,18 @@ int iopt_map_file_pages(struct iommufd_c
+ 		if (!file)
+ 			return -EBADF;
+ 
++		/*
++		 * iopt_pages keeps a reference to the file until the mapping is
++		 * destroyed, so only accept the files memfd_pin_folios() is able
++		 * to pin.  Any other fd, in particular one that itself owns an
++		 * iommufd_ctx (iommufd, vfio, ...), would put the file into a
++		 * reference cycle with this iommufd and never be released.
++		 */
++		if (!file_is_memfd_compatible(file)) {
++			fput(file);
++			return -EINVAL;
++		}
++
+ 		pages = iopt_alloc_file_pages(file, start_byte, start, length,
+ 					      iommu_prot & IOMMU_WRITE);
+ 		fput(file);
+_

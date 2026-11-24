@@ -1,0 +1,84 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: coda: don't change file->f_mapping in coda_file_mmap()
+Date: Mon, 23 Nov 2026 16:28:23 -0800
+
+coda_file_mmap() points coda_file->f_mapping at the container file's
+mapping.  Nothing says that ->mmap() may do this, and no other ->mmap()
+in the tree does: every other assignment to f_mapping is made when the
+file is opened or created.
+
+It breaks mmap_region(), which calls mapping_map_writable(file->f_mapping)
+before ->mmap() and mapping_unmap_writable(file->f_mapping) afterwards.
+The count is taken on the Coda inode's mapping and dropped from the
+container file's mapping.  The container file's i_mmap_writable is then
+one too low, and goes negative when the VMA is removed.  A negative
+i_mmap_writable means that writable mappings are denied, so from then on
+
+- a shared mmap() of the container file fails with -EPERM, and
+
+- so does a shared mmap() of the Coda file through a file which was
+  opened while the Coda inode pointed at the container file's mapping.
+  It does so from the first mmap() until the files which were mapped
+  have been closed.
+
+With a Coda file which has a tmpfs container file, two tasks which loop
+over open(O_RDWR), mmap(MAP_SHARED), munmap() and close() see about a
+third of their mmap() calls fail with -EPERM (215 to 223 out of 600 in
+six runs).  Afterwards mmap(PROT_READ|PROT_WRITE, MAP_SHARED) of the
+container file itself fails with -EPERM.
+
+coda_file_mmap() passes the container file in vma->vm_file, so the VMA
+is attached to the container file's mapping without any help from
+coda_file->f_mapping, and nothing in fs/coda reads f_mapping.  Remove the
+assignment.
+
+After this, fadvise(), readahead() and sync_file_range() on a Coda file
+which has been mapped no longer act on the container file's page cache.
+They act on the mapping which the file was opened with, as they always
+did before the first mmap().  fsync() and msync() are not affected:
+coda_fsync() uses coda_inode->i_mapping and the container file, and
+msync() uses vma->vm_file.
+
+Cc: Jan Harkes <jaharkes@cs.cmu.edu>
+Cc: <coda@cs.cmu.edu>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+---
+NOTES (everything from here to the diffstat is not changelog).
+
+- This replaces mm-vma-dont-re-read-file-f_mapping-after-mmap.patch.
+  Please drop that one.
+- No Signed-off-by, Fixes: or stable Cc from me.  Fixes: is unresolved:
+  my tree is shallow and I could not look up when vm_file became the
+  container file or when mmap_region() gained the temporary count.
+- Audit: I grepped the whole tree for assignments to ->f_mapping.  Apart
+  from this one they are all in open or file-creation paths (bdev_open,
+  dax_open, drm_open, accel_open, kfd_open, vfio, proc_bus_pci_open,
+  open_port, sysfs_kf_bin_open, anon_inode_getfile, drm_gem_dmabuf_export,
+  i915 mmap_singleton, do_dentry_open and the file table).
+- Not changed: a Coda file opened while the inode is redirected still
+  inherits the container file's mapping from do_dentry_open().  From
+  reading only: if Venus gave that open a different container file, its
+  f_mapping would belong to an inode which this file does not pin.  I
+  have not tried to make that go wrong.  Setting f_mapping to
+  &coda_inode->i_data in coda_open() would close it, but that is a
+  bigger change and Jan should say whether he wants it.
+
+Tested under QEMU (PROVE_LOCKING, a stand-in for Venus in a separate
+process, tmpfs container file), on top of the coda vc_mutex patch:
+- without this patch: 215-223 of 600 mmap() calls fail with -EPERM and
+  the container file can no longer be mapped shared and writable;
+- with it: 0 of 600 fail, and the container file maps;
+- a byte written through a MAP_SHARED mapping of the Coda file is seen
+  in the container file; msync(), fsync(), posix_fadvise(WILLNEED) and
+  sync_file_range() on the Coda fd all return 0;
+- no lockdep or other warnings.
+Not tested: a real Venus, or a container file on a disk filesystem.
+
+FOR THE TESTING CHAT: needs a Coda setup, or a stand-in for Venus which
+reads /dev/cfs0 from a separate process (not a thread) and answers
+CODA_ROOT, CODA_GETATTR, CODA_LOOKUP, CODA_OPEN_BY_FD, CODA_ACCESS_INTENT,
+CODA_FSYNC, CODA_RELEASE.  Open a Coda file O_RDWR from two processes,
+loop mmap(MAP_SHARED)/munmap/close/open in both and count -EPERM; then
+mmap the container file itself MAP_SHARED, PROT_READ|PROT_WRITE.  Use a
+container file on ext4 as well as tmpfs, and check that data written
+through the mapping is on disk after msync() and after fsync().
