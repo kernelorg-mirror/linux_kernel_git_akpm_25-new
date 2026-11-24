@@ -1,0 +1,107 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: proc: serialize task owner lookup and inode updates
+Date: Tue, 24 Nov 2026 01:30:00 -0800
+
+Concurrent lookups of the same /proc/<pid> entry write its inode UID and
+GID without serialization.  KCSAN reports two such writes.  If the task
+changes credentials between lookups, an older owner can also overwrite a
+newer one.  An AppArmor rule using the cached inode owner can then deny
+access incorrectly or permit access that the new owner would not allow. 
+The new syzbot report demonstrates the concurrent writes, not an actual
+permission failure.
+
+Alexey Dobriyan proposed serializing the stores in 2019 [1].  The
+subsequent discussion pointed out that calculating the owner before
+acquiring the lock still allows an older snapshot to be stored last [2].
+
+Take inode->i_lock before calculating and installing the owner.  Cover
+the ordinary pid, fd and map_files revalidation paths, and serialize
+their concurrent mode updates where present.  On PREEMPT_RT, make
+pid_revalidate() retry in ref-walk instead of acquiring the sleeping
+inode lock during RCU-walk.  This adds an inode lock to procfs
+revalidation, and an RCU-walk retry on PREEMPT_RT.
+
+This serializes the procfs owner writers and prevents an older procfs
+lookup from committing its owner after a newer lookup.  Security hooks
+and readers of inode ownership have their own synchronization rules;
+this change does not make the inode owner a snapshot of a task whose
+credentials are changing concurrently.
+
+Link: https://lore.kernel.org/r/20191020173010.GA14744@avx2 [1]
+Link: https://lore.kernel.org/r/000000000000328b2905951a7667@google.com [2]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: <syzbot+3b8f4ae71137f7af00ca@syzkaller.appspotmail.com>
+Closes: https://syzkaller.appspot.com/bug?extid=3b8f4ae71137f7af00ca
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Seth Forshee <sforshee@kernel.org>
+Cc: Stephen Brennan <stephen.s.brennan@oracle.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: John Johansen <john.johansen@canonical.com>
+Cc: Georgia Garcia <georgia.garcia@canonical.com>
+Cc: Paul Moore <paul@paul-moore.com>
+Cc: Stephen Smalley <stephen.smalley.work@gmail.com>
+Cc: Casey Schaufler <casey@schaufler-ca.com>
+
+ fs/proc/base.c |    8 ++++++++
+ fs/proc/fd.c   |    2 ++
+ 2 files changed, 10 insertions(+)
+
+--- a/fs/proc/base.c~proc-serialize-task-owner-lookup-and-inode-updates
++++ a/fs/proc/base.c
+@@ -2029,9 +2029,11 @@ int pid_getattr(const struct mnt_idmap *
+  */
+ void pid_update_inode(struct task_struct *task, struct inode *inode)
+ {
++	spin_lock(&inode->i_lock);
+ 	task_dump_owner(task, inode->i_mode, &inode->i_uid, &inode->i_gid);
+ 
+ 	inode->i_mode &= ~(S_ISUID | S_ISGID);
++	spin_unlock(&inode->i_lock);
+ 	security_task_to_inode(task, inode);
+ }
+ 
+@@ -2047,6 +2049,10 @@ static int pid_revalidate(struct inode *
+ 	struct task_struct *task;
+ 	int ret = 0;
+ 
++	/* i_lock can sleep on PREEMPT_RT; RCU-walk cannot. */
++	if (IS_ENABLED(CONFIG_PREEMPT_RT) && (flags & LOOKUP_RCU))
++		return -ECHILD;
++
+ 	rcu_read_lock();
+ 	inode = d_inode_rcu(dentry);
+ 	if (!inode)
+@@ -2210,7 +2216,9 @@ static int map_files_d_revalidate(struct
+ 	mmput(mm);
+ 
+ 	if (exact_vma_exists) {
++		spin_lock(&inode->i_lock);
+ 		task_dump_owner(task, 0, &inode->i_uid, &inode->i_gid);
++		spin_unlock(&inode->i_lock);
+ 
+ 		security_task_to_inode(task, inode);
+ 		status = 1;
+--- a/fs/proc/fd.c~proc-serialize-task-owner-lookup-and-inode-updates
++++ a/fs/proc/fd.c
+@@ -127,6 +127,7 @@ static bool tid_fd_mode(struct task_stru
+ static void tid_fd_update_inode(struct task_struct *task, struct inode *inode,
+ 				fmode_t f_mode)
+ {
++	spin_lock(&inode->i_lock);
+ 	task_dump_owner(task, 0, &inode->i_uid, &inode->i_gid);
+ 
+ 	if (S_ISLNK(inode->i_mode)) {
+@@ -137,6 +138,7 @@ static void tid_fd_update_inode(struct t
+ 			i_mode |= S_IWUSR | S_IXUSR;
+ 		inode->i_mode = i_mode;
+ 	}
++	spin_unlock(&inode->i_lock);
+ 	security_task_to_inode(task, inode);
+ }
+ 
+_
