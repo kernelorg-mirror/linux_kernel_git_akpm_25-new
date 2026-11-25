@@ -1,0 +1,117 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: proc: don't lock task inodes whose owner has not changed
+Date: Tue, 24 Nov 2026 15:50:00 -0800
+
+"proc: serialize task owner lookup and inode updates" takes
+inode->i_lock on every lookup of a /proc/<pid> entry.  In a 64-vCPU
+guest that cost 67% of the stat() rate when 64 threads used
+/proc/thread-self/stat, 62% when 16 processes used one
+/proc/<pid>/status, and about 4% when 64 processes each used their own.
+
+The owner of these inodes is recomputed from the task on every lookup
+but it almost never changes.  So compare first, and take the lock only
+when there is something to store.  A lookup which finds the right owner
+and mode already in place now writes nothing to the inode.  The code
+before either patch stored them on every lookup, so lookups of one
+inode from many CPUs no longer share a dirty cacheline at all.
+
+An unlocked comparison on its own does not work.  If a task's owner
+goes A, B, A then the inode can show A while a lookup which saw B is
+about to store it.  A lookup which compares, finds A and returns is
+then overtaken by the stale store, and the task can again be denied
+access to its own files.
+
+So updates are now made inside a write section of a new per-inode
+seqcount, still under i_lock, and they read the task's credentials
+inside that section.  The comparison is a read section of the same
+seqcount.  It waits for an update which is in flight, and it is only
+trusted if no update started while it ran.  Every later update reads
+the task after the comparison did and cannot store anything older.
+
+security_task_to_inode() is called on every lookup, outside the lock,
+as before.
+
+With a 300us test-only delay between an observer reading the owner and
+storing it, a task which sets its euid to 1000, makes itself dumpable
+and opens its own /proc/<pid>/environ was refused 8 times in 126,196
+opens and 6 times in 121,218 when the update was skipped after a plain
+comparison.  With this patch it was not refused in 102,762 and 102,671
+opens.
+
+The seqcount fits in existing padding: struct proc_inode stays at 632
+bytes on x86_64.
+
+Cc: Alexey Dobriyan <adobriyan@gmail.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Jan Kara <jack@suse.cz>
+Cc: Jann Horn <jannh@google.com>
+Cc: Seth Forshee <sforshee@kernel.org>
+Cc: Stephen Brennan <stephen.s.brennan@oracle.com>
+Cc: Marco Elver <elver@google.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Kees Cook <kees@kernel.org>
+Cc: John Johansen <john.johansen@canonical.com>
+---
+NOTES (below the cut, not for the changelog)
+
+Goes on top of the serialize patch; written to be folded into it.  When
+you fold, the first paragraph and the test paragraph want merging with
+that patch's own changelog.  No Signed-off-by, as before.  The Cc list
+is the one from my respin of the base patch.
+
+It applies to mm-new 87cdbd9bd631 plus either my respin or your
+original (the PREEMPT_RT hunk in pid_revalidate() does not overlap).
+
+Do NOT combine this with proc-call-security_task_to_inode-under-i_lock.
+That patch moves the LSM hook inside i_lock in the three functions
+rewritten here, so it will not apply, and redoing it would put the lock
+back on every lookup.  An LSM's label can change without the uid
+changing, so the hook cannot be skipped by the comparison.  If the LSM
+label race is to be fixed, the place is inside each LSM's hook, under
+the lock it already takes there (selinux_task_to_inode() reads the
+task's SID before taking isec->lock).
+
+What I ran, all on mm-new + respin + this, x86_64, 2 emulated CPUs:
+- lockdep, PROVE_RAW_LOCK_NESTING, DEBUG_ATOMIC_SLEEP: 25s owner-flip
+  stress, 194,912 own-owner checks, 0 stale; 20s environ race, 0
+  refusals in 111,912 opens; no lockdep reports.
+- the same with the 300us delay: figures in the changelog.
+- PREEMPT_RT with lockdep: stress 47,792 checks, 0 stale; race 0 of
+  32,032; no reports.
+- lsm=selinux stress and lsm=smack race on a lockdep kernel: 0 and 0,
+  no reports.  I did not check the LSM labels themselves.
+
+What the tests do not show: I also tried this patch with the
+read_seqcount_retry() result ignored, and that did not fail either (0
+of 102,327 and 0 of 102,141).  In this test the waiting done by
+read_seqcount_begin() is what matters.  The retry check covers an
+update which starts during the comparison, which can only store
+something stale if the task's credentials change in that same window.
+I have no test which fails without it; it is there because it costs
+one load and makes the rule simple.
+
+Not done: any performance measurement (2 emulated CPUs say nothing),
+KCSAN, a model check, other architectures.
+
+Not covered: the mode of a /proc/<pid>/fd/<n> link comes from f_mode,
+which tid_fd_revalidate() reads before any of this.  A stale f_mode
+can still overwrite a newer one, with or without these patches.
+
+FOR THE TESTING CHAT
+
+Correctness: same reproducer as in the base patch's notes.  It should
+never report a stale owner or a refused open.
+
+Performance: please rerun exactly what produced the table in the
+changelog, on three kernels built from one config: (1) neither patch,
+(2) the serialize patch alone, (3) both.  procbench.c is quoted in the
+base patch's notes.  What I expect, and have NOT measured:
+- same-inode modes (thread-stat, one-stat, self-stat, self-open,
+  self-fd): (3) at least as fast as (1), and far above (2);
+- spread-stat: (3) within noise of (1);
+- ps -fe: no change.
+Please flag any mode where (3) is more than 3% below (1) at any worker
+count.  If SELinux is enabled in the guest, say so: its hook takes a
+per-inode spinlock on every lookup and will cap the same-inode modes
+on all three kernels.  A PREEMPT_RT run of (1) against (3) would be
+worth having.
