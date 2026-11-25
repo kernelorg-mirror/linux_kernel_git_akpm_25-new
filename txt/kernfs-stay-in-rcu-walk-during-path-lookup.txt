@@ -11,6 +11,28 @@ of the same depth did not change.  The guest was QEMU without KVM, where
 atomic operations are costly, so real hardware will gain less per CPU.
 This has not been measured on real hardware or with more than four CPUs.
 
+This helps programs which open or stat many files under /sys or
+/sys/fs/cgroup from many CPUs at once.  Three kinds have been reported.
+Daemons which poll cgroup files: oomd and the "below" monitor at Meta
+[1][2].  Many copies of one application reading sysfs attributes: 200
+processes reading /sys/class/infiniband on a 384-CPU machine at Oracle
+[3].  And very large machines in general: IBM systems, CoreOS users, and
+reports from Brice Goglin and Fox Chen [4].
+
+The complaints go back to 2021 [4].  At Oracle a profile of open() had
+49% of its samples under kernfs_iop_permission(), and still had 26% there
+after kernfs_iattr_rwsem was split from kernfs_rwsem to fix that [3].  At
+Meta, oomd and below were stuck in kernfs_dop_revalidate() for minutes
+behind a writer [1].  Cgroup mkdir and rmdir waiting for
+kernfs_iattr_rwsem, which every path walk takes for reading, held up the
+OOM daemon and the monitoring agent for up to 22 minutes, and one stall
+lasted 90 minutes and ended in a reboot [2].  Ian Kent has a report of
+contention in ->d_revalidate() which he could not explain [5].  Minchan
+Kim described a convoy on the rwsem when it was still global [6].
+
+This patch takes kernfs_iattr_rwsem out of the path walk for inodes whose
+mode and owner are current.  It does not change the writers.
+
 kernfs is the filesystem behind sysfs and cgroupfs.  A path lookup starts
 in RCU walk, which takes no locks and no references.
 kernfs_dop_revalidate() and kernfs_iop_permission() both return -ECHILD
@@ -68,8 +90,43 @@ in RCU walk, so a lookup through a sysfs symlink, such as the entries of
 ->getattr() still takes kernfs_iattr_rwsem, so stat() takes it once per
 call where it took it once per directory.
 
+Earlier work on this:
+
+2021  Ian Kent turned the global kernfs_mutex into an rwsem and cached
+      negative dentries [4].  Early versions of that series had a patch
+      to stay in RCU walk.  It was dropped in v3 because "it doesn't
+      actually give very much improvement" and "if there's a place where
+      mistakes could go unnoticed it would be in that path".
+2021  Minchan Kim made the rwsem per-filesystem [6].
+2022  Imran Khan replaced the global open-file mutex with hashed ones
+      [7].  Ian Kent took i_lock out of the inode refresh [8].
+2023  Imran Khan split kernfs_iattr_rwsem from kernfs_rwsem [3].
+2024  Tejun Heo made kernfs_nodes RCU-freed [9].
+2025  Sebastian Andrzej Siewior made a node's name and parent readable
+      under RCU [10].
+2026  Shakeel Butt made kernfs_dop_revalidate() lockless and left
+      lifting its LOOKUP_RCU bail "to a separate series" [1], took work
+      out from under the kernfs_rwsem write lock [11], and stopped mkdir
+      and rmdir taking kernfs_iattr_rwsem for writing [2].  The last of
+      those is not yet upstream.
+
+Link: https://lore.kernel.org/20260821050507.2161607-1-shakeel.butt@linux.dev [1]
+Link: https://lore.kernel.org/20261118220154.2965621-1-shakeel.butt@linux.dev [2]
+Link: https://lore.kernel.org/20230309110932.2889010-2-imran.f.khan@oracle.com [3]
+Link: https://lore.kernel.org/162642752894.63632.5596341704463755308.stgit@web.messagingengine.com [4]
+Link: https://lore.kernel.org/1c96890d-5ec9-4f2d-a897-8f8c46ea87f7@themaw.net [5]
+Link: https://lore.kernel.org/20211118230008.2679780-1-minchan@kernel.org [6]
+Link: https://lore.kernel.org/20220615021059.862643-1-imran.f.khan@oracle.com [7]
+Link: https://lore.kernel.org/166606025456.13363.3829702374064563472.stgit@donald.themaw.net [8]
+Link: https://lore.kernel.org/20240109214828.252092-4-tj@kernel.org [9]
+Link: https://lore.kernel.org/20250213145023.2820193-1-bigeasy@linutronix.de [10]
+Link: https://lore.kernel.org/20260913021453.21507-1-shakeel.butt@linux.dev [11]
 Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Cc: Tejun Heo <tj@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Ian Kent <raven@themaw.net>
+Cc: Imran Khan <imran.f.khan@oracle.com>
 ---
 Base: mm-new 5bd93e4b0b35 ("kmsan: fix metadata loss during HugeTLB struct
 page reinitialization").  checkpatch --strict complains only about the
@@ -167,7 +224,37 @@ Things you should know before merging:
 - struct kernfs_root grows by a seqcount_t and struct kernfs_super_info
   by an rcu_head.  struct kernfs_node does not change.
 
-- This is Greg's and Tejun's code and neither has seen it.
+- After the tests I changed the four lockless reads of a kuid_t or
+  kgid_t to read the .val inside it, as ef179363b043 ("kernfs: avoid
+  READ_ONCE() on a kgid_t in kernfs_new_node()") did, because
+  READ_ONCE() of a struct draws a sparse warning on SMP alpha.
+  fs/kernfs/inode.o of B is byte for byte the same before and after, so
+  the results above stand.
+
+- This overlaps work in progress.  Shakeel Butt made
+  kernfs_dop_revalidate() lockless in 8c2a5e65a977 (v7.4) and wrote
+  there that lifting the LOOKUP_RCU bail "is left to the series fixing"
+  kernfs_iop_permission().  I found no such series on lore or in
+  linux-next.  His "kernfs: stop taking kernfs_iattr_rwsem for writing
+  in mkdir/rmdir" (6 patches, 18 November, Acked-by Tejun, applied to
+  vfs-7.5.kernfs by Christian on 20 November but not yet in the
+  published branch) changes the same functions.  This patch applies
+  with offsets to vfs-7.5.kernfs at ccf2a4692fed, and on top of those
+  six patches.  That is patch --dry-run only: it was not built or run
+  there.  With his series the paragraph above about times and link
+  count is no longer needed, because the refresh stops copying them.
+
+- I have not read the stay-in-RCU-walk patch which Ian Kent dropped in
+  2021, only his reasons for dropping it in [4].  The upstream commits
+  behind the other references are 7ba0273b2f34 and c7e7c04274b1 [4],
+  393c3714081a [6], 1d25b84e444a [7], aa1d058d48f2 [8], 9caf69614225
+  [3], 4207b556e62f [9], 741c10b096bc and 633488947ef6 [10],
+  8c2a5e65a977 [1] and 4424f06120fd [11].
+
+- kernfs patches have lately gone in through Christian's vfs tree as
+  well as through driver-core.  None of the people in the Cc list has
+  seen this.  get_maintainer.pl gives only Greg and Tejun; I added the
+  other four from the history.
 
 FOR THE TESTING CHAT
 
@@ -653,7 +740,7 @@ The test program, kt.c:
 Test-only patch 1, on top of this patch.  It adds the two delays:
 
 :diff --git a/fs/attr.c b/fs/attr.c
-:index 9706d370f..3f5eb90e2 100644
+:index 9706d370f3..3f5eb90e22 100644
 :--- a/fs/attr.c
 :+++ b/fs/attr.c
 :@@ -7,6 +7,7 @@
@@ -675,7 +762,7 @@ Test-only patch 1, on top of this patch.  It adds the two delays:
 : 	if (ia_valid & ATTR_MODE) {
 : 		umode_t mode = attr->ia_mode;
 :diff --git a/fs/kernfs/inode.c b/fs/kernfs/inode.c
-:index f5cfc9c0e..71994d0d3 100644
+:index 12e47a7738..b81d20c52c 100644
 :--- a/fs/kernfs/inode.c
 :+++ b/fs/kernfs/inode.c
 :@@ -14,6 +14,7 @@
@@ -687,7 +774,7 @@ Test-only patch 1, on top of this patch.  It adds the two delays:
 : #include "kernfs-internal.h"
 : 
 :@@ -342,6 +343,10 @@ static int kernfs_permission_lockless(struct kernfs_root *root,
-: 	    !gid_eq(READ_ONCE(inode->i_gid), gid))
+: 	    READ_ONCE(inode->i_gid.val) != __kgid_val(gid))
 : 		return -ECHILD;
 : 
 :+	/* TEST ONLY: let a chown() start between the comparison and the check */
@@ -702,7 +789,7 @@ Test-only patch 2, on top of test-only patch 1.  It removes the recheck
 of the seqcount, to show that the race test can fail:
 
 :diff --git a/fs/kernfs/inode.c b/fs/kernfs/inode.c
-:index 71994d0d3..fdbf28528 100644
+:index b81d20c52c..fdc72e40a9 100644
 :--- a/fs/kernfs/inode.c
 :+++ b/fs/kernfs/inode.c
 :@@ -348,8 +348,7 @@ static int kernfs_permission_lockless(struct kernfs_root *root,
