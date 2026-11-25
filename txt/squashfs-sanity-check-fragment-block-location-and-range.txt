@@ -1,0 +1,106 @@
+From: Phillip Lougher <phillip@squashfs.org.uk>
+Subject: Squashfs: sanity check fragment block location and range
+Date: Wed, 25 Nov 2026 01:47:30 +0000
+
+When reading fragment blocks from disk the location and range of the
+fragment block is not sanity checked before it is passed down to
+squashfs_read_data().
+
+In squashfs_read_data() the block location and range are sanity checked
+to the extent that the location plus block length does not go beyond the
+end of the filesystem.  But, a block location can be crafted to be close
+to 2^64, and so the addition of the location and the length can cause
+arthimetic overflow, and thereby evade the sanity check.
+
+This evasion, however, will be caught when the code after the sanity
+check tries to read the block from the filesystem.  This is because
+it is the block location that is passed to the I/O read, and not
+the result of the overflowed sanity check.  This will return error
+because it will be beyond the end of the device.
+
+The real issue here is that leaving the sanity checking of the fragment
+block location and range to squashfs_read_data() is sub-optimal.  This
+is because a fragment cache buffer has to be obtained (with possible
+waits fop a free buffer, and then the eviction of the original cached
+contents) before squashfs_read_data() is called.
+
+This adds unnecessary overhead and contention, which could be exploited
+to reduce performance, and this is for incorrect values that should have
+been detected earlier.
+
+This commit adds extra sanity checking to ensure the fragment block
+location and range are within bounds before a free fragment block is
+obtained.
+
+Also because the fragment block value is unchecked, a false value of
+SQUASHFS_INVALID_BLK read off disk, will trick the code into believing
+the file doesn't have a fragment, because that value is later used to
+indicate if a file has a fragment.  To avoid this, this commit adds and
+uses an inode flag.
+  
+Reproducer
+==========
+
+The reproducer generates a Squashfs filesytem with a fragment block, and
+then corrupts the location of the fragment block to 2^64 - 32 KiB.  If
+the exploit succeeds this corrupted value is paased to
+squaashfs_read_data() and it is not detected until the I/O read fails.
+
+=====================================================================
+#!/bin/bash
+
+ARGS="-quiet -no-progress -noI -noD -noF -no-sparse -comp gzip"
+
+finish() {
+	popd 2>&1 > /dev/null
+	rm -rf $DIR
+	exit 1
+}
+
+DIR=$(mktemp -d)
+
+pushd $DIR 2>&1 > /dev/null
+
+echo Create Squashfs filesystem with one file
+
+echo "/ d 0777 0 0" > pseudo
+echo "zero f 0777 0 0 dd if=/dev/zero bs=1024 count=32 2>/dev/null" >> pseudo
+
+if ! mksquashfs - img.sqsh -pf pseudo $ARGS; then
+	echo Failed to create Squashfs filesystem
+	finish
+
+fi
+
+echo "Corrupt the location of fragment block 0"
+echo "Alter it to the value 0xFFFFFFFFFFFF8000 (2^64 - 32 KiB)"
+echo "The block location is stored at byte offset 32958"
+
+/usr/bin/echo -en "\x00\x80\xff\xff\xff\xff\xff\xff" > file
+dd if=file of=img.sqsh seek=32958 bs=1 count=8 conv=notrunc status=none
+
+echo Mount the filesystem to /mnt
+
+if ! mount -t squashfs img.sqsh /mnt; then
+	echo Mount of Squashfs filesystem failed
+	finish
+fi
+
+echo Read the file zero.
+echo If the exploit succeeds, dmesg should show the following:
+echo "dd: attempt to access beyond end of device"
+echo "	loop20: rw=2048, sector=36028797018963904, nr_sectors = 64 limit=72"
+echo "SQUASHFS error: Failed to read block 0xffffffffffff8000: -5"
+echo "SQUASHFS error: Unable to read fragment cache entry [ffffffffffff8000]"
+echo "SQUASHFS error: Unable to read fragment cache entry [ffffffffffff8000]"
+echo "SQUASHFS error: Unable to read page, block ffffffffffff8000, size 1008000"
+
+dd if=/mnt/zero
+
+popd 2>&1> /dev/null
+
+rm -rf $DIR
+=========================================================================
+
+Link: https://patch.msgid.link/20261125014737.347231-17-phillip@squashfs.org.uk
+Signed-off-by: Phillip Lougher <phillip@squashfs.org.uk>
