@@ -52,66 +52,77 @@ Cc: Dmitry Vyukov <dvyukov@google.com>
 Cc: Kees Cook <kees@kernel.org>
 Cc: John Johansen <john.johansen@canonical.com>
 ---
-NOTES (below the cut, not for the changelog)
 
-Goes on top of the serialize patch; written to be folded into it.  When
-you fold, the first paragraph and the test paragraph want merging with
-that patch's own changelog.  No Signed-off-by, as before.  The Cc list
-is the one from my respin of the base patch.
+correctness testing:
 
-It applies to mm-new 87cdbd9bd631 plus either my respin or your
-original (the PREEMPT_RT hunk in pid_revalidate() does not overlap).
+I tested "proc: serialize task owner lookup and inode updates"
+(proc-serialize-task-owner-updates.patch) together with
+"proc: don't lock task inodes whose owner has not changed"
+(proc-dont-lock-task-inodes-whose-owner-has-not-changed.patch).
 
-Do NOT combine this with proc-call-security_task_to_inode-under-i_lock.
-That patch moves the LSM hook inside i_lock in the three functions
-rewritten here, so it will not apply, and redoing it would put the lock
-back on every lookup.  An LSM's label can change without the uid
-changing, so the hook cannot be skipped by the comparison.  If the LSM
-label race is to be fixed, the place is inside each LSM's hook, under
-the lock it already takes there (selinux_task_to_inode() reads the
-task's SID before taking isec->lock).
+A had neither patch; B had both. Fresh x86-64 QEMU guests used four
+vCPUs and two virtual NUMA nodes. The ordinary A/B kernels had KASAN
+and lockdep enabled; a separate matched A/B pair used PREEMPT_RT.
 
-What I ran, all on mm-new + respin + this, x86_64, 2 emulated CPUs:
-- lockdep, PROVE_RAW_LOCK_NESTING, DEBUG_ATOMIC_SLEEP: 25s owner-flip
-  stress, 194,912 own-owner checks, 0 stale; 20s environ race, 0
-  refusals in 111,912 opens; no lockdep reports.
-- the same with the 300us delay: figures in the changelog.
-- PREEMPT_RT with lockdep: stress 47,792 checks, 0 stale; race 0 of
-  32,032; no reports.
-- lsm=selinux stress and lsm=smack race on a lockdep kernel: 0 and 0,
-  no reports.  I did not check the LSM labels themselves.
+A task repeatedly changed its effective UID between 0 and 1000, made
+itself dumpable, and opened its own /proc/<pid>/environ while two other
+processes looked up its proc entries. The same test-only 300 us delay
+after reading the task owner was present on A and B.
 
-What the tests do not show: I also tried this patch with the
-read_seqcount_retry() result ignored, and that did not fail either (0
-of 102,327 and 0 of 102,141).  In this test the waiting done by
-read_seqcount_begin() is what matters.  The retry check covers an
-update which starts during the comparison, which can only store
-something stale if the task's credentials change in that same window.
-I have no test which fails without it; it is there because it costs
-one load and makes the rule simple.
+                         A, neither patch       B, both patches
+Ordinary kernel          104 / 434,042 denied   0 / 365,377 denied
+PREEMPT_RT                52 / 306,797 denied   0 / 271,267 denied
 
-Not done: any performance measurement (2 emulated CPUs say nothing),
-KCSAN, a model check, other architectures.
+On A, open() sometimes returned EACCES after the task set its effective
+UID to 1000 and made itself dumpable.  This reproduces the stale-owner
+permission failure addressed by the patches.
 
-Not covered: the mode of a /proc/<pid>/fd/<n> link comes from f_mode,
-which tid_fd_revalidate() reads before any of this.  A stale f_mode
-can still overwrite a newer one, with or without these patches.
+Function tracing also confirmed lookups through pid_update_inode(),
+tid_fd_update_inode(), and map_files_d_revalidate().  Additional B
+diagnostics reached a seqcount read during an update, a read that needed
+retry, and the path that avoids an inode write.  The tests changed fd/40
+between read-only and write-only files and exercised lookup during task
+exit.  No KASAN or locking warning was found.
 
-FOR THE TESTING CHAT
+SELinux was disabled, and KCSAN was not run. The A/B results establish
+the effect of the two patches together, not each patch separately.
 
-Correctness: same reproducer as in the base patch's notes.  It should
-never report a stale owner or a refused open.
 
-Performance: please rerun exactly what produced the table in the
-changelog, on three kernels built from one config: (1) neither patch,
-(2) the serialize patch alone, (3) both.  procbench.c is quoted in the
-base patch's notes.  What I expect, and have NOT measured:
-- same-inode modes (thread-stat, one-stat, self-stat, self-open,
-  self-fd): (3) at least as fast as (1), and far above (2);
-- spread-stat: (3) within noise of (1);
-- ps -fe: no change.
-Please flag any mode where (3) is more than 3% below (1) at any worker
-count.  If SELinux is enabled in the guest, say so: its hook takes a
-per-inode spinlock on every lookup and will cap the same-inode modes
-on all three kernels.  A PREEMPT_RT run of (1) against (3) would be
-worth having.
+performance testing:
+
+I compared three kernels built with the same configuration and compiler:
+
+  A: neither patch
+  B: "proc: serialize task owner lookup and inode updates"
+     (proc-serialize-task-owner-updates.patch)
+  C: B plus "proc: don't lock task inodes whose owner has not changed"
+     (proc-dont-lock-task-inodes-whose-owner-has-not-changed.patch)
+
+Each ran in a separate 64-vCPU, 16-GiB QEMU guest with two virtual NUMA
+nodes. SELinux and KASAN were off. A local test program repeatedly
+stat()ed, opened, or readlink()ed proc entries with concurrent workers.
+Each figure below is the median of three 3-second runs, in million
+operations per second; brackets show the range.
+
+Operation                         A             B             C       C/A
+64 threads: thread-self/stat   7.42 [7.37-7.45] 2.31 [2.30-2.48] 9.00 [8.92-9.24] +21%
+16 processes: one pid/status    3.83 [3.82-4.07] 1.48 [1.47-1.52] 5.05 [5.04-5.20] +32%
+64 threads: self/status stat    1.96 [1.91-2.05] 1.83 [1.81-1.88] 2.05 [2.04-2.11]  +5%
+64 threads: self/status open    1.28 [1.26-1.31] 1.22 [1.21-1.22] 1.25 [1.24-1.26]  -3%
+64 threads: self/fd readlink    1.21 [1.21-1.22] 1.22 [1.21-1.32] 1.35 [1.30-1.36] +11%
+64 processes: separate pids  120.11 [119.39-120.27]
+                              115.43 [114.86-115.61]
+                              113.05 [112.62-113.15]                         -5.9%
+1 thread: thread-self/stat      1.32 [1.31-1.32] 1.29 [1.28-1.29] 1.28 [1.28-1.29]  -3.0%
+
+The second patch more than recovered the large shared-inode throughput
+losses introduced by the first.  The separate-pid test remained 5.9% below
+A, with non-overlapping ranges, and the one-worker result was just over 3%
+below A.  Repeated "ps -fe" runs were essentially unchanged at about 52
+calls per second on all three kernels.
+
+The timed tests totalled 198 seconds.  These are guest measurements; they
+do not establish the cost on bare metal or PREEMPT_RT.  The ps run did not
+include thousands of background tasks.
+
+
