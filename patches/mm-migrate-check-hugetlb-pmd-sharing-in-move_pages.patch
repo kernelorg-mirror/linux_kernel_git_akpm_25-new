@@ -1,0 +1,143 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/migrate: check hugetlb PMD sharing in move_pages()
+Date: Wed, 25 Nov 2026 23:33:09 +0100
+
+Without MPOL_MF_MOVE_ALL, which requires CAP_SYS_NICE, move_pages(2)
+refuses to migrate folios that might be mapped by other processes.
+
+However, folio_maybe_mapped_shared() does not check for page table
+sharing. So move_pages(2) with MPOL_MF_MOVE can migrate hugetlb
+folios that other processes map.
+
+mbind(2) and migrate_pages(2) already handle PMD table sharing since
+commit 73bdf65ea748 ("migrate: hugetlb: check for hugetlb shared PMD in
+node migration"), but we missed move_pages(2).
+
+Let's fix it by using hugetlb_folio_maybe_mapped_shared() for hugetlb
+folios in move_pages(2). Such folios are now reported with -EACCES in
+the status array.
+
+Rework the code to have separate checks for hugetlb vs. !hugetlb.
+
+This has low urgency.
+
+Link: https://patch.msgid.link/20261125-hugetlb_fixes_2-v1-11-db27fd2f71a8@kernel.org
+Fixes: e632a938d914 ("mm: migrate: add hugepage migration code to move_pages()")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Jinmeng Zhou <jinmengzhou22@gmail.com>
+Cc: Hongfu Li <lihongfu@kylinos.cn>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Dave McCracken <dave.mccracken@oracle.com>
+Cc: Andy Whitcroft <apw@shadowen.org>
+Cc: Adam Litke <agl@us.ibm.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Kenneth W Chen <kenneth.w.chen@intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joern Engel <joern@logfs.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Guillaume Morin <guillaume@morinfr.org>
+Cc: Wanpeng Li <liwp.linux@gmail.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Andrew Morton <akpm@osdl.org>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: "Oscar Salvador (SUSE)" <osalvador@kernel.org>
+Cc: <stable@vger.kernel.org>
+
+ mm/migrate.c |   23 +++++++++++++++--------
+ 1 file changed, 15 insertions(+), 8 deletions(-)
+
+--- a/mm/migrate.c~mm-migrate-check-hugetlb-pmd-sharing-in-move_pages
++++ a/mm/migrate.c
+@@ -2281,8 +2281,9 @@ static int do_move_pages_to_node(struct
+ 	return err;
+ }
+ 
+-static int __add_folio_for_migration(struct folio *folio, int node,
+-		struct list_head *pagelist, bool migrate_all)
++static int __add_folio_for_migration(struct folio *folio,
++		struct folio_walk *fw, int node, struct list_head *pagelist,
++		bool migrate_all)
+ {
+ 	if (is_zero_folio(folio) || is_huge_zero_folio(folio))
+ 		return -EFAULT;
+@@ -2293,13 +2294,19 @@ static int __add_folio_for_migration(str
+ 	if (folio_nid(folio) == node)
+ 		return 0;
+ 
+-	if (folio_maybe_mapped_shared(folio) && !migrate_all)
+-		return -EACCES;
+-
+ 	if (folio_test_hugetlb(folio)) {
++		/* fw->ptep aliases fw->pmdp and fw->pudp. */
++		if (!migrate_all && hugetlb_folio_maybe_mapped_shared(folio, fw->ptep))
++			return -EACCES;
+ 		if (folio_isolate_hugetlb(folio, pagelist))
+ 			return 1;
+-	} else if (folio_isolate_lru(folio)) {
++		return -EBUSY;
++	}
++
++	if (!migrate_all && folio_maybe_mapped_shared(folio))
++		return -EACCES;
++
++	if (folio_isolate_lru(folio)) {
+ 		list_add_tail(&folio->lru, pagelist);
+ 		node_stat_mod_folio(folio,
+ 			NR_ISOLATED_ANON + folio_is_file_lru(folio),
+@@ -2334,8 +2341,8 @@ static int add_folio_for_migration(struc
+ 	if (vma && vma_migratable(vma)) {
+ 		folio = folio_walk_start(&fw, vma, addr, FW_ZEROPAGE);
+ 		if (folio) {
+-			err = __add_folio_for_migration(folio, node, pagelist,
+-							migrate_all);
++			err = __add_folio_for_migration(folio, &fw, node,
++							pagelist, migrate_all);
+ 			folio_walk_end(&fw, vma);
+ 		} else {
+ 			err = -ENOENT;
+_

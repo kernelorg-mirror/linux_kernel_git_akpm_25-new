@@ -1,0 +1,145 @@
+From: Chris Mason <mason@kernel.org>
+Subject: hugetlbfs: recheck the vma range after the lock wait
+Date: Wed, 25 Nov 2026 23:33:06 +0100
+
+A hole punch or a truncation of a hugetlb file that races with a split
+of a shared vma can lead to a use-after-free read of a page table, and
+to an MMU notifier range with end <= start, which trips a WARN_ON_ONCE()
+in KVM.
+
+hugetlb_unmap_file_folio() computes the address of the folio in a vma
+and walks the page tables to unmap the folio. As free_pgtables() unlinks
+a vma from the rmap tree before it frees its page tables, i_mmap_rwsem
+does not protect page tables outside of the vma, so walking them can
+result in a use-after-free read.
+
+The rmap tree walk guarantees that a found vma spans our folio. However,
+when we have to fall back to locking the vma lock first and drop the
+i_mmap_rwsem, we don't check whether that is still the case after we
+acquired the vma lock and the i_mmap_rwsem. The following is then
+possible:
+
+    hugetlb_unmap_file_folio()          __split_vma(), new_below == 0
+    ==========================          =============================
+    hugetlb_vma_trylock_write() fails
+    i_mmap_unlock_write()
+    down_write(&vma_lock->rw_sema)
+                                        vma_prepare()
+                                          i_mmap_lock_write()
+                                        vma->vm_end = addr
+                                        vma_complete()
+                                          i_mmap_unlock_write()
+    i_mmap_lock_write()
+    vma_lock->vma is not NULL
+    vma_offset_start() >= vma->vm_end
+    vma_offset_end() == vma->vm_end
+    hugetlb_vma_maps_pfn(vma, v_start)
+    unmap_hugepage_range(vma, v_start, v_end)
+
+Similarly, a split with new_below == 1, where the vma keeps the upper
+part and vm_start and vm_pgoff move up, or shrinking the vma with
+mremap() can leave the vma not covering our folio.
+
+Let's fix it by checking whether the possibly split vma still spans our
+folio. Add a VM_WARN_ON_ONCE() to highlight the problem that was
+previously missed.
+
+This has medium urgency, as this is triggerable by unprivileged users.
+
+[david@kernel.org: adjust comment and description]
+Link: https://patch.msgid.link/20261125-hugetlb_fixes_2-v1-8-db27fd2f71a8@kernel.org
+Fixes: 40549ba8f8e0 ("hugetlb: use new vma_lock for pmd sharing synchronization")
+Signed-off-by: Chris Mason <mason@kernel.org>
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Jinmeng Zhou <jinmengzhou22@gmail.com>
+Cc: Hongfu Li <lihongfu@kylinos.cn>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Dave McCracken <dave.mccracken@oracle.com>
+Cc: Andy Whitcroft <apw@shadowen.org>
+Cc: Adam Litke <agl@us.ibm.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Kenneth W Chen <kenneth.w.chen@intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joern Engel <joern@logfs.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Guillaume Morin <guillaume@morinfr.org>
+Cc: Wanpeng Li <liwp.linux@gmail.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Andrew Morton <akpm@osdl.org>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: "Oscar Salvador (SUSE)" <osalvador@kernel.org>
+Cc: <stable@vger.kernel.org>
+
+ fs/hugetlbfs/inode.c |    8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+--- a/fs/hugetlbfs/inode.c~hugetlbfs-recheck-the-vma-range-after-the-lock-wait
++++ a/fs/hugetlbfs/inode.c
+@@ -442,10 +442,11 @@ retry:
+ 		i_mmap_lock_write(mapping);
+ 
+ 		vma = vma_lock->vma;
+-		if (!vma) {
++		if (!vma || vma_start_pgoff(vma) >= end || vma_end_pgoff(vma) <= start) {
+ 			/*
+-			 * If lock is no longer attached to vma, then just
+-			 * unlock, drop our reference and retry looking for
++			 * If the lock is no longer attached to this vma, or if
++			 * the vma changed and no longer covers the folio, then
++			 * just unlock, drop our reference and retry looking for
+ 			 * other vmas.
+ 			 */
+ 			up_write(&vma_lock->rw_sema);
+@@ -459,6 +460,7 @@ retry:
+ 		 */
+ 		v_start = vma_offset_start(vma, start);
+ 		v_end = vma_offset_end(vma, end);
++		VM_WARN_ON_ONCE(v_start >= v_end);
+ 		if (hugetlb_vma_maps_pfn(vma, v_start, pfn))
+ 			unmap_hugepage_range(vma, v_start, v_end, NULL,
+ 					     ZAP_FLAG_DROP_MARKER);
+_

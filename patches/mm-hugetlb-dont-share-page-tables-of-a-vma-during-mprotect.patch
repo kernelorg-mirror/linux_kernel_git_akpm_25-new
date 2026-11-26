@@ -1,0 +1,151 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/hugetlb: don't share page tables of a VMA during mprotect()
+Date: Wed, 25 Nov 2026 23:33:10 +0100
+
+When mprotect() of a shared hugetlb mapping races with a hugetlb fault
+in another process that can share the same PMD table, we can end up with
+page table entries that don't match the VMA flags, such as writable ones
+in a PROT_READ mapping or PROT_NONE ones in accessible VMAs.
+
+huge_pmd_share() takes i_mmap_rwsem and shares a PMD table if the flags
+of the two VMAs match, so while that lock is held the entries in a
+table have to match the flags of its VMA.
+
+However, mprotect_fixup() stores the new flags without i_mmap_rwsem, and
+only hugetlb_change_protection() takes it. A fault in between shares a
+table that still has the old entries, and the walk then unshares the
+table instead of changing them:
+
+    process A                        process C
+    VMA is RW, entries are RW        VMA is R, PUD is empty
+    =========================        ======================
+    mprotect_fixup()
+      VMA flags = R
+                                     huge_pmd_share()
+                                       i_mmap_lock_read()
+                                       flags match, take A's table
+                                       i_mmap_unlock_read()
+      hugetlb_change_protection()
+        i_mmap_lock_write()
+        huge_pmd_unshare()
+          clear A's PUD, return 1
+        skip the entries
+                                     VMA is R, entries are RW
+
+mprotect() changes both the flags and the entries while holding the
+mmap lock in write mode.
+
+Let's fix it by only sharing the page tables of another VMA if we can
+try-read-lock the mmap lock of its mm. If the trylock fails, we simply
+try the next VMA, or allocate our own page table.
+
+A trylock is fine, as we hold i_mmap_rwsem, which is usually taken under
+the mmap lock. We should use the VMA lock instead, but we'll do that
+separately.
+
+This has medium urgency, as it can result in endless page fault loops if
+mprotect() races with PMD table sharing and we end up with PROT_NONE
+entries in accessible VMAs. If the kernel accesses such memory, for
+example in copy_to_user(), the loop happens in the kernel and the task
+cannot be killed.
+
+Link: https://patch.msgid.link/20261125-hugetlb_fixes_2-v1-12-db27fd2f71a8@kernel.org
+Fixes: 39dde65c9940 ("[PATCH] shared page table for hugetlb page")
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Reported-by: Chris Mason <mason@kernel.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Jinmeng Zhou <jinmengzhou22@gmail.com>
+Cc: Hongfu Li <lihongfu@kylinos.cn>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Dave McCracken <dave.mccracken@oracle.com>
+Cc: Andy Whitcroft <apw@shadowen.org>
+Cc: Adam Litke <agl@us.ibm.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Kenneth W Chen <kenneth.w.chen@intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joern Engel <joern@logfs.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Guillaume Morin <guillaume@morinfr.org>
+Cc: Wanpeng Li <liwp.linux@gmail.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Andrew Morton <akpm@osdl.org>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: "Oscar Salvador (SUSE)" <osalvador@kernel.org>
+Cc: <stable@vger.kernel.org>
+
+ mm/hugetlb.c |   14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+--- a/mm/hugetlb.c~mm-hugetlb-dont-share-page-tables-of-a-vma-during-mprotect
++++ a/mm/hugetlb.c
+@@ -7241,15 +7241,23 @@ pte_t *huge_pmd_share(struct mm_struct *
+ 		if (svma == vma)
+ 			continue;
+ 
++		/*
++		 * Stabilize the svma flags, as mprotect() changes flags
++		 * before adjusting page tables.
++		 */
++		if (!mmap_read_trylock(svma->vm_mm))
++			continue;
++
+ 		saddr = page_table_shareable(svma, vma, addr, idx);
+ 		if (saddr) {
+ 			spte = hugetlb_walk(svma, saddr,
+ 					    vma_mmu_pagesize(svma));
+-			if (spte) {
++			if (spte)
+ 				ptdesc_pmd_pts_inc(virt_to_ptdesc(spte));
+-				break;
+-			}
+ 		}
++		mmap_read_unlock(svma->vm_mm);
++		if (spte)
++			break;
+ 	}
+ 
+ 	if (!spte)
+_

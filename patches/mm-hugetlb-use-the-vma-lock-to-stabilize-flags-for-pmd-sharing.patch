@@ -1,0 +1,247 @@
+From: "David Hildenbrand (Arm)" <david@kernel.org>
+Subject: mm/hugetlb: use the VMA lock to stabilize flags for PMD sharing
+Date: Wed, 25 Nov 2026 23:33:17 +0100
+
+huge_pmd_share() currently only shares the page tables of another VMA if
+it can read-lock the mmap lock of the corresponding mm. That refuses
+sharing whenever that mm is write-locked or if the mmap lock is
+contended.
+
+mprotect() holds the VMA write lock while changing the flags and the
+page table entries, so let's read-lock only that VMA instead. As we hold
+i_mmap_rwsem, that VMA remains part of its mm and cannot go away.
+
+Add vma_trylock_read(), a variant of vma_start_read(), that does not
+require being called with the RCU read lock held, and will also not drop
+it itself.
+
+Link: https://patch.msgid.link/20261125-hugetlb_fixes_2-v1-19-db27fd2f71a8@kernel.org
+Signed-off-by: David Hildenbrand (Arm) <david@kernel.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Muchun Song <muchun.song@linux.dev>
+Cc: Oscar Salvador <osalvador@suse.de>
+Cc: Jinmeng Zhou <jinmengzhou22@gmail.com>
+Cc: Hongfu Li <lihongfu@kylinos.cn>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Mike Kravetz <mike.kravetz@oracle.com>
+Cc: Naoya Horiguchi <nao.horiguchi@gmail.com>
+Cc: Hugh Dickins <hughd@google.com>
+Cc: Baolin Wang <baolin.wang@linux.alibaba.com>
+Cc: Dave Airlie <airlied@redhat.com>
+Cc: Vivek Kasireddy <vivek.kasireddy@intel.com>
+Cc: Gerd Hoffmann <kraxel@redhat.com>
+Cc: Mike Rapoport <rppt@kernel.org>
+Cc: Mel Gorman <mel@csn.ul.ie>
+Cc: Dave McCracken <dave.mccracken@oracle.com>
+Cc: Andy Whitcroft <apw@shadowen.org>
+Cc: Adam Litke <agl@us.ibm.com>
+Cc: Lorenzo Stoakes <ljs@kernel.org>
+Cc: Rik van Riel <riel@surriel.com>
+Cc: Liam R. Howlett <liam@infradead.org>
+Cc: Vlastimil Babka <vbabka@kernel.org>
+Cc: Harry Yoo <harry@kernel.org>
+Cc: Jann Horn <jannh@google.com>
+Cc: Lance Yang <lance.yang@linux.dev>
+Cc: James Houghton <jthoughton@google.com>
+Cc: Yang Shi <shy828301@gmail.com>
+Cc: Suren Baghdasaryan <surenb@google.com>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Pedro Falcato <pfalcato@suse.de>
+Cc: Gregory Price <gourry@gourry.net>
+Cc: Zi Yan <ziy@nvidia.com>
+Cc: Joshua Hahn <joshua.hahnjy@gmail.com>
+Cc: Rakie Kim <rakie.kim@sk.com>
+Cc: Ying Huang <ying.huang@linux.alibaba.com>
+Cc: Matthew Brost <matthew.brost@intel.com>
+Cc: Byungchul Park <byungchul@sk.com>
+Cc: Alistair Popple <apopple@nvidia.com>
+Cc: Wanpeng Li <liwanp@linux.vnet.ibm.com>
+Cc: Andi Kleen <ak@linux.intel.com>
+Cc: Kenneth W Chen <kenneth.w.chen@intel.com>
+Cc: Michal Hocko <mhocko@suse.com>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joern Engel <joern@logfs.org>
+Cc: Jonathan Corbet <corbet@lwn.net>
+Cc: Shuah Khan <skhan@linuxfoundation.org>
+Cc: Randy Dunlap <rdunlap@infradead.org>
+Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+Cc: Kiryl Shutsemau <kas@kernel.org>
+Cc: Sasha Levin <sasha.levin@oracle.com>
+Cc: Guillaume Morin <guillaume@morinfr.org>
+Cc: Wanpeng Li <liwp.linux@gmail.com>
+Cc: Jason Gunthorpe <jgg@ziepe.ca>
+Cc: Andrew Morton <akpm@osdl.org>
+Cc: Chris Mason <mason@kernel.org>
+Cc: luojiajun <luojiajun3@huawei.com>
+Cc: Josef Bacik <josef@toxicpanda.com>
+Cc: Daehyeon Ko <4ncienth@gmail.com>
+Cc: Ackerley Tng <ackerleytng@google.com>
+Cc: Jiaqi Yan <jiaqiyan@google.com>
+Cc: "Oscar Salvador (SUSE)" <osalvador@kernel.org>
+
+ include/linux/mmap_lock.h |    1 
+ mm/hugetlb.c              |    4 -
+ mm/mmap_lock.c            |   78 ++++++++++++++++++++++++------------
+ 3 files changed, 55 insertions(+), 28 deletions(-)
+
+--- a/include/linux/mmap_lock.h~mm-hugetlb-use-the-vma-lock-to-stabilize-flags-for-pmd-sharing
++++ a/include/linux/mmap_lock.h
+@@ -278,6 +278,7 @@ static inline bool vma_start_read_locked
+ 
+ struct vm_area_struct *vma_start_read_unlocked(struct mm_struct *mm,
+ 					       unsigned long address);
++bool vma_trylock_read(struct vm_area_struct *vma);
+ 
+ static inline void vma_end_read(struct vm_area_struct *vma)
+ {
+--- a/mm/hugetlb.c~mm-hugetlb-use-the-vma-lock-to-stabilize-flags-for-pmd-sharing
++++ a/mm/hugetlb.c
+@@ -7264,7 +7264,7 @@ pte_t *huge_pmd_share(struct mm_struct *
+ 		 * Stabilize the svma flags, as mprotect() changes flags
+ 		 * before adjusting page tables.
+ 		 */
+-		if (!mmap_read_trylock(svma->vm_mm))
++		if (!vma_trylock_read(svma))
+ 			continue;
+ 
+ 		saddr = page_table_shareable(svma, vma, addr, idx);
+@@ -7274,7 +7274,7 @@ pte_t *huge_pmd_share(struct mm_struct *
+ 			if (spte)
+ 				ptdesc_pmd_pts_inc(virt_to_ptdesc(spte));
+ 		}
+-		mmap_read_unlock(svma->vm_mm);
++		vma_end_read(svma);
+ 		if (spte)
+ 			break;
+ 	}
+--- a/mm/mmap_lock.c~mm-hugetlb-use-the-vma-lock-to-stabilize-flags-for-pmd-sharing
++++ a/mm/mmap_lock.c
+@@ -212,26 +212,17 @@ static bool vma_seqcount_is_write_locked
+ }
+ 
+ /*
+- * Try to read-lock a vma. The function is allowed to occasionally yield false
+- * locked result to avoid performance overhead, in which case we fall back to
+- * using mmap_lock. The function should never yield false unlocked result.
+- * False locked result is possible if vma gets reused and attached to a
+- * different mm before we lock it.
+- * Returns the vma on success, NULL on failure to lock and EAGAIN if vma got
+- * detached.
+- *
+- * IMPORTANT: RCU lock must be held upon entering the function, but upon error
+- *            IT IS RELEASED. The caller must handle this correctly.
++ * Like vma_start_read(), but without RCU handling: the caller must make sure
++ * that the vma cannot be freed, for example by holding the RCU lock.
+  */
+-static struct vm_area_struct *vma_start_read(struct mm_struct *mm,
+-					     struct vm_area_struct *vma)
++static struct vm_area_struct *__vma_start_read(struct mm_struct *mm,
++		struct vm_area_struct *vma)
+ {
+ 	unsigned int vma_seq;
+ 	unsigned int mm_seq;
+ 	struct mm_struct *other_mm;
+ 	int oldcnt;
+ 
+-	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "no rcu lock held");
+ 	/*
+ 	 * Check before locking. A race might cause false locked result.
+ 	 * We can use READ_ONCE() for the mm_lock_seq here, and don't need
+@@ -241,10 +232,8 @@ static struct vm_area_struct *vma_start_
+ 	 */
+ 	vma_seq = READ_ONCE(vma->vm_lock_seq);
+ 	mm_seq = READ_ONCE(mm->mm_lock_seq.sequence);
+-	if (vma_seqcount_is_write_locked(vma_seq, mm_seq)) {
+-		vma = NULL;
+-		goto err;
+-	}
++	if (vma_seqcount_is_write_locked(vma_seq, mm_seq))
++		return NULL;
+ 
+ 	/*
+ 	 * If VM_REFCNT_EXCLUDE_READERS_FLAG is set,
+@@ -257,8 +246,7 @@ static struct vm_area_struct *vma_start_
+ 	if (unlikely(!__refcount_inc_not_zero_limited_acquire(&vma->vm_refcnt, &oldcnt,
+ 							      VM_REFCNT_LIMIT))) {
+ 		/* return EAGAIN if vma got detached from under us */
+-		vma = oldcnt ? NULL : ERR_PTR(-EAGAIN);
+-		goto err;
++		return oldcnt ? NULL : ERR_PTR(-EAGAIN);
+ 	}
+ 
+ 	__vma_lockdep_acquire_read(vma);
+@@ -288,15 +276,10 @@ static struct vm_area_struct *vma_start_
+ 	mm_seq = raw_read_seqcount(&mm->mm_lock_seq);
+ 	if (unlikely(vma_seqcount_is_write_locked(vma_seq, mm_seq))) {
+ 		vma_refcount_put(vma);
+-		vma = NULL;
+-		goto err;
++		return NULL;
+ 	}
+ 
+ 	return vma;
+-err:
+-	rcu_read_unlock();
+-
+-	return vma;
+ err_unstable:
+ 	/*
+ 	 * If vma got attached to another mm from under us, that mm is not
+@@ -309,11 +292,54 @@ err_unstable:
+ 	mmgrab(other_mm);
+ 	vma_refcount_put(vma);
+ 	mmdrop_async(other_mm);
+-	rcu_read_unlock();
+ 
+ 	return NULL;
+ }
+ 
++/**
++ * vma_start_read() - Try to read-lock a vma looked up under RCU.
++ * @mm: The mm the vma is expected to belong to.
++ * @vma: The vma to read-lock.
++ *
++ * The function is allowed to occasionally yield false locked result to avoid
++ * performance overhead, in which case we fall back to using mmap_lock. The
++ * function should never yield false unlocked result. False locked result is
++ * possible if vma gets reused and attached to a different mm before we lock it.
++ *
++ * Context: RCU lock must be held upon entering the function, but upon error
++ * IT IS RELEASED. The caller must handle this correctly.
++ *
++ * Return: The vma on success, NULL on failure to lock and ERR_PTR(-EAGAIN) if
++ * the vma got detached.
++ */
++static struct vm_area_struct *vma_start_read(struct mm_struct *mm,
++		struct vm_area_struct *vma)
++{
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "no rcu lock held");
++
++	vma = __vma_start_read(mm, vma);
++	if (IS_ERR_OR_NULL(vma))
++		rcu_read_unlock();
++	return vma;
++}
++
++/**
++ * vma_trylock_read() - Try to read-lock a VMA that belongs to its mm.
++ * @vma: The VMA to read-lock.
++ *
++ * Unlike vma_start_read(), this function does not deal with VMAs that might
++ * get freed and reused in another mm concurrently.
++ *
++ * Context: The caller must make sure that @vma remains part of @vma->vm_mm
++ * and cannot go away.
++ *
++ * Return: true if @vma is read-locked, false otherwise.
++ */
++bool vma_trylock_read(struct vm_area_struct *vma)
++{
++	return !IS_ERR_OR_NULL(__vma_start_read(vma->vm_mm, vma));
++}
++
+ /*
+  * Lookup and lock a VMA under RCU protection. Returned VMA is guaranteed to be
+  * stable and not isolated. If the VMA is not found or is being modified the
+_
