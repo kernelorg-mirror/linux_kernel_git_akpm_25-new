@@ -1,0 +1,97 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: kernfs: report times and link count from the node in getattr
+Date: Wed, 18 Nov 2026 14:01:48 -0800
+
+Patch series "kernfs: stop taking kernfs_iattr_rwsem for writing in
+mkdir/rmdir".
+
+In the Meta fleet, cgroup mkdir and rmdir can stall cgroup operations
+on the whole host.  They hold cgroup_mutex and kernfs_rwsem while they
+wait for kernfs_iattr_rwsem, which every path walk takes for reading,
+and they take it once or twice for every file of the cgroup.  systemd,
+clone3() into a cgroup, BPF queries and the OOM daemon all wait behind
+them.
+
+- Our lock monitor saw a kernfs_rwsem writer blocked on
+  kernfs_iattr_rwsem several thousand times on a large number of hosts
+  in 29 days (in mkdir and rmdir), for up to 1.8 s at a time.
+
+- Under memory and CPU pressure the waits become host-wide stalls.  In
+  one week, we observed several cases where the OOM daemon and the
+  monitoring agent were stuck for up to 22 minutes.  In October, one
+  batch job caused these stalls on a large number of hosts.  On the
+  sampled hosts with current kernels, the cgroup_mutex owner was always
+  waiting for kernfs_iattr_rwsem (in mkdir and rmdir).  One specific
+  stall lasted 90 minutes and ended in a reboot.
+
+The write lock is not needed for most of what it covers:
+
+- kernfs_rwsem already serialises the parent's two counters and
+  KERNFS_REMOVING (patches 3 and 4).
+- The parent's times get a seqlock of their own (patch 5).
+- Only inode setup needs to set a directory's i_nlink, so removal can
+  clear it without the lock (patches 2 and 6).
+
+The lock also kept times and link counts stable while getattr and
+permission copied them into the shared inode.  Patches 1 and 2 make
+getattr report them from the node and stop copying them, so stat()
+cannot return a stale or torn value.
+
+After the series, mkdir and rmdir take no kernfs_iattr_rwsem for
+writing.  Write acquisitions, from lock_stat:
+
+                                          before   after
+  5 dummy netdevs created and removed       1850       0
+  100 cgroup mkdirs and 100 rmdirs          7500       0
+
+Latency in a VM with 8 vCPUs, while 32 threads walk cgroupfs paths
+(worst of three 20 s runs; mkdir and rmdir by a SCHED_FIFO thread):
+
+                         before                  after
+                    p50     p99     max     p50    p99    max
+  cgroup mkdir     2.8ms   9.0ms  20.1ms    25us   37us   84us
+  cgroup rmdir     4.2ms  12.7ms  26.6ms    28us   38us  107us
+
+A write that only needs cgroup_mutex waited up to 23 ms before and up
+to 34 us after.  With 8 threads and no writer, stat() and access() on
+a path whose directories have iattrs are 12-14% faster, since the
+refresh copies less.
+
+Tested with the kernfs selftests on lockdep + KASAN and KCSAN kernels;
+with extra checks of link counts, times and IN_DELETE_SELF; with
+concurrent mkdir/rmdir, setattr, stat, readdir and netdev churn; and
+with test-only delays that force the stale stat(), lost time update,
+backwards time, overwritten setattr and stat()-during-removal races.
+KCSAN reports nothing new, and its set_nlink() reports from the refresh
+are gone.
+
+Based on vfs-7.5.kernfs.  It also applies to v7.4-rc3.
+
+
+This patch (of 6):
+
+getattr and permission copy a node's attributes into its inode while
+holding kernfs_iattr_rwsem for reading, so several of them can write
+the same inode at once.  That is safe only because every update of
+these attributes takes the lock for writing, so they all write the same
+values.  Commit aa1d058d48f2 ("kernfs: dont take i_lock on inode attr
+read") relies on this.  Setting up a node's first iattrs from setxattr
+does not take the lock, but a refresh that misses them writes no times.
+
+The next patches let a directory's times and link count change without
+that lock.  A slow refresh could then write an old value after a newer
+one, and stat() could return a stale or torn time or link count.
+
+Make getattr report the times and link count from the node instead of
+the inode.  Permission checks use neither.  Nothing changes yet, except
+that a stat() racing a node's first setxattr can report the new times.
+
+Link: https://lore.kernel.org/20261118220154.2965621-1-shakeel.butt@linux.dev
+Link: https://patch.msgid.link/20261118220154.2965621-2-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: T.J. Mercier <tjmercier@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>
+Cc: Ian Kent <raven@themaw.net>

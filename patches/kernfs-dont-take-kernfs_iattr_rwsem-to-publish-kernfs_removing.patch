@@ -1,0 +1,79 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: kernfs: don't take kernfs_iattr_rwsem to publish KERNFS_REMOVING
+Date: Wed, 18 Nov 2026 14:01:51 -0800
+
+__kernfs_remove() takes kernfs_iattr_rwsem for writing while it marks
+a subtree KERNFS_REMOVING, inside kernfs_rwsem.  Commit 507d8ce13f5b
+("kernfs: Don't set_nlink for directories being removed") added it so
+that a refresh would not set the i_nlink of a directory whose removal
+has started.  The refresh no longer sets i_nlink, so the lock is not
+needed.
+
+The flag is only set here, under kernfs_rwsem.  Inode setup reads it
+under kernfs_rwsem.  getattr reads it without and reports the old link
+count or 0, either of which is right for a stat() racing the removal.
+
+Drop the lock, mark the store and the load, and read the flags once in
+kernfs_dir_nlink(), as the type bits share the word.
+
+kernfs_iattr_rwsem write acquisitions (lock_stat), before -> after:
+
+  5 dummy netdevs created and removed     1110 ->  740
+  100 cgroup mkdirs and 100 rmdirs        4500 -> 3000
+
+Link: https://patch.msgid.link/20261118220154.2965621-5-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: T.J. Mercier <tjmercier@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>
+Cc: Ian Kent <raven@themaw.net>
+
+ fs/kernfs/dir.c   |   10 ++++++----
+ fs/kernfs/inode.c |    7 +++++--
+ 2 files changed, 11 insertions(+), 6 deletions(-)
+
+--- a/fs/kernfs/dir.c~kernfs-dont-take-kernfs_iattr_rwsem-to-publish-kernfs_removing
++++ a/fs/kernfs/dir.c
+@@ -1553,15 +1553,17 @@ static void __kernfs_remove(struct kernf
+ 
+ 	pr_debug("kernfs %s: removing\n", kernfs_rcu_name(kn));
+ 
+-	/* prevent new usage by marking all nodes removing and deactivating */
+-	down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
++	/*
++	 * Prevent new usage by marking all nodes removing and deactivating.
++	 * KERNFS_REMOVING is only set here, under kernfs_rwsem.
++	 * kernfs_dir_nlink() reads it without that lock.
++	 */
+ 	pos = NULL;
+ 	while ((pos = kernfs_next_descendant_post(pos, kn))) {
+-		pos->flags |= KERNFS_REMOVING;
++		WRITE_ONCE(pos->flags, pos->flags | KERNFS_REMOVING);
+ 		if (kernfs_active(pos))
+ 			atomic_add(KN_DEACTIVATED_BIAS, &pos->active);
+ 	}
+-	up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 
+ 	/* deactivate and unlink the subtree node-by-node */
+ 	do {
+--- a/fs/kernfs/inode.c~kernfs-dont-take-kernfs_iattr_rwsem-to-publish-kernfs_removing
++++ a/fs/kernfs/inode.c
+@@ -165,9 +165,12 @@ static inline void set_inode_attr(struct
+  */
+ static bool kernfs_dir_nlink(struct kernfs_node *kn, unsigned int *nlink)
+ {
+-	if (kernfs_type(kn) != KERNFS_DIR)
++	/* KERNFS_REMOVING can be set concurrently; read the flags once. */
++	unsigned short flags = READ_ONCE(kn->flags);
++
++	if ((flags & KERNFS_TYPE_MASK) != KERNFS_DIR)
+ 		return false;
+-	*nlink = (kn->flags & KERNFS_REMOVING) ? 0 :
++	*nlink = (flags & KERNFS_REMOVING) ? 0 :
+ 		 READ_ONCE(kn->dir.subdirs) + 2;
+ 	return true;
+ }
+_

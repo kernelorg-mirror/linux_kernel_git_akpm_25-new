@@ -2,33 +2,45 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: kernfs: stay in RCU walk during path lookup
 Date: Tue, 24 Nov 2026 22:00:14 -0800
 
-In an emulated four-CPU guest, four processes calling stat() on
-/sys/fs/cgroup/t/a/b/c/d/cgroup.procs went from 179,000 to 405,000 calls
-per second.  access(R_OK) went from 194,000 to 533,000 and open()+close()
-from 122,000 to 219,000.  One process calling stat() went from 65,000 to
-126,000.  Paths under /sys/devices gained about as much, and a tmpfs path
-of the same depth did not change.  The guest was QEMU without KVM, where
-atomic operations are costly, so real hardware will gain less per CPU.
-This has not been measured on real hardware or with more than four CPUs.
+In a 64-CPU KVM guest, 64 processes which each call access() on the
+cgroup.procs file of a different cgroup went from 1.46 million calls per
+second between them to 72.8 million.  With open() and close() they went
+from 1.43 million to 32.4 million, and with stat() from 1.41 million to
+7.66 million.  When all 64 use the same file, access() went from 1.42
+million to 11.8 million and stat() from 1.39 million to 4.85 million.
+Files under /sys/devices gained about as much: stat() on 64 of them went
+from 1.35 million to 6.06 million.  A tmpfs path of the same depth did not
+change.  Without the patch, perf had 86% of the cycles of the access() and
+stat() runs in queued_spin_lock_slowpath().
 
-This helps programs which open or stat many files under /sys or
-/sys/fs/cgroup from many CPUs at once.  Three kinds have been reported.
-Daemons which poll cgroup files: oomd and the "below" monitor at Meta
-[1][2].  Many copies of one application reading sysfs attributes: 200
-processes reading /sys/class/infiniband on a 384-CPU machine at Oracle
-[3].  And very large machines in general: IBM systems, CoreOS users, and
-reports from Brice Goglin and Fox Chen [4].
+Reading a file gains less than looking it up.  64 processes which open an
+attribute under /sys/class/net/lo, read 40 bytes and close it went from
+518,000 to 880,000 reads per second.  64 processes which read the same few
+files of one cgroup to the end, as a daemon polling that cgroup would, did
+not change, and neither did 64 processes opening one file.  Those are
+limited by the file and not by the path to it.  Reading the files of 64
+different cgroups at once has not been measured.
 
-The complaints go back to 2021 [4].  At Oracle a profile of open() had
-49% of its samples under kernfs_iop_permission(), and still had 26% there
-after kernfs_iattr_rwsem was split from kernfs_rwsem to fix that [3].  At
-Meta, oomd and below were stuck in kernfs_dop_revalidate() for minutes
-behind a writer [1].  Cgroup mkdir and rmdir waiting for
-kernfs_iattr_rwsem, which every path walk takes for reading, held up the
-OOM daemon and the monitoring agent for up to 22 minutes, and one stall
-lasted 90 minutes and ended in a reboot [2].  Ian Kent has a report of
-contention in ->d_revalidate() which he could not explain [5].  Minchan
-Kim described a convoy on the rwsem when it was still global [6].
+These figures are from a 64-core host with the guest's CPUs not pinned.
+They were measured without [2], and before the seqcount described below
+was moved to a cacheline of its own.
+
+The contention has been reported since 2021 [4], from IBM systems, from
+CoreOS users, and by Brice Goglin and Fox Chen.  At Oracle, 200 processes
+reading /sys/class/infiniband on a 384-CPU machine had 49% of the samples
+of open() under kernfs_iop_permission(), and still had 26% there after
+kernfs_iattr_rwsem was split from kernfs_rwsem to fix that [3].  Ian Kent
+has a report of contention in ->d_revalidate() which he could not explain
+[5].  Minchan Kim described a convoy on the rwsem when it was still global
+[6].
+
+Meta's reports are of stalls, not of throughput: oomd and the "below"
+monitor stuck for minutes behind a writer in kernfs_dop_revalidate() [1],
+and held up for as long as 22 minutes by cgroup mkdir and rmdir waiting
+for kernfs_iattr_rwsem, which every path walk takes for reading [2].  [1]
+and [2] deal with those.  This patch stops most path walks taking that
+lock, but going by the figures above it will not make polling a cgroup's
+files any faster.
 
 This patch takes kernfs_iattr_rwsem out of the path walk for inodes whose
 mode and owner are current.  It does not change the writers.
@@ -80,15 +92,30 @@ directory of mode 0007 had its owner flipped between 1000:2000 and
 lookup through it.  It was allowed in 77,677 of 722,434 lookups when the
 seqcount was not rechecked, and in none of 700,728 with this patch.
 
+Without the delays, in the 64-CPU guest, 60 seconds of the same test made
+40 million chown() calls and 140 million lookups, and none was allowed.
+
+Every lockless check reads the seqcount, and only setattr (chmod(),
+chown() and the like) writes it.  The locks in struct kernfs_root are
+written all the time: ->getattr() takes kernfs_iattr_rwsem for reading on
+every stat().  When the seqcount shared a cacheline with that rwsem, 32
+processes calling stat() cut the rate of 32 others calling access() by
+85%, from 42.2 million to 6.35 million per second.  With the seqcount
+moved to the next cacheline they cut it by 6.6%, from 42.8 million to
+40.0 million.  So give it a cacheline of its own at the end of the
+struct, which grows from 232 to 320 bytes on x86_64.  There is one of
+these for sysfs and one for each cgroup hierarchy.
+
 ->permission() no longer refreshes the times and link count of the inode
 when it takes the lockless path.  ->getattr() refreshes them before it
 reports them, as before.
 
 Two things are not changed.  kernfs_iop_get_link() still returns -ECHILD
 in RCU walk, so a lookup through a sysfs symlink, such as the entries of
-/sys/class and of /sys/bus/*/devices, leaves RCU walk there.  And
-->getattr() still takes kernfs_iattr_rwsem, so stat() takes it once per
-call where it took it once per directory.
+/sys/class and of /sys/bus/*/devices, leaves RCU walk there.  stat() and
+access() through one gained about 2x.  And ->getattr() still takes
+kernfs_iattr_rwsem, so stat() takes it once per call where it took it once
+per directory.
 
 Earlier work on this:
 
@@ -129,200 +156,173 @@ Cc: Shakeel Butt <shakeel.butt@linux.dev>
 Cc: Ian Kent <raven@themaw.net>
 Cc: Imran Khan <imran.f.khan@oracle.com>
 ---
-Base: mm-new 5bd93e4b0b35 ("kmsan: fix metadata loss during HugeTLB struct
-page reinitialization").  checkpatch --strict complains only about the
-missing Signed-off-by.
+This replaces the version in the queue (sha256 a76004bde0ec...).  Two
+things changed:
 
-What was built and run, all in a cloud workspace with four CPUs and no
-KVM: x86_64 defconfig cut down (no modules, most drivers off, SELinux
-off), gcc 13.3.0, booted in QEMU 8.2.2 with -accel tcg,thread=multi
--smp 4 -m 2G and a busybox initramfs.
+- iattr_seq moved from beside kernfs_iattr_rwsem to the end of struct
+  kernfs_root, cacheline aligned.  Only fs/kernfs/kernfs-internal.h
+  differs from the old diff.
+- The changelog is rewritten around testbot's 64-CPU results.
 
-  A     5bd93e4b0b35
-  B     A plus this patch
-  Bdbg  B with PROVE_LOCKING, KASAN, DEBUG_ATOMIC_SLEEP,
-        DEBUG_OBJECTS_RCU_HEAD and DEBUG_PREEMPT
+Base: mm-new 3d27e49eb905 ("tools/mm: page-types: flush pending idle bitmap
+bits after walking").  Built: fs/kernfs/ with x86_64 defconfig and gcc
+13.3.0, no warnings.  Nothing was booted or run on this version.
 
-Timing.  Thousands of calls per second, median [range], and the change in
-the median.  Each run is 3 seconds.  A has 9 runs of each case from 3
-boots, B has 6 from 2 boots.  A and B boots were interleaved.
+Layout with that config: kernfs_iattr_rwsem at offset 136, the last of the
+other fields ends at 232, iattr_seq is at 256, sizeof is 320.
 
-op  procs files               A                     B
-stat   1 cgroup, 1 file       65.2 [51.5-85.5]   125.7 [103.4-137.4]  +93%
-stat   4 cgroup, 1 file    179.0 [172.5-205.1]   405.2 [343.2-443.1] +126%
-stat   4 cgroup, 4 files   260.8 [247.5-278.3]   546.9 [488.8-569.2] +110%
-stat   4 sysfs, 1 file     230.3 [201.4-243.2]   473.0 [421.7-502.3] +105%
-stat   4 sysfs, 4 files    253.4 [230.9-282.7]   504.6 [422.5-523.2]  +99%
-access 1 cgroup, 1 file       76.3 [68.1-92.9]   140.7 [134.0-154.6]  +84%
-access 4 cgroup, 1 file    193.8 [179.2-209.4]   533.3 [515.0-593.4] +175%
-access 4 cgroup, 4 files   290.8 [266.7-307.4]   679.1 [654.1-718.6] +133%
-access 4 sysfs, 1 file     236.9 [219.3-255.7]   610.0 [575.5-661.9] +157%
-access 4 sysfs, 4 files    265.2 [251.4-280.4]   690.1 [617.9-698.7] +160%
-open   1 cgroup, 1 file       42.9 [39.1-54.5]      70.8 [64.2-72.9]  +65%
-open   4 cgroup, 1 file    122.3 [107.8-142.0]   219.4 [203.0-243.8]  +79%
-open   4 cgroup, 4 files   177.0 [151.4-193.5]   316.8 [283.7-343.8]  +79%
-open   4 sysfs, 1 file     157.8 [148.2-192.2]   266.0 [260.1-270.8]  +69%
-open   4 sysfs, 4 files    189.6 [165.0-202.1]   342.9 [316.6-374.1]  +81%
-control, 6 runs each:
-stat   4 tmpfs, 1 file     735.0 [709.4-826.1]   721.0 [642.8-778.6]   -2%
-access 4 tmpfs, 1 file   1002.7 [854.2-1180.5] 1005.0 [835.9-1196.4]   +0%
-open   4 tmpfs, 1 file     550.2 [480.1-633.1]   575.6 [542.7-610.0]   +5%
+Where the figures in the changelog come from.  All are from testbot's
+report of 26 November, from runs of the old version on mm-new without
+Shakeel Butt's six patches:
 
-The cgroup file is /sys/fs/cgroup/t/a/b/c/d/cgroup.procs, or
-/sys/fs/cgroup/t/p[0-3]/cgroup.procs for "4 files".  The sysfs file is
-/sys/devices/system/cpu/cpu[0-3]/topology/core_id.  The tmpfs file is
-/tmp/t/a/b/c/d/f.
+  lookups, perf profile, chown race  kernfs-rcu-warm-redo-64cpu-20261125-01
+  stat()/access() interference       kernfs-rcu-contention-kcsan-selinux-
+                                     20261126-01
+  sysfs reads, cgroup file reads     kernfs-rcu-workloads-64cpu-20261125-01
+  64 processes opening one file      kernfs-rcu-perf-64cpu-20261125-01
 
-These numbers say that the patch helps and roughly where.  They do not
-say by how much on real hardware.  The emulator makes every atomic
-operation and lock expensive, which is why even one process gains so
-much.  Nothing here shows what happens at 64 CPUs, which is where the
-shared rwsem and the dentry references should hurt most.
-
-Correctness, on A and on B, with the kt program below:
-
-  kt perm   3,000 chmod()/chown() steps, each followed by a lookup as
-            uid 1000 which must see exactly the new permission, with
-            three other processes looking up the same path.  0 wrong on
-            both kernels.
-  kt neg    3,000 rounds of mkdir/rmdir, each followed by a lookup which
-            must see it.  0 wrong on both.
-  kt race   20 seconds of the owner flip which the changelog describes.
-            A: 481,282 chowns, 2,850,611 lookups, none allowed.
-            B: 2,349,046 chowns, 9,732,523 lookups, none allowed.
-
-Bdbg ran perm and neg at a tenth of that size and race for the same 20
-seconds (37,440 chowns, 139,974 lookups), then 30 seconds of kt churn and
-30 seconds of kt mnt (155 mounts).  All results were right and there was
-no lockdep, KASAN, RCU or sleeping-while-atomic report.
-
-The 77,677 and 0 in the changelog are from B with the two test patches
-below (0 of 700,728) and B with only the first of them plus the
-read_seqcount_retry() removed (77,677 of 722,434), 30 seconds each.  A was
-not run with the delay.
+The 77,677 and 0 with the test-only delays are from the old version's own
+notes (four emulated CPUs).  I did not rerun them.  Replace the figures
+with those from the retest below.
 
 Things you should know before merging:
 
-- Not built or run: PREEMPT_RT, KCSAN, 32-bit, any other architecture,
-  SELinux or any other LSM.  The LSM permission hook now runs in RCU walk
-  for kernfs inodes, as it does for other filesystems.
+- The seqcount is not where testbot's experiment had it.  That experiment
+  aligned it in place, which going by the offsets in its report (0xc0 of
+  0x140) leaves kernfs_supers_rwsem, and probably kernfs_rename_lock, on
+  the same cacheline.  Node removal and kernfs_notify() take the first
+  for reading and kernfs path lookups (/proc/PID/cgroup) take the second,
+  so they would write that line.  Testbot's interference test had only
+  stat() callers and could not show it.  I have not seen its patch; this
+  is inferred.  Step 2 below tests the new placement.
 
-- The kfree_rcu() in kernfs_kill_sb() is there by reading, not because a
-  test failed.  I ran Bdbg with that line put back to kfree() for 90
-  seconds of kt mnt (479 mounts) and KASAN reported nothing, so the test
-  does not reach that window.
+- The alignment relies on kmalloc() returning 64-byte aligned memory for
+  a 320-byte object, which the kmalloc-512 cache does.  Where it did not,
+  the cost would be the false sharing again, not a bug.
 
-- Nothing here renames a kernfs node during a lookup.  cgroup2 has no
-  rename and I did not set up a network device to rename.  The rename
-  check in kernfs_dop_revalidate() is not changed, but it has not run in
-  RCU walk under test.
+- Shakeel's "kernfs: stop taking kernfs_iattr_rwsem for writing in
+  mkdir/rmdir" [2] was applied to vfs-7.5.kernfs by Christian on 20
+  November.  As of 25 November it is not in the published branch
+  (ccf2a4692fed) and not in mm-new.  The old version of this patch
+  applies on top of the six with offsets, and fs/kernfs/ builds there.
+  On top of them the changelog paragraph about times and link count is
+  no longer needed, because the refresh stops copying them.
 
-- An earlier version of the patch disabled preemption in the write
-  section.  setattr_copy() calls capable(), which can reach an LSM's
-  audit code and so a sleeping lock on PREEMPT_RT, so I changed it to the
-  raw seqcount operations.  The numbers above are from the final version.
+- The kfree_rcu() in kernfs_kill_sb() is still there by reading.  Testbot
+  ran that path 2,216 times under KASAN without a report, which shows
+  that it runs, not that a walker was ever inside the window.
 
-- struct kernfs_root grows by a seqcount_t and struct kernfs_super_info
-  by an rcu_head.  struct kernfs_node does not change.
+- Testbot ran these on the old version, A against B, with nothing wrong:
+  the permission, negative dentry and chown race tests at full speed,
+  lockdep with KASAN, PREEMPT_RT, a veth rename loop and a Debian boot.
+  Not tested: an SELinux decision on a kernfs path (only the mode bits,
+  with SELinux enforcing), 32-bit, any other architecture, bare metal.
 
-- After the tests I changed the four lockless reads of a kuid_t or
-  kgid_t to read the .val inside it, as ef179363b043 ("kernfs: avoid
-  READ_ONCE() on a kgid_t in kernfs_new_node()") did, because
-  READ_ONCE() of a struct draws a sparse warning on SMP alpha.
-  fs/kernfs/inode.o of B is byte for byte the same before and after, so
-  the results above stand.
+- KCSAN reported races on both kernels in generic VFS code (d_flags,
+  d_inode, i_flags).  None named a field which this patch adds or reads
+  locklessly.  The sets of reports differed between A and B, and testbot
+  does not call either kernel clean.
 
-- This overlaps work in progress.  Shakeel Butt made
-  kernfs_dop_revalidate() lockless in 8c2a5e65a977 (v7.4) and wrote
-  there that lifting the LOOKUP_RCU bail "is left to the series fixing"
-  kernfs_iop_permission().  I found no such series on lore or in
-  linux-next.  His "kernfs: stop taking kernfs_iattr_rwsem for writing
-  in mkdir/rmdir" (6 patches, 18 November, Acked-by Tejun, applied to
-  vfs-7.5.kernfs by Christian on 20 November but not yet in the
-  published branch) changes the same functions.  This patch applies
-  with offsets to vfs-7.5.kernfs at ccf2a4692fed, and on top of those
-  six patches.  That is patch --dry-run only: it was not built or run
-  there.  With his series the paragraph above about times and link
-  count is no longer needed, because the refresh stops copying them.
+- None of the people in the Cc list has seen this.  Shakeel wrote in
+  8c2a5e65a977 that lifting the LOOKUP_RCU bail "is left to the series
+  fixing" kernfs_iop_permission(), so he should see it first.
 
-- I have not read the stay-in-RCU-walk patch which Ian Kent dropped in
-  2021, only his reasons for dropping it in [4].  The upstream commits
-  behind the other references are 7ba0273b2f34 and c7e7c04274b1 [4],
-  393c3714081a [6], 1d25b84e444a [7], aa1d058d48f2 [8], 9caf69614225
-  [3], 4207b556e62f [9], 741c10b096bc and 633488947ef6 [10],
-  8c2a5e65a977 [1] and 4424f06120fd [11].
-
-- kernfs patches have lately gone in through Christian's vfs tree as
-  well as through driver-core.  None of the people in the Cc list has
-  seen this.  get_maintainer.pl gives only Greg and Tejun; I added the
-  other four from the history.
+- The history and the references [1] to [11] are carried over unchanged
+  from the old version.  Of those I have read only [2].
 
 FOR THE TESTING CHAT
 
 Work in steps and look at each result before starting the next.  Do not
 leave a list of runs going unattended.
 
-Kernels: A is mm-new 5bd93e4b0b35.  B is A plus this patch.  Same config
-and compiler for both.  Build a timing pair with no debug options and a
-debug pair with PROVE_LOCKING, KASAN and DEBUG_ATOMIC_SLEEP.  If there is
-time, also build B with PREEMPT_RT and B with KCSAN.
+Kernels:
 
-Where: real hardware or a KVM guest, with as many CPUs as you can get,
-16 or more.  The workspace above could only emulate four.
+  A   mm-new 3d27e49eb905 plus Shakeel Butt's six kernfs patches:
+        b4 am 20261118220154.2965621-1-shakeel.butt@linux.dev
+      then git am the result.  It applies cleanly.
+  B   A plus this patch (it applies with offsets).
 
-Setup, as root, with cgroup2 on /sys/fs/cgroup and N the number of CPUs:
+  timing pair: no LOCK_STAT, LOCKDEP, PROVE_LOCKING, KASAN or KCSAN.
+               Check that CONFIG_LOCKDEP is not set before timing.
+  debug pair:  PROVE_LOCKING, PROVE_RCU, KASAN, DEBUG_ATOMIC_SLEEP.
 
-  gcc -O2 -static -o kt kt.c
-  mkdir -p /sys/fs/cgroup/t/a/b/c/d /sys/fs/cgroup/work /m
-  for i in $(seq 0 $((N-1))); do mkdir -p /sys/fs/cgroup/t/p$i; done
-  mkdir -p /tmp/t/a/b/c/d; echo 1 > /tmp/t/a/b/c/d/f    (/tmp on tmpfs)
+Guest: 64 CPUs, KVM, as before.  No memory limits, no swap, no probes
+while timing.
 
-uids 1000 and 2000 do not have to exist.  /sys/fs/cgroup/work must not be
-in use by anything else: the tests chmod and chown it.
+Setup, as root, cgroup2 on /sys/fs/cgroup, /tmp on tmpfs:
 
-1. Timing, on the timing pair, A then B then A then B.  For OP in stat,
-   access and open:
+  gcc -O2 -static -o kt kt.c                 (kt.c is below, unchanged)
+  mkdir -p /sys/fs/cgroup/t/a/b/c/d /sys/fs/cgroup/work /sys/fs/cgroup/v
+  for i in $(seq 0 63); do mkdir -p /sys/fs/cgroup/t/p$i; done
+  for i in $(seq 0 31); do mkdir -p /sys/fs/cgroup/u/q$i; done
+  mkdir -p /tmp/t/a/b/c/d; echo 1 > /tmp/t/a/b/c/d/f
 
-     kt perf OP 1 3 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs
-     kt perf OP N 3 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs
-     kt perf OP N 3 /sys/fs/cgroup/t/p*/cgroup.procs
-     kt perf OP N 3 /sys/devices/system/cpu/cpu0/topology/core_id
-     kt perf OP N 3 /tmp/t/a/b/c/d/f          (control)
+Path sets:
 
-   Run each three times per boot and report median and range.  Expect B
-   to be faster than A on the kernfs paths, most of all with N processes,
-   and the tmpfs control to be the same on A and B.  Flag any kernfs case
-   where B is slower than A by more than the run-to-run range, and flag
-   the control if it differs by more than that range, because then the
-   other numbers cannot be trusted.
+  C1  /sys/fs/cgroup/t/a/b/c/d/cgroup.procs
+  CN  /sys/fs/cgroup/t/p*/cgroup.procs                 (64 paths)
+  S1  /sys/devices/system/cpu/cpu0/topology/core_id
+  SN  /sys/devices/system/cpu/cpu*/topology/core_id    (64 paths)
+  T1  /tmp/t/a/b/c/d/f                                 (control)
+  UN  /sys/fs/cgroup/u/q*/cgroup.procs                 (32 paths)
 
-2. Correctness, on both kernels of both pairs:
+1. Throughput, timing pair.  These figures go into the changelog.
+
+     for OP in access, open, stat; NPROC in 1, 64;
+     PATHS in C1, CN, S1, SN, T1:
+         kt perf OP NPROC 5 PATHS
+
+   Three runs of each per boot, two boots per kernel, order A B A B.
+   Report ops/s as median [min-max] for A and B and the change.
+   Expect B well above A on the kernfs rows at 64 processes, except
+   open on C1 and S1, and T1 the same on both.
+   Flag any kernfs row where B is below A by more than the run-to-run
+   range.  Flag T1 if A and B differ by more than its range.
+
+2. Interference, timing pair, B and then A.  Three 5-second runs each of
+
+     a)  kt perf access 32 5 CN
+     b)  a) while "kt perf stat 32 20 UN" runs in the background
+     c)  a) while four shell loops each mkdir and rmdir their own
+         directory under /sys/fs/cgroup/v
+     d)  a) while eight shell loops each read /proc/self/cgroup
+
+   Start the background load two seconds before a).  Report the access
+   ops/s of each, and for c) and d) how many loop iterations ran.
+   Expect on B: b), c) and d) each within 10% of a).
+   Flag on B anything more than 20% below a), and report A's figures
+   beside it whatever they are.
+
+3. File reads from different cgroups, timing pair.  The earlier cgroup
+   read mixes had every worker read the same files in one directory.
+   Rerun the below-like full-to-EOF mix from kernfs-rcu-workloads-64cpu
+   with 64 workers, each reading the files of its own cgroup
+   (/sys/fs/cgroup/t/p0 to p63), and once more with the shared directory
+   as before.  Report A and B for both.  This is a measurement, with no
+   expected result; say what limits it if perf can tell.
+
+4. Correctness, both pairs, A and B, nothing else running:
 
      kt perm /sys/fs/cgroup/work 300      expect "0 wrong"
      kt neg  /sys/fs/cgroup/work 3000     expect "0 wrong"
-     kt race /sys/fs/cgroup/work 20       expect "0 ALLOWED, 0 other"
+     kt race /sys/fs/cgroup/work 60       expect "0 ALLOWED, 0 other"
 
-   Flag anything else, on either kernel, and say which.  A failure on A
-   as well as B is not caused by the patch.
+   then on the debug pair
 
-3. On the debug pair, and on the PREEMPT_RT and KCSAN kernels if built:
+     kt churn /sys/fs/cgroup/work 60
+     kt mnt /m 60                         (mkdir /m first)
 
-     kt churn /sys/fs/cgroup/work 30
-     kt mnt /m 30
+   and read dmesg.  Report the chown and lookup counts of kt race.
+   Flag any other result and say on which kernel.  Flag any lockdep,
+   KASAN, RCU or "sleeping function called from invalid context" report
+   which A does not also give.
 
-   then look at dmesg.  Flag any lockdep, KASAN, KCSAN, RCU or "sleeping
-   function called from invalid context" report which A does not also
-   give.
+5. The veth rename loop from the warm-redo case, 60 seconds on the
+   timing pair and on the debug pair.  Every stat must succeed or fail
+   with ENOENT.
 
-4. Things the workspace could not do, worth trying on B with A as the
-   control:
-
-   - Rename a network device back and forth (ip link set dev X name Y)
-     while other processes stat /sys/devices/virtual/net/X/mtu and
-     .../Y/mtu.  Every stat must succeed or fail with ENOENT.
-   - Boot with SELinux enforcing and repeat step 2.
-   - Boot a normal distribution on B and look for anything in the boot
-     log or in udev and systemd which A does not show.
+Not wanted this time: reclaim, KCSAN, SELinux, PREEMPT_RT, distro boot.
+The code those exercised is unchanged; only a struct field moved.
 
 The test program, kt.c:
 
@@ -806,13 +806,13 @@ of the seqcount, to show that the race test can fail:
 
  fs/kernfs/dir.c             |   15 +++--
  fs/kernfs/inode.c           |   99 ++++++++++++++++++++++++++++++----
- fs/kernfs/kernfs-internal.h |    9 +++
+ fs/kernfs/kernfs-internal.h |   13 ++++
  fs/kernfs/mount.c           |    5 +
- 4 files changed, 111 insertions(+), 17 deletions(-)
+ 4 files changed, 115 insertions(+), 17 deletions(-)
 
 --- a/fs/kernfs/dir.c~kernfs-stay-in-rcu-walk-during-path-lookup
 +++ a/fs/kernfs/dir.c
-@@ -1041,6 +1041,7 @@ struct kernfs_root *kernfs_create_root(s
+@@ -1031,6 +1031,7 @@ struct kernfs_root *kernfs_create_root(s
  	spin_lock_init(&root->kernfs_idr_lock);
  	init_rwsem(&root->kernfs_rwsem);
  	init_rwsem(&root->kernfs_iattr_rwsem);
@@ -820,7 +820,7 @@ of the seqcount, to show that the race test can fail:
  	init_rwsem(&root->kernfs_supers_rwsem);
  	INIT_LIST_HEAD(&root->supers);
  	rwlock_init(&root->kernfs_rename_lock);
-@@ -1185,14 +1186,20 @@ static int kernfs_dop_revalidate(struct
+@@ -1175,14 +1176,20 @@ static int kernfs_dop_revalidate(struct
  				 struct dentry *dentry, unsigned int flags)
  {
  	struct kernfs_node *parent = dir->i_private;
@@ -844,7 +844,7 @@ of the seqcount, to show that the race test can fail:
  		/*
  		 * If the kernfs parent node has changed discard and proceed to
  		 * ->lookup.
-@@ -1206,7 +1213,7 @@ static int kernfs_dop_revalidate(struct
+@@ -1196,7 +1203,7 @@ static int kernfs_dop_revalidate(struct
  		return !kernfs_dir_changed(parent, dentry);
  	}
  
@@ -855,7 +855,7 @@ of the seqcount, to show that the race test can fail:
  
 --- a/fs/kernfs/inode.c~kernfs-stay-in-rcu-walk-during-path-lookup
 +++ a/fs/kernfs/inode.c
-@@ -65,6 +65,26 @@ static struct kernfs_iattrs *kernfs_iatt
+@@ -93,6 +93,26 @@ static struct kernfs_iattrs *kernfs_iatt
  	return __kernfs_iattrs(kn, false);
  }
  
@@ -882,7 +882,7 @@ of the seqcount, to show that the race test can fail:
  int __kernfs_setattr(struct kernfs_node *kn, const struct iattr *iattr)
  {
  	struct kernfs_iattrs *attrs;
-@@ -102,7 +122,9 @@ int kernfs_setattr(struct kernfs_node *k
+@@ -134,7 +154,9 @@ int kernfs_setattr(struct kernfs_node *k
  	struct kernfs_root *root = kernfs_root(kn);
  
  	down_write(&root->kernfs_iattr_rwsem);
@@ -892,7 +892,7 @@ of the seqcount, to show that the race test can fail:
  	up_write(&root->kernfs_iattr_rwsem);
  	return ret;
  }
-@@ -124,12 +146,12 @@ int kernfs_iop_setattr(const struct mnt_
+@@ -156,12 +178,12 @@ int kernfs_iop_setattr(const struct mnt_
  	if (error)
  		goto out;
  
@@ -909,7 +909,7 @@ of the seqcount, to show that the race test can fail:
  
  out:
  	up_write(&root->kernfs_iattr_rwsem);
-@@ -270,18 +292,73 @@ void kernfs_evict_inode(struct inode *in
+@@ -359,18 +381,73 @@ void kernfs_evict_inode(struct inode *in
  	kernfs_put(kn);
  }
  
@@ -992,20 +992,24 @@ of the seqcount, to show that the race test can fail:
  	kernfs_refresh_inode(kn, inode);
 --- a/fs/kernfs/kernfs-internal.h~kernfs-stay-in-rcu-walk-during-path-lookup
 +++ a/fs/kernfs/kernfs-internal.h
-@@ -48,6 +48,12 @@ struct kernfs_root {
- 	wait_queue_head_t	deactivate_waitq;
- 	struct rw_semaphore	kernfs_rwsem;
- 	struct rw_semaphore	kernfs_iattr_rwsem;
+@@ -57,6 +57,16 @@ struct kernfs_root {
+ 	struct rcu_head		rcu;
+ 
+ 	struct simple_xattr_cache xa_cache;
++
 +	/*
 +	 * Odd while the mode or owner of a node and of its inode are being
-+	 * changed.  Written under kernfs_iattr_rwsem.  It lets
-+	 * kernfs_iop_permission() check them without that lock.
++	 * changed.  Written under kernfs_iattr_rwsem, by setattr only.  It
++	 * lets kernfs_iop_permission() check them without that lock.
++	 *
++	 * Every path walk reads this and the locks above are written all the
++	 * time, so it has a cacheline to itself.  Keep it last.
 +	 */
-+	seqcount_t		iattr_seq;
- 	struct rw_semaphore	kernfs_supers_rwsem;
++	seqcount_t		iattr_seq ____cacheline_aligned_in_smp;
+ };
  
- 	/* kn->parent and kn->name */
-@@ -102,6 +108,9 @@ struct kernfs_super_info {
+ /* +1 to avoid triggering overflow warning when negating it */
+@@ -103,6 +113,9 @@ struct kernfs_super_info {
  
  	/* anchored at kernfs_root->supers, protected by kernfs_rwsem */
  	struct list_head	node;

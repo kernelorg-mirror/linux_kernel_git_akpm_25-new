@@ -1,0 +1,244 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: kernfs: update a directory's times without kernfs_iattr_rwsem
+Date: Wed, 18 Nov 2026 14:01:52 -0800
+
+kernfs_add_one() and __kernfs_remove() update the parent's ctime and
+mtime under kernfs_iattr_rwsem for writing, inside kernfs_rwsem.  This
+is where cgroup mkdirs block on Meta fleet: the writer waits for every
+path walk's permission check while it holds kernfs_rwsem and
+cgroup_mutex.
+
+The lock keeps the times stable for getattr, now their only reader, and
+a timespec64 is too wide for a single store.  Give the three times a
+seqlock instead.  setattr takes it in addition to kernfs_iattr_rwsem,
+adding or removing an entry takes only the seqlock, and getattr retries
+if a write was in progress.  Adding or removing an entry reads the clock
+with the seqlock held, so updates store their times in the order they
+happen.  A racing stat() can see the new link count with the old times,
+or the reverse.
+
+A directory without iattrs still skips the update.  So that an update
+racing with setting up the iattrs is not lost, take the seqlock of new
+iattrs before publishing them and set their times after.  An update
+that found no iattrs ran before the times were set, and a writer that
+finds the new iattrs waits for them. mkdir no longer takes
+kernfs_iattr_rwsem for writing.
+
+kernfs_iattr_rwsem write acquisitions (lock_stat), before -> after:
+
+  5 dummy netdevs created and removed      740 ->  370
+  100 cgroup mkdirs and 100 rmdirs        3000 -> 1500
+
+Link: https://patch.msgid.link/20261118220154.2965621-6-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: T.J. Mercier <tjmercier@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>
+Cc: Ian Kent <raven@themaw.net>
+
+ fs/kernfs/dir.c             |   26 +---------
+ fs/kernfs/inode.c           |   85 +++++++++++++++++++++++++++-------
+ fs/kernfs/kernfs-internal.h |    2 
+ 3 files changed, 75 insertions(+), 38 deletions(-)
+
+--- a/fs/kernfs/dir.c~kernfs-update-a-directorys-times-without-kernfs_iattr_rwsem
++++ a/fs/kernfs/dir.c
+@@ -825,7 +825,6 @@ err_unlock:
+ int kernfs_add_one(struct kernfs_node *kn)
+ {
+ 	struct kernfs_root *root = kernfs_root(kn);
+-	struct kernfs_iattrs *ps_iattr;
+ 	struct kernfs_node *parent;
+ 	bool has_ns;
+ 	int ret;
+@@ -853,16 +852,7 @@ int kernfs_add_one(struct kernfs_node *k
+ 	if (ret)
+ 		goto out_unlock;
+ 
+-	/* Update timestamps on the parent */
+-	down_write(&root->kernfs_iattr_rwsem);
+-
+-	ps_iattr = parent->iattr;
+-	if (ps_iattr) {
+-		ktime_get_real_ts64(&ps_iattr->ia_ctime);
+-		ps_iattr->ia_mtime = ps_iattr->ia_ctime;
+-	}
+-
+-	up_write(&root->kernfs_iattr_rwsem);
++	kernfs_dir_update_times(parent);
+ 
+ 	/*
+ 	 * Activate the new node unless CREATE_DEACTIVATED is requested.
+@@ -1584,20 +1574,12 @@ static void __kernfs_remove(struct kernf
+ 		 * to decide who's responsible for cleanups.
+ 		 */
+ 		if (!parent || kernfs_unlink_sibling(pos)) {
+-			struct kernfs_iattrs *ps_iattr =
+-				parent ? parent->iattr : NULL;
+-
+ 			down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+-
+ 			kernfs_clear_inode_nlink(pos);
+-
+-			/* update timestamps on the parent */
+-			if (ps_iattr) {
+-				ktime_get_real_ts64(&ps_iattr->ia_ctime);
+-				ps_iattr->ia_mtime = ps_iattr->ia_ctime;
+-			}
+-
+ 			up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
++
++			if (parent)
++				kernfs_dir_update_times(parent);
+ 			kernfs_put(pos);
+ 		}
+ 
+--- a/fs/kernfs/inode.c~kernfs-update-a-directorys-times-without-kernfs_iattr_rwsem
++++ a/fs/kernfs/inode.c
+@@ -24,6 +24,22 @@ static const struct inode_operations ker
+ 	.listxattr	= kernfs_iop_listxattr,
+ };
+ 
++/* Copy the times of @attrs.  Writers hold ia_time_lock. */
++static void kernfs_iattrs_get_times(struct kernfs_iattrs *attrs,
++				    struct timespec64 *atime,
++				    struct timespec64 *mtime,
++				    struct timespec64 *ctime)
++{
++	unsigned int seq;
++
++	do {
++		seq = read_seqbegin(&attrs->ia_time_lock);
++		*atime = attrs->ia_atime;
++		*mtime = attrs->ia_mtime;
++		*ctime = attrs->ia_ctime;
++	} while (read_seqretry(&attrs->ia_time_lock, seq));
++}
++
+ static struct kernfs_iattrs *__kernfs_iattrs(struct kernfs_node *kn, bool alloc)
+ {
+ 	struct kernfs_iattrs *ret __free(kfree) = NULL;
+@@ -41,16 +57,28 @@ static struct kernfs_iattrs *__kernfs_ia
+ 	/* assign default attributes */
+ 	ret->ia_uid = GLOBAL_ROOT_UID;
+ 	ret->ia_gid = GLOBAL_ROOT_GID;
+-
+-	ktime_get_real_ts64(&ret->ia_atime);
+-	ret->ia_mtime = ret->ia_atime;
+-	ret->ia_ctime = ret->ia_atime;
++	seqlock_init(&ret->ia_time_lock);
+ 
+ 	simple_xattr_limits_init(&ret->xattr_limits);
+ 
++	/*
++	 * Publish with ia_time_lock held and set the times after.  An entry
++	 * added or removed while @kn had no iattrs is then covered, and a
++	 * writer that finds the new iattrs waits instead of being
++	 * overwritten.
++	 */
++	write_seqlock(&ret->ia_time_lock);
++
+ 	/* If someone raced us, recognize it. */
+-	if (!try_cmpxchg(&kn->iattr, &attr, ret))
++	if (!try_cmpxchg(&kn->iattr, &attr, ret)) {
++		write_sequnlock(&ret->ia_time_lock);
+ 		return READ_ONCE(kn->iattr);
++	}
++
++	ktime_get_real_ts64(&ret->ia_atime);
++	ret->ia_mtime = ret->ia_atime;
++	ret->ia_ctime = ret->ia_atime;
++	write_sequnlock(&ret->ia_time_lock);
+ 
+ 	return no_free_ptr(ret);
+ }
+@@ -78,12 +106,16 @@ int __kernfs_setattr(struct kernfs_node
+ 		attrs->ia_uid = iattr->ia_uid;
+ 	if (ia_valid & ATTR_GID)
+ 		attrs->ia_gid = iattr->ia_gid;
+-	if (ia_valid & ATTR_ATIME)
+-		attrs->ia_atime = iattr->ia_atime;
+-	if (ia_valid & ATTR_MTIME)
+-		attrs->ia_mtime = iattr->ia_mtime;
+-	if (ia_valid & ATTR_CTIME)
+-		attrs->ia_ctime = iattr->ia_ctime;
++	if (ia_valid & (ATTR_ATIME | ATTR_MTIME | ATTR_CTIME)) {
++		write_seqlock(&attrs->ia_time_lock);
++		if (ia_valid & ATTR_ATIME)
++			attrs->ia_atime = iattr->ia_atime;
++		if (ia_valid & ATTR_MTIME)
++			attrs->ia_mtime = iattr->ia_mtime;
++		if (ia_valid & ATTR_CTIME)
++			attrs->ia_ctime = iattr->ia_ctime;
++		write_sequnlock(&attrs->ia_time_lock);
++	}
+ 	if (ia_valid & ATTR_MODE)
+ 		kn->mode = iattr->ia_mode;
+ 	return 0;
+@@ -159,6 +191,29 @@ static inline void set_inode_attr(struct
+ 	inode->i_gid = attrs->ia_gid;
+ }
+ 
++/**
++ * kernfs_dir_update_times - set a directory's ctime and mtime to now
++ * @kn: the directory, kept alive by the caller
++ *
++ * Call after adding or removing an entry, with kernfs_rwsem held for
++ * writing.  Does nothing if @kn has no iattrs yet.
++ */
++void kernfs_dir_update_times(struct kernfs_node *kn)
++{
++	struct kernfs_iattrs *attrs = kernfs_iattrs_noalloc(kn);
++
++	lockdep_assert_held_write(&kernfs_root(kn)->kernfs_rwsem);
++
++	if (!attrs)
++		return;
++
++	/* Read the clock under the lock, so updates store times in order. */
++	write_seqlock(&attrs->ia_time_lock);
++	ktime_get_real_ts64(&attrs->ia_ctime);
++	attrs->ia_mtime = attrs->ia_ctime;
++	write_sequnlock(&attrs->ia_time_lock);
++}
++
+ /*
+  * Get a directory's link count: its subdirectories plus two, or 0 once
+  * its removal has started.  Return false for other nodes.
+@@ -208,11 +263,9 @@ int kernfs_iop_getattr(const struct mnt_
+ 	 * Report them from the node.
+ 	 */
+ 	attrs = kernfs_iattrs_noalloc(kn);
+-	if (attrs) {
+-		stat->atime = attrs->ia_atime;
+-		stat->mtime = attrs->ia_mtime;
+-		stat->ctime = attrs->ia_ctime;
+-	}
++	if (attrs)
++		kernfs_iattrs_get_times(attrs, &stat->atime, &stat->mtime,
++					&stat->ctime);
+ 	if (kernfs_dir_nlink(kn, &nlink))
+ 		stat->nlink = nlink;
+ 	up_read(&root->kernfs_iattr_rwsem);
+--- a/fs/kernfs/kernfs-internal.h~kernfs-update-a-directorys-times-without-kernfs_iattr_rwsem
++++ a/fs/kernfs/kernfs-internal.h
+@@ -25,6 +25,7 @@ struct kernfs_iattrs {
+ 	struct timespec64	ia_atime;
+ 	struct timespec64	ia_mtime;
+ 	struct timespec64	ia_ctime;
++	seqlock_t		ia_time_lock;	/* protects the times above */
+ 
+ 	struct list_head	xattrs;
+ 	struct simple_xattr_limits xattr_limits;
+@@ -186,6 +187,7 @@ int kernfs_iop_getattr(const struct mnt_
+ 		       u32 request_mask, unsigned int query_flags);
+ ssize_t kernfs_iop_listxattr(struct dentry *dentry, char *buf, size_t size);
+ int __kernfs_setattr(struct kernfs_node *kn, const struct iattr *iattr);
++void kernfs_dir_update_times(struct kernfs_node *kn);
+ 
+ /*
+  * dir.c
+_

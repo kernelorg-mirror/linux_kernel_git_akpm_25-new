@@ -1,0 +1,96 @@
+From: Shakeel Butt <shakeel.butt@linux.dev>
+Subject: kernfs: don't take kernfs_iattr_rwsem for the directory counters
+Date: Wed, 18 Nov 2026 14:01:50 -0800
+
+kernfs_link_sibling() and kernfs_unlink_sibling() take
+kernfs_iattr_rwsem for writing to update the parent's dir.subdirs and
+dir.rev.  Every permission check and getattr takes the lock for
+reading, so under load the writer waits, while it holds kernfs_rwsem
+and, for cgroups, cgroup_mutex.
+
+Both writers hold kernfs_rwsem for writing, which is enough.  Commit
+0559f63057f9 ("kernfs: fix missing kernfs_iattr_rwsem locking") added
+the lock to keep the link count stable for getattr, which now reads it
+from the node; the refresh no longer copies it.  The other readers,
+kernfs_dir_changed(), kernfs_set_rev(), kobject_has_children() and
+resctrl, never took the lock.  A racing stat() sees the old or the new
+link count.  While a subdirectory is renamed within the directory, it
+can also see one less, as it could before.
+
+Drop the lock, mark the accesses, and assert that kernfs_rwsem is held.
+
+kernfs_iattr_rwsem write acquisitions (lock_stat), before -> after:
+
+  5 dummy netdevs created and removed     1850 -> 1110
+  100 cgroup mkdirs and 100 rmdirs        7500 -> 4500
+
+Link: https://patch.msgid.link/20261118220154.2965621-4-shakeel.butt@linux.dev
+Signed-off-by: Shakeel Butt <shakeel.butt@linux.dev>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Acked-by: Tejun Heo <tj@kernel.org>
+Reviewed-by: T.J. Mercier <tjmercier@google.com>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jori Koolstra <jkoolstra@xs4all.nl>
+Cc: Ian Kent <raven@themaw.net>
+
+ fs/kernfs/dir.c   |   12 ++++++------
+ fs/kernfs/inode.c |    3 ++-
+ 2 files changed, 8 insertions(+), 7 deletions(-)
+
+--- a/fs/kernfs/dir.c~kernfs-dont-take-kernfs_iattr_rwsem-for-the-directory-counters
++++ a/fs/kernfs/dir.c
+@@ -387,6 +387,8 @@ static int kernfs_link_sibling(struct ke
+ 	struct kernfs_node *kn_parent;
+ 	struct rb_node **node;
+ 
++	lockdep_assert_held_write(&kernfs_root(kn)->kernfs_rwsem);
++
+ 	kn_parent = kernfs_parent(kn);
+ 	node = &kn_parent->dir.children.rb_node;
+ 
+@@ -410,11 +412,9 @@ static int kernfs_link_sibling(struct ke
+ 	rb_insert_color(&kn->rb, &kn_parent->dir.children);
+ 
+ 	/* successfully added, account subdir number */
+-	down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 	if (kernfs_type(kn) == KERNFS_DIR)
+-		kn_parent->dir.subdirs++;
++		WRITE_ONCE(kn_parent->dir.subdirs, kn_parent->dir.subdirs + 1);
+ 	kernfs_inc_rev(kn_parent);
+-	up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 
+ 	return 0;
+ }
+@@ -436,15 +436,15 @@ static bool kernfs_unlink_sibling(struct
+ {
+ 	struct kernfs_node *kn_parent;
+ 
++	lockdep_assert_held_write(&kernfs_root(kn)->kernfs_rwsem);
++
+ 	if (RB_EMPTY_NODE(&kn->rb))
+ 		return false;
+ 
+ 	kn_parent = kernfs_parent(kn);
+-	down_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 	if (kernfs_type(kn) == KERNFS_DIR)
+-		kn_parent->dir.subdirs--;
++		WRITE_ONCE(kn_parent->dir.subdirs, kn_parent->dir.subdirs - 1);
+ 	kernfs_inc_rev(kn_parent);
+-	up_write(&kernfs_root(kn)->kernfs_iattr_rwsem);
+ 
+ 	rb_erase(&kn->rb, &kn_parent->dir.children);
+ 	RB_CLEAR_NODE(&kn->rb);
+--- a/fs/kernfs/inode.c~kernfs-dont-take-kernfs_iattr_rwsem-for-the-directory-counters
++++ a/fs/kernfs/inode.c
+@@ -167,7 +167,8 @@ static bool kernfs_dir_nlink(struct kern
+ {
+ 	if (kernfs_type(kn) != KERNFS_DIR)
+ 		return false;
+-	*nlink = (kn->flags & KERNFS_REMOVING) ? 0 : kn->dir.subdirs + 2;
++	*nlink = (kn->flags & KERNFS_REMOVING) ? 0 :
++		 READ_ONCE(kn->dir.subdirs) + 2;
+ 	return true;
+ }
+ 
+_
