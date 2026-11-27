@@ -1,0 +1,173 @@
+From: Andrew Morton <akpm@linux-foundation.org>
+Subject: kernfs: make ->getattr() lockless
+Date: Fri, 27 Nov 2026 15:40:00 -0800
+
+stat() on a kernfs file no longer takes a lock in the path walk, but
+kernfs_iop_getattr() still takes kernfs_iattr_rwsem for reading on every
+call.  All it needs the lock for is to refresh the mode and owner in the
+inode before generic_fillattr() copies them out.  The times and the link
+count are read from the node and need no lock.
+
+So do what kernfs_iop_permission() now does: inside a read section of
+root->iattr_seq, check that the inode's mode and owner are those of the
+node, and if they are, fill in the kstat without the lock.  If a setattr
+is running, or started meanwhile, or the inode is stale, take the lock and
+refresh as before.
+
+The comparison moves into kernfs_inode_current() so that both callers
+use it.
+
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+---
+On top of kernfs-path-lookup-scalability-improvements.patch (your copy
+with the kernfs_free_rcu() comment moved), which is on mm-new
+3d27e49eb905 plus Shakeel's six.
+
+Compile-tested only: fs/kernfs/ builds with x86_64 defconfig, no
+warnings.  Nothing was run.  The changelog has no figures because there
+are none yet.
+
+For a quick test, A = the queue with the path lookup patch, B = A plus
+this:
+
+  kt perf stat 64 5 /sys/fs/cgroup/t/p*/cgroup.procs        (was 17.6M/s)
+  kt perf stat 64 5 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs   (was 8.65M/s)
+  kt perf stat 1  5 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs
+  kt perf access 64 5 /sys/fs/cgroup/t/p*/cgroup.procs      (control)
+
+and the convoy test, case d (the monitor calls stat() before open()),
+which stalled for up to 556 ms.  It should now behave like case c.
+
+Before this is believed, the chown race needs a stat() in it: a reader
+calling stat() on the mode-0007 directory while its owner flips must
+never see uid 1000 with gid 1000.  kt race does not do that today.
+
+generic_fillattr() also reads i_ino, i_rdev, i_size, i_blocks and
+i_nlink from the inode.  kernfs does not change the first four after
+the inode is set up, and the link count is overwritten from the node
+for directories, as before.  I checked that by reading, not by test.
+
+ fs/kernfs/inode.c |   82 ++++++++++++++++++++++++++++++--------------
+ 1 file changed, 56 insertions(+), 26 deletions(-)
+
+--- a/fs/kernfs/inode.c~kernfs-make-getattr-lockless
++++ a/fs/kernfs/inode.c
+@@ -278,6 +278,45 @@ static void kernfs_refresh_inode(struct
+ 		set_inode_attr(inode, attrs);
+ }
+ 
++/*
++ * Are the mode and owner in @inode the same as those in @kn?  Only
++ * meaningful inside a read section of root->iattr_seq: see
++ * kernfs_permission_lockless().
++ */
++static bool kernfs_inode_current(struct kernfs_node *kn, struct inode *inode)
++{
++	struct kernfs_iattrs *attrs;
++	kuid_t uid = GLOBAL_ROOT_UID;
++	kgid_t gid = GLOBAL_ROOT_GID;
++
++	/* A node without attrs is owned by root, and so is its inode. */
++	attrs = READ_ONCE(kn->iattr);
++	if (attrs) {
++		uid = KUIDT_INIT(READ_ONCE(attrs->ia_uid.val));
++		gid = KGIDT_INIT(READ_ONCE(attrs->ia_gid.val));
++	}
++
++	return READ_ONCE(inode->i_mode) == READ_ONCE(kn->mode) &&
++	       READ_ONCE(inode->i_uid.val) == __kuid_val(uid) &&
++	       READ_ONCE(inode->i_gid.val) == __kgid_val(gid);
++}
++
++/*
++ * The inode's times and link count are not kept up to date.  Report them
++ * from the node.  Neither needs kernfs_iattr_rwsem.
++ */
++static void kernfs_stat_from_node(struct kernfs_node *kn, struct kstat *stat)
++{
++	struct kernfs_iattrs *attrs = kernfs_iattrs_noalloc(kn);
++	unsigned int nlink;
++
++	if (attrs)
++		kernfs_iattrs_get_times(attrs, &stat->atime, &stat->mtime,
++					&stat->ctime);
++	if (kernfs_dir_nlink(kn, &nlink))
++		stat->nlink = nlink;
++}
++
+ int kernfs_iop_getattr(const struct mnt_idmap *idmap,
+ 		       const struct path *path, struct kstat *stat,
+ 		       u32 request_mask, unsigned int query_flags)
+@@ -285,23 +324,26 @@ int kernfs_iop_getattr(const struct mnt_
+ 	struct inode *inode = d_inode(path->dentry);
+ 	struct kernfs_node *kn = inode->i_private;
+ 	struct kernfs_root *root = kernfs_root(kn);
+-	struct kernfs_iattrs *attrs;
+-	unsigned int nlink;
++	unsigned int seq;
++
++	/*
++	 * As in kernfs_permission_lockless(): if no setattr is running and
++	 * the mode and owner in the inode are current, there is nothing to
++	 * refresh and the lock is not needed.  If a setattr started
++	 * meanwhile, do it again under the lock.
++	 */
++	seq = raw_read_seqcount(&root->iattr_seq);
++	if (!(seq & 1) && kernfs_inode_current(kn, inode)) {
++		generic_fillattr(&nop_mnt_idmap, request_mask, inode, stat);
++		kernfs_stat_from_node(kn, stat);
++		if (!read_seqcount_retry(&root->iattr_seq, seq))
++			return 0;
++	}
+ 
+ 	down_read(&root->kernfs_iattr_rwsem);
+ 	kernfs_refresh_inode(kn, inode);
+ 	generic_fillattr(&nop_mnt_idmap, request_mask, inode, stat);
+-
+-	/*
+-	 * The inode's times and link count are not kept up to date.
+-	 * Report them from the node.
+-	 */
+-	attrs = kernfs_iattrs_noalloc(kn);
+-	if (attrs)
+-		kernfs_iattrs_get_times(attrs, &stat->atime, &stat->mtime,
+-					&stat->ctime);
+-	if (kernfs_dir_nlink(kn, &nlink))
+-		stat->nlink = nlink;
++	kernfs_stat_from_node(kn, stat);
+ 	up_read(&root->kernfs_iattr_rwsem);
+ 
+ 	return 0;
+@@ -420,9 +462,6 @@ static int kernfs_permission_lockless(st
+ 				      struct kernfs_node *kn,
+ 				      struct inode *inode, int mask)
+ {
+-	struct kernfs_iattrs *attrs;
+-	kuid_t uid = GLOBAL_ROOT_UID;
+-	kgid_t gid = GLOBAL_ROOT_GID;
+ 	unsigned int seq;
+ 	int ret;
+ 
+@@ -431,16 +470,7 @@ static int kernfs_permission_lockless(st
+ 	if (seq & 1)
+ 		return -ECHILD;
+ 
+-	/* A node without attrs is owned by root, and so is its inode. */
+-	attrs = READ_ONCE(kn->iattr);
+-	if (attrs) {
+-		uid = KUIDT_INIT(READ_ONCE(attrs->ia_uid.val));
+-		gid = KGIDT_INIT(READ_ONCE(attrs->ia_gid.val));
+-	}
+-
+-	if (READ_ONCE(inode->i_mode) != READ_ONCE(kn->mode) ||
+-	    READ_ONCE(inode->i_uid.val) != __kuid_val(uid) ||
+-	    READ_ONCE(inode->i_gid.val) != __kgid_val(gid))
++	if (!kernfs_inode_current(kn, inode))
+ 		return -ECHILD;
+ 
+ 	ret = generic_permission(&nop_mnt_idmap, inode, mask);
+_
