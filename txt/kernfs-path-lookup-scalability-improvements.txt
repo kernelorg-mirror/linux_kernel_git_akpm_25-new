@@ -1,6 +1,69 @@
 From: Andrew Morton <akpm@linux-foundation.org>
-Subject: kernfs: stay in RCU walk during path lookup
+Subject: kernfs: path lookup scalability improvements
 Date: Tue, 24 Nov 2026 22:00:14 -0800
+
+Improve kernfs scalability by keeping path lookups in RCU walk, which
+takes kernfs_iattr_rwsem and the dentry reference counts out of them.
+Throughput improvements of more than 40x were measured for highly
+contended workloads in a 64-CPU guest.
+
+The main work happens in kernfs_iop_permission() and
+kernfs_dop_revalidate().  The latter simply stops refusing RCU walk.  In
+the former the inode's mode/uid/gid are checked against the kernfs_node's
+under a new per-fs seqcount.  If they match then the inode needs no
+refresh and we avoid taking kernfs_iattr_rwsem.  So
+
+        seq = raw_read_seqcount(&root->iattr_seq);
+        if (seq is odd)
+                slowpath;       /* a setattr is in progress */
+        if (inode's mode/uid/gid != kernfs_node's mode/uid/gid)
+                slowpath;
+        ret = generic_permission();
+        if (read_seqcount_retry(&root->iattr_seq, seq))
+                slowpath;
+        return ret;
+
+where the slowpath leaves RCU walk, takes kernfs_iattr_rwsem and refreshes
+the inode, as before.
+
+The tricky part is kernfs_iop_permission()'s call of
+kernfs_permission_lockless().  This lockless comparison is safe due to
+three observed behaviors.  These behaviors introduce some fragility - they
+must be preserved.
+
+1: Every change to a visible node's mode or owner goes through
+   __kernfs_setattr() with kernfs_iattr_rwsem held for writing, inside a
+   write section of the seqcount.  The only other store to the inode's
+   copies is kernfs_refresh_inode() copying from the node under the read
+   lock.
+
+   Comments were added to these sites to explain the dependency.
+
+2: The node, its iattrs and the root are all freed through RCU.
+
+   Comments were added to these sites to explain the dependency.
+
+3: generic_permission() consults only the mode, uid and gid of the
+   inode.  True for kernfs because it has no POSIX ACLs.
+
+   This is an expansion of generic_permission()'s contract.  A comment
+   was added to generic_permission() to explain this, with a reference
+   to kernfs.
+
+Detailed performance and correctness testing results are presented below
+this patch's "---" so they can be viewed via this patch's Link:.
+
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Tejun Heo <tj@kernel.org>
+Cc: Christian Brauner <brauner@kernel.org>
+Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Ian Kent <raven@themaw.net>
+Cc: Imran Khan <imran.f.khan@oracle.com>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Jan Kara <jack@suse.cz>
+---
+
+DETAILED DESCRIPTION AND RESULTS
 
 Let path lookups in sysfs and cgroupfs stay in RCU walk, so that looking
 up a file which is already in the dcache takes no locks and no references,
@@ -57,6 +120,7 @@ udev-trigger-settle                            0%
 parallel-sysfs-cat                             0%
 systemd-cgls                                   0%
 cold-find-sys-devices                          0%
+
 
 Speedup is the change in the median rate (or, for the timed tests, in
 1/time) from the kernel without this patch to the kernel with it.
@@ -189,6 +253,7 @@ to 556 ms, because ->getattr() still takes the lock.  This convoy was
 constructed to show the effect.  It is not a reproduction of any stall
 which has been reported.
 
+
 kernfs is the filesystem behind sysfs and cgroupfs.  A path lookup starts
 in RCU walk, which takes no locks and no references.
 kernfs_dop_revalidate() and kernfs_iop_permission() both return -ECHILD
@@ -260,34 +325,28 @@ and [2] deal with those.  For a single monitor this patch is worth about
 5% (the monitor-sweep tests), and it takes the monitor's lookups out of
 the queue for that lock.
 
-
 Correctness was tested on the same two kernels in 64-CPU guests.  A
 directory of mode 0007 had its owner flipped between 1000:2000 and
 2000:1000 while a process with uid 1000 and gid 1000, which must always be
 refused, looked up a name in it: 35.6 million chown() calls and 125.6
 million lookups in 60 seconds, and 8 million more lookups under lockdep
-and KASAN, with none allowed.
-
-3,000 rounds each of a permission-change test and a negative-dentry test
-gave no wrong result.  With lockdep, PROVE_RCU, KASAN and
-DEBUG_ATOMIC_SLEEP, 60 seconds of cgroup mkdir, rmdir, chmod and chown
-against concurrent path walkers, 2,268 mounts and unmounts of a private
-sysfs, and 2,000 renames of a veth device against 16.8 million stat()
-calls on its two names produced no report, and every stat() either
-succeeded or failed with ENOENT.
-
-On PREEMPT_RT with the same debug options, the chown() test (1.2 million
-chown() calls and 4 million lookups, none allowed), the permission-change
-and negative-dentry tests, the churn and 1,339 mounts and unmounts
-produced no report either.
-
+and KASAN, with none allowed.  3,000 rounds each of a permission-change
+test and a negative-dentry test gave no wrong result.  With lockdep,
+PROVE_RCU, KASAN and DEBUG_ATOMIC_SLEEP, 60 seconds of cgroup mkdir,
+rmdir, chmod and chown against concurrent path walkers, 2,268 mounts and
+unmounts of a private sysfs, and 2,000 renames of a veth device against
+16.8 million stat() calls on its two names produced no report, and every
+stat() either succeeded or failed with ENOENT.  On PREEMPT_RT with the
+same debug options, the chown() test (1.2 million chown() calls and 4
+million lookups, none allowed), the permission-change and negative-dentry
+tests, the churn and 1,339 mounts and unmounts produced no report either.
 KCSAN reported data races on both kernels.  The two which name
 kernfs_iop_permission() appeared only without this patch.  Those which
 appeared only with it are in the VFS's own RCU walk (lookup_fast(),
 link_path_walk() and path_lookupat() against changes to dentry state),
-which kernfs lookups did not reach before.  None names anything this patch
-adds.  An SELinux allow or deny decision on a kernfs path was not tested:
-the SELinux runs exercised only the mode bits.
+which kernfs lookups did not reach before.  None names anything this
+patch adds.  An SELinux allow or deny decision on a kernfs path was not
+tested: the SELinux runs exercised only the mode bits.
 
 Earlier work on this:
 
@@ -320,255 +379,3 @@ Link: https://lore.kernel.org/166606025456.13363.3829702374064563472.stgit@donal
 Link: https://lore.kernel.org/20240109214828.252092-4-tj@kernel.org [9]
 Link: https://lore.kernel.org/20250213145023.2820193-1-bigeasy@linutronix.de [10]
 Link: https://lore.kernel.org/20260913021453.21507-1-shakeel.butt@linux.dev [11]
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Cc: Tejun Heo <tj@kernel.org>
-Cc: Christian Brauner <brauner@kernel.org>
-Cc: Shakeel Butt <shakeel.butt@linux.dev>
-Cc: Ian Kent <raven@themaw.net>
-Cc: Imran Khan <imran.f.khan@oracle.com>
-
- fs/kernfs/dir.c             |   15 +++-
- fs/kernfs/inode.c           |  111 ++++++++++++++++++++++++++++++----
- fs/kernfs/kernfs-internal.h |   13 +++
- fs/kernfs/mount.c           |    5 -
- 4 files changed, 127 insertions(+), 17 deletions(-)
-
---- a/fs/kernfs/dir.c~kernfs-stay-in-rcu-walk-during-path-lookup
-+++ a/fs/kernfs/dir.c
-@@ -1041,6 +1041,7 @@ struct kernfs_root *kernfs_create_root(s
- 	spin_lock_init(&root->kernfs_idr_lock);
- 	init_rwsem(&root->kernfs_rwsem);
- 	init_rwsem(&root->kernfs_iattr_rwsem);
-+	seqcount_init(&root->iattr_seq);
- 	init_rwsem(&root->kernfs_supers_rwsem);
- 	INIT_LIST_HEAD(&root->supers);
- 	rwlock_init(&root->kernfs_rename_lock);
-@@ -1185,14 +1186,20 @@ static int kernfs_dop_revalidate(struct
- 				 struct dentry *dentry, unsigned int flags)
- {
- 	struct kernfs_node *parent = dir->i_private;
-+	struct inode *inode;
- 	struct kernfs_node *kn;
- 	const char *kn_name;
- 
--	if (flags & LOOKUP_RCU)
--		return -ECHILD;
-+	/*
-+	 * This can be called in RCU walk: nothing below sleeps or takes a
-+	 * lock.  The dentry can then lose its inode at any time, so read
-+	 * ->d_inode once.  The caller rechecks ->d_seq and will not use a
-+	 * dentry which was killed under us.
-+	 */
-+	inode = d_inode_rcu(dentry);
- 
- 	/* Negative hashed dentry? */
--	if (d_really_is_negative(dentry)) {
-+	if (!inode) {
- 		/*
- 		 * If the kernfs parent node has changed discard and proceed to
- 		 * ->lookup.
-@@ -1206,7 +1213,7 @@ static int kernfs_dop_revalidate(struct
- 		return !kernfs_dir_changed(parent, dentry);
- 	}
- 
--	kn = kernfs_dentry_node(dentry);
-+	kn = inode->i_private;
- 
- 	guard(rcu)();
- 
---- a/fs/kernfs/inode.c~kernfs-stay-in-rcu-walk-during-path-lookup
-+++ a/fs/kernfs/inode.c
-@@ -65,6 +65,26 @@ static struct kernfs_iattrs *kernfs_iatt
- 	return __kernfs_iattrs(kn, false);
- }
- 
-+/*
-+ * A change to the mode or the owner of a visible node, and of the inode it
-+ * is being made through, goes inside a write section of root->iattr_seq.
-+ * kernfs_iattr_rwsem serializes the writers.
-+ *
-+ * These are the raw seqcount operations because the section can be
-+ * preempted and can sleep.  That is fine: a reader never waits for it, see
-+ * kernfs_permission_lockless().
-+ */
-+static void kernfs_iattr_seq_begin(struct kernfs_root *root)
-+{
-+	lockdep_assert_held_write(&root->kernfs_iattr_rwsem);
-+	raw_write_seqcount_begin(&root->iattr_seq);
-+}
-+
-+static void kernfs_iattr_seq_end(struct kernfs_root *root)
-+{
-+	raw_write_seqcount_end(&root->iattr_seq);
-+}
-+
- int __kernfs_setattr(struct kernfs_node *kn, const struct iattr *iattr)
- {
- 	struct kernfs_iattrs *attrs;
-@@ -102,7 +122,9 @@ int kernfs_setattr(struct kernfs_node *k
- 	struct kernfs_root *root = kernfs_root(kn);
- 
- 	down_write(&root->kernfs_iattr_rwsem);
-+	kernfs_iattr_seq_begin(root);
- 	ret = __kernfs_setattr(kn, iattr);
-+	kernfs_iattr_seq_end(root);
- 	up_write(&root->kernfs_iattr_rwsem);
- 	return ret;
- }
-@@ -124,12 +146,12 @@ int kernfs_iop_setattr(const struct mnt_
- 	if (error)
- 		goto out;
- 
-+	kernfs_iattr_seq_begin(root);
- 	error = __kernfs_setattr(kn, iattr);
--	if (error)
--		goto out;
--
- 	/* this ignores size changes */
--	setattr_copy(&nop_mnt_idmap, inode, iattr);
-+	if (!error)
-+		setattr_copy(&nop_mnt_idmap, inode, iattr);
-+	kernfs_iattr_seq_end(root);
- 
- out:
- 	up_write(&root->kernfs_iattr_rwsem);
-@@ -270,18 +292,85 @@ void kernfs_evict_inode(struct inode *in
- 	kernfs_put(kn);
- }
- 
--int kernfs_iop_permission(const struct mnt_idmap *idmap,
--			  struct inode *inode, int mask)
-+/**
-+ * kernfs_permission_lockless - check permission without kernfs_iattr_rwsem
-+ * @root: kernfs_root which @kn belongs to
-+ * @kn: kernfs_node which @inode was instantiated from
-+ * @inode: inode to check
-+ * @mask: MAY_* mask, as for generic_permission()
-+ *
-+ * generic_permission() looks at the mode and the owner in @inode, which
-+ * are copies of those in @kn.  If the copies are current then there is
-+ * nothing to refresh, and so no need for the lock.  The read section of
-+ * root->iattr_seq makes sure that neither @kn nor @inode was part way
-+ * through chmod() or chown() while they were compared and checked.  The
-+ * only other stores to those fields of @inode are made by
-+ * kernfs_refresh_inode(), which copies them from @kn while holding
-+ * kernfs_iattr_rwsem for read, and that can only store the values which
-+ * were compared here.
-+ *
-+ * This sleeps nowhere and stores nothing, so it is safe in RCU walk: @kn,
-+ * its attrs and @root are all freed by RCU.
-+ *
-+ * Return: the result of generic_permission(), or -ECHILD if the caller
-+ * has to refresh @inode under kernfs_iattr_rwsem and check again.
-+ */
-+static int kernfs_permission_lockless(struct kernfs_root *root,
-+				      struct kernfs_node *kn,
-+				      struct inode *inode, int mask)
- {
--	struct kernfs_node *kn;
--	struct kernfs_root *root;
-+	struct kernfs_iattrs *attrs;
-+	kuid_t uid = GLOBAL_ROOT_UID;
-+	kgid_t gid = GLOBAL_ROOT_GID;
-+	unsigned int seq;
- 	int ret;
- 
--	if (mask & MAY_NOT_BLOCK)
-+	/* Don't wait for a writer: it can sleep, and it holds the lock. */
-+	seq = raw_read_seqcount(&root->iattr_seq);
-+	if (seq & 1)
- 		return -ECHILD;
- 
--	kn = inode->i_private;
--	root = kernfs_root(kn);
-+	/* A node without attrs is owned by root, and so is its inode. */
-+	attrs = READ_ONCE(kn->iattr);
-+	if (attrs) {
-+		uid = KUIDT_INIT(READ_ONCE(attrs->ia_uid.val));
-+		gid = KGIDT_INIT(READ_ONCE(attrs->ia_gid.val));
-+	}
-+
-+	if (READ_ONCE(inode->i_mode) != READ_ONCE(kn->mode) ||
-+	    READ_ONCE(inode->i_uid.val) != __kuid_val(uid) ||
-+	    READ_ONCE(inode->i_gid.val) != __kgid_val(gid))
-+		return -ECHILD;
-+
-+	ret = generic_permission(&nop_mnt_idmap, inode, mask);
-+	if (read_seqcount_retry(&root->iattr_seq, seq))
-+		return -ECHILD;
-+
-+	return ret;
-+}
-+
-+/*
-+ * generic_permission() looks only at the mode and owner in @inode, which
-+ * are copies of those in its kernfs_node.  Try the check without
-+ * kernfs_iattr_rwsem first.  That is safe because:
-+ *
-+ * - The copies are compared with the node's.  If they differ, fall back:
-+ *   take the lock and refresh the inode, leaving RCU walk first.
-+ * - A chmod() or chown() cannot be caught half done.  Setattr is a write
-+ *   section of root->iattr_seq, the check is a read section, and a check
-+ *   which overlaps a write section falls back too.
-+ * - The node, its attrs and the root are freed by RCU.
-+ */
-+int kernfs_iop_permission(const struct mnt_idmap *idmap,
-+			  struct inode *inode, int mask)
-+{
-+	struct kernfs_node *kn = inode->i_private;
-+	struct kernfs_root *root = kernfs_root(kn);
-+	int ret;
-+
-+	ret = kernfs_permission_lockless(root, kn, inode, mask);
-+	if (ret != -ECHILD || (mask & MAY_NOT_BLOCK))
-+		return ret;
- 
- 	down_read(&root->kernfs_iattr_rwsem);
- 	kernfs_refresh_inode(kn, inode);
---- a/fs/kernfs/kernfs-internal.h~kernfs-stay-in-rcu-walk-during-path-lookup
-+++ a/fs/kernfs/kernfs-internal.h
-@@ -56,6 +56,16 @@ struct kernfs_root {
- 	struct rcu_head		rcu;
- 
- 	struct simple_xattr_cache xa_cache;
-+
-+	/*
-+	 * Odd while the mode or owner of a node and of its inode are being
-+	 * changed.  Written under kernfs_iattr_rwsem, by setattr only.  It
-+	 * lets kernfs_iop_permission() check them without that lock.
-+	 *
-+	 * Every path walk reads this and the locks above are written all the
-+	 * time, so it has a cacheline to itself.  Keep it last.
-+	 */
-+	seqcount_t		iattr_seq ____cacheline_aligned_in_smp;
- };
- 
- /* +1 to avoid triggering overflow warning when negating it */
-@@ -102,6 +112,9 @@ struct kernfs_super_info {
- 
- 	/* anchored at kernfs_root->supers, protected by kernfs_rwsem */
- 	struct list_head	node;
-+
-+	/* kernfs_dop_revalidate() reads ->ns in RCU walk */
-+	struct rcu_head		rcu;
- };
- #define kernfs_info(SB) ((struct kernfs_super_info *)(SB->s_fs_info))
- 
---- a/fs/kernfs/mount.c~kernfs-stay-in-rcu-walk-during-path-lookup
-+++ a/fs/kernfs/mount.c
-@@ -445,10 +445,11 @@ void kernfs_kill_sb(struct super_block *
- 
- 	/*
- 	 * Mark the superblock dead so sget_fc() can't find it,
--	 * before freeing kernfs_super_info.
-+	 * before freeing kernfs_super_info.  An RCU walk which is still
-+	 * inside this superblock can be reading info->ns.
- 	 */
- 	kill_anon_super(sb);
--	kfree(info);
-+	kfree_rcu(info, rcu);
- }
- 
- static void __init kernfs_mutex_init(void)
-_
