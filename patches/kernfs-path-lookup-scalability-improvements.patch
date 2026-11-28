@@ -2,6 +2,48 @@ From: Andrew Morton <akpm@linux-foundation.org>
 Subject: kernfs: path lookup scalability improvements
 Date: Tue, 24 Nov 2026 22:00:14 -0800
 
+Patch series "kernfs: lockless path lookup and stat()".
+
+A path lookup in sysfs or cgroupfs leaves RCU walk at its first kernfs
+component and then takes kernfs_iattr_rwsem for reading in every directory
+of the path.  There is one of those rwsems per filesystem.  stat() takes
+it once more in ->getattr().
+
+That costs scalability: however many CPUs are doing lookups, each of these
+filesystems manages about 1.5 million per second in total.  And it costs
+reliability: one reader which is preempted while it holds the rwsem, plus
+one chown() waiting for it, stalls every other lookup and stat() in the
+filesystem.
+
+Patch 1 keeps lookups of cached paths in RCU walk, with no kernfs lock.
+Patch 2 makes ->getattr() lockless in the same way.
+
+In a 64-CPU guest with 64 processes, each using a different cgroup file,
+patch 1 made access() 49x faster, open() and close() 22x faster and stat()
+13x faster.  Patch 2 made stat() a further 3x faster.  A process running
+alone gained 23% to 46% from patch 1 and nothing from patch 2.
+
+A single process reading the files of 500 cgroups, while a chown() waited
+behind a preempted reader, had sweeps of 1.2 to 1.8 seconds where 17ms is
+normal.  With patch 1 its longest sweep was 29ms if it only opened the
+files, and with patch 2 also if it called stat() on each first.
+
+Not covered: a lookup through a kernfs symlink (everything under
+/sys/class) still leaves RCU walk, as do lookups of names which are not
+in the dcache.  readdir is untouched.  Many processes opening the same
+file are limited by a per-file mutex and gained nothing.
+
+The permission and stat() results were checked while the owner of a
+directory was being changed, more than 100 million times each, with no
+wrong result, and each check has a negative control which fails.  Lockdep,
+KASAN and PREEMPT_RT kernels reported nothing.
+
+This is on top of Shakeel Butt's "kernfs: stop taking kernfs_iattr_rwsem
+for writing in mkdir/rmdir" [1].
+
+
+This patch (of 2):
+
 Improve kernfs scalability by keeping path lookups in RCU walk, which
 takes kernfs_iattr_rwsem and the dentry reference counts out of them.
 Throughput improvements of more than 40x were measured for highly
@@ -53,6 +95,7 @@ must be preserved.
 Detailed performance and correctness testing results are presented below
 this patch's "---" so they can be viewed via this patch's Link:.
 
+Link: https://lore.kernel.org/20261118220154.2965621-1-shakeel.butt@linux.dev [1]
 Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
 Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Cc: Tejun Heo <tj@kernel.org>
@@ -80,7 +123,7 @@ The figures below are from KVM guests with 64 virtual CPUs in two NUMA
 nodes and 16GB of memory, on a 64-core, 128-thread AMD Threadripper PRO
 3995WX.  The virtual CPUs were not pinned.  The kernel was 7.4-rc3 with
 the mm queue, built without lockdep, KASAN or other debug options, and
-both of the kernels being compared had [2] applied.  Each figure is the
+both of the kernels being compared had [1] applied.  Each figure is the
 median of three or more runs of between 1 and 10 seconds.  Most were
 repeated on two boots of each kernel, booted alternately.
 
@@ -148,6 +191,7 @@ million to 29.4 million.
 
 stat-64-cgroup-files: as above, with stat().  1.37 million to 17.6
 million.  stat() still takes kernfs_iattr_rwsem once, in ->getattr().
+The next patch removes that.
 
 access-64-one-cgroup-file: 64 processes all call access() on the same
 cgroup.procs file.  They now contend on that file's dentry.
@@ -250,9 +294,9 @@ behind the chown().  Without this patch the longest sweep in 30 seconds
 took between 1.2 and 1.8 seconds.  With it the longest took 29 ms, because
 the sweep's lookups no longer take the lock.  When the sweep called stat()
 on each file before opening it, the patched kernel stalled as well, for up
-to 556 ms, because ->getattr() still takes the lock.  This convoy was
-constructed to show the effect.  It is not a reproduction of any stall
-which has been reported.
+to 556 ms, because ->getattr() still takes the lock.  The next patch
+removes that.  This convoy was constructed to show the effect.  It is not
+a reproduction of any stall which has been reported.
 
 
 kernfs is the filesystem behind sysfs and cgroupfs.  A path lookup starts
@@ -305,7 +349,8 @@ Three things are not changed.  kernfs_iop_get_link() still returns -ECHILD
 in RCU walk, so a lookup through a sysfs symlink, such as the entries of
 /sys/class and of /sys/bus/*/devices, leaves RCU walk there.  ->getattr()
 still takes kernfs_iattr_rwsem, so stat() takes it once per call where it
-took it once per directory.  And opening a file still takes a mutex which
+took it once per directory; the next patch removes that.  And opening a
+file still takes a mutex which
 all the openers of that file share, which is now what limits many
 processes opening the same file.
 
@@ -319,10 +364,10 @@ contention in ->d_revalidate() which he could not explain [5].  Minchan
 Kim described a convoy on the rwsem when it was still global [6].
 
 Meta's reports are of stalls, not of throughput: oomd and the "below"
-monitor stuck for minutes behind a writer in kernfs_dop_revalidate() [1],
+monitor stuck for minutes behind a writer in kernfs_dop_revalidate() [2],
 and held up for as long as 22 minutes by cgroup mkdir and rmdir waiting
-for kernfs_iattr_rwsem, which every path walk takes for reading [2].  [1]
-and [2] deal with those.  For a single monitor this patch is worth about
+for kernfs_iattr_rwsem, which every path walk takes for reading [1].  [2]
+and [1] deal with those.  For a single monitor this patch is worth about
 5% (the monitor-sweep tests), and it takes the monitor's lookups out of
 the queue for that lock.
 
@@ -364,13 +409,13 @@ Earlier work on this:
 2025  Sebastian Andrzej Siewior made a node's name and parent readable
       under RCU [10].
 2026  Shakeel Butt made kernfs_dop_revalidate() lockless and left
-      lifting its LOOKUP_RCU bail "to a separate series" [1], took work
+      lifting its LOOKUP_RCU bail "to a separate series" [2], took work
       out from under the kernfs_rwsem write lock [11], and stopped mkdir
-      and rmdir taking kernfs_iattr_rwsem for writing [2].  The last of
+      and rmdir taking kernfs_iattr_rwsem for writing [1].  The last of
       those is not yet upstream, and this patch goes on top of it.
 
-Link: https://lore.kernel.org/20260821050507.2161607-1-shakeel.butt@linux.dev [1]
-Link: https://lore.kernel.org/20261118220154.2965621-1-shakeel.butt@linux.dev [2]
+Link: https://lore.kernel.org/20261118220154.2965621-1-shakeel.butt@linux.dev [1]
+Link: https://lore.kernel.org/20260821050507.2161607-1-shakeel.butt@linux.dev [2]
 Link: https://lore.kernel.org/20230309110932.2889010-2-imran.f.khan@oracle.com [3]
 Link: https://lore.kernel.org/162642752894.63632.5596341704463755308.stgit@web.messagingengine.com [4]
 Link: https://lore.kernel.org/1c96890d-5ec9-4f2d-a897-8f8c46ea87f7@themaw.net [5]

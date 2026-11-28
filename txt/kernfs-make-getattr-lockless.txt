@@ -11,41 +11,100 @@ count are read from the node and need no lock.
 So do what kernfs_iop_permission() now does: inside a read section of
 root->iattr_seq, check that the inode's mode and owner are those of the
 node, and if they are, fill in the kstat without the lock.  If a setattr
-is running, or started meanwhile, or the inode is stale, take the lock and
-refresh as before.
+is running, or started meanwhile, or the inode is stale, take the lock
+and refresh as before.
 
-The comparison moves into kernfs_inode_current() so that both callers
-use it.
+The comparison moves into kernfs_inode_current() so that both callers use
+it.
+
+In a 64-CPU guest, 64 processes calling stat() on 64 different cgroup
+files went from 15.6 million calls per second to 47.1 million, which is
+90% of what access() manages on the same files.  One process alone is
+unchanged.
+
+It also removes a stall.  A process which calls stat() and then open() on
+the files of 500 cgroups, while a chown() waits behind a preempted holder
+of kernfs_iattr_rwsem, had sweeps of up to 1.6 seconds.  With this patch
+its longest sweep was 29ms.
+
+Detailed testing results are below this patch's "---".
 
 Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Cc: Tejun Heo <tj@kernel.org>
 Cc: Christian Brauner <brauner@kernel.org>
 Cc: Shakeel Butt <shakeel.butt@linux.dev>
+Cc: Ian Kent <raven@themaw.net>
+Cc: Imran Khan <imran.f.khan@oracle.com>
 ---
-On top of kernfs-path-lookup-scalability-improvements.patch (your copy
-with the kernfs_free_rcu() comment moved), which is on mm-new
-3d27e49eb905 plus Shakeel's six.
+DETAILED RESULTS
 
-Compile-tested only: fs/kernfs/ builds with x86_64 defconfig, no
-warnings.  Nothing was run.  The changelog has no figures because there
-are none yet.
+All from 64-CPU KVM guests on a 64-core, 128-thread AMD Threadripper PRO
+3995WX, virtual CPUs not pinned.  "Before" is the previous patch, "after"
+adds this one.  Both have Shakeel Butt's series underneath.
 
-For a quick test, A = the queue with the path lookup patch, B = A plus
-this:
+Performance, millions of calls per second, median of two boots of each
+kernel, three two-second runs per boot, no debug options:
 
-  kt perf stat 64 5 /sys/fs/cgroup/t/p*/cgroup.procs        (was 17.6M/s)
-  kt perf stat 64 5 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs   (was 8.65M/s)
-  kt perf stat 1  5 /sys/fs/cgroup/t/a/b/c/d/cgroup.procs
-  kt perf access 64 5 /sys/fs/cgroup/t/p*/cgroup.procs      (control)
+Test                                     Before    After
+stat-1-cgroup-file                         1.44     1.43
+stat-64-cgroup-files                       15.6     47.1
+stat-64-one-cgroup-file                    7.12     8.03
+access-64-cgroup-files                     51.1     52.3
 
-and the convoy test, case d (the monitor calls stat() before open()),
-which stalled for up to 556 ms.  It should now behave like case c.
+stat-1-cgroup-file: one process calls stat() on one cgroup.procs file.
 
-Before this is believed, the chown race needs a stat() in it: a reader
-calling stat() on the mode-0007 directory while its owner flips must
-never see uid 1000 with gid 1000.  kt race does not do that today.
+stat-64-cgroup-files: 64 processes each call stat() on the cgroup.procs
+file of a different cgroup.
 
-generic_fillattr() also reads i_ino, i_rdev, i_size, i_blocks and
-i_nlink from the inode.  kernfs does not change the first four after
-the inode is set up, and the link count is overwritten from the node
-for directories, as before.  I checked that by reading, not by test.
+stat-64-one-cgroup-file: 64 processes call stat() on the same file.  The
+13% is within the variation between runs.
+
+access-64-cgroup-files: the control.  access() on the files of
+stat-64-cgroup-files.  These rates are from a different test program
+from the one behind the previous patch's table and should not be compared
+with it.
+
+Correctness.  The owner of a mode-0007 cgroup directory was flipped
+between 1000:2000 and 2000:1000 for 60 seconds while four processes
+called stat() and fstat() on it.  Any other uid and gid pair is a result
+read half way through a chown().
+
+Kernel                               chown()s   stat()s   Mixed
+before                                  8.0M     144.6M       0
+after                                  19.9M     364.6M       0
+after, lockdep and KASAN                2.0M     106.4M       0
+after, with delays                      1.0M       3.5M       0
+after, with delays, no recheck          1.0M       5.4M    2.96M
+
+"With delays" is a test-only patch which waits 50us between the uid and
+gid stores in setattr_copy() and 20us in ->getattr() between the check
+and the use.  "No recheck" is a second test-only patch which removes the
+read_seqcount_retry() from ->getattr().  That is the negative control:
+its first wrong result was uid 2000 with gid 2000.
+
+The permission test of the previous patch still passes with this one
+(150 million lookups against 44 million chown()s, none allowed), as do
+its permission-change test and, with lockdep, PROVE_RCU, KASAN and
+DEBUG_ATOMIC_SLEEP, 60 seconds of mkdir, rmdir, chmod and chown.
+
+The stall.  One process sweeps 500 cgroups, reading seven files in each.
+Another calls chown() on an unrelated cgroup once a second.  A SCHED_IDLE
+process which shares its CPU with a busy loop calls stat() on a cgroup
+file, so that it is often descheduled while it holds kernfs_iattr_rwsem.
+Longest sweep in each of three 30-second runs, in milliseconds:
+
+Sweep does                           Before            After
+open() only                       29, 26, 30       30, 24, 32
+stat() then open()             371, 1626, 26       28, 27, 29
+
+With this patch the SCHED_IDLE process seldom takes the rwsem either, so
+there are fewer holders as well as fewer waiters.  This convoy was
+constructed to show the effect.  It is not a reproduction of any stall
+which has been reported.
+
+Not tested with this patch: PREEMPT_RT, KCSAN.
+
+generic_fillattr() also reads i_ino, i_rdev, i_size, i_blocks and i_nlink
+from the inode.  kernfs does not change the first four after the inode is
+set up, and the link count is overwritten from the node for directories,
+as before.
